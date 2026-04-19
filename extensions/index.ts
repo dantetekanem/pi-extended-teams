@@ -11,8 +11,12 @@ import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
 import * as predefined from "../src/utils/predefined-teams";
 import {
+  isKnownQualifiedModel,
+  listPreferredQualifiedModels,
   loadModelResolutionConfig,
-  resolveModelWithProvider,
+  loadPiModelSettings,
+  normalizeQualifiedModel,
+  sortAvailableModels,
 } from "../src/utils/model-resolution";
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -105,10 +109,53 @@ function getAvailableModels(): Array<{ provider: string; model: string }> {
   }
 }
 
-function resolveConfiguredModel(modelName: string): string | null {
+function getModelSelectionState(projectDir: string, preferredModels: string[] = []) {
   const availableModels = getAvailableModels();
-  const config = loadModelResolutionConfig({ projectDir: process.cwd() });
-  return resolveModelWithProvider(modelName, availableModels, config);
+  const piSettings = loadPiModelSettings({ projectDir });
+  const config = loadModelResolutionConfig({ projectDir });
+  const preferredQualifiedModels = listPreferredQualifiedModels(availableModels, {
+    projectDir,
+    preferredModels,
+  });
+  const sortedModels = sortAvailableModels(availableModels, {
+    preferredModels: preferredQualifiedModels,
+    providerPriority: config.providerPriority,
+  });
+
+  return {
+    availableModels,
+    piSettings,
+    providerPriority: config.providerPriority,
+    preferredQualifiedModels,
+    sortedModels,
+  };
+}
+
+function requireQualifiedKnownModel(
+  model: string | undefined,
+  availableModels: Array<{ provider: string; model: string }>,
+  fieldName: string
+): string | undefined {
+  if (!model) {
+    return undefined;
+  }
+
+  const normalized = normalizeQualifiedModel(model);
+  if (!normalized) {
+    throw new Error(
+      `${fieldName} must be a fully qualified provider/model string. ` +
+      `Use list_available_models to choose a valid model.`
+    );
+  }
+
+  if (!isKnownQualifiedModel(normalized, availableModels)) {
+    throw new Error(
+      `${fieldName} \"${normalized}\" is not available. ` +
+      `Use list_available_models to choose a valid model.`
+    );
+  }
+
+  return normalized;
 }
 
 /**
@@ -446,23 +493,85 @@ export default function (pi: ExtensionAPI) {
 
   // Tools
   pi.registerTool({
+    name: "list_available_models",
+    label: "List Available Models",
+    description: "List available fully qualified models for team creation and teammate spawning. Use this before creating a new team or spawning teammates. Models must be specified as provider/model.",
+    parameters: Type.Object({}),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const state = getModelSelectionState(ctx.cwd);
+      const lines = [
+        "Choose a fully qualified provider/model string from this list when creating teams or spawning teammates.",
+        "Unqualified model names like \"gpt-5\" or \"haiku\" are not accepted.",
+      ];
+
+      if (state.preferredQualifiedModels.length > 0) {
+        lines.push("", "Preferred models (from pi settings, in priority order):");
+        for (const model of state.preferredQualifiedModels) {
+          lines.push(`- ${model}`);
+        }
+      }
+
+      if (state.providerPriority.length > 0) {
+        lines.push("", "Provider priority (from pi-teams config):");
+        for (const provider of state.providerPriority) {
+          lines.push(`- ${provider}`);
+        }
+      }
+
+      if (state.piSettings.defaultModel || state.piSettings.enabledModels?.length) {
+        lines.push("", "Pi model settings:");
+        if (state.piSettings.defaultProvider) {
+          lines.push(`- defaultProvider: ${state.piSettings.defaultProvider}`);
+        }
+        if (state.piSettings.defaultModel) {
+          lines.push(`- defaultModel: ${state.piSettings.defaultModel}`);
+        }
+        if (state.piSettings.enabledModels?.length) {
+          lines.push(`- enabledModels: ${state.piSettings.enabledModels.join(", ")}`);
+        }
+      }
+
+      lines.push("", "Available models (already sorted with preferred models first):");
+      for (const model of state.sortedModels) {
+        const tags: string[] = [];
+        if (model.preferred) tags.push("preferred");
+        if (model.providerPriorityIndex !== Number.MAX_SAFE_INTEGER) tags.push(`provider-priority:${model.providerPriorityIndex + 1}`);
+        lines.push(`- ${model.qualified}${tags.length ? ` [${tags.join(", ")}]` : ""}`);
+      }
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: {
+          preferredModels: state.preferredQualifiedModels,
+          providerPriority: state.providerPriority,
+          piSettings: state.piSettings,
+          models: state.sortedModels,
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "team_create",
     label: "Create Team",
-    description: "Create a new agent team.",
+    description: "Create a new agent team. If you specify default_model, it must be a fully qualified provider/model string from list_available_models.",
     parameters: Type.Object({
       team_name: Type.String(),
       description: Type.Optional(Type.String()),
-      default_model: Type.Optional(Type.String()),
+      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). Use list_available_models first." })),
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const { availableModels } = getModelSelectionState(ctx.cwd);
+      const defaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
+
       // Auto-cleanup stale team if the previous lead process is dead
       // This handles the case where a session was aborted and restarted
       if (teams.teamExists(params.team_name)) {
         cleanupStaleTeam(params.team_name, terminal);
       }
       
-      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, params.default_model, params.separate_windows);
+      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, defaultModel, params.separate_windows);
       // Register this session as the lead so it can receive inbox messages
       registerLeadSession(params.team_name);
       // Update teamName and start inbox polling for the lead
@@ -478,13 +587,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_teammate",
     label: "Spawn Teammate",
-    description: "Spawn a new teammate in a terminal pane or separate window.",
+    description: "Spawn a new teammate in a terminal pane or separate window. The model must be a fully qualified provider/model string from list_available_models, or the team must already have a fully qualified default model.",
     parameters: Type.Object({
       team_name: Type.String(),
       name: Type.String(),
       prompt: Type.String(),
       cwd: Type.String(),
-      model: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first." })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
       plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
       separate_window: Type.Optional(Type.Boolean({ default: false })),
@@ -511,21 +620,15 @@ export default function (pi: ExtensionAPI) {
         await teams.removeMember(safeTeamName, safeName);
       }
       
-      let chosenModel = params.model || teamConfig.defaultModel;
+      const { availableModels } = getModelSelectionState(ctx.cwd, [teamConfig.defaultModel].filter(Boolean) as string[]);
+      const explicitModel = requireQualifiedKnownModel(params.model, availableModels, "model");
+      const teamDefaultModel = requireQualifiedKnownModel(teamConfig.defaultModel, availableModels, "team default model");
+      const chosenModel = explicitModel || teamDefaultModel;
 
-      // Resolve model to provider/model format
-      if (chosenModel) {
-        if (!chosenModel.includes('/')) {
-          // Try to resolve using available models plus local/global pi-teams config
-          const resolved = resolveConfiguredModel(chosenModel);
-          if (resolved) {
-            chosenModel = resolved;
-          } else if (teamConfig.defaultModel && teamConfig.defaultModel.includes('/')) {
-            // Fall back to team default provider
-            const [provider] = teamConfig.defaultModel.split('/');
-            chosenModel = `${provider}/${chosenModel}`;
-          }
-        }
+      if (!chosenModel) {
+        throw new Error(
+          "No model specified. Use list_available_models to choose a fully qualified provider/model and pass it as model, or create the team with a fully qualified default_model."
+        );
       }
 
       const useSeparateWindow = params.separate_window ?? teamConfig.separateWindows ?? false;
@@ -1028,12 +1131,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "create_predefined_team",
     label: "Create Predefined Team",
-    description: "Create a team from a predefined team configuration. Spawns all agents defined in the team template from teams.yaml. Each agent is spawned with its predefined prompt, tools, and settings.",
+    description: "Create a team from a predefined team configuration. Any default_model you pass must be a fully qualified provider/model string from list_available_models. Agent definitions with models must also already be fully qualified.",
     parameters: Type.Object({
       team_name: Type.String({ description: "Name for the new team instance" }),
       predefined_team: Type.String({ description: "Name of the predefined team template from teams.yaml" }),
       cwd: Type.String({ description: "Working directory for spawned agents" }),
-      default_model: Type.Optional(Type.String({ description: "Default model for agents without a specified model" })),
+      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model) for agents without a specified model. Use list_available_models first." })),
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
@@ -1049,8 +1152,11 @@ export default function (pi: ExtensionAPI) {
         throw new Error("No terminal adapter detected.");
       }
 
+      const { availableModels } = getModelSelectionState(ctx.cwd);
+      const defaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
+
       // Create the team
-      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, params.default_model, params.separate_windows);
+      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel, params.separate_windows);
       registerLeadSession(params.team_name);
       // Update teamName and start inbox polling for the lead
       teamName = params.team_name;
@@ -1072,16 +1178,13 @@ export default function (pi: ExtensionAPI) {
           const safeName = paths.sanitizeName(agentName);
           const safeTeamName = paths.sanitizeName(params.team_name);
           
-          let chosenModel = agentDef.model || params.default_model || config.defaultModel;
-          
-          if (chosenModel && !chosenModel.includes('/')) {
-            const resolved = resolveConfiguredModel(chosenModel);
-            if (resolved) {
-              chosenModel = resolved;
-            } else if (config.defaultModel && config.defaultModel.includes('/')) {
-              const [provider] = config.defaultModel.split('/');
-              chosenModel = `${provider}/${chosenModel}`;
-            }
+          const agentModel = requireQualifiedKnownModel(agentDef.model, availableModels, `model for predefined agent \"${agentName}\"`);
+          const chosenModel = agentModel || defaultModel || config.defaultModel;
+
+          if (!chosenModel) {
+            throw new Error(
+              `No model specified for predefined agent \"${agentName}\". Add a fully qualified model to the agent definition or pass a fully qualified default_model.`
+            );
           }
 
           const useSeparateWindow = params.separate_windows ?? config.separateWindows ?? false;

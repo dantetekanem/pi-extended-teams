@@ -9,66 +9,60 @@ export interface AvailableModel {
 
 export interface ModelResolutionConfig {
   providerPriority?: string[];
-  explicitOnlyProviders?: string[];
 }
 
 export interface ResolvedModelResolutionConfig {
   providerPriority: string[];
-  explicitOnlyProviders: string[];
 }
 
-/**
- * Default provider priority used for bare model names.
- * OAuth/subscription providers go first, then API-key providers.
- */
-export const DEFAULT_PROVIDER_PRIORITY = [
-  "google-gemini-cli",
-  "github-copilot",
-  "kimi-sub",
-  "anthropic",
-  "openai",
-  "google",
-  "zai",
-  "openrouter",
-  "azure-openai",
-  "amazon-bedrock",
-  "mistral",
-  "groq",
-  "cerebras",
-  "xai",
-  "vercel-ai-gateway",
-];
+export interface PiModelSettings {
+  defaultProvider?: string;
+  defaultModel?: string;
+  enabledModels?: string[];
+}
+
+export interface SortedModel extends AvailableModel {
+  qualified: string;
+  preferred: boolean;
+  preferredIndex: number;
+  providerPriorityIndex: number;
+}
+
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 function normalizeList(values: unknown): string[] | undefined {
-  if (!Array.isArray(values)) {
-    return undefined;
-  }
+  if (!Array.isArray(values)) return undefined;
 
   const normalized = values
-    .map((value) => String(value).trim().toLowerCase())
+    .map((value) => String(value).trim())
     .filter(Boolean);
 
   return normalized.length > 0 ? Array.from(new Set(normalized)) : [];
 }
 
-function readConfigFile(configPath: string): ModelResolutionConfig {
-  if (!fs.existsSync(configPath)) {
-    return {};
-  }
+function readJsonFile<T>(filePath: string): T | null {
+  if (!fs.existsSync(filePath)) return null;
 
   try {
-    const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as ModelResolutionConfig;
-    return {
-      providerPriority: normalizeList(parsed.providerPriority),
-      explicitOnlyProviders: normalizeList(parsed.explicitOnlyProviders),
-    };
+    return JSON.parse(fs.readFileSync(filePath, "utf-8")) as T;
   } catch {
-    return {};
+    return null;
   }
 }
 
+function readConfigFile(configPath: string): ModelResolutionConfig {
+  const parsed = readJsonFile<ModelResolutionConfig>(configPath);
+  if (!parsed) {
+    return {};
+  }
+
+  return {
+    providerPriority: normalizeList(parsed.providerPriority)?.map((value) => value.toLowerCase()),
+  };
+}
+
 /**
- * Loads model resolution config.
+ * Loads pi-teams model-selection preferences.
  *
  * Supported locations:
  * - ~/.pi/pi-teams.json
@@ -87,88 +81,237 @@ export function loadModelResolutionConfig(options?: {
   const projectConfigPath = projectDir ? path.join(projectDir, ".pi", "pi-teams.json") : null;
 
   const merged: ResolvedModelResolutionConfig = {
-    providerPriority: [...DEFAULT_PROVIDER_PRIORITY],
-    explicitOnlyProviders: [],
+    providerPriority: [],
   };
 
   for (const configPath of [globalConfigPath, projectConfigPath]) {
     if (!configPath) continue;
 
     const config = readConfigFile(configPath);
-    if (config.providerPriority && config.providerPriority.length > 0) {
+    if (config.providerPriority) {
       merged.providerPriority = config.providerPriority;
-    }
-    if (config.explicitOnlyProviders) {
-      merged.explicitOnlyProviders = config.explicitOnlyProviders;
     }
   }
 
   return merged;
 }
 
-function sortByProviderPriority(
-  models: AvailableModel[],
-  providerPriority: string[]
-): AvailableModel[] {
-  return [...models].sort((a, b) => {
-    const aIndex = providerPriority.indexOf(a.provider.toLowerCase());
-    const bIndex = providerPriority.indexOf(b.provider.toLowerCase());
-    const aPriority = aIndex === -1 ? Number.MAX_SAFE_INTEGER : aIndex;
-    const bPriority = bIndex === -1 ? Number.MAX_SAFE_INTEGER : bIndex;
-    return aPriority - bPriority;
-  });
+/**
+ * Loads pi settings relevant to model selection.
+ *
+ * Supported locations:
+ * - ~/.pi/agent/settings.json
+ * - <project>/.pi/settings.json
+ *
+ * Project-local settings override global settings.
+ */
+export function loadPiModelSettings(options?: {
+  projectDir?: string;
+  homeDir?: string;
+}): PiModelSettings {
+  const homeDir = options?.homeDir ?? os.homedir();
+  const projectDir = options?.projectDir;
+
+  const globalSettingsPath = path.join(homeDir, ".pi", "agent", "settings.json");
+  const projectSettingsPath = projectDir ? path.join(projectDir, ".pi", "settings.json") : null;
+
+  const merged: PiModelSettings = {};
+
+  for (const settingsPath of [globalSettingsPath, projectSettingsPath]) {
+    if (!settingsPath) continue;
+
+    const settings = readJsonFile<PiModelSettings>(settingsPath);
+    if (!settings) continue;
+
+    if (typeof settings.defaultProvider === "string" && settings.defaultProvider.trim()) {
+      merged.defaultProvider = settings.defaultProvider.trim();
+    }
+    if (typeof settings.defaultModel === "string" && settings.defaultModel.trim()) {
+      merged.defaultModel = settings.defaultModel.trim();
+    }
+    if (Array.isArray(settings.enabledModels)) {
+      merged.enabledModels = settings.enabledModels
+        .map((value) => String(value).trim())
+        .filter(Boolean);
+    }
+  }
+
+  return merged;
 }
 
-/**
- * Finds the best matching provider/model string for an unqualified model name.
- * Providers listed in explicitOnlyProviders are ignored unless the caller passes
- * a fully qualified provider/model string.
- */
-export function resolveModelWithProvider(
-  modelName: string,
-  availableModels: AvailableModel[],
-  config?: Partial<ResolvedModelResolutionConfig>
-): string | null {
-  if (modelName.includes("/")) {
-    return modelName;
+export function stripThinkingSuffix(specifier: string): string {
+  const trimmed = specifier.trim();
+  const lastColon = trimmed.lastIndexOf(":");
+  if (lastColon === -1) {
+    return trimmed;
   }
 
-  if (availableModels.length === 0) {
+  const suffix = trimmed.slice(lastColon + 1).toLowerCase();
+  return THINKING_LEVELS.has(suffix) ? trimmed.slice(0, lastColon) : trimmed;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function matchesPattern(pattern: string, value: string): boolean {
+  const normalizedPattern = pattern.toLowerCase();
+  const normalizedValue = value.toLowerCase();
+
+  if (normalizedPattern.includes("*")) {
+    const regex = new RegExp(`^${normalizedPattern.split("*").map(escapeRegex).join(".*")}$`, "i");
+    return regex.test(value);
+  }
+
+  return normalizedValue === normalizedPattern || normalizedValue.includes(normalizedPattern);
+}
+
+export function parseQualifiedModel(specifier: string): AvailableModel | null {
+  const cleaned = stripThinkingSuffix(specifier);
+  const slashIndex = cleaned.indexOf("/");
+  if (slashIndex === -1) {
     return null;
   }
 
-  const providerPriority = config?.providerPriority?.length
-    ? config.providerPriority.map((value) => value.toLowerCase())
-    : DEFAULT_PROVIDER_PRIORITY;
-  const explicitOnlyProviders = new Set(
-    (config?.explicitOnlyProviders ?? []).map((value) => value.toLowerCase())
-  );
-
-  const candidates = availableModels.filter(
-    (model) => !explicitOnlyProviders.has(model.provider.toLowerCase())
-  );
-
-  if (candidates.length === 0) {
+  const provider = cleaned.slice(0, slashIndex).trim();
+  const model = cleaned.slice(slashIndex + 1).trim();
+  if (!provider || !model) {
     return null;
   }
 
-  const lowerModelName = modelName.toLowerCase();
+  return { provider, model };
+}
 
-  const exactMatches = candidates.filter(
-    (model) => model.model.toLowerCase() === lowerModelName
-  );
-  if (exactMatches.length > 0) {
-    const preferred = sortByProviderPriority(exactMatches, providerPriority)[0];
-    return `${preferred.provider}/${preferred.model}`;
+export function isQualifiedModel(specifier: string): boolean {
+  return parseQualifiedModel(specifier) !== null;
+}
+
+export function normalizeQualifiedModel(specifier: string): string | null {
+  const parsed = parseQualifiedModel(specifier);
+  return parsed ? `${parsed.provider}/${parsed.model}` : null;
+}
+
+function qualifyDefaultModel(settings: PiModelSettings): string | null {
+  if (!settings.defaultModel) {
+    return null;
   }
 
-  const partialMatches = candidates.filter((model) =>
-    model.model.toLowerCase().includes(lowerModelName)
-  );
-  if (partialMatches.length > 0) {
-    const preferred = sortByProviderPriority(partialMatches, providerPriority)[0];
-    return `${preferred.provider}/${preferred.model}`;
+  if (isQualifiedModel(settings.defaultModel)) {
+    return normalizeQualifiedModel(settings.defaultModel);
+  }
+
+  if (settings.defaultProvider) {
+    return `${settings.defaultProvider}/${stripThinkingSuffix(settings.defaultModel)}`;
   }
 
   return null;
+}
+
+/**
+ * Builds a list of preferred fully-qualified models from pi settings.
+ *
+ * Order is significant:
+ * 1. preferredModels passed by the caller (must already be fully qualified)
+ * 2. pi default model (qualified via defaultProvider when necessary)
+ * 3. available models matching enabledModels patterns, in settings order
+ */
+export function buildPreferredModelsFromSettings(
+  availableModels: AvailableModel[],
+  settings: PiModelSettings,
+  preferredModels: string[] = []
+): string[] {
+  const results: string[] = [];
+  const seen = new Set<string>();
+
+  const push = (specifier?: string | null) => {
+    if (!specifier) return;
+    const normalized = normalizeQualifiedModel(specifier);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    results.push(normalized);
+  };
+
+  for (const model of preferredModels) {
+    push(model);
+  }
+
+  push(qualifyDefaultModel(settings));
+
+  for (const pattern of settings.enabledModels ?? []) {
+    const cleanedPattern = stripThinkingSuffix(pattern);
+    for (const availableModel of availableModels) {
+      const qualified = `${availableModel.provider}/${availableModel.model}`;
+      const target = cleanedPattern.includes("/") ? qualified : availableModel.model;
+      if (matchesPattern(cleanedPattern, target)) {
+        push(qualified);
+      }
+    }
+  }
+
+  return results;
+}
+
+export function listPreferredQualifiedModels(
+  availableModels: AvailableModel[],
+  options?: {
+    projectDir?: string;
+    homeDir?: string;
+    preferredModels?: string[];
+  }
+): string[] {
+  const settings = loadPiModelSettings(options);
+  return buildPreferredModelsFromSettings(availableModels, settings, options?.preferredModels ?? []);
+}
+
+export function sortAvailableModels(
+  availableModels: AvailableModel[],
+  options?: {
+    preferredModels?: string[];
+    providerPriority?: string[];
+  }
+): SortedModel[] {
+  const preferredModels = options?.preferredModels ?? [];
+  const providerPriority = (options?.providerPriority ?? []).map((value) => value.toLowerCase());
+
+  const preferredIndex = new Map(preferredModels.map((value, index) => [value, index]));
+  const providerPriorityIndex = new Map(providerPriority.map((value, index) => [value, index]));
+
+  return availableModels
+    .map((model) => {
+      const qualified = `${model.provider}/${model.model}`;
+      return {
+        ...model,
+        qualified,
+        preferred: preferredIndex.has(qualified),
+        preferredIndex: preferredIndex.get(qualified) ?? Number.MAX_SAFE_INTEGER,
+        providerPriorityIndex: providerPriorityIndex.get(model.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .sort((a, b) => {
+      if (a.preferred !== b.preferred) {
+        return a.preferred ? -1 : 1;
+      }
+      if (a.preferredIndex !== b.preferredIndex) {
+        return a.preferredIndex - b.preferredIndex;
+      }
+      if (a.providerPriorityIndex !== b.providerPriorityIndex) {
+        return a.providerPriorityIndex - b.providerPriorityIndex;
+      }
+      const providerCompare = a.provider.localeCompare(b.provider);
+      if (providerCompare !== 0) {
+        return providerCompare;
+      }
+      return a.model.localeCompare(b.model);
+    });
+}
+
+export function isKnownQualifiedModel(model: string, availableModels: AvailableModel[]): boolean {
+  const normalized = normalizeQualifiedModel(model);
+  if (!normalized) {
+    return false;
+  }
+
+  return availableModels.some(
+    (availableModel) => `${availableModel.provider}/${availableModel.model}` === normalized
+  );
 }

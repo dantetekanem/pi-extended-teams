@@ -3,57 +3,52 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  DEFAULT_PROVIDER_PRIORITY,
+  buildPreferredModelsFromSettings,
+  isKnownQualifiedModel,
+  isQualifiedModel,
+  listPreferredQualifiedModels,
   loadModelResolutionConfig,
-  resolveModelWithProvider,
+  loadPiModelSettings,
+  normalizeQualifiedModel,
+  parseQualifiedModel,
+  sortAvailableModels,
+  stripThinkingSuffix,
   type AvailableModel,
 } from "./model-resolution";
 
 const availableModels: AvailableModel[] = [
   { provider: "openrouter", model: "gpt-5" },
   { provider: "openai-codex", model: "gpt-5.4" },
-  { provider: "anthropic", model: "claude-sonnet-4" },
-  { provider: "github-copilot", model: "claude-sonnet-4" },
+  { provider: "claude-agent-sdk", model: "claude-sonnet-4-6" },
+  { provider: "claude-agent-sdk", model: "claude-opus-4-7" },
+  { provider: "kimi-coding", model: "kimi-for-coding" },
 ];
 
-describe("resolveModelWithProvider", () => {
-  it("returns provider-qualified models as-is", () => {
-    expect(resolveModelWithProvider("openrouter/gpt-5", availableModels)).toBe("openrouter/gpt-5");
-  });
-
-  it("uses configured provider priority for exact matches", () => {
-    const resolved = resolveModelWithProvider("claude-sonnet-4", availableModels, {
-      providerPriority: ["anthropic", "github-copilot"],
+describe("qualified model helpers", () => {
+  it("parses qualified models", () => {
+    expect(parseQualifiedModel("openai-codex/gpt-5.4")).toEqual({
+      provider: "openai-codex",
+      model: "gpt-5.4",
     });
-
-    expect(resolved).toBe("anthropic/claude-sonnet-4");
   });
 
-  it("supports explicit-only providers for bare model names", () => {
-    const resolved = resolveModelWithProvider("gpt-5", availableModels, {
-      explicitOnlyProviders: ["openrouter"],
-    });
-
-    expect(resolved).toBe("openai-codex/gpt-5.4");
+  it("strips thinking suffixes", () => {
+    expect(stripThinkingSuffix("openai-codex/gpt-5.4:high")).toBe("openai-codex/gpt-5.4");
   });
 
-  it("returns null when only explicit-only providers match", () => {
-    const resolved = resolveModelWithProvider(
-      "gpt-5",
-      [{ provider: "openrouter", model: "gpt-5" }],
-      { explicitOnlyProviders: ["openrouter"] }
-    );
-
-    expect(resolved).toBeNull();
+  it("detects qualified models", () => {
+    expect(isQualifiedModel("openai-codex/gpt-5.4")).toBe(true);
+    expect(isQualifiedModel("gpt-5")).toBe(false);
   });
 
-  it("falls back to default provider priority when no config is supplied", () => {
-    const resolved = resolveModelWithProvider("claude-sonnet-4", availableModels);
-    const highestPriority = DEFAULT_PROVIDER_PRIORITY.find((provider) =>
-      ["anthropic", "github-copilot"].includes(provider)
-    );
+  it("normalizes qualified models", () => {
+    expect(normalizeQualifiedModel("openai-codex/gpt-5.4:high")).toBe("openai-codex/gpt-5.4");
+    expect(normalizeQualifiedModel("gpt-5")).toBeNull();
+  });
 
-    expect(resolved).toBe(`${highestPriority}/claude-sonnet-4`);
+  it("checks known qualified models", () => {
+    expect(isKnownQualifiedModel("openai-codex/gpt-5.4", availableModels)).toBe(true);
+    expect(isKnownQualifiedModel("openrouter/gpt-4o", availableModels)).toBe(false);
   });
 });
 
@@ -72,46 +67,149 @@ describe("loadModelResolutionConfig", () => {
     fs.rmSync(testRoot, { recursive: true, force: true });
   });
 
-  it("loads defaults when no config files exist", () => {
+  it("loads empty defaults when no config files exist", () => {
     fs.rmSync(path.join(homeDir, ".pi"), { recursive: true, force: true });
     fs.rmSync(path.join(projectDir, ".pi"), { recursive: true, force: true });
 
     const config = loadModelResolutionConfig({ homeDir, projectDir });
 
-    expect(config.providerPriority).toEqual(DEFAULT_PROVIDER_PRIORITY);
-    expect(config.explicitOnlyProviders).toEqual([]);
+    expect(config.providerPriority).toEqual([]);
   });
 
   it("loads global config", () => {
     fs.writeFileSync(
       path.join(homeDir, ".pi", "pi-teams.json"),
-      JSON.stringify({ explicitOnlyProviders: ["openrouter"] }, null, 2)
+      JSON.stringify({ providerPriority: ["openai-codex", "claude-agent-sdk"] }, null, 2)
     );
 
     const config = loadModelResolutionConfig({ homeDir, projectDir });
 
-    expect(config.explicitOnlyProviders).toEqual(["openrouter"]);
+    expect(config.providerPriority).toEqual(["openai-codex", "claude-agent-sdk"]);
   });
 
   it("lets project config override global config", () => {
     fs.writeFileSync(
       path.join(homeDir, ".pi", "pi-teams.json"),
-      JSON.stringify({
-        providerPriority: ["github-copilot", "anthropic"],
-        explicitOnlyProviders: ["openrouter"],
-      }, null, 2)
+      JSON.stringify({ providerPriority: ["claude-agent-sdk"] }, null, 2)
     );
     fs.writeFileSync(
       path.join(projectDir, ".pi", "pi-teams.json"),
-      JSON.stringify({
-        providerPriority: ["anthropic", "github-copilot"],
-        explicitOnlyProviders: [],
-      }, null, 2)
+      JSON.stringify({ providerPriority: ["openai-codex"] }, null, 2)
     );
 
     const config = loadModelResolutionConfig({ homeDir, projectDir });
 
-    expect(config.providerPriority).toEqual(["anthropic", "github-copilot"]);
-    expect(config.explicitOnlyProviders).toEqual([]);
+    expect(config.providerPriority).toEqual(["openai-codex"]);
+  });
+});
+
+describe("loadPiModelSettings", () => {
+  const testRoot = path.join(os.tmpdir(), `pi-teams-pi-settings-${Date.now()}`);
+  const homeDir = path.join(testRoot, "home");
+  const projectDir = path.join(testRoot, "project");
+
+  beforeEach(() => {
+    fs.rmSync(testRoot, { recursive: true, force: true });
+    fs.mkdirSync(path.join(homeDir, ".pi", "agent"), { recursive: true });
+    fs.mkdirSync(path.join(projectDir, ".pi"), { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(testRoot, { recursive: true, force: true });
+  });
+
+  it("loads global pi settings", () => {
+    fs.writeFileSync(
+      path.join(homeDir, ".pi", "agent", "settings.json"),
+      JSON.stringify({
+        defaultProvider: "openai-codex",
+        defaultModel: "gpt-5.4",
+        enabledModels: ["claude-*"],
+      }, null, 2)
+    );
+
+    const settings = loadPiModelSettings({ homeDir, projectDir });
+
+    expect(settings.defaultProvider).toBe("openai-codex");
+    expect(settings.defaultModel).toBe("gpt-5.4");
+    expect(settings.enabledModels).toEqual(["claude-*"]);
+  });
+
+  it("lets project pi settings override global settings", () => {
+    fs.writeFileSync(
+      path.join(homeDir, ".pi", "agent", "settings.json"),
+      JSON.stringify({ defaultProvider: "claude-agent-sdk", defaultModel: "claude-opus-4-7" }, null, 2)
+    );
+    fs.writeFileSync(
+      path.join(projectDir, ".pi", "settings.json"),
+      JSON.stringify({ defaultProvider: "openai-codex", defaultModel: "gpt-5.4" }, null, 2)
+    );
+
+    const settings = loadPiModelSettings({ homeDir, projectDir });
+
+    expect(settings.defaultProvider).toBe("openai-codex");
+    expect(settings.defaultModel).toBe("gpt-5.4");
+  });
+});
+
+describe("preferred model selection", () => {
+  it("builds preferred models from explicit preferences and pi settings", () => {
+    const preferred = buildPreferredModelsFromSettings(
+      availableModels,
+      {
+        defaultProvider: "openai-codex",
+        defaultModel: "gpt-5.4",
+        enabledModels: ["claude-*", "kimi-for-coding"],
+      },
+      ["claude-agent-sdk/claude-opus-4-7"]
+    );
+
+    expect(preferred).toEqual([
+      "claude-agent-sdk/claude-opus-4-7",
+      "openai-codex/gpt-5.4",
+      "claude-agent-sdk/claude-sonnet-4-6",
+      "kimi-coding/kimi-for-coding",
+    ]);
+  });
+
+  it("lists preferred qualified models from on-disk settings", () => {
+    const testRoot = path.join(os.tmpdir(), `pi-teams-preferred-${Date.now()}`);
+    const homeDir = path.join(testRoot, "home");
+
+    fs.mkdirSync(path.join(homeDir, ".pi", "agent"), { recursive: true });
+    fs.writeFileSync(
+      path.join(homeDir, ".pi", "agent", "settings.json"),
+      JSON.stringify({
+        defaultProvider: "openai-codex",
+        defaultModel: "gpt-5.4",
+        enabledModels: ["claude-*"],
+      }, null, 2)
+    );
+
+    const preferred = listPreferredQualifiedModels(availableModels, { homeDir });
+    expect(preferred).toEqual([
+      "openai-codex/gpt-5.4",
+      "claude-agent-sdk/claude-sonnet-4-6",
+      "claude-agent-sdk/claude-opus-4-7",
+    ]);
+
+    fs.rmSync(testRoot, { recursive: true, force: true });
+  });
+});
+
+describe("sortAvailableModels", () => {
+  it("sorts preferred models first, then provider priority, then alphabetically", () => {
+    const sorted = sortAvailableModels(availableModels, {
+      preferredModels: ["openai-codex/gpt-5.4", "claude-agent-sdk/claude-sonnet-4-6"],
+      providerPriority: ["kimi-coding", "claude-agent-sdk"],
+    });
+
+    expect(sorted.map((model) => model.qualified)).toEqual([
+      "openai-codex/gpt-5.4",
+      "claude-agent-sdk/claude-sonnet-4-6",
+      "kimi-coding/kimi-for-coding",
+      "claude-agent-sdk/claude-opus-4-7",
+      "openrouter/gpt-5",
+    ]);
   });
 });

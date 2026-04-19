@@ -96,6 +96,38 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 
 > **Example:** Specifying `gemini-2.5-flash` will automatically use `google-gemini-cli/gemini-2.5-flash` if available, saving API costs.
 
+**Configuring provider resolution:**
+You can customize this behavior globally with `~/.pi/pi-teams.json` or per-project with `.pi/pi-teams.json`.
+Project-local config overrides global config.
+
+```json
+{
+  "providerPriority": [
+    "google-gemini-cli",
+    "github-copilot",
+    "kimi-sub",
+    "anthropic",
+    "openai",
+    "google",
+    "zai",
+    "azure-openai",
+    "amazon-bedrock",
+    "mistral",
+    "groq",
+    "cerebras",
+    "xai",
+    "vercel-ai-gateway",
+    "openrouter"
+  ],
+  "explicitOnlyProviders": ["openrouter"]
+}
+```
+
+- `providerPriority`: Controls the order used when multiple providers match a bare model name.
+- `explicitOnlyProviders`: Providers that are ignored for bare model names and only used when you explicitly specify `provider/model`.
+
+> **Example:** With `"explicitOnlyProviders": ["openrouter"]`, `model: "gpt-5"` will not resolve to OpenRouter unless you explicitly use `openrouter/gpt-5`.
+
 ### 3. Assign Task & Get Approval
 > **You:** "Create a task for security-bot: 'Check the .env.example file for sensitive defaults' and set it to in_progress."
 

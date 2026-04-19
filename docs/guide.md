@@ -330,6 +330,38 @@ pi  # Then try to use tmux commands
 
 Check your pi config for available models.
 
+If you want to control which provider wins for bare model names, add global or project-local pi-teams config:
+
+- Global: `~/.pi/pi-teams.json`
+- Project-local: `.pi/pi-teams.json`
+
+Example:
+
+```json
+{
+  "providerPriority": [
+    "google-gemini-cli",
+    "github-copilot",
+    "kimi-sub",
+    "anthropic",
+    "openai",
+    "google",
+    "zai",
+    "azure-openai",
+    "amazon-bedrock",
+    "mistral",
+    "groq",
+    "cerebras",
+    "xai",
+    "vercel-ai-gateway",
+    "openrouter"
+  ],
+  "explicitOnlyProviders": ["openrouter"]
+}
+```
+
+With `explicitOnlyProviders`, a provider is ignored for bare model names like `gpt-5` and only used when you explicitly specify `provider/model`.
+
 ### Data Location
 
 All team data is stored in:

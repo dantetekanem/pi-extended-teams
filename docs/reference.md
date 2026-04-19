@@ -575,6 +575,45 @@ All pi-teams data is stored in your home directory under `~/.pi/`:
 }
 ```
 
+### Model Resolution Configuration
+
+You can customize how pi-teams resolves bare model names like `gpt-5` or `haiku`.
+
+Supported config locations:
+- Global: `~/.pi/pi-teams.json`
+- Project-local: `.pi/pi-teams.json`
+
+Project-local config overrides global config.
+
+Example:
+
+```json
+{
+  "providerPriority": [
+    "google-gemini-cli",
+    "github-copilot",
+    "kimi-sub",
+    "anthropic",
+    "openai",
+    "google",
+    "zai",
+    "azure-openai",
+    "amazon-bedrock",
+    "mistral",
+    "groq",
+    "cerebras",
+    "xai",
+    "vercel-ai-gateway",
+    "openrouter"
+  ],
+  "explicitOnlyProviders": ["openrouter"]
+}
+```
+
+Fields:
+- `providerPriority`: Ordered list used when more than one provider matches the same bare model name.
+- `explicitOnlyProviders`: Providers that are skipped for bare model names and only used when you explicitly provide `provider/model`.
+
 ---
 
 ## Environment Variables

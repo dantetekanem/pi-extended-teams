@@ -10,6 +10,10 @@ import { Member } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
 import * as predefined from "../src/utils/predefined-teams";
+import {
+  loadModelResolutionConfig,
+  resolveModelWithProvider,
+} from "../src/utils/model-resolution";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -101,83 +105,10 @@ function getAvailableModels(): Array<{ provider: string; model: string }> {
   }
 }
 
-/**
- * Provider priority list - OAuth/subscription providers first (cheaper), then API-key providers
- */
-const PROVIDER_PRIORITY = [
-  // OAuth / Subscription providers (typically free/cheaper)
-  "google-gemini-cli",  // Google Gemini CLI - OAuth, free tier
-  "github-copilot",     // GitHub Copilot - subscription
-  "kimi-sub",           // Kimi subscription
-  // API key providers
-  "anthropic",
-  "openai",
-  "google",
-  "zai",
-  "openrouter",
-  "azure-openai",
-  "amazon-bedrock",
-  "mistral",
-  "groq",
-  "cerebras",
-  "xai",
-  "vercel-ai-gateway",
-];
-
-/**
- * Find the best matching provider for a given model name.
- * Returns the full provider/model string or null if not found.
- */
-function resolveModelWithProvider(modelName: string): string | null {
-  // If already has provider prefix, return as-is
-  if (modelName.includes("/")) {
-    return modelName;
-  }
-
+function resolveConfiguredModel(modelName: string): string | null {
   const availableModels = getAvailableModels();
-  if (availableModels.length === 0) {
-    return null;
-  }
-
-  const lowerModelName = modelName.toLowerCase();
-
-  // Find all exact matches (case-insensitive) and sort by provider priority
-  const exactMatches = availableModels.filter(
-    (m) => m.model.toLowerCase() === lowerModelName
-  );
-
-  if (exactMatches.length > 0) {
-    // Sort by provider priority (lower index = higher priority)
-    exactMatches.sort((a, b) => {
-      const aIndex = PROVIDER_PRIORITY.indexOf(a.provider);
-      const bIndex = PROVIDER_PRIORITY.indexOf(b.provider);
-      // If provider not in priority list, put it at the end
-      const aPriority = aIndex === -1 ? 999 : aIndex;
-      const bPriority = bIndex === -1 ? 999 : bIndex;
-      return aPriority - bPriority;
-    });
-    return `${exactMatches[0].provider}/${exactMatches[0].model}`;
-  }
-
-  // Try partial match (model name contains the search term)
-  const partialMatches = availableModels.filter((m) =>
-    m.model.toLowerCase().includes(lowerModelName)
-  );
-
-  if (partialMatches.length > 0) {
-    for (const preferredProvider of PROVIDER_PRIORITY) {
-      const match = partialMatches.find(
-        (m) => m.provider === preferredProvider
-      );
-      if (match) {
-        return `${match.provider}/${match.model}`;
-      }
-    }
-    // Return first match if no preferred provider found
-    return `${partialMatches[0].provider}/${partialMatches[0].model}`;
-  }
-
-  return null;
+  const config = loadModelResolutionConfig({ projectDir: process.cwd() });
+  return resolveModelWithProvider(modelName, availableModels, config);
 }
 
 /**
@@ -585,8 +516,8 @@ export default function (pi: ExtensionAPI) {
       // Resolve model to provider/model format
       if (chosenModel) {
         if (!chosenModel.includes('/')) {
-          // Try to resolve using available models from pi --list-models
-          const resolved = resolveModelWithProvider(chosenModel);
+          // Try to resolve using available models plus local/global pi-teams config
+          const resolved = resolveConfiguredModel(chosenModel);
           if (resolved) {
             chosenModel = resolved;
           } else if (teamConfig.defaultModel && teamConfig.defaultModel.includes('/')) {
@@ -1144,7 +1075,7 @@ export default function (pi: ExtensionAPI) {
           let chosenModel = agentDef.model || params.default_model || config.defaultModel;
           
           if (chosenModel && !chosenModel.includes('/')) {
-            const resolved = resolveModelWithProvider(chosenModel);
+            const resolved = resolveConfiguredModel(chosenModel);
             if (resolved) {
               chosenModel = resolved;
             } else if (config.defaultModel && config.defaultModel.includes('/')) {

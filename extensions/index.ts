@@ -21,7 +21,6 @@ import {
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
-import { spawnSync } from "node:child_process";
 
 /**
  * Build the command used to relaunch pi for teammate processes.
@@ -59,58 +58,20 @@ function getPiLaunchCommand(): string {
   return "pi";
 }
 
-// Cache for available models
-let availableModelsCache: Array<{ provider: string; model: string }> | null = null;
-let modelsCacheTime = 0;
-const MODELS_CACHE_TTL = 60000; // 1 minute
-
-/**
- * Query available models from pi --list-models
- */
-function getAvailableModels(): Array<{ provider: string; model: string }> {
-  const now = Date.now();
-  if (availableModelsCache && now - modelsCacheTime < MODELS_CACHE_TTL) {
-    return availableModelsCache;
-  }
-
+async function getAvailableModels(ctx: any): Promise<Array<{ provider: string; model: string }>> {
   try {
-    const result = spawnSync("pi", ["--list-models"], {
-      encoding: "utf-8",
-      timeout: 10000,
-    });
-
-    if (result.status !== 0 || !result.stdout) {
-      return [];
-    }
-
-    const models: Array<{ provider: string; model: string }> = [];
-    const lines = result.stdout.split("\n");
-
-    for (const line of lines) {
-      // Skip header line and empty lines
-      if (!line.trim() || line.startsWith("provider")) continue;
-
-      // Parse: provider model context max-out thinking images
-      const parts = line.trim().split(/\s+/);
-      if (parts.length >= 2) {
-        const provider = parts[0];
-        const model = parts[1];
-        if (provider && model) {
-          models.push({ provider, model });
-        }
-      }
-    }
-
-    availableModelsCache = models;
-    modelsCacheTime = now;
-    return models;
-  } catch (e) {
+    const available = await ctx.modelRegistry.getAvailable();
+    return available.map((model: any) => ({
+      provider: model.provider,
+      model: model.id,
+    }));
+  } catch {
     return [];
   }
 }
 
-function getModelSelectionState(projectDir: string, preferredModels: string[] = []) {
-  const availableModels = getAvailableModels();
+async function getModelSelectionState(ctx: any, projectDir: string, preferredModels: string[] = []) {
+  const availableModels = await getAvailableModels(ctx);
   const piSettings = loadPiModelSettings({ projectDir });
   const config = loadModelResolutionConfig({ projectDir });
   const preferredQualifiedModels = listPreferredQualifiedModels(availableModels, {
@@ -498,7 +459,7 @@ export default function (pi: ExtensionAPI) {
     description: "List available fully qualified models for team creation and teammate spawning. Use this before creating a new team or spawning teammates. Models must be specified as provider/model.",
     parameters: Type.Object({}),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const state = getModelSelectionState(ctx.cwd);
+      const state = await getModelSelectionState(ctx, ctx.cwd);
       const lines = [
         "Choose a fully qualified provider/model string from this list when creating teams or spawning teammates.",
         "Unqualified model names like \"gpt-5\" or \"haiku\" are not accepted.",
@@ -562,7 +523,7 @@ export default function (pi: ExtensionAPI) {
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const { availableModels } = getModelSelectionState(ctx.cwd);
+      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
       const defaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
 
       // Auto-cleanup stale team if the previous lead process is dead
@@ -620,7 +581,7 @@ export default function (pi: ExtensionAPI) {
         await teams.removeMember(safeTeamName, safeName);
       }
       
-      const { availableModels } = getModelSelectionState(ctx.cwd, [teamConfig.defaultModel].filter(Boolean) as string[]);
+      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel].filter(Boolean) as string[]);
       const explicitModel = requireQualifiedKnownModel(params.model, availableModels, "model");
       const teamDefaultModel = requireQualifiedKnownModel(teamConfig.defaultModel, availableModels, "team default model");
       const chosenModel = explicitModel || teamDefaultModel;
@@ -1152,7 +1113,7 @@ export default function (pi: ExtensionAPI) {
         throw new Error("No terminal adapter detected.");
       }
 
-      const { availableModels } = getModelSelectionState(ctx.cwd);
+      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
       const defaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
 
       // Create the team

@@ -92,6 +92,13 @@ async function getModelSelectionState(ctx: any, projectDir: string, preferredMod
   };
 }
 
+function getCurrentQualifiedModel(ctx: any): string | undefined {
+  if (!ctx.model?.provider || !ctx.model?.id) {
+    return undefined;
+  }
+  return `${ctx.model.provider}/${ctx.model.id}`;
+}
+
 function requireQualifiedKnownModel(
   model: string | undefined,
   availableModels: Array<{ provider: string; model: string }>,
@@ -515,16 +522,18 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "team_create",
     label: "Create Team",
-    description: "Create a new agent team. If you specify default_model, it must be a fully qualified provider/model string from list_available_models.",
+    description: "Create a new agent team. If you specify default_model, it must be a fully qualified provider/model string from list_available_models. If omitted, the current active model is used.",
     parameters: Type.Object({
       team_name: Type.String(),
       description: Type.Optional(Type.String()),
-      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). Use list_available_models first." })),
+      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). Use list_available_models first. If omitted, the current active model is used." })),
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
-      const defaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
+      const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
+      const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
+      const defaultModel = explicitDefaultModel || currentModel;
 
       // Auto-cleanup stale team if the previous lead process is dead
       // This handles the case where a session was aborted and restarted
@@ -548,13 +557,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_teammate",
     label: "Spawn Teammate",
-    description: "Spawn a new teammate in a terminal pane or separate window. The model must be a fully qualified provider/model string from list_available_models, or the team must already have a fully qualified default model.",
+    description: "Spawn a new teammate in a terminal pane or separate window. The model must be a fully qualified provider/model string from list_available_models. If omitted, pi-teams uses the team's default model, or else the current active model.",
     parameters: Type.Object({
       team_name: Type.String(),
       name: Type.String(),
       prompt: Type.String(),
       cwd: Type.String(),
-      model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first." })),
+      model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first. If omitted, pi-teams uses the team's default model, or else the current active model." })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
       plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
       separate_window: Type.Optional(Type.Boolean({ default: false })),
@@ -581,14 +590,16 @@ export default function (pi: ExtensionAPI) {
         await teams.removeMember(safeTeamName, safeName);
       }
       
-      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel].filter(Boolean) as string[]);
+      const currentModelHint = getCurrentQualifiedModel(ctx);
+      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint].filter(Boolean) as string[]);
       const explicitModel = requireQualifiedKnownModel(params.model, availableModels, "model");
       const teamDefaultModel = requireQualifiedKnownModel(teamConfig.defaultModel, availableModels, "team default model");
-      const chosenModel = explicitModel || teamDefaultModel;
+      const currentModel = requireQualifiedKnownModel(currentModelHint, availableModels, "current model");
+      const chosenModel = explicitModel || teamDefaultModel || currentModel;
 
       if (!chosenModel) {
         throw new Error(
-          "No model specified. Use list_available_models to choose a fully qualified provider/model and pass it as model, or create the team with a fully qualified default_model."
+          "No model specified. Use list_available_models to choose a fully qualified provider/model and pass it as model, create the team with a fully qualified default_model, or ensure the current session has an active model."
         );
       }
 
@@ -1092,12 +1103,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "create_predefined_team",
     label: "Create Predefined Team",
-    description: "Create a team from a predefined team configuration. Any default_model you pass must be a fully qualified provider/model string from list_available_models. Agent definitions with models must also already be fully qualified.",
+    description: "Create a team from a predefined team configuration. Any default_model you pass must be a fully qualified provider/model string from list_available_models. If omitted, the current active model is used. Agent definitions with models must also already be fully qualified.",
     parameters: Type.Object({
       team_name: Type.String({ description: "Name for the new team instance" }),
       predefined_team: Type.String({ description: "Name of the predefined team template from teams.yaml" }),
       cwd: Type.String({ description: "Working directory for spawned agents" }),
-      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model) for agents without a specified model. Use list_available_models first." })),
+      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model) for agents without a specified model. Use list_available_models first. If omitted, the current active model is used." })),
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
@@ -1114,7 +1125,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
-      const defaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
+      const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
+      const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
+      const defaultModel = explicitDefaultModel || currentModel;
 
       // Create the team
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel, params.separate_windows);

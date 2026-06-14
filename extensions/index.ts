@@ -126,6 +126,43 @@ function requireQualifiedKnownModel(
   return normalized;
 }
 
+function optionalKnownQualifiedModel(
+  model: string | undefined,
+  availableModels: Array<{ provider: string; model: string }>
+): string | undefined {
+  if (!model) return undefined;
+
+  const normalized = normalizeQualifiedModel(model);
+  if (!normalized || !isKnownQualifiedModel(normalized, availableModels)) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function getPiTeamsExtensionSource(): string {
+  return process.env.PI_TEAMS_EXTENSION_SOURCE || __filename;
+}
+
+function buildPiCommand(piBinary: string, chosenModel?: string, thinking?: string): string {
+  const extensionArgs = `--no-extensions --extension ${shellQuote(getPiTeamsExtensionSource())}`;
+
+  if (chosenModel) {
+    const modelArg = thinking ? `${chosenModel}:${thinking}` : chosenModel;
+    return `${piBinary} ${extensionArgs} --model ${shellQuote(modelArg)}`;
+  }
+
+  if (thinking) {
+    return `${piBinary} ${extensionArgs} --thinking ${shellQuote(thinking)}`;
+  }
+
+  return `${piBinary} ${extensionArgs}`;
+}
+
 /**
  * Find the team this session is the lead for (if any).
  * Checks the lead-session.json file to match PID.
@@ -341,7 +378,6 @@ export default function (pi: ExtensionAPI) {
         });
       }
       ctx.ui.notify(`Teammate: ${agentName} (Team: ${teamName})`, "info");
-      ctx.ui.setStatus("00-pi-teams", `[${agentName.toUpperCase()}]`);
 
       if (terminal) {
         const fullTitle = teamName ? `${teamName}: ${agentName}` : agentName;
@@ -382,7 +418,6 @@ export default function (pi: ExtensionAPI) {
       }
     } else if (teamName) {
       // Lead reconnecting to an existing team
-      ctx.ui.setStatus("pi-teams", `Lead @ ${teamName}`);
       startLeadInboxPolling();
     }
   });
@@ -593,7 +628,7 @@ export default function (pi: ExtensionAPI) {
       const currentModelHint = getCurrentQualifiedModel(ctx);
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint].filter(Boolean) as string[]);
       const explicitModel = requireQualifiedKnownModel(params.model, availableModels, "model");
-      const teamDefaultModel = requireQualifiedKnownModel(teamConfig.defaultModel, availableModels, "team default model");
+      const teamDefaultModel = optionalKnownQualifiedModel(teamConfig.defaultModel, availableModels);
       const currentModel = requireQualifiedKnownModel(currentModelHint, availableModels, "current model");
       const chosenModel = explicitModel || teamDefaultModel || currentModel;
 
@@ -627,18 +662,7 @@ export default function (pi: ExtensionAPI) {
       await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, params.prompt, "Initial prompt");
 
       const piBinary = getPiLaunchCommand();
-      let piCmd = piBinary;
-
-      if (chosenModel) {
-        // Use the combined --model provider/model:thinking format
-        if (params.thinking) {
-          piCmd = `${piBinary} --model ${chosenModel}:${params.thinking}`;
-        } else {
-          piCmd = `${piBinary} --model ${chosenModel}`;
-        }
-      } else if (params.thinking) {
-        piCmd = `${piBinary} --thinking ${params.thinking}`;
-      }
+      const piCmd = buildPiCommand(piBinary, chosenModel, params.thinking);
 
       const env: Record<string, string> = {
         ...process.env,
@@ -712,11 +736,10 @@ export default function (pi: ExtensionAPI) {
       const teamConfig = await teams.readConfig(safeTeamName);
       const cwd = params.cwd || process.cwd();
       const piBinary = getPiLaunchCommand();
-      let piCmd = piBinary;
-      if (teamConfig.defaultModel) {
-        // Use the combined --model provider/model format
-        piCmd = `${piBinary} --model ${teamConfig.defaultModel}`;
-      }
+      const currentModelHint = getCurrentQualifiedModel(ctx);
+      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint].filter(Boolean) as string[]);
+      const chosenModel = optionalKnownQualifiedModel(teamConfig.defaultModel, availableModels) || requireQualifiedKnownModel(currentModelHint, availableModels, "current model");
+      const piCmd = buildPiCommand(piBinary, chosenModel);
 
       const env = { ...process.env, PI_TEAM_NAME: safeTeamName, PI_AGENT_NAME: "team-lead" };
       try {
@@ -1184,17 +1207,7 @@ export default function (pi: ExtensionAPI) {
           await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, agentDef.prompt, "Initial prompt from predefined team");
 
           const piBinary = getPiLaunchCommand();
-          let piCmd = piBinary;
-
-          if (chosenModel) {
-            if (agentDef.thinking) {
-              piCmd = `${piBinary} --model ${chosenModel}:${agentDef.thinking}`;
-            } else {
-              piCmd = `${piBinary} --model ${chosenModel}`;
-            }
-          } else if (agentDef.thinking) {
-            piCmd = `${piBinary} --thinking ${agentDef.thinking}`;
-          }
+          const piCmd = buildPiCommand(piBinary, chosenModel, agentDef.thinking);
 
           const env: Record<string, string> = {
             ...process.env,

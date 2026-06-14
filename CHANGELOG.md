@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - pi-extended-teams
+
+Renamed from `pi-teams` and re-homed at
+[`dantetekanem/pi-extended-teams`](https://github.com/dantetekanem/pi-extended-teams).
+
+### Changed
+- **tmux-only**: removed the Zellij, cmux, iTerm2, WezTerm, and Windows Terminal
+  adapters and all separate-window code paths. pi-extended-teams now requires
+  running inside tmux and fails fast otherwise.
+
+### Fixed
+- **tmux `isAlive`**: now checks pane existence via `display-message` instead of
+  the incorrect `has-session` lookup, so teammate liveness reporting is accurate.
+
+### Roadmap
+See [PLAN.md](PLAN.md) for the in-progress feature set (read/write roles,
+in-process read agents, watchdog, write-coordination, self-termination, shared
+memory, extension orchestration).
+
 ## [0.9.14] - 2025-04-03
 
 ### Fixed

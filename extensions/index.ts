@@ -8,7 +8,6 @@ import * as messaging from "../src/utils/messaging";
 import * as runtime from "../src/utils/runtime";
 import { Member } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
-import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
 import * as predefined from "../src/utils/predefined-teams";
 import {
   isKnownQualifiedModel,
@@ -253,13 +252,8 @@ function cleanupStaleTeam(teamName: string, terminal: any): boolean {
           }
           
           // Kill via terminal adapter
-          if (terminal) {
-            if (member.windowId) {
-              try { terminal.killWindow(member.windowId); } catch {}
-            }
-            if (member.tmuxPaneId) {
-              try { terminal.kill(member.tmuxPaneId); } catch {}
-            }
+          if (terminal && member.tmuxPaneId) {
+            try { terminal.kill(member.tmuxPaneId); } catch {}
           }
         }
       } catch {}
@@ -483,10 +477,6 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    if (member.windowId && terminal) {
-      terminal.killWindow(member.windowId);
-    }
-
     if (member.tmuxPaneId && terminal) {
       terminal.kill(member.tmuxPaneId);
     }
@@ -562,7 +552,6 @@ export default function (pi: ExtensionAPI) {
       team_name: Type.String(),
       description: Type.Optional(Type.String()),
       default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). Use list_available_models first. If omitted, the current active model is used." })),
-      separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
@@ -575,8 +564,8 @@ export default function (pi: ExtensionAPI) {
       if (teams.teamExists(params.team_name)) {
         cleanupStaleTeam(params.team_name, terminal);
       }
-      
-      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, defaultModel, params.separate_windows);
+
+      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, defaultModel);
       // Register this session as the lead so it can receive inbox messages
       registerLeadSession(params.team_name);
       // Update teamName and start inbox polling for the lead
@@ -592,7 +581,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_teammate",
     label: "Spawn Teammate",
-    description: "Spawn a new teammate in a terminal pane or separate window. The model must be a fully qualified provider/model string from list_available_models. If omitted, pi-teams uses the team's default model, or else the current active model.",
+    description: "Spawn a new teammate in a tmux pane. The model must be a fully qualified provider/model string from list_available_models. If omitted, pi-extended-teams uses the team's default model, or else the current active model.",
     parameters: Type.Object({
       team_name: Type.String(),
       name: Type.String(),
@@ -601,7 +590,6 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first. If omitted, pi-teams uses the team's default model, or else the current active model." })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
       plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
-      separate_window: Type.Optional(Type.Boolean({ default: false })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const safeName = paths.sanitizeName(params.name);
@@ -612,7 +600,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (!terminal) {
-        throw new Error("No terminal adapter detected.");
+        throw new Error("pi-extended-teams requires running inside tmux.");
       }
 
       const teamConfig = await teams.readConfig(safeTeamName);
@@ -636,11 +624,6 @@ export default function (pi: ExtensionAPI) {
         throw new Error(
           "No model specified. Use list_available_models to choose a fully qualified provider/model and pass it as model, create the team with a fully qualified default_model, or ensure the current session has an active model."
         );
-      }
-
-      const useSeparateWindow = params.separate_window ?? teamConfig.separateWindows ?? false;
-      if (useSeparateWindow && !terminal.supportsWindows()) {
-        throw new Error(`Separate windows mode is not supported in ${terminal.name}.`);
       }
 
       const member: Member = {
@@ -671,85 +654,28 @@ export default function (pi: ExtensionAPI) {
       };
 
       let terminalId = "";
-      let isWindow = false;
 
       try {
-        if (useSeparateWindow) {
-          isWindow = true;
-          terminalId = terminal.spawnWindow({
-            name: safeName,
-            cwd: params.cwd,
-            command: piCmd,
-            env: env,
-            teamName: safeTeamName,
-          });
-          await teams.updateMember(safeTeamName, safeName, { windowId: terminalId });
-        } else {
-          if (terminal instanceof Iterm2Adapter) {
-            const teammates = teamConfig.members.filter(m => m.agentType === "teammate" && m.tmuxPaneId.startsWith("iterm_"));
-            const lastTeammate = teammates.length > 0 ? teammates[teammates.length - 1] : null;
-            if (lastTeammate?.tmuxPaneId) {
-              terminal.setSpawnContext({ lastSessionId: lastTeammate.tmuxPaneId.replace("iterm_", "") });
-            } else {
-              terminal.setSpawnContext({});
-            }
-          }
+        const leadMember = teamConfig.members.find(m => m.name === "team-lead");
+        const anchorPaneId = leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined;
 
-          const leadMember = teamConfig.members.find(m => m.name === "team-lead");
-          const anchorPaneId = terminal.name === "tmux"
-            ? leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined
-            : undefined;
-
-          terminalId = terminal.spawn({
-            name: safeName,
-            cwd: params.cwd,
-            command: piCmd,
-            env: env,
-            anchorPaneId,
-          });
-          await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: terminalId });
-        }
+        terminalId = terminal.spawn({
+          name: safeName,
+          cwd: params.cwd,
+          command: piCmd,
+          env: env,
+          anchorPaneId,
+        });
+        await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: terminalId });
       } catch (e) {
-        throw new Error(`Failed to spawn ${terminal.name} ${isWindow ? 'window' : 'pane'}: ${e}`);
+        throw new Error(`Failed to spawn tmux pane: ${e}`);
       }
 
       return {
-        content: [{ type: "text", text: `Teammate ${params.name} spawned in ${isWindow ? 'window' : 'pane'} ${terminalId}.` }],
-        details: { agentId: member.agentId, terminalId, isWindow },
+        content: [{ type: "text", text: `Teammate ${params.name} spawned in pane ${terminalId}.` }],
+        details: { agentId: member.agentId, terminalId },
       };
     },
-  });
-
-  pi.registerTool({
-    name: "spawn_lead_window",
-    label: "Spawn Lead Window",
-    description: "Open the team lead in a separate OS window.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      cwd: Type.Optional(Type.String()),
-    }),
-    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const safeTeamName = paths.sanitizeName(params.team_name);
-      if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
-      if (!terminal || !terminal.supportsWindows()) throw new Error("Windows mode not supported.");
-
-      const teamConfig = await teams.readConfig(safeTeamName);
-      const cwd = params.cwd || process.cwd();
-      const piBinary = getPiLaunchCommand();
-      const currentModelHint = getCurrentQualifiedModel(ctx);
-      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint].filter(Boolean) as string[]);
-      const chosenModel = optionalKnownQualifiedModel(teamConfig.defaultModel, availableModels) || requireQualifiedKnownModel(currentModelHint, availableModels, "current model");
-      const piCmd = buildPiCommand(piBinary, chosenModel);
-
-      const env = { ...process.env, PI_TEAM_NAME: safeTeamName, PI_AGENT_NAME: "team-lead" };
-      try {
-        const windowId = terminal.spawnWindow({ name: "team-lead", cwd, command: piCmd, env, teamName: safeTeamName });
-        await teams.updateMember(safeTeamName, "team-lead", { windowId });
-        return { content: [{ type: "text", text: `Lead window spawned: ${windowId}` }], details: { windowId } };
-      } catch (e) {
-        throw new Error(`Failed: ${e}`);
-      }
-    }
   });
 
   pi.registerTool({
@@ -999,9 +925,7 @@ export default function (pi: ExtensionAPI) {
       if (!member) throw new Error(`Teammate ${params.agent_name} not found`);
 
       let alive = false;
-      if (member.windowId && terminal) {
-        alive = terminal.isWindowAlive(member.windowId);
-      } else if (member.tmuxPaneId && terminal) {
+      if (member.tmuxPaneId && terminal) {
         alive = terminal.isAlive(member.tmuxPaneId);
       }
 
@@ -1132,7 +1056,6 @@ export default function (pi: ExtensionAPI) {
       predefined_team: Type.String({ description: "Name of the predefined team template from teams.yaml" }),
       cwd: Type.String({ description: "Working directory for spawned agents" }),
       default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model) for agents without a specified model. Use list_available_models first. If omitted, the current active model is used." })),
-      separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const projectDir = ctx.cwd;
@@ -1144,7 +1067,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (!terminal) {
-        throw new Error("No terminal adapter detected.");
+        throw new Error("pi-extended-teams requires running inside tmux.");
       }
 
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
@@ -1153,7 +1076,7 @@ export default function (pi: ExtensionAPI) {
       const defaultModel = explicitDefaultModel || currentModel;
 
       // Create the team
-      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel, params.separate_windows);
+      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
       registerLeadSession(params.team_name);
       // Update teamName and start inbox polling for the lead
       teamName = params.team_name;
@@ -1184,11 +1107,6 @@ export default function (pi: ExtensionAPI) {
             );
           }
 
-          const useSeparateWindow = params.separate_windows ?? config.separateWindows ?? false;
-          if (useSeparateWindow && !terminal.supportsWindows()) {
-            throw new Error(`Separate windows mode is not supported in ${terminal.name}.`);
-          }
-
           const member: Member = {
             agentId: `${safeName}@${safeTeamName}`,
             name: safeName,
@@ -1216,44 +1134,19 @@ export default function (pi: ExtensionAPI) {
           };
 
           let terminalId = "";
-          let isWindow = false;
 
           try {
-            if (useSeparateWindow) {
-              isWindow = true;
-              terminalId = terminal.spawnWindow({
-                name: safeName,
-                cwd: params.cwd,
-                command: piCmd,
-                env: env,
-                teamName: safeTeamName,
-              });
-              await teams.updateMember(safeTeamName, safeName, { windowId: terminalId });
-            } else {
-              if (terminal instanceof Iterm2Adapter) {
-                const teammates = (await teams.readConfig(safeTeamName)).members.filter(m => m.agentType === "teammate" && m.tmuxPaneId.startsWith("iterm_"));
-                const lastTeammate = teammates.length > 0 ? teammates[teammates.length - 1] : null;
-                if (lastTeammate?.tmuxPaneId) {
-                  terminal.setSpawnContext({ lastSessionId: lastTeammate.tmuxPaneId.replace("iterm_", "") });
-                } else {
-                  terminal.setSpawnContext({});
-                }
-              }
+            const leadMember = (await teams.readConfig(safeTeamName)).members.find(m => m.name === "team-lead");
+            const anchorPaneId = leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined;
 
-              const leadMember = (await teams.readConfig(safeTeamName)).members.find(m => m.name === "team-lead");
-              const anchorPaneId = terminal.name === "tmux"
-                ? leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined
-                : undefined;
-
-              terminalId = terminal.spawn({
-                name: safeName,
-                cwd: params.cwd,
-                command: piCmd,
-                env: env,
-                anchorPaneId,
-              });
-              await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: terminalId });
-            }
+            terminalId = terminal.spawn({
+              name: safeName,
+              cwd: params.cwd,
+              command: piCmd,
+              env: env,
+              anchorPaneId,
+            });
+            await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: terminalId });
 
             spawnResults.push({ name: agentName, status: "spawned", error: undefined });
           } catch (e) {

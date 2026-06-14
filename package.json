@@ -19,7 +19,6 @@
     "team-collaboration",
     "agent-orchestration",
     "coding-assistant",
-    "terminal",
     "tmux"
   ],
   "scripts": {

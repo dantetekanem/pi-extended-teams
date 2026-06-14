@@ -1,21 +1,19 @@
-# pi-teams 🚀
+# pi-extended-teams 🚀
 
-**pi-teams** turns your single Pi agent into a coordinated software engineering team. It allows you to spawn multiple "Teammate" agents in separate terminal panes that work autonomously, communicate with each other, and manage a shared task board—all mediated through tmux, Zellij, iTerm2, WezTerm, or Windows Terminal.
+**pi-extended-teams** turns your single Pi agent into a coordinated, self-managing software engineering team. The lead **divides work to conquer it**: read-only agents investigate in the background while write agents implement in **tmux** panes — with file-write coordination, a 3-writer cap, a watchdog that reaps anything stale, and agents that kill themselves the moment their work is reported back.
 
-### 🖥️ pi-teams in Action
+> Extended fork of [`pi-teams`](https://github.com/burggraf/pi-teams) (Mark Burggraf). **tmux is the only supported backend.**
 
-| iTerm2 | tmux | Zellij |
-| :---: | :---: | :---: |
-| <a href="iTerm2.png"><img src="iTerm2.png" width="300" alt="pi-teams in iTerm2"></a> | <a href="tmux.png"><img src="tmux.png" width="300" alt="pi-teams in tmux"></a> | <a href="zellij.png"><img src="zellij.png" width="300" alt="pi-teams in Zellij"></a> |
+### 🖥️ pi-extended-teams in Action
 
-*Also works with **WezTerm** and **Windows Terminal** (cross-platform support)*
+<a href="tmux.png"><img src="tmux.png" width="420" alt="pi-extended-teams in tmux"></a>
 
 ## 🛠 Installation
 
-Open your Pi terminal and type:
+You must be running inside a **tmux** session. Open your Pi terminal and type:
 
 ```bash
-pi install npm:pi-teams
+pi install npm:pi-extended-teams
 ```
 
 ## 🚀 Quick Start
@@ -24,7 +22,7 @@ pi install npm:pi-teams
 # 1. See available fully qualified models first
 "List available models for team creation"
 
-# 2. Start a team (inside tmux, Zellij, or iTerm2)
+# 2. Start a team (inside tmux)
 "Create a team named 'my-team' using 'openai-codex/gpt-5.4'"
 
 # 3. Spawn teammates
@@ -65,19 +63,8 @@ pi install npm:pi-teams
 **Set a default model for the whole team:**
 > **You:** "List available models for team creation, then create a team named 'Research' using 'openai-codex/gpt-5.4' for everyone."
 
-**Start a team in "Separate Windows" mode:**
-> **You:** "Create a team named 'Dev' and open everyone in separate windows."
-*(Supported in iTerm2 and WezTerm only)*
-
 ### 2. Spawn Teammate with Custom Settings
 > **You:** "Spawn a teammate named 'security-bot' using 'openai-codex/gpt-5.4' in the current folder. Tell them to scan for hardcoded API keys."
-
-**Spawn a specific teammate in a separate window:**
-> **You:** "Spawn 'researcher' in a separate window."
-
-**Move the Team Lead to a separate window:**
-> **You:** "Open the team lead in its own window."
-*(Requires separate_windows mode enabled or iTerm2/WezTerm)*
 
 **Use a different model:**
 > **You:** "List available models for team creation, then spawn a teammate named 'speed-bot' using 'claude-agent-sdk/claude-sonnet-4-6' to quickly run some benchmarks."
@@ -89,10 +76,10 @@ pi install npm:pi-teams
 > **You:** "List available models for team creation, then spawn a teammate named 'architect-bot' using 'openai-codex/gpt-5.4' with 'high' thinking level for deep reasoning."
 
 **Explicit model selection:**
-pi-teams does **not** auto-resolve bare model names like `gpt-5` or `haiku`.
+pi-extended-teams does **not** auto-resolve bare model names like `gpt-5` or `haiku`.
 When creating a new team or spawning teammates, use `list_available_models` first and then pass a fully qualified `provider/model` string.
 
-If you provide a model that is not fully qualified or not available, pi-teams will fail fast and ask you to choose a valid model.
+If you provide a model that is not fully qualified or not available, pi-extended-teams will fail fast and ask you to choose a valid model.
 
 **Configuring model-list ordering:**
 You can customize the order shown by `list_available_models` globally with `~/.pi/pi-teams.json` or per-project with `.pi/pi-teams.json`.
@@ -124,7 +111,7 @@ Teammates in `planning` mode will use `task_submit_plan`. As the lead, review th
 > **You:** "We're done. Shut down the team and close the panes."
 
 **Automatic Cleanup:**
-When you shut down a team, pi-teams automatically cleans up orphaned agent session folders from `~/.pi/agent/teams/` that are older than 1 hour. This prevents accumulation of stale session data over time.
+When you shut down a team, pi-extended-teams automatically cleans up orphaned agent session folders from `~/.pi/agent/teams/` that are older than 1 hour. This prevents accumulation of stale session data over time.
 
 **Manual Cleanup:**
 If you need to clean up agent sessions without shutting down a team, or want to use a different age threshold:
@@ -217,7 +204,7 @@ This single command:
 3. Each agent gets its predefined prompt, tools, model, and thinking settings
 
 **With options:**
-> **You:** "Create a team named 'big-team' from 'full' predefined team using 'openai-codex/gpt-5.4' as default model and separate windows."
+> **You:** "Create a team named 'big-team' from 'full' predefined team using 'openai-codex/gpt-5.4' as default model."
 
 ---
 
@@ -273,9 +260,8 @@ Once saved, use it just like any predefined team:
 
 ## 🪟 Terminal Requirements
 
-To show multiple agents on one screen, **pi-teams** requires a way to manage terminal panes. It supports **tmux**, **Zellij**, **iTerm2**, **WezTerm**, and **Windows Terminal**.
-
-### Option 1: tmux (Recommended)
+**pi-extended-teams is tmux-only.** It spawns and manages teammate write agents
+as tmux panes, and fails fast if `pi` is not launched inside a tmux session.
 
 Install tmux:
 - **macOS**: `brew install tmux`
@@ -283,70 +269,16 @@ Install tmux:
 
 How to run:
 ```bash
-tmux  # Start tmux session
-pi   # Start pi inside tmux
+tmux   # Start a tmux session
+pi     # Start pi inside tmux
 ```
 
-### Option 2: Zellij
-
-Simply start `pi` inside a Zellij session. **pi-teams** will detect it via the `ZELLIJ` environment variable and use `zellij run` to spawn teammates in new panes.
-
-### Option 3: iTerm2 (macOS)
-
-If you are using **iTerm2** on macOS and are *not* inside tmux or Zellij, **pi-teams** can manage your team in two ways:
-1. **Panes (Default)**: Automatically split your current window into an optimized layout.
-2. **Windows**: Create true separate OS windows for each agent.
-
-It will name the panes or windows with the teammate's agent name for easy identification.
-
-### Option 4: WezTerm (macOS, Linux, Windows)
-
-**WezTerm** is a GPU-accelerated, cross-platform terminal emulator written in Rust. Like iTerm2, it supports both **Panes** and **Separate OS Windows**.
-
-Install WezTerm:
-- **macOS**: `brew install --cask wezterm`
-- **Linux**: See [wezterm.org/installation](https://wezterm.org/installation)
-- **Windows**: Download from [wezterm.org](https://wezterm.org)
-
-How to run:
-```bash
-wezterm  # Start WezTerm
-pi       # Start pi inside WezTerm
-```
-
-### Option 5: Windows Terminal (Windows)
-
-**Windows Terminal** is the modern, feature-rich terminal emulator for Windows 10/11. It supports both **Panes** and **Separate OS Windows**.
-
-**Requirements:**
-- Windows 10 (version 19041 or later) or Windows 11
-- Windows Terminal installed (available from Microsoft Store or winget)
-- PowerShell 5.1 or later (pwsh.exe)
-
-Install Windows Terminal:
-- **Microsoft Store**: Search for "Windows Terminal" and install
-- **winget**: `winget install Microsoft.WindowsTerminal`
-- **Scoop**: `scoop install windows-terminal`
-
-Install PowerShell Core (optional but recommended):
-- **winget**: `winget install Microsoft.PowerShell`
-- **Scoop**: `scoop install powershell`
-
-How to run:
-```powershell
-# Open Windows Terminal and start pi
-wt
-pi
-```
-
-Or start pi directly from Windows Terminal with new window:
-```powershell
-wt -- pwsh -c "pi"
-```
-
-**Note:** On Windows, pi-teams uses PowerShell for command execution. Make sure `pi` is in your PATH. If you installed pi via npm and Node.js, verify both are accessible from PowerShell.
+> Read-only agents run **in-process** (no tmux pane) and are surfaced in a status
+> line above the input bar. Only write agents occupy panes.
 
 ## 📜 Credits & Attribution
+
+This project is an extended fork of [pi-teams](https://github.com/burggraf/pi-teams) by [Mark Burggraf](https://github.com/burggraf).
 
 This project is a port of the excellent [claude-code-teams-mcp](https://github.com/cs50victor/claude-code-teams-mcp) by [cs50victor](https://github.com/cs50victor).
 

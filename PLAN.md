@@ -30,17 +30,17 @@ so "done" is unambiguous.
 Goal: consolidate all work onto `main`, re-home to the new origin, and strip
 fork references. **Reversible local steps first; push last.**
 
-- [ ] Commit outstanding working-tree change (`extensions/index.ts` status-bar removal)
-- [ ] Fast-forward `main` to include all local-branch work (`local-spawn-inherit` is ahead by 4 commits; `main` is an ancestor — clean FF)
-- [ ] Rename package `pi-teams` → `pi-extended-teams` in `package.json`
-- [ ] Update `repository.url` → `dantetekanem/pi-extended-teams`
-- [ ] Update `pi.image` raw URL → `dantetekanem/pi-extended-teams`
-- [ ] Update `author` and any burggraf/watzon strings (only `package.json` currently matches)
-- [ ] Remove fork remotes (`origin` → burggraf, `watzon`), add new `origin`
-- [ ] `git branch -M main`, delete redundant `local-spawn-inherit` once merged
-- [ ] `git push -u origin main`
-- [ ] Update `README.md` title/badges/clone URL to the new repo
-- [ ] Refresh `CHANGELOG.md` with a `pi-extended-teams` heading
+- [x] Commit outstanding working-tree change (`extensions/index.ts` status-bar removal)
+- [x] Fast-forward `main` to include all local-branch work (`local-spawn-inherit` is ahead by 4 commits; `main` is an ancestor — clean FF)
+- [x] Rename package `pi-teams` → `pi-extended-teams` in `package.json`
+- [x] Update `repository.url` → `dantetekanem/pi-extended-teams`
+- [x] Update `pi.image` raw URL → `dantetekanem/pi-extended-teams`
+- [x] Update `author` and any burggraf/watzon strings (only `package.json` currently matches)
+- [x] Remove fork remotes (`origin` → burggraf, `watzon`), add new `origin`
+- [x] `git branch -M main`, delete redundant `local-spawn-inherit` once merged
+- [x] `git push -u origin main`
+- [x] Update `README.md` title/badges/clone URL to the new repo
+- [x] Refresh `CHANGELOG.md` with a `pi-extended-teams` heading
 
 **Acceptance:** `git remote -v` shows only the new origin; `main` builds and
 tests pass; no `burggraf`/`watzon` strings remain (`grep -rI` clean).
@@ -51,12 +51,12 @@ tests pass; no `burggraf`/`watzon` strings remain (`grep -rI` clean).
 
 Goal: make tmux the only backend and delete the dead surface area.
 
-- [ ] Remove non-tmux adapters: `zellij-adapter`, `cmux-adapter`, `iterm2-adapter`, `wezterm-adapter`, `windows-adapter` (+ their tests)
-- [ ] Reduce `terminal-registry.ts` to tmux detection; error clearly if `TMUX` is unset ("pi-extended-teams requires running inside tmux")
-- [ ] Drop `separate_windows` / `spawn_lead_window` / `supportsWindows()` window paths from `extensions/index.ts`
-- [ ] Remove the `Iterm2Adapter` spawn-context branches in `spawn_teammate` and `create_predefined_team`
-- [ ] Delete now-irrelevant docs: `WEZTERM_SUPPORT.md`, `WEZTERM_LAYOUT_FIX.md`, zellij/iterm imagery references
-- [ ] Update `package.json` keywords (drop multi-terminal claims)
+- [x] Remove non-tmux adapters: `zellij-adapter`, `cmux-adapter`, `iterm2-adapter`, `wezterm-adapter`, `windows-adapter` (+ their tests)
+- [x] Reduce `terminal-registry.ts` to tmux detection; error clearly if `TMUX` is unset ("pi-extended-teams requires running inside tmux")
+- [x] Drop `separate_windows` / `spawn_lead_window` / `supportsWindows()` window paths from `extensions/index.ts`
+- [x] Remove the `Iterm2Adapter` spawn-context branches in `spawn_teammate` and `create_predefined_team`
+- [x] Delete now-irrelevant docs: `WEZTERM_SUPPORT.md`, `WEZTERM_LAYOUT_FIX.md`, zellij/iterm imagery references
+- [x] Update `package.json` keywords (drop multi-terminal claims)
 
 **Acceptance:** code references exactly one adapter; launching outside tmux
 fails fast with a helpful message; test suite green.

@@ -4,7 +4,6 @@
  * Implements the TerminalAdapter interface for tmux terminal multiplexer.
  */
 
-import { execSync } from "node:child_process";
 import { TerminalAdapter, SpawnOptions, execCommand } from "../utils/terminal-adapter";
 
 export class TmuxAdapter implements TerminalAdapter {
@@ -103,10 +102,8 @@ export class TmuxAdapter implements TerminalAdapter {
   }
 
   kill(paneId: string): void {
-    if (!paneId || paneId.startsWith("iterm_") || paneId.startsWith("zellij_")) {
-      return; // Not a tmux pane
-    }
-    
+    if (!paneId) return;
+
     try {
       execCommand("tmux", ["kill-pane", "-t", paneId.trim()]);
     } catch {
@@ -115,16 +112,9 @@ export class TmuxAdapter implements TerminalAdapter {
   }
 
   isAlive(paneId: string): boolean {
-    if (!paneId || paneId.startsWith("iterm_") || paneId.startsWith("zellij_")) {
-      return false; // Not a tmux pane
-    }
-
-    try {
-      execSync(`tmux has-session -t ${paneId}`);
-      return true;
-    } catch {
-      return false;
-    }
+    if (!paneId) return false;
+    // A pane is alive if tmux still reports it as a valid pane id.
+    return this.isPaneUsable(paneId.trim());
   }
 
   setTitle(title: string): void {
@@ -137,40 +127,5 @@ export class TmuxAdapter implements TerminalAdapter {
     } catch {
       // Ignore errors
     }
-  }
-
-  /**
-   * tmux does not support spawning separate OS windows
-   */
-  supportsWindows(): boolean {
-    return false;
-  }
-
-  /**
-   * Not supported - throws error
-   */
-  spawnWindow(_options: SpawnOptions): string {
-    throw new Error("tmux does not support spawning separate OS windows. Use iTerm2 or WezTerm instead.");
-  }
-
-  /**
-   * Not supported - no-op
-   */
-  setWindowTitle(_windowId: string, _title: string): void {
-    // Not supported
-  }
-
-  /**
-   * Not supported - no-op
-   */
-  killWindow(_windowId: string): void {
-    // Not supported
-  }
-
-  /**
-   * Not supported - always returns false
-   */
-  isWindowAlive(_windowId: string): boolean {
-    return false;
   }
 }

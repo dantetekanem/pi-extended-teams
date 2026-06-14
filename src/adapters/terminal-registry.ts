@@ -1,37 +1,12 @@
 /**
  * Terminal Registry
  *
- * Manages terminal adapters and provides automatic selection based on
- * the current environment.
+ * pi-extended-teams is tmux-only. This module resolves the single tmux
+ * adapter and fails fast when not running inside a tmux session.
  */
 
 import { TerminalAdapter } from "../utils/terminal-adapter";
 import { TmuxAdapter } from "./tmux-adapter";
-import { ZellijAdapter } from "./zellij-adapter";
-import { CmuxAdapter } from "./cmux-adapter";
-import { Iterm2Adapter } from "./iterm2-adapter";
-import { WezTermAdapter } from "./wezterm-adapter";
-import { WindowsAdapter } from "./windows-adapter";
-
-/**
- * Available terminal adapters, ordered by priority
- *
- * Detection order (first match wins):
- * 1. tmux - if TMUX env is set
- * 2. Zellij - if ZELLIJ env is set and not in tmux
- * 3. cmux - if CMUX_SOCKET_PATH or CMUX_WORKSPACE_ID env is set
- * 4. iTerm2 - if TERM_PROGRAM=iTerm.app and not in tmux/zellij/cmux
- * 5. WezTerm - if WEZTERM_PANE env is set and not in tmux/zellij/cmux
- * 6. Windows - if platform is win32 and not in tmux/zellij/cmux/iTerm2/WezTerm
- */
-const adapters: TerminalAdapter[] = [
-  new TmuxAdapter(),
-  new ZellijAdapter(),
-  new CmuxAdapter(),
-  new Iterm2Adapter(),
-  new WezTermAdapter(),
-  new WindowsAdapter(),
-];
 
 /**
  * Cached detected adapter
@@ -39,50 +14,35 @@ const adapters: TerminalAdapter[] = [
 let cachedAdapter: TerminalAdapter | null = null;
 
 /**
- * Detect and return the appropriate terminal adapter for the current environment.
+ * Detect and return the tmux adapter, or null if not running inside tmux.
  *
- * Detection order (first match wins):
- * 1. tmux - if TMUX env is set
- * 2. Zellij - if ZELLIJ env is set and not in tmux
- * 3. cmux - if CMUX_SOCKET_PATH or CMUX_WORKSPACE_ID env is set
- * 4. iTerm2 - if TERM_PROGRAM=iTerm.app and not in tmux/zellij/cmux
- * 5. WezTerm - if WEZTERM_PANE env is set and not in tmux/zellij/cmux
- * 6. Windows - if platform is win32 and not in tmux/zellij/cmux/iTerm2/WezTerm
- *
- * @returns The detected terminal adapter, or null if none detected
+ * @returns The tmux adapter, or null if TMUX is not set
  */
 export function getTerminalAdapter(): TerminalAdapter | null {
   if (cachedAdapter) {
     return cachedAdapter;
   }
 
-  for (const adapter of adapters) {
-    if (adapter.detect()) {
-      cachedAdapter = adapter;
-      return adapter;
-    }
+  const adapter = new TmuxAdapter();
+  if (adapter.detect()) {
+    cachedAdapter = adapter;
+    return adapter;
   }
 
   return null;
 }
 
 /**
- * Get a specific terminal adapter by name.
- *
- * @param name - The adapter name (e.g., "tmux", "zellij", "cmux", "iTerm2", "WezTerm", "Windows")
- * @returns The adapter instance, or undefined if not found
+ * Require the tmux adapter, throwing a clear error when unavailable.
  */
-export function getAdapterByName(name: string): TerminalAdapter | undefined {
-  return adapters.find(a => a.name === name);
-}
-
-/**
- * Get all available adapters.
- *
- * @returns Array of all registered adapters
- */
-export function getAllAdapters(): TerminalAdapter[] {
-  return [...adapters];
+export function requireTerminalAdapter(): TerminalAdapter {
+  const adapter = getTerminalAdapter();
+  if (!adapter) {
+    throw new Error(
+      "pi-extended-teams requires running inside tmux. Start a tmux session and launch pi from within it."
+    );
+  }
+  return adapter;
 }
 
 /**
@@ -100,22 +60,12 @@ export function setAdapter(adapter: TerminalAdapter): void {
 }
 
 /**
- * Check if any terminal adapter is available.
+ * Check if a tmux adapter is available.
  *
- * @returns true if a terminal adapter was detected
+ * @returns true if running inside tmux
  */
 export function hasTerminalAdapter(): boolean {
   return getTerminalAdapter() !== null;
-}
-
-/**
- * Check if the current terminal supports spawning separate OS windows.
- *
- * @returns true if the detected terminal supports windows (iTerm2, WezTerm, Windows, cmux)
- */
-export function supportsWindows(): boolean {
-  const adapter = getTerminalAdapter();
-  return adapter?.supportsWindows() ?? false;
 }
 
 /**

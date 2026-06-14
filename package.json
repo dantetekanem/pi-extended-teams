@@ -1,12 +1,12 @@
 {
-  "name": "pi-teams",
+  "name": "pi-extended-teams",
   "version": "0.9.14",
-  "description": "Agent teams for pi, ported from claude-code-teams-mcp",
+  "description": "tmux-only, self-managing, role-aware agent teams for pi (extended fork of pi-teams)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/burggraf/pi-teams.git"
+    "url": "git+https://github.com/dantetekanem/pi-extended-teams.git"
   },
-  "author": "Mark Burggraf",
+  "author": "dantetekanem",
   "license": "MIT",
   "keywords": [
     "pi-package",
@@ -41,7 +41,7 @@
     "@sinclair/typebox": "*"
   },
   "pi": {
-    "image": "https://raw.githubusercontent.com/burggraf/pi-teams/main/pi-team-in-action.png",
+    "image": "https://raw.githubusercontent.com/dantetekanem/pi-extended-teams/main/pi-team-in-action.png",
     "extensions": [
       "extensions/index.ts"
     ],

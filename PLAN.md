@@ -74,12 +74,16 @@ must already support diverging later.
   ```jsonc
   {
     "watchdog": { "bufferSeconds": 30 },        // Phase 4
-    "writeAgents": { "maxConcurrent": 3 },      // Phase 6
+    "writeAgents": { "maxConcurrent": 3, "queueOverflow": true }, // Phase 6 (queue, don't reject)
     "roles": {
       "read":  { "model": null, "thinking": null },   // null = inherit current model
       "write": { "model": null, "thinking": null }
     },
-    "categories": {}                            // named role presets, see below
+    "categories": {},                           // named role presets, see below
+    "extensions": {                             // Phase 9 — which pi extensions spawned agents load
+      "allow": ["pi-emote", "ada"],             // loaded into spawned (write) agents
+      "block": []                               // explicitly kept out
+    }
   }
   ```
 - [ ] Add `role: "read" | "write"` to the `Member` interface (`src/utils/models.ts`)
@@ -150,18 +154,20 @@ rare safety net rather than routine cleanup.
 
 ---
 
-## Phase 6 — Write-agent concurrency cap (max 3)
+## Phase 6 — Write-agent concurrency cap (max 3, queued)
 
-Goal: at most 3 write agents at any time; read agents unlimited.
+Goal: at most 3 write agents running at any time; read agents unlimited.
+Overflow is **queued**, not rejected.
 
-- [ ] Count active write members before `spawn_teammate(role:"write")`
-- [ ] If at `writeAgents.maxConcurrent` (default 3), reject with a clear message or queue (decide + document; default: reject and tell lead to wait)
-- [ ] Optional: a lightweight write-slot queue so the lead can pre-stage work
-- [ ] Read-agent spawns bypass the cap entirely
-- [ ] Tests: 4th concurrent writer is refused; a writer exiting frees a slot
+- [ ] Count active write members before starting a `spawn_teammate(role:"write")`
+- [ ] If at `writeAgents.maxConcurrent` (default 3), enqueue the spawn request (persisted under the team dir) instead of rejecting
+- [ ] When a write agent exits (`report_and_exit` / watchdog reap), dequeue and auto-spawn the next pending writer
+- [ ] Lead can inspect the write queue (`list_write_queue`) and cancel pending entries
+- [ ] Read-agent spawns bypass the cap and the queue entirely
+- [ ] Tests: 4th writer is queued (not refused); a writer exiting auto-starts the next; queue order preserved (FIFO)
 
-**Acceptance:** spawning a 4th writer fails fast; after one writer exits, a new
-one spawns.
+**Acceptance:** requesting a 4th writer queues it; when a slot frees, the queued
+writer spawns automatically without lead intervention.
 
 ---
 
@@ -197,21 +203,28 @@ stays current as agents come and go.
 
 ---
 
-## Phase 9 — Shared memory, Ada artifacts & frictionless skills
+## Phase 9 — Shared memory, extension orchestration & frictionless skills
 
-Goal: agents share memory and artifacts, and load skills by name with one call.
+Goal: agents share memory, can use **other** pi extensions (Ada artifacts,
+pi-emote, …) without this extension reimplementing them, and load skills by name
+with one call.
 
 - [ ] Shared memory store under the team dir (`shared/memory/*.md`), with `memory_write` / `memory_read` / `memory_list` tools (lock-guarded)
-- [ ] Ada artifacts: define the artifact location/contract and `artifact_put` / `artifact_get` / `artifact_list` tools  *(confirm the exact "ada artifacts" spec with the user)*
+- [ ] **Extension orchestration (not reimplementation):** `buildPiCommand` stops hard-coding `--no-extensions` and instead loads the `extensions.allow` list from settings into spawned write agents (Ada artifacts + pi-emote come from the user's own extensions); `extensions.block` keeps named ones out
+- [ ] Spawned agents are told (system prompt / skill doc) which extensions are available and how to use them — including Ada for artifacts
 - [ ] `use_skill(name)` tool: resolves a skill by name from the skills path and loads it into the calling agent's context — just "use this skill name"
-- [ ] Document the shared-memory + artifact conventions in the skill doc
-- [ ] Tests: write→read round-trip on shared memory; `use_skill` loads a known skill
+- [ ] Document the shared-memory conventions and the extension allow/block model in the skill doc
+- [ ] Tests: write→read round-trip on shared memory; `use_skill` loads a known skill; allow-list controls which extensions a spawned agent loads
 
-**Acceptance:** one agent writes a memo, another reads it; `use_skill("teams")`
-injects the skill without extra ceremony.
+**Acceptance:** one agent writes a memo, another reads it; a spawned write agent
+loads `pi-emote` + the user's `ada` extension per settings, while blocked
+extensions stay out; `use_skill("teams")` injects the skill without ceremony.
 
-> Open question: confirm what "Ada artifacts" refers to (an existing Ada system
-> vs. a generic artifact bucket). Spec'd generically above pending confirmation.
+> Decision (from user): "Ada artifacts" = the user's **own `ada` extension**,
+> not something this package implements. pi-extended-teams must know how to *use*
+> other extensions and let the user **allow/block which extensions spawned write
+> agents load**, configured in settings.json (pi-emote and other already-filtered
+> ones remain available).
 
 ---
 
@@ -246,12 +259,15 @@ and runs from the new repo.
 ## Risks & open questions
 
 1. **In-process read agents (Phase 3):** depends on pi exposing a nested agent
-   loop + token usage to extensions. Needs a research spike before committing.
-2. **"Ada artifacts" (Phase 9):** exact meaning to confirm with the user.
+   loop + token usage to extensions. **Decision: spike first** — confirm before
+   committing; if usage isn't exposed, fall back to estimated tokens; if
+   in-process isn't feasible, run readers as background tmux panes.
+2. **Extension orchestration (Phase 9):** resolved — Ada is the user's own
+   extension; we orchestrate via an allow/block list, not reimplement.
 3. **Watchdog vs. legitimately-long tool calls (Phase 4):** buffer must be
    generous enough not to reap agents mid-long-operation.
-4. **Cap vs. queue for writers (Phase 6):** default is reject-and-wait; revisit
-   if it proves too rigid.
+4. **Writer overflow (Phase 6):** resolved — **queue** overflow and auto-spawn
+   when a slot frees (FIFO).
 
 ## Suggested order
 

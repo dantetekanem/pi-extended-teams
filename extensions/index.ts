@@ -9,7 +9,7 @@ import * as runtime from "../src/utils/runtime";
 import { Member } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import * as predefined from "../src/utils/predefined-teams";
-import { loadSettings, resolveModel, resolveRole, type AgentRole } from "../src/utils/settings";
+import { loadSettings, resolveAllowedExtensions, resolveModel, resolveRole, type AgentRole } from "../src/utils/settings";
 import {
   isKnownQualifiedModel,
   listPreferredQualifiedModels,
@@ -134,8 +134,21 @@ function getPiTeamsExtensionSource(): string {
   return process.env.PI_TEAMS_EXTENSION_SOURCE || __filename;
 }
 
-function buildPiCommand(piBinary: string, chosenModel?: string, thinking?: string): string {
-  const extensionArgs = `--no-extensions --extension ${shellQuote(getPiTeamsExtensionSource())}`;
+function buildExtensionArgs(allowedExtensions: string[] = []): string {
+  const parts = ["--no-extensions", "--extension", shellQuote(getPiTeamsExtensionSource())];
+  for (const source of allowedExtensions) {
+    parts.push("--extension", shellQuote(source));
+  }
+  return parts.join(" ");
+}
+
+function buildPiCommand(
+  piBinary: string,
+  chosenModel?: string,
+  thinking?: string,
+  allowedExtensions: string[] = []
+): string {
+  const extensionArgs = buildExtensionArgs(allowedExtensions);
 
   if (chosenModel) {
     const modelArg = thinking ? `${chosenModel}:${thinking}` : chosenModel;
@@ -648,7 +661,8 @@ export default function (pi: ExtensionAPI) {
       await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, params.prompt, "Initial prompt");
 
       const piBinary = getPiLaunchCommand();
-      const piCmd = buildPiCommand(piBinary, chosenModel, chosenThinking);
+      const allowedExtensions = resolveAllowedExtensions(settings);
+      const piCmd = buildPiCommand(piBinary, chosenModel, chosenThinking, allowedExtensions);
 
       const env: Record<string, string> = {
         ...process.env,
@@ -1077,6 +1091,7 @@ export default function (pi: ExtensionAPI) {
       const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
       const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
       const defaultModel = explicitDefaultModel || currentModel;
+      const allowedExtensions = resolveAllowedExtensions(loadSettings({ projectDir: ctx.cwd }));
 
       // Create the team
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
@@ -1129,7 +1144,7 @@ export default function (pi: ExtensionAPI) {
           await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, agentDef.prompt, "Initial prompt from predefined team");
 
           const piBinary = getPiLaunchCommand();
-          const piCmd = buildPiCommand(piBinary, chosenModel, agentDef.thinking);
+          const piCmd = buildPiCommand(piBinary, chosenModel, agentDef.thinking, allowedExtensions);
 
           const env: Record<string, string> = {
             ...process.env,

@@ -260,6 +260,19 @@ export function resolveModel(
 }
 
 /**
+ * Resolve which extension sources spawned agents should load.
+ *
+ * Spawned agents launch with `--no-extensions` (nothing auto-discovered) plus
+ * the pi-extended-teams extension itself. This returns the additional extension
+ * sources to load (e.g. "npm:pi-emote", "ada"), honoring the allow list minus
+ * anything in the block list.
+ */
+export function resolveAllowedExtensions(settings: PiExtendedTeamsSettings): string[] {
+  const blocked = new Set(settings.extensions.block);
+  return settings.extensions.allow.filter((source) => !blocked.has(source));
+}
+
+/**
  * Effective role for a category: category.role wins, else the requested role.
  */
 export function resolveRole(

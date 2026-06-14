@@ -103,7 +103,24 @@ Goal: read-only agents do **not** spawn a tmux pane. They run as background
 in-process agents, surfaced in a status line above the input bar (below
 pi-emote), showing elapsed time and token usage.
 
-- [ ] Research pi's in-process sub-agent API (how `ExtensionAPI` can run a nested agent loop without a new pty); document findings in this file
+- [x] Research pi's in-process sub-agent API (how `ExtensionAPI` can run a nested agent loop without a new pty); document findings in this file
+
+  **Spike findings (verified against installed `@mariozechner/pi-coding-agent`):**
+  - **Nested agents are feasible.** `createAgentSession({ cwd, model, tools, ... })`
+    returns an `AgentSession`; `session.prompt(text)` runs it in-process, and
+    `session.subscribe(listener)` streams events. SDK docs explicitly list
+    "Build custom tools that spawn sub-agents" as a use case. Tools can be
+    overridden per session (restrict a read agent to read/search/no-write).
+  - **Status UI exists.** `ctx.ui.setWidget(key, lines, { placement: "aboveEditor" })`
+    renders above the input bar (multiple widgets stack by key → key sorting puts
+    ours below pi-emote). `ctx.ui.setStatus(key, text)` is the lighter footer
+    option. Either satisfies "like pi-emote does."
+  - **Token usage exists.** `ContextUsage { tokens, contextWindow, percent }` via
+    `ctx.getContextUsage()` for the current session; a nested `AgentSession`
+    exposes its own usage/tokens to subscribe to. Elapsed time is wall-clock.
+  - **Caveat:** the nested-session lifecycle (resource loading, tool restriction,
+    teardown) must be validated in a live pi+tmux session — it can't be exercised
+    by the unit-test harness. Implementation lands behind that verification.
 - [ ] Implement `spawn_read_agent`: starts a background read-only agent in-process (tools restricted to read/search/no-write)
 - [ ] Track each running read agent: `{ name, startedAt, tokensUsed, status }`
 - [ ] Render a status entry per the pi-emote pattern via `ctx.ui.setStatus(key, text)` using a key that sorts **below** pi-emote (e.g. `"01-pi-teams-read"`); show count + per-agent elapsed + tokens
@@ -210,7 +227,7 @@ pi-emote, …) without this extension reimplementing them, and load skills by na
 with one call.
 
 - [ ] Shared memory store under the team dir (`shared/memory/*.md`), with `memory_write` / `memory_read` / `memory_list` tools (lock-guarded)
-- [ ] **Extension orchestration (not reimplementation):** `buildPiCommand` stops hard-coding `--no-extensions` and instead loads the `extensions.allow` list from settings into spawned write agents (Ada artifacts + pi-emote come from the user's own extensions); `extensions.block` keeps named ones out
+- [x] **Extension orchestration (not reimplementation):** `buildPiCommand` keeps `--no-extensions` as the isolation baseline and adds one `--extension <source>` per entry in `resolveAllowedExtensions(settings)` (allow minus block) for spawned write agents — Ada + pi-emote come from the user's own extensions. Wired into `spawn_teammate` and `create_predefined_team`; tested in `settings.test.ts`
 - [ ] Spawned agents are told (system prompt / skill doc) which extensions are available and how to use them — including Ada for artifacts
 - [ ] `use_skill(name)` tool: resolves a skill by name from the skills path and loads it into the calling agent's context — just "use this skill name"
 - [ ] Document the shared-memory conventions and the extension allow/block model in the skill doc

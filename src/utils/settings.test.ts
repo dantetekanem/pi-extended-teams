@@ -7,6 +7,7 @@ import {
   globalSettingsPath,
   loadSettings,
   projectSettingsPath,
+  resolveAllowedExtensions,
   resolveModel,
   resolveRole,
   type PiExtendedTeamsSettings,
@@ -177,6 +178,19 @@ describe("resolveModel", () => {
     expect(() =>
       resolveModel(structuredClone(DEFAULT_SETTINGS), { role: "read", category: "nope" })
     ).toThrow(/Unknown category/);
+  });
+});
+
+describe("resolveAllowedExtensions", () => {
+  it("returns allow minus block", () => {
+    const s = structuredClone(DEFAULT_SETTINGS);
+    s.extensions.allow = ["pi-emote", "ada", "noisy"];
+    s.extensions.block = ["noisy"];
+    expect(resolveAllowedExtensions(s)).toEqual(["pi-emote", "ada"]);
+  });
+
+  it("is empty by default", () => {
+    expect(resolveAllowedExtensions(structuredClone(DEFAULT_SETTINGS))).toEqual([]);
   });
 });
 

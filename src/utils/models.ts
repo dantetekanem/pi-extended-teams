@@ -18,6 +18,10 @@ export interface Member {
   planModeRequired?: boolean;
   backendType?: string;
   isActive?: boolean;
+  /** "read" agents run in-process (no pane); "write" agents spawn in tmux. */
+  role?: "read" | "write";
+  /** Optional category preset name from settings.json. */
+  category?: string;
 }
 
 export interface TeamConfig {

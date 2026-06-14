@@ -69,8 +69,8 @@ Goal: introduce the `read` vs `write` role and a settings file that drives
 per-role model/thinking. Today both roles share the current model; the schema
 must already support diverging later.
 
-- [ ] Define settings loader for `~/.pi/agent/pi-extended-teams/settings.json` (global) with optional project override `<project>/.pi/pi-extended-teams.json`
-- [ ] Settings schema (initial):
+- [x] Define settings loader for `~/.pi/agent/pi-extended-teams/settings.json` (global) with optional project override `<project>/.pi/pi-extended-teams.json` (`src/utils/settings.ts`)
+- [x] Settings schema (initial):
   ```jsonc
   {
     "watchdog": { "bufferSeconds": 30 },        // Phase 4
@@ -86,11 +86,11 @@ must already support diverging later.
     }
   }
   ```
-- [ ] Add `role: "read" | "write"` to the `Member` interface (`src/utils/models.ts`)
-- [ ] Resolve a member's effective model/thinking: explicit arg → category → role default → team default → current model
-- [ ] Support **categories**: named presets (e.g. `"researcher"`, `"implementer"`) that bundle role + model + thinking, referenced by name at spawn time
-- [ ] `spawn_teammate` gains `role` (required) and optional `category`
-- [ ] Tests for settings precedence and category resolution
+- [x] Add `role: "read" | "write"` (and `category`) to the `Member` interface (`src/utils/models.ts`)
+- [x] Resolve a member's effective model/thinking: explicit arg → category → role default → team default → current model (`resolveModel`)
+- [x] Support **categories**: named presets (e.g. `"researcher"`, `"implementer"`) that bundle role + model + thinking, referenced by name at spawn time
+- [x] `spawn_teammate` gains `role` (optional, defaults `write`) and optional `category` *(kept optional for backward compat; Phase 3 enforces read-agent semantics)*
+- [x] Tests for settings precedence and category resolution (`src/utils/settings.test.ts`, 13 tests)
 
 **Acceptance:** spawning with `role: "write"` and no model still works (inherits
 current); setting `roles.write.thinking` in settings changes only writers.

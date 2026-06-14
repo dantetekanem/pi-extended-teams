@@ -9,6 +9,7 @@ import * as runtime from "../src/utils/runtime";
 import { Member } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import * as predefined from "../src/utils/predefined-teams";
+import { loadSettings, resolveModel, resolveRole, type AgentRole } from "../src/utils/settings";
 import {
   isKnownQualifiedModel,
   listPreferredQualifiedModels,
@@ -120,20 +121,6 @@ function requireQualifiedKnownModel(
       `${fieldName} \"${normalized}\" is not available. ` +
       `Use list_available_models to choose a valid model.`
     );
-  }
-
-  return normalized;
-}
-
-function optionalKnownQualifiedModel(
-  model: string | undefined,
-  availableModels: Array<{ provider: string; model: string }>
-): string | undefined {
-  if (!model) return undefined;
-
-  const normalized = normalizeQualifiedModel(model);
-  if (!normalized || !isKnownQualifiedModel(normalized, availableModels)) {
-    return undefined;
   }
 
   return normalized;
@@ -581,13 +568,15 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_teammate",
     label: "Spawn Teammate",
-    description: "Spawn a new teammate in a tmux pane. The model must be a fully qualified provider/model string from list_available_models. If omitted, pi-extended-teams uses the team's default model, or else the current active model.",
+    description: "Spawn a new teammate in a tmux pane. Set role to 'write' (default, can edit files) or 'read' (read-only investigation). Model resolves from explicit arg -> category -> role default -> team default -> current model, using settings.json. Any explicit model must be a fully qualified provider/model from list_available_models.",
     parameters: Type.Object({
       team_name: Type.String(),
       name: Type.String(),
       prompt: Type.String(),
       cwd: Type.String(),
-      model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first. If omitted, pi-teams uses the team's default model, or else the current active model." })),
+      role: Type.Optional(StringEnum(["read", "write"], { description: "Agent role. 'write' agents spawn in tmux and can edit files (default). 'read' agents are read-only. Defaults to 'write'." })),
+      category: Type.Optional(Type.String({ description: "Optional category preset name from settings.json (bundles role + model + thinking)." })),
+      model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first. If omitted, the category/role/team default or current model is used." })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
       plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
     }),
@@ -604,7 +593,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const teamConfig = await teams.readConfig(safeTeamName);
-      
+
       // Check if a teammate with this name already exists - kill them first
       // This handles the case where the user aborts mid-execution and restarts
       const existingMember = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
@@ -612,32 +601,46 @@ export default function (pi: ExtensionAPI) {
         await killTeammate(safeTeamName, existingMember);
         await teams.removeMember(safeTeamName, safeName);
       }
-      
+
+      const settings = loadSettings({ projectDir: ctx.cwd });
+      const role: AgentRole = resolveRole(settings, params.role ?? "write", params.category);
+
       const currentModelHint = getCurrentQualifiedModel(ctx);
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint].filter(Boolean) as string[]);
-      const explicitModel = requireQualifiedKnownModel(params.model, availableModels, "model");
-      const teamDefaultModel = optionalKnownQualifiedModel(teamConfig.defaultModel, availableModels);
-      const currentModel = requireQualifiedKnownModel(currentModelHint, availableModels, "current model");
-      const chosenModel = explicitModel || teamDefaultModel || currentModel;
+
+      const resolved = resolveModel(settings, {
+        role,
+        category: params.category,
+        explicitModel: params.model,
+        explicitThinking: params.thinking,
+        teamDefaultModel: teamConfig.defaultModel,
+        currentModel: currentModelHint,
+      });
+
+      const chosenModel = requireQualifiedKnownModel(resolved.model ?? undefined, availableModels, "resolved model");
 
       if (!chosenModel) {
         throw new Error(
-          "No model specified. Use list_available_models to choose a fully qualified provider/model and pass it as model, create the team with a fully qualified default_model, or ensure the current session has an active model."
+          "No model could be resolved. Pass a fully qualified model, configure a category/role default in settings.json, create the team with a default_model, or ensure the current session has an active model."
         );
       }
+
+      const chosenThinking = (resolved.thinking ?? undefined) as Member["thinking"];
 
       const member: Member = {
         agentId: `${safeName}@${safeTeamName}`,
         name: safeName,
         agentType: "teammate",
+        role,
+        category: params.category,
         model: chosenModel,
         joinedAt: Date.now(),
         tmuxPaneId: "",
         cwd: params.cwd,
         subscriptions: [],
         prompt: params.prompt,
-        color: "blue",
-        thinking: params.thinking,
+        color: role === "read" ? "cyan" : "blue",
+        thinking: chosenThinking,
         planModeRequired: params.plan_mode_required,
       };
 
@@ -645,7 +648,7 @@ export default function (pi: ExtensionAPI) {
       await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, params.prompt, "Initial prompt");
 
       const piBinary = getPiLaunchCommand();
-      const piCmd = buildPiCommand(piBinary, chosenModel, params.thinking);
+      const piCmd = buildPiCommand(piBinary, chosenModel, chosenThinking);
 
       const env: Record<string, string> = {
         ...process.env,
@@ -1111,6 +1114,7 @@ export default function (pi: ExtensionAPI) {
             agentId: `${safeName}@${safeTeamName}`,
             name: safeName,
             agentType: "teammate",
+            role: "write",
             model: chosenModel,
             joinedAt: Date.now(),
             tmuxPaneId: "",

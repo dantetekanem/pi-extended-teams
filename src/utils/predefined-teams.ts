@@ -495,8 +495,7 @@ export function listRuntimeTeams(): Array<{
   for (const teamDir of fs.readdirSync(teamsDir, { withFileTypes: true })) {
     if (!teamDir.isDirectory()) continue;
 
-    const configFile = path.join(teamsDir.path || teamsDir.name, teamDir.name, "config.json");
-    const configPath = path.join(os.homedir(), ".pi", "teams", teamDir.name, "config.json");
+    const configPath = path.join(teamsDir, teamDir.name, "config.json");
     
     if (fs.existsSync(configPath)) {
       try {

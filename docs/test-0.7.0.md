@@ -42,7 +42,7 @@ Prompt (run in terminal):
 Create tasks appropriate for each teammate's thinking level.
 
 Prompt:
-"Create a task for DeepThinker: 'Analyze the pi-teams codebase architecture and suggest improvements for scalability'. Set it to in_progress.
+"Create a task for DeepThinker: 'Analyze the pi-extended-teams codebase architecture and suggest improvements for scalability'. Set it to in_progress.
 Create a task for FastWorker: 'List all TypeScript files in the src directory'. Set it to in_progress."
 
 ---

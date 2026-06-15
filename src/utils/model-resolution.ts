@@ -62,12 +62,14 @@ function readConfigFile(configPath: string): ModelResolutionConfig {
 }
 
 /**
- * Loads pi-teams model-selection preferences.
+ * Loads pi-extended-teams model-selection preferences.
  *
  * Supported locations:
- * - ~/.pi/pi-teams.json
- * - <project>/.pi/pi-teams.json
+ * - ~/.pi/pi-extended-teams.json
+ * - <project>/.pi/pi-extended-teams.json
  *
+ * Legacy ~/.pi/pi-teams.json and <project>/.pi/pi-teams.json files are still
+ * read for compatibility, but the pi-extended-teams paths win when present.
  * Project-local config overrides global config.
  */
 export function loadModelResolutionConfig(options?: {
@@ -77,14 +79,16 @@ export function loadModelResolutionConfig(options?: {
   const homeDir = options?.homeDir ?? os.homedir();
   const projectDir = options?.projectDir;
 
-  const globalConfigPath = path.join(homeDir, ".pi", "pi-teams.json");
-  const projectConfigPath = projectDir ? path.join(projectDir, ".pi", "pi-teams.json") : null;
+  const legacyGlobalConfigPath = path.join(homeDir, ".pi", "pi-teams.json");
+  const globalConfigPath = path.join(homeDir, ".pi", "pi-extended-teams.json");
+  const legacyProjectConfigPath = projectDir ? path.join(projectDir, ".pi", "pi-teams.json") : null;
+  const projectConfigPath = projectDir ? path.join(projectDir, ".pi", "pi-extended-teams.json") : null;
 
   const merged: ResolvedModelResolutionConfig = {
     providerPriority: [],
   };
 
-  for (const configPath of [globalConfigPath, projectConfigPath]) {
+  for (const configPath of [legacyGlobalConfigPath, globalConfigPath, legacyProjectConfigPath, projectConfigPath]) {
     if (!configPath) continue;
 
     const config = readConfigFile(configPath);

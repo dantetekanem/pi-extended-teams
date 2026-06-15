@@ -53,7 +53,7 @@ describe("qualified model helpers", () => {
 });
 
 describe("loadModelResolutionConfig", () => {
-  const testRoot = path.join(os.tmpdir(), `pi-teams-model-config-${Date.now()}`);
+  const testRoot = path.join(os.tmpdir(), `pi-extended-teams-model-config-${Date.now()}`);
   const homeDir = path.join(testRoot, "home");
   const projectDir = path.join(testRoot, "project");
 
@@ -78,7 +78,7 @@ describe("loadModelResolutionConfig", () => {
 
   it("loads global config", () => {
     fs.writeFileSync(
-      path.join(homeDir, ".pi", "pi-teams.json"),
+      path.join(homeDir, ".pi", "pi-extended-teams.json"),
       JSON.stringify({ providerPriority: ["openai-codex", "claude-agent-sdk"] }, null, 2)
     );
 
@@ -89,11 +89,26 @@ describe("loadModelResolutionConfig", () => {
 
   it("lets project config override global config", () => {
     fs.writeFileSync(
+      path.join(homeDir, ".pi", "pi-extended-teams.json"),
+      JSON.stringify({ providerPriority: ["claude-agent-sdk"] }, null, 2)
+    );
+    fs.writeFileSync(
+      path.join(projectDir, ".pi", "pi-extended-teams.json"),
+      JSON.stringify({ providerPriority: ["openai-codex"] }, null, 2)
+    );
+
+    const config = loadModelResolutionConfig({ homeDir, projectDir });
+
+    expect(config.providerPriority).toEqual(["openai-codex"]);
+  });
+
+  it("keeps legacy pi-teams config as a lower-priority compatibility path", () => {
+    fs.writeFileSync(
       path.join(homeDir, ".pi", "pi-teams.json"),
       JSON.stringify({ providerPriority: ["claude-agent-sdk"] }, null, 2)
     );
     fs.writeFileSync(
-      path.join(projectDir, ".pi", "pi-teams.json"),
+      path.join(homeDir, ".pi", "pi-extended-teams.json"),
       JSON.stringify({ providerPriority: ["openai-codex"] }, null, 2)
     );
 
@@ -104,7 +119,7 @@ describe("loadModelResolutionConfig", () => {
 });
 
 describe("loadPiModelSettings", () => {
-  const testRoot = path.join(os.tmpdir(), `pi-teams-pi-settings-${Date.now()}`);
+  const testRoot = path.join(os.tmpdir(), `pi-extended-teams-pi-settings-${Date.now()}`);
   const homeDir = path.join(testRoot, "home");
   const projectDir = path.join(testRoot, "project");
 
@@ -173,7 +188,7 @@ describe("preferred model selection", () => {
   });
 
   it("lists preferred qualified models from on-disk settings", () => {
-    const testRoot = path.join(os.tmpdir(), `pi-teams-preferred-${Date.now()}`);
+    const testRoot = path.join(os.tmpdir(), `pi-extended-teams-preferred-${Date.now()}`);
     const homeDir = path.join(testRoot, "home");
 
     fs.mkdirSync(path.join(homeDir, ".pi", "agent"), { recursive: true });

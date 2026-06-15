@@ -2,10 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased] - pi-extended-teams
+## [Unreleased]
+
+## [0.9.15] - 2026-06-14
 
 Renamed from `pi-teams` and re-homed at
 [`dantetekanem/pi-extended-teams`](https://github.com/dantetekanem/pi-extended-teams).
+
+### Added
+- In-process read agents with compact status and `/team` overlay.
+- Write-agent concurrency cap with persistent FIFO queue plus queue inspection/cancel tools.
+- Watchdog/reaper loop for stale teammates and queued-writer draining.
+- `list_teammates`, shared memory tools, and `use_skill`.
+- Extension integration tests for writer queue/drain and `report_and_exit` cleanup.
 
 ### Changed
 - **tmux-only**: removed the Zellij, cmux, iTerm2, WezTerm, and Windows Terminal

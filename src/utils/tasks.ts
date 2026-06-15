@@ -1,8 +1,33 @@
-// Project: pi-teams
+// Project: pi-extended-teams
 import fs from "node:fs";
 import path from "node:path";
 import { TaskFile } from "./models";
 import { taskDir, sanitizeName } from "./paths";
+
+export interface FileClaimConflict {
+  path: string;
+  heldBy: string;
+}
+
+const FILE_CLAIM_BLOCK_PREFIX = "file-claim:";
+
+function fileClaimBlockId(conflict: FileClaimConflict): string {
+  return `${FILE_CLAIM_BLOCK_PREFIX}${encodeURIComponent(conflict.path)}:${encodeURIComponent(conflict.heldBy)}`;
+}
+
+function parseFileClaimBlockPath(blocker: string): string | null {
+  if (!blocker.startsWith(FILE_CLAIM_BLOCK_PREFIX)) return null;
+  const encodedPath = blocker.slice(FILE_CLAIM_BLOCK_PREFIX.length).split(":", 1)[0];
+  try {
+    return decodeURIComponent(encodedPath);
+  } catch {
+    return null;
+  }
+}
+
+function isOpenTask(task: TaskFile): boolean {
+  return task.status !== "completed" && task.status !== "deleted";
+}
 import { teamExists } from "./teams";
 import { withLock } from "./lock";
 import { runHook } from "./hooks";
@@ -161,6 +186,91 @@ export async function listTasks(teamName: string): Promise<TaskFile[]> {
       })
       .filter(t => t !== null);
     return tasks.sort((a, b) => parseInt(a.id, 10) - parseInt(b.id, 10));
+  });
+}
+
+export async function markOwnerTasksBlockedByFileClaims(
+  teamName: string,
+  agentName: string,
+  conflicts: FileClaimConflict[],
+  blockedAt: string = new Date().toISOString()
+): Promise<TaskFile[]> {
+  if (conflicts.length === 0) return [];
+
+  const dir = taskDir(teamName);
+  if (!fs.existsSync(dir)) return [];
+
+  return await withLock(dir, async () => {
+    const blockerIds = conflicts.map(fileClaimBlockId);
+    const updatedTasks: TaskFile[] = [];
+    const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
+
+    for (const f of files) {
+      const p = path.join(dir, f);
+      const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
+      if (task.owner !== agentName || !isOpenTask(task)) continue;
+
+      task.blockedBy = Array.from(new Set([...(task.blockedBy || []), ...blockerIds]));
+      task.metadata = {
+        ...(task.metadata || {}),
+        fileClaimBlock: { blockedAt, conflicts },
+      };
+      fs.writeFileSync(p, JSON.stringify(task, null, 2));
+      updatedTasks.push(task);
+    }
+
+    return updatedTasks;
+  });
+}
+
+export async function clearOwnerFileClaimBlocks(
+  teamName: string,
+  agentName: string,
+  paths?: string[]
+): Promise<TaskFile[]> {
+  const dir = taskDir(teamName);
+  if (!fs.existsSync(dir)) return [];
+  const pathSet = paths ? new Set(paths) : undefined;
+
+  return await withLock(dir, async () => {
+    const updatedTasks: TaskFile[] = [];
+    const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
+
+    for (const f of files) {
+      const p = path.join(dir, f);
+      const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
+      if (task.owner !== agentName) continue;
+
+      const originalBlockedBy = task.blockedBy || [];
+      const nextBlockedBy = originalBlockedBy.filter(blocker => {
+        const blockedPath = parseFileClaimBlockPath(blocker);
+        if (!blockedPath) return true;
+        return pathSet ? !pathSet.has(blockedPath) : false;
+      });
+
+      const fileClaimBlock = task.metadata?.fileClaimBlock as { conflicts?: FileClaimConflict[] } | undefined;
+      const remainingConflicts = fileClaimBlock?.conflicts
+        ? fileClaimBlock.conflicts.filter(conflict => pathSet ? !pathSet.has(conflict.path) : false)
+        : [];
+
+      const metadata = { ...(task.metadata || {}) };
+      if (remainingConflicts.length > 0) {
+        metadata.fileClaimBlock = { ...fileClaimBlock, conflicts: remainingConflicts };
+      } else {
+        delete metadata.fileClaimBlock;
+      }
+
+      const metadataChanged = JSON.stringify(metadata) !== JSON.stringify(task.metadata || {});
+      const blockedByChanged = nextBlockedBy.length !== originalBlockedBy.length;
+      if (!metadataChanged && !blockedByChanged) continue;
+
+      task.blockedBy = nextBlockedBy;
+      task.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
+      fs.writeFileSync(p, JSON.stringify(task, null, 2));
+      updatedTasks.push(task);
+    }
+
+    return updatedTasks;
   });
 }
 

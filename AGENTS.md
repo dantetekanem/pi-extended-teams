@@ -1,12 +1,12 @@
-# pi-teams: Agent Guide 🤖
+# pi-extended-teams: Agent Guide 🤖
 
-This guide explains how `pi-teams` transforms your single Pi agent into a coordinated team of specialists. It covers the roles, capabilities, and coordination patterns available to you as the **Team Lead**.
+This guide explains how `pi-extended-teams` transforms your single Pi agent into a coordinated team of specialists. It covers the roles, capabilities, and coordination patterns available to you as the **Team Lead**.
 
 ---
 
 ## 🎭 The Two Roles
 
-In a `pi-teams` environment, there are two distinct types of agents:
+In a `pi-extended-teams` environment, there are two distinct types of agents:
 
 ### 1. The Team Lead (You)
 The agent in your main terminal window. You are responsible for:
@@ -16,7 +16,7 @@ The agent in your main terminal window. You are responsible for:
 - **Quality Control**: Reviewing plans and approving finished work.
 
 ### 2. Teammates (The Specialists)
-Agents spawned in separate panes. They are designed for:
+Agents running either in-process for read-only work or in tmux panes for write work. They are designed for:
 - **Focus**: Executing specific, isolated tasks (e.g., "Security Audit", "Frontend Refactor").
 - **Parallelism**: Working on multiple parts of the project simultaneously.
 - **Autonomy**: Checking their own inboxes, submitting plans, and reporting progress without constant hand-holding.
@@ -75,7 +75,7 @@ Use automated hooks to ensure standards.
 
 ---
 
-## 🛑 When to Use pi-teams
+## 🛑 When to Use pi-extended-teams
 - **Complex Projects**: Tasks that involve multiple files and logic layers.
 - **Research & Execution**: One agent researches while another implements.
 - **Parallel Testing**: Running different test suites in parallel.

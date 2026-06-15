@@ -1,4 +1,4 @@
-# Implementation Plan: Separate Windows Mode for pi-teams
+# Implementation Plan: Separate Windows Mode for pi-extended-teams
 
 ## Goal
 Implement the ability to open team members (including the team lead) in separate OS windows instead of panes, with window titles set to "team-name: agent-name" format.

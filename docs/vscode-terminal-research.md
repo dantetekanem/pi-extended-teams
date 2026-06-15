@@ -2,13 +2,13 @@
 
 ## Executive Summary
 
-After researching VS Code and Cursor integrated terminal capabilities, **I recommend AGAINST implementing direct VS Code/Cursor terminal support for pi-teams at this time**. The fundamental issue is that VS Code does not provide a command-line API for spawning or managing terminal panes from within an integrated terminal. While a VS Code extension could theoretically provide this functionality, it would require users to install an additional extension and would not work "out of the box" like the current tmux/Zellij/iTerm2 solutions.
+After researching VS Code and Cursor integrated terminal capabilities, **I recommend AGAINST implementing direct VS Code/Cursor terminal support for pi-extended-teams at this time**. The fundamental issue is that VS Code does not provide a command-line API for spawning or managing terminal panes from within an integrated terminal. While a VS Code extension could theoretically provide this functionality, it would require users to install an additional extension and would not work "out of the box" like the current tmux/Zellij/iTerm2 solutions.
 
 ---
 
 ## Research Scope
 
-This document investigates whether pi-teams can work with VS Code and Cursor integrated terminals, specifically:
+This document investigates whether pi-extended-teams can work with VS Code and Cursor integrated terminals, specifically:
 
 1. Detecting when running inside VS Code/Cursor integrated terminal
 2. Programmatically creating new terminal instances
@@ -149,7 +149,7 @@ Extensions can register custom terminal profiles:
       "profiles": [
         {
           "title": "Pi-Teams Terminal",
-          "id": "pi-teams-terminal"
+          "id": "pi-extended-teams-terminal"
         }
       ]
     }
@@ -157,7 +157,7 @@ Extensions can register custom terminal profiles:
 }
 
 // Register provider
-vscode.window.registerTerminalProfileProvider('pi-teams-terminal', {
+vscode.window.registerTerminalProfileProvider('pi-extended-teams-terminal', {
   provideTerminalProfile(token) {
     return {
       name: "Pi-Teams Agent",
@@ -229,15 +229,15 @@ vscode.window.registerTerminalProfileProvider('pi-teams-terminal', {
 
 ### ⚠️ Approach 4: VS Code Extension (Partial Solution)
 
-**Investigated**: Create a VS Code extension that pi-teams can communicate with
+**Investigated**: Create a VS Code extension that pi-extended-teams can communicate with
 
 **Feasible Design**:
-1. pi-teams detects VS Code environment (`TERM_PROGRAM=vscode`)
-2. pi-teams spawns child processes that communicate with the extension
+1. pi-extended-teams detects VS Code environment (`TERM_PROGRAM=vscode`)
+2. pi-extended-teams spawns child processes that communicate with the extension
 3. Extension receives requests and creates terminals via VS Code API
 
 **Communication Mechanisms**:
-- **Local WebSocket server**: Extension starts server, pi-teams connects
+- **Local WebSocket server**: Extension starts server, pi-extended-teams connects
 - **Named pipes/Unix domain sockets**: On Linux/macOS
 - **File system polling**: Write request files, extension reads them
 - **Local HTTP server**: Easier cross-platform
@@ -245,7 +245,7 @@ vscode.window.registerTerminalProfileProvider('pi-teams-terminal', {
 **Example Architecture**:
 ```
 ┌─────────────┐
-│  pi-teams   │ ← Running in integrated terminal
+│  pi-extended-teams   │ ← Running in integrated terminal
 │  (node.js)  │
 └──────┬──────┘
        │
@@ -253,7 +253,7 @@ vscode.window.registerTerminalProfileProvider('pi-teams-terminal', {
        │    { name: "agent-1", cwd: "/path", command: "pi ..." }
        ↓
 ┌───────────────────────────┐
-│  pi-teams VS Code Extension │ ← Running in extension host
+│  pi-extended-teams VS Code Extension │ ← Running in extension host
 │  (TypeScript)              │
 └───────┬───────────────────┘
         │
@@ -274,7 +274,7 @@ vscode.window.registerTerminalProfileProvider('pi-teams-terminal', {
 **Cons**:
 - ❌ Users must install extension (additional dependency)
 - ❌ Extension adds ~5-10MB to install
-- ❌ Extension must be maintained alongside pi-teams
+- ❌ Extension must be maintained alongside pi-extended-teams
 - ❌ Extension adds startup overhead
 - ❌ Extension permissions/security concerns
 - ❌ Not "plug and play" like tmux/Zellij
@@ -283,7 +283,7 @@ vscode.window.registerTerminalProfileProvider('pi-teams-terminal', {
 
 ---
 
-## 6. Comparison with Existing pi-teams Adapters
+## 6. Comparison with Existing pi-extended-teams Adapters
 
 | Feature | tmux | Zellij | iTerm2 | VS Code (CLI) | VS Code (Extension) |
 |---------|------|--------|---------|----------------|---------------------|
@@ -377,7 +377,7 @@ The fundamental blocker: **VS Code provides no command-line or shell interface f
 1. **No native CLI support**: VS Code provides no command-line API for terminal management
 2. **Extension required**: Would require users to install and configure an extension
 3. **User friction**: Adds setup complexity vs. "just use tmux"
-4. **Maintenance burden**: Extension must be maintained alongside pi-teams
+4. **Maintenance burden**: Extension must be maintained alongside pi-extended-teams
 5. **Limited benefit**: Users can simply run `tmux` inside VS Code integrated terminal
 6. **Alternative exists**: tmux/Zellij work perfectly fine inside VS Code terminals
 
@@ -387,7 +387,7 @@ The fundamental blocker: **VS Code provides no command-line or shell interface f
 
 ```bash
 # Option 1: Run tmux inside VS Code integrated terminal
-tmux new -s pi-teams
+tmux new -s pi-extended-teams
 pi create-team my-team
 pi spawn-teammate ...
 
@@ -414,27 +414,27 @@ If there's strong user demand for native VS Code integration:
 #### Architecture
 
 ```
-1. pi-teams detects VS Code (TERM_PROGRAM=vscode)
+1. pi-extended-teams detects VS Code (TERM_PROGRAM=vscode)
 
-2. pi-teams spawns a lightweight HTTP server
+2. pi-extended-teams spawns a lightweight HTTP server
    - Port: Random free port (e.g., 34567)
    - Endpoint: POST /create-terminal
    - Payload: { name, cwd, command, env }
 
-3. User installs "pi-teams" VS Code extension
+3. User installs "pi-extended-teams" VS Code extension
    - Extension starts HTTP client on activation
-   - Finds pi-teams server port via shared file or env var
+   - Finds pi-extended-teams server port via shared file or env var
 
 4. Extension receives create-terminal requests
    - Calls vscode.window.createTerminal()
    - Returns terminal ID
 
-5. pi-teams tracks terminal IDs via extension responses
+5. pi-extended-teams tracks terminal IDs via extension responses
 ```
 
 #### Implementation Sketch
 
-**pi-teams (TypeScript)**:
+**pi-extended-teams (TypeScript)**:
 ```typescript
 class VSCodeAdapter implements TerminalAdapter {
   name = "vscode";
@@ -450,7 +450,7 @@ class VSCodeAdapter implements TerminalAdapter {
     // Write request file
     const requestId = uuidv4();
     await fs.writeFile(
-      `/tmp/pi-teams-request-${requestId}.json`,
+      `/tmp/pi-extended-teams-request-${requestId}.json`,
       JSON.stringify({ ...options, requestId })
     );
 
@@ -481,7 +481,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Watch for request files
   const watcher = vscode.workspace.createFileSystemWatcher(
-    '/tmp/pi-teams-request-*.json'
+    '/tmp/pi-extended-teams-request-*.json'
   );
 
   watcher.onDidChange(async (uri) => {
@@ -531,7 +531,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 ### Could We Detect Existing Terminal Tabs?
 
-**Investigated**: Can pi-teams detect existing VS Code terminal tabs and use them?
+**Investigated**: Can pi-extended-teams detect existing VS Code terminal tabs and use them?
 
 **Findings**:
 - VS Code extension API can get list of terminals: `vscode.window.terminals`
@@ -603,9 +603,9 @@ export class VSCodeAdapter implements TerminalAdapter {
   spawn(options: SpawnOptions): string {
     throw new Error(
       "VS Code integrated terminals do not support spawning " +
-      "new terminals from command line. Please run pi-teams " +
+      "new terminals from command line. Please run pi-extended-teams " +
       "inside tmux, Zellij, or iTerm2 for terminal management. " +
-      "Alternatively, install the pi-teams VS Code extension " +
+      "Alternatively, install the pi-extended-teams VS Code extension " +
       "(if implemented)."
     );
   }
@@ -629,13 +629,13 @@ export class VSCodeAdapter implements TerminalAdapter {
 ```
 ❌ Cannot spawn terminal in VS Code integrated terminal
 
-pi-teams requires a terminal multiplexer to create multiple panes.
+pi-extended-teams requires a terminal multiplexer to create multiple panes.
 
 For VS Code users, we recommend one of these options:
 
 Option 1: Run tmux inside VS Code integrated terminal
   ┌────────────────────────────────────────┐
-  │ $ tmux new -s pi-teams              │
+  │ $ tmux new -s pi-extended-teams              │
   │ $ pi create-team my-team              │
   │ $ pi spawn-teammate security-bot ...   │
   └────────────────────────────────────────┘
@@ -654,7 +654,7 @@ Option 3: Use a terminal with multiplexer support
   │ • Zellij - Install: cargo install ... │
   └────────────────────────────────────────┘
 
-Learn more: https://github.com/your-org/pi-teams#terminal-support
+Learn more: https://github.com/your-org/pi-extended-teams#terminal-support
 ```
 
 ---
@@ -681,7 +681,7 @@ For VS Code/Cursor users, recommend:
 
 ```bash
 # Option 1: Run tmux inside VS Code (simplest)
-tmux new -s pi-teams
+tmux new -s pi-extended-teams
 
 # Option 2: Start tmux first, then open VS Code
 tmux new -s dev
@@ -690,17 +690,17 @@ code .
 
 ### Documentation Update
 
-Add to pi-teams README.md:
+Add to pi-extended-teams README.md:
 
 ```markdown
-## Using pi-teams with VS Code or Cursor
+## Using pi-extended-teams with VS Code or Cursor
 
-pi-teams works great with VS Code and Cursor! Simply run tmux
+pi-extended-teams works great with VS Code and Cursor! Simply run tmux
 or Zellij inside the integrated terminal:
 
 ```bash
 # Start tmux in VS Code integrated terminal
-$ tmux new -s pi-teams
+$ tmux new -s pi-extended-teams
 $ pi create-team my-team
 $ pi spawn-teammate security-bot "Scan for vulnerabilities"
 ```
@@ -860,9 +860,9 @@ process.env.TERM_PROGRAM === 'iTerm.app'
 
 ```bash
 # Step 1: Start tmux
-tmux new -s pi-teams
+tmux new -s pi-extended-teams
 
-# Step 2: Use pi-teams
+# Step 2: Use pi-extended-teams
 pi create-team my-team
 pi spawn-teammate frontend-dev
 pi spawn-teammate backend-dev

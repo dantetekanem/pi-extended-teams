@@ -148,7 +148,7 @@ full:
 });
 
 describe("discoverAgents", () => {
-  const testDir = path.join(os.tmpdir(), "pi-teams-test-agents-" + Date.now());
+  const testDir = path.join(os.tmpdir(), "pi-extended-teams-test-agents-" + Date.now());
 
   beforeEach(() => {
     if (fs.existsSync(testDir)) {
@@ -220,7 +220,7 @@ Valid prompt`);
 });
 
 describe("discoverTeams", () => {
-  const testDir = path.join(os.tmpdir(), "pi-teams-test-teams-" + Date.now());
+  const testDir = path.join(os.tmpdir(), "pi-extended-teams-test-teams-" + Date.now());
 
   beforeEach(() => {
     if (fs.existsSync(testDir)) {
@@ -259,7 +259,7 @@ describe("getAllAgentDefinitions and getAllPredefinedTeams", () => {
   const globalDir = path.join(os.homedir(), ".pi", "agent", "agents");
   const globalTeamsDir = path.join(os.homedir(), ".pi");
   const legacyGlobalTeamsDir = path.join(os.homedir(), ".pi", "agent");
-  const projectDir = path.join(os.tmpdir(), "pi-teams-test-project-" + Date.now());
+  const projectDir = path.join(os.tmpdir(), "pi-extended-teams-test-project-" + Date.now());
   const projectAgentsDir = path.join(projectDir, ".pi", "agents");
   const projectTeamsDir = path.join(projectDir, ".pi");
 
@@ -386,7 +386,7 @@ legacy-global:
 });
 
 describe("getAgentDefinition and getPredefinedTeam", () => {
-  const projectDir = path.join(os.tmpdir(), "pi-teams-test-get-" + Date.now());
+  const projectDir = path.join(os.tmpdir(), "pi-extended-teams-test-get-" + Date.now());
   const projectAgentsDir = path.join(projectDir, ".pi", "agents");
   const projectTeamsDir = path.join(projectDir, ".pi");
 
@@ -445,7 +445,7 @@ describe("saveTeamTemplate", () => {
   const rootPiDir = path.join(os.homedir(), ".pi");
   const globalAgentsDir = path.join(rootPiDir, "agent", "agents");
   const globalTeamsPath = path.join(rootPiDir, "teams.yaml");
-  const projectDir = path.join(os.tmpdir(), "pi-teams-test-save-" + Date.now());
+  const projectDir = path.join(os.tmpdir(), "pi-extended-teams-test-save-" + Date.now());
 
   let originalGlobalTeams: string | null = null;
   let originalAgentFiles = new Set<string>();

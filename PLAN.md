@@ -1,8 +1,7 @@
 # pi-extended-teams — Implementation Plan
 
-Fork of `pi-teams` (Mark Burggraf / watzon), re-homed at
-`https://github.com/dantetekanem/pi-extended-teams` and extended with a
-tmux-only, self-managing, role-aware multi-agent runtime.
+Renamed and re-homed at `https://github.com/dantetekanem/pi-extended-teams`,
+with a tmux-only, self-managing, role-aware multi-agent runtime.
 
 This document is the single source of truth for the migration and the new
 feature set. Check items off as they land. Each phase has acceptance criteria
@@ -35,15 +34,15 @@ fork references. **Reversible local steps first; push last.**
 - [x] Rename package `pi-teams` → `pi-extended-teams` in `package.json`
 - [x] Update `repository.url` → `dantetekanem/pi-extended-teams`
 - [x] Update `pi.image` raw URL → `dantetekanem/pi-extended-teams`
-- [x] Update `author` and any burggraf/watzon strings (only `package.json` currently matches)
-- [x] Remove fork remotes (`origin` → burggraf, `watzon`), add new `origin`
+- [x] Update `author` and old upstream attribution strings
+- [x] Remove fork remotes and add new `origin`
 - [x] `git branch -M main`, delete redundant `local-spawn-inherit` once merged
 - [x] `git push -u origin main`
 - [x] Update `README.md` title/badges/clone URL to the new repo
 - [x] Refresh `CHANGELOG.md` with a `pi-extended-teams` heading
 
 **Acceptance:** `git remote -v` shows only the new origin; `main` builds and
-tests pass; no `burggraf`/`watzon` strings remain (`grep -rI` clean).
+tests pass; no old upstream attribution strings remain (`grep -rI` clean).
 
 ---
 
@@ -121,12 +120,12 @@ pi-emote), showing elapsed time and token usage.
   - **Caveat:** the nested-session lifecycle (resource loading, tool restriction,
     teardown) must be validated in a live pi+tmux session — it can't be exercised
     by the unit-test harness. Implementation lands behind that verification.
-- [ ] Implement `spawn_read_agent`: starts a background read-only agent in-process (tools restricted to read/search/no-write)
-- [ ] Track each running read agent: `{ name, startedAt, tokensUsed, status }`
-- [ ] Render a status entry per the pi-emote pattern via `ctx.ui.setStatus(key, text)` using a key that sorts **below** pi-emote (e.g. `"01-pi-teams-read"`); show count + per-agent elapsed + tokens
-- [ ] Background ticker updates elapsed/token figures (poll the agent's usage)
-- [ ] On completion, read agent reports back to lead and is removed from the status line
-- [ ] Enforce **unlimited** read agents (no cap)
+- [x] Implement read-agent spawning inside `spawn_teammate(role: "read")`: starts a background read-only agent in-process (tools restricted to read/search/list/no-write)
+- [x] Track each running read agent: `{ name, startedAt, tokensUsed, status }`
+- [x] Render a status entry per the pi-emote pattern via `ctx.ui.setStatus(key, text)` using key `"01-pi-extended-teams-read"`; show count + per-agent elapsed + tokens in Pi's bottom status bar
+- [x] Background ticker updates elapsed/token figures (poll the agent's usage)
+- [x] On completion, read agent reports back to lead and is removed from the status line
+- [x] Enforce **unlimited** read agents (no cap)
 
 **Acceptance:** spawning a read agent opens no tmux pane; the status line shows
 `reading: N agents` with live elapsed + token counts; it clears on finish.
@@ -160,8 +159,8 @@ ping, a background check confirms whether it is truly stale.
 Goal: every agent kills itself after sending its final message back to the lead.
 Nothing is left stale or idle.
 
-- [ ] Add a `report_and_exit` tool: sends final message to `team-lead`, then triggers self-shutdown (write agent: kill own tmux pane + clean PID/runtime; read agent: deregister from status line)
-- [ ] Update `before_agent_start` teammate system prompt to mandate `report_and_exit` as the final step
+- [x] Add a `report_and_exit` tool: sends final message to `team-lead`, releases claims, removes the member from team config, clears runtime status, then triggers self-shutdown for write agents
+- [x] Update `before_agent_start` teammate system prompt to mandate `report_and_exit` as the final step for write agents
 - [ ] Lead-side reaper confirms the pane/PID is gone after a completion message; force-kills if it lingers
 - [ ] Release any held file write-claims (Phase 7) on exit
 - [ ] Tests: after `report_and_exit`, no pane, no PID file, no runtime status, claims released
@@ -192,12 +191,12 @@ writer spawns automatically without lead intervention.
 
 Goal: no two agents write the same file at the same time.
 
-- [ ] Shared file-claim registry under the team dir (e.g. `claims/<hash(path)>.json` with `{ agent, path, since }`), guarded by `withLock`
-- [ ] `claim_file(paths[])` / `release_file(paths[])` tools for write agents
-- [ ] A write agent must hold a claim before editing; claim is exclusive per path
-- [ ] Claims auto-release on `report_and_exit` and on watchdog-confirmed death
-- [ ] Lead can inspect current claims; conflicting claims surface as a blocked task
-- [ ] Tests (extend `lock.race.test.ts` / `tasks.race.test.ts`): two writers contend on one path ⇒ one waits/declines
+- [x] Shared file-claim registry under the team dir (`claims.json` with `{ agent, path, since }`), guarded by `withLock`
+- [x] `claim_file(paths[])` / `release_file(paths[])` tools for write agents; `list_file_claims` lets the lead inspect current claims
+- [x] Write-agent system prompt mandates holding a claim before editing; claim grant is exclusive per path
+- [x] Claims auto-release on `report_and_exit`, teammate shutdown, and watchdog-confirmed death (`check_teammate` dead cleanup)
+- [x] Conflicting claims surface as a blocked owned task via `blockedBy` + `metadata.fileClaimBlock`
+- [x] Tests (`src/utils/claims.test.ts`, `src/utils/tasks.test.ts`): two writers contend on one path ⇒ one is granted and one is blocked; owned task blockers are marked and cleared
 
 **Acceptance:** concurrent writers targeting the same file are serialized;
 stale claims from dead agents are reclaimed automatically.

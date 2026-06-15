@@ -6,7 +6,7 @@ import { appendMessage, readInbox, sendPlainMessage, broadcastMessage } from "./
 import * as paths from "./paths";
 
 // Mock the paths to use a temporary directory
-const testDir = path.join(os.tmpdir(), "pi-teams-test-" + Date.now());
+const testDir = path.join(os.tmpdir(), "pi-extended-teams-test-" + Date.now());
 
 describe("Messaging Utilities", () => {
   beforeEach(() => {

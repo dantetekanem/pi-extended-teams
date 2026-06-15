@@ -245,7 +245,7 @@ While not tested in this research, iTerm2 is known to have:
 
 ## Recommendations
 
-### For the pi-teams Project
+### For the pi-extended-teams Project
 
 **Primary Recommendation:**
 > **Do NOT implement Terminal.app tab support.** Use separate windows instead.

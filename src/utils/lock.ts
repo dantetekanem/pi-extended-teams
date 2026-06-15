@@ -1,4 +1,4 @@
-// Project: pi-teams
+// Project: pi-extended-teams
 import fs from "node:fs";
 import path from "node:path";
 

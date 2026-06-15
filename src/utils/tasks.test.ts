@@ -1,14 +1,23 @@
-// Project: pi-teams
+// Project: pi-extended-teams
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createTask, updateTask, readTask, listTasks, submitPlan, evaluatePlan } from "./tasks";
+import {
+  createTask,
+  updateTask,
+  readTask,
+  listTasks,
+  submitPlan,
+  evaluatePlan,
+  markOwnerTasksBlockedByFileClaims,
+  clearOwnerFileClaimBlocks,
+} from "./tasks";
 import * as paths from "./paths";
 import * as teams from "./teams";
 
 // Mock the paths to use a temporary directory
-const testDir = path.join(os.tmpdir(), "pi-teams-test-" + Date.now());
+const testDir = path.join(os.tmpdir(), "pi-extended-teams-test-" + Date.now());
 
 describe("Tasks Utilities", () => {
   beforeEach(() => {
@@ -130,6 +139,53 @@ describe("Tasks Utilities", () => {
     await submitPlan("test-team", task.id, "My plan");
     await expect(evaluatePlan("test-team", task.id, "reject")).rejects.toThrow("Feedback is required when rejecting a plan");
     await expect(evaluatePlan("test-team", task.id, "reject", "   ")).rejects.toThrow("Feedback is required when rejecting a plan");
+  });
+
+  it("marks owned open tasks blocked by file-claim conflicts", async () => {
+    const task = await createTask("test-team", "Claim Block Test", "Should be blocked");
+    await updateTask("test-team", task.id, {
+      status: "in_progress",
+      owner: "alice",
+      blockedBy: ["upstream-task"],
+    });
+
+    const conflicts = [{ path: "src/a.ts", heldBy: "bob" }];
+    const updated = await markOwnerTasksBlockedByFileClaims(
+      "test-team",
+      "alice",
+      conflicts,
+      "2026-06-14T00:00:00.000Z"
+    );
+
+    expect(updated.map(t => t.id)).toEqual([task.id]);
+    const blockedTask = await readTask("test-team", task.id);
+    expect(blockedTask.blockedBy).toEqual(["upstream-task", "file-claim:src%2Fa.ts:bob"]);
+    expect(blockedTask.metadata?.fileClaimBlock).toEqual({
+      blockedAt: "2026-06-14T00:00:00.000Z",
+      conflicts,
+    });
+  });
+
+  it("clears file-claim blockers after the owner gets the claim", async () => {
+    const task = await createTask("test-team", "Claim Clear Test", "Should unblock");
+    await updateTask("test-team", task.id, {
+      status: "in_progress",
+      owner: "alice",
+      blockedBy: ["upstream-task"],
+    });
+    await markOwnerTasksBlockedByFileClaims(
+      "test-team",
+      "alice",
+      [{ path: "src/a.ts", heldBy: "bob" }],
+      "2026-06-14T00:00:00.000Z"
+    );
+
+    const updated = await clearOwnerFileClaimBlocks("test-team", "alice", ["src/a.ts"]);
+
+    expect(updated.map(t => t.id)).toEqual([task.id]);
+    const unblockedTask = await readTask("test-team", task.id);
+    expect(unblockedTask.blockedBy).toEqual(["upstream-task"]);
+    expect(unblockedTask.metadata?.fileClaimBlock).toBeUndefined();
   });
 
   it("should sanitize task IDs in all file operations", async () => {

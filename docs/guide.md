@@ -1,6 +1,6 @@
-# pi-teams Usage Guide
+# pi-extended-teams Usage Guide
 
-This guide provides detailed examples, patterns, and best practices for using pi-teams.
+This guide provides detailed examples, patterns, and best practices for using pi-extended-teams.
 
 ## Table of Contents
 
@@ -16,10 +16,10 @@ This guide provides detailed examples, patterns, and best practices for using pi
 
 ### Basic Team Setup
 
-First, make sure you're inside a tmux session, Zellij session, or iTerm2:
+First, make sure you're inside a tmux session. Write agents require tmux panes; read agents run in-process and do not open panes.
 
 ```bash
-tmux  # or zellij, or just use iTerm2
+tmux
 ```
 
 Then start pi:
@@ -74,13 +74,13 @@ Create a hook script at `.pi/team-hooks/task_completed.sh`:
 # This script runs automatically when any task is completed
 
 echo "Running post-task checks..."
-npm test
+pnpm test
 if [ $? -ne 0 ]; then
   echo "Tests failed! Please fix before marking task complete."
   exit 1
 fi
 
-npm run lint
+pnpm run lint
 echo "All checks passed!"
 ```
 
@@ -168,7 +168,7 @@ TASK_DATA="$1"
 SUBJECT=$(echo "$TASK_DATA" | jq -r '.subject')
 
 echo "Running tests after task: $SUBJECT"
-npm test
+pnpm test
 ```
 
 #### Notify Slack
@@ -197,9 +197,9 @@ SUBJECT=$(echo "$TASK_DATA" | jq -r '.subject')
 
 # Only run full test suite for production-related tasks
 if [[ "$SUBJECT" == *"production"* ]] || [[ "$SUBJECT" == *"deploy"* ]]; then
-  npm run test:ci
+  pnpm run test:ci
 else
-  npm test
+  pnpm test
 fi
 ```
 
@@ -271,13 +271,15 @@ Bad task:
 "Fix signup form"
 ```
 
-### 6. Check Progress Regularly
+### 6. Let the Extension Wake the Lead
+
+For routine report completion, you do not need to ask the lead to sleep, wait, or create a separate polling loop. pi-extended-teams watches the lead inbox while the lead is idle and wakes the lead when teammate reports are ready.
+
+Use manual checks only when you need explicit state or suspect a stall:
 
 > **You:** "List all tasks"
 > **You:** "Check my inbox for messages"
 > **You:** "How is the team doing?"
-
-This helps you catch blockers early and provide feedback.
 
 ---
 
@@ -331,13 +333,13 @@ Examples:
 - `claude-agent-sdk/claude-sonnet-4-6`
 - `kimi-coding/kimi-for-coding`
 
-pi-teams does not auto-resolve bare model names like `gpt-5` or `haiku` when creating new teams or spawning new teammates.
-If a model is not fully qualified or not available, pi-teams fails fast.
+pi-extended-teams does not auto-resolve bare model names like `gpt-5` or `haiku` when creating new teams or spawning new teammates.
+If a model is not fully qualified or not available, pi-extended-teams fails fast.
 
-If you want to control the order shown by `list_available_models`, add global or project-local pi-teams config:
+If you want to control the order shown by `list_available_models`, add global or project-local pi-extended-teams config:
 
-- Global: `~/.pi/pi-teams.json`
-- Project-local: `.pi/pi-teams.json`
+- Global: `~/.pi/pi-extended-teams.json`
+- Project-local: `.pi/pi-extended-teams.json`
 
 Example:
 
@@ -362,16 +364,16 @@ All team data is stored in:
 
 You can manually inspect these JSON files to debug issues.
 
-### iTerm2 Not Working
+### Write-Agent Panes Not Appearing
 
-**Problem**: iTerm2 splits aren't appearing.
+**Problem**: write-agent tmux panes are not appearing.
 
 **Requirements**:
-1. You must be on macOS
-2. iTerm2 must be your terminal
-3. You must NOT be inside tmux or Zellij (iTerm2 detection only works as a fallback)
+1. Start Pi from inside a tmux session.
+2. Make sure `TMUX` is present in the environment.
+3. Use read agents for investigation when you do not need a pane.
 
-**Alternative**: Use tmux or Zellij for more reliable pane management.
+pi-extended-teams is tmux-only for write-agent panes. Zellij and iTerm2 pane backends are not supported.
 
 ---
 
@@ -391,17 +393,13 @@ This enables autonomous coordination. You can see these messages by:
 
 ## Cleanup
 
-To remove all team data:
+To remove all team data, shut down the team:
 
 ```bash
-# Shut down team first
 > "Shut down the team named 'my-team'"
-
-# Then delete data directory
-rm -rf ~/.pi/teams/my-team/
-rm -rf ~/.pi/tasks/my-team/
-rm -rf ~/.pi/messages/my-team/
 ```
+
+`team_shutdown` closes teammate panes, removes team/task state, and runs built-in stale session cleanup. Do not manually delete state unless you are recovering from a broken shutdown.
 
 Or use the delete command:
 > **You:** "Delete the team named 'my-team'"

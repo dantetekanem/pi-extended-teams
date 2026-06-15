@@ -1,8 +1,8 @@
 # pi-extended-teams 🚀
 
-**pi-extended-teams** turns your single Pi agent into a coordinated, self-managing software engineering team. The lead **divides work to conquer it**: read-only agents investigate in the background while write agents implement in **tmux** panes — with file-write coordination, a 3-writer cap, a watchdog that reaps anything stale, and agents that kill themselves the moment their work is reported back.
+**pi-extended-teams** turns your single Pi agent into a coordinated, self-managing software engineering team. The lead **divides work to conquer it**: read-only agents investigate in-process in the background while write agents implement in **tmux** panes — with file-write coordination, a 3-writer cap, a watchdog that reaps anything stale, and agents that clean themselves up when their work is reported back.
 
-> Extended fork of [`pi-teams`](https://github.com/burggraf/pi-teams) (Mark Burggraf). **tmux is the only supported backend.**
+> **tmux is the only supported backend for write agents.** Read-only agents run in-process and do not open panes.
 
 ### 🖥️ pi-extended-teams in Action
 
@@ -42,14 +42,16 @@ pi install npm:pi-extended-teams
 - **Spawn Specialists**: Create agents like "Security Expert" or "Frontend Pro" to handle sub-tasks in parallel.
 - **Shared Task Board**: Keep everyone on the same page with a persistent list of tasks and their status.
 - **Agent Messaging**: Agents can send direct messages to each other and to you (the Team Lead) to report progress.
-- **Autonomous Work**: Teammates automatically "wake up," read their instructions, and poll their inboxes for new work while idle.
-- **Beautiful UI**: Optimized vertical splits in `tmux` with clear labels so you always know who is doing what.
+- **Autonomous Work**: Teammates automatically read their instructions and poll their inboxes for new work while idle; the lead session watches for teammate reports and wakes itself when results are ready, so leads do not need sleeps or ad hoc polling loops.
+- **Readable Team UI**: `/team` opens an organized teammate overview; status bars stay compact and avoid raw noisy dumps.
+- **Write-Agent Queue**: At most 3 write agents run by default; overflow is queued and starts when a slot frees.
+- **Beautiful Write-Agent UI**: Optimized vertical splits in `tmux` with clear labels for write agents.
+- **Advisory File Claims**: Write agents coordinate file ownership through `claim_file`, `release_file`, and `list_file_claims`. Claims are lock-protected protocol state, not filesystem sandbox enforcement; cooperative agents must claim before editing.
 
 ### Advanced Features
 - **Predefined Teams**: Define team templates in `teams.yaml` and spawn entire teams with a single command.
 - **Save Teams as Templates**: Convert any runtime team into a reusable template with a single command.
-- **Isolated OS Windows**: Launch teammates in true separate OS windows instead of panes.
-- **Persistent Window Titles**: Windows are automatically titled `[team-name]: [agent-name]` for easy identification in your window manager.
+- **Persistent Pane Titles**: Write-agent panes are automatically titled `[team-name]: [agent-name]` for easy identification.
 - **Plan Approval Mode**: Require teammates to submit their implementation plans for your approval before they touch any code.
 - **Broadcast Messaging**: Send a message to the entire team at once for global coordination and announcements.
 - **Quality Gate Hooks**: Automated shell scripts run when tasks are completed (e.g., to run tests or linting).
@@ -82,8 +84,8 @@ When creating a new team or spawning teammates, use `list_available_models` firs
 If you provide a model that is not fully qualified or not available, pi-extended-teams will fail fast and ask you to choose a valid model.
 
 **Configuring model-list ordering:**
-You can customize the order shown by `list_available_models` globally with `~/.pi/pi-teams.json` or per-project with `.pi/pi-teams.json`.
-Project-local config overrides global config.
+You can customize the order shown by `list_available_models` globally with `~/.pi/pi-extended-teams.json` or per-project with `.pi/pi-extended-teams.json`.
+Project-local config overrides global config. Legacy `pi-teams.json` files are still read at lower priority for compatibility.
 
 ```json
 {
@@ -278,11 +280,9 @@ pi     # Start pi inside tmux
 
 ## 📜 Credits & Attribution
 
-This project is an extended fork of [pi-teams](https://github.com/burggraf/pi-teams) by [Mark Burggraf](https://github.com/burggraf).
+This project adapts the coordination ideas from [claude-code-teams-mcp](https://github.com/cs50victor/claude-code-teams-mcp) by [cs50victor](https://github.com/cs50victor) into a native **Pi Package**.
 
-This project is a port of the excellent [claude-code-teams-mcp](https://github.com/cs50victor/claude-code-teams-mcp) by [cs50victor](https://github.com/cs50victor).
-
-We have adapted the original MCP coordination protocol to work natively as a **Pi Package**, adding features like auto-starting teammates, balanced vertical UI layouts, automatic inbox polling, plan approval mode, broadcast messaging, and quality gate hooks.
+pi-extended-teams adds role-aware read/write agents, in-process read agents, tmux-managed write panes, compact inbox status, `/team` overview, plan approval mode, broadcast messaging, quality gate hooks, advisory file-claim coordination, write-agent queueing, and watchdog cleanup.
 
 ## 📄 License
 MIT

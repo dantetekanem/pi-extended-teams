@@ -1,4 +1,4 @@
-# pi-teams Tool Reference
+# pi-extended-teams Tool Reference
 
 Complete documentation of all tools, parameters, and automated behavior.
 
@@ -10,6 +10,8 @@ Complete documentation of all tools, parameters, and automated behavior.
 - [Teammates](#teammates)
 - [Task Management](#task-management)
 - [Messaging](#messaging)
+- [File Claims](#file-claims)
+- [Shared Memory & Skills](#shared-memory--skills)
 - [Task Planning & Approval](#task-planning--approval)
 - [Automated Behavior](#automated-behavior)
 - [Task Statuses](#task-statuses)
@@ -23,12 +25,12 @@ Complete documentation of all tools, parameters, and automated behavior.
 
 List available fully qualified models for creating new teams and spawning new teammates.
 
-Use this tool before choosing a model. pi-teams expects fully qualified `provider/model` strings and rejects bare names like `gpt-5` or `haiku`.
+Use this tool before choosing a model. pi-extended-teams expects fully qualified `provider/model` strings and rejects bare names like `gpt-5` or `haiku`.
 
 **Returns**:
 - Available models, already sorted with preferred models first
 - Preferred models derived from pi settings
-- Provider priority from pi-teams config (if configured)
+- Provider priority from pi-extended-teams config (if configured)
 
 **Example**:
 ```javascript
@@ -52,36 +54,16 @@ team_create({ team_name: "research", default_model: "openai-codex/gpt-5.4" })
 
 ---
 
-### team_delete
+### team_shutdown
 
-Delete a team and all its data (configuration, tasks, messages).
+Shut down a team, close its write-agent tmux panes, and remove team/task state.
 
 **Parameters**:
-- `team_name` (required): Name of the team to delete
+- `team_name` (required): Name of the team to shut down
 
 **Example**:
 ```javascript
-team_delete({ team_name: "my-team" })
-```
-
----
-
-### read_config
-
-Get details about the team and its members.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-
-**Returns**: Team configuration including:
-- Team name and description
-- Default model
-- List of members with their models and thinking levels
-- Creation timestamp
-
-**Example**:
-```javascript
-read_config({ team_name: "my-team" })
+team_shutdown({ team_name: "my-team" })
 ```
 
 ---
@@ -90,16 +72,18 @@ read_config({ team_name: "my-team" })
 
 ### spawn_teammate
 
-Launch a new agent into a terminal pane with a role and instructions.
+Launch a teammate with a role and instructions. Read teammates run in-process without panes. Write teammates spawn into tmux panes; if the configured write-agent cap is full, overflow is queued when `writeAgents.queueOverflow` is enabled.
 
 **Parameters**:
 - `team_name` (required): Name of the team
 - `name` (required): Friendly name for the teammate (e.g., "security-bot")
 - `prompt` (required): Instructions for the teammate's role and initial task
 - `cwd` (required): Working directory for the teammate
-- `model` (optional): Fully qualified AI model for this teammate (overrides team default)
+- `role` (optional): `read` for read-only in-process investigation, or `write` for a tmux write agent. Defaults to `write`.
+- `category` (optional): Named preset from settings that can bundle role, model, and thinking.
+- `model` (optional): Fully qualified AI model for this teammate (overrides team/default settings)
 - `thinking` (optional): Thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`)
-- `plan_mode_required` (optional): If `true`, teammate must submit plans for approval
+- `plan_mode_required` (optional): If `true`, write teammate must submit plans for approval
 
 **Model Rules**:
 - Use `list_available_models` first when choosing a model for a new team or teammate
@@ -156,9 +140,52 @@ spawn_teammate({
 
 ---
 
+### list_teammates
+
+List the live roster for a team, including roles, status, current tasks, held file claims, unread inbox counts, and queued write agents.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+
+**Example**:
+```javascript
+list_teammates({ team_name: "my-team" })
+```
+
+---
+
+### list_write_queue
+
+List pending write-agent spawns for a team. Read agents never enter this queue.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+
+**Example**:
+```javascript
+list_write_queue({ team_name: "my-team" })
+```
+
+---
+
+### cancel_write_queue
+
+Cancel one pending write-agent spawn by queue id.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `id` (required): Queue id returned by `spawn_teammate` or `list_write_queue`
+
+**Example**:
+```javascript
+cancel_write_queue({ team_name: "my-team", id: "queue-id" })
+```
+
+---
+
 ### check_teammate
 
-Check if a teammate is still running or has unread messages.
+Check if a teammate is still running or has unread messages. This is a targeted liveness diagnostic, not the normal way to wait for team completion; the extension wakes the lead when reports arrive.
 
 **Parameters**:
 - `team_name` (required): Name of the team
@@ -180,20 +207,7 @@ check_teammate({ team_name: "my-team", agent_name: "security-bot" })
 
 ---
 
-### force_kill_teammate
 
-Forcibly kill a teammate's tmux pane and remove them from the team.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `agent_name` (required): Name of the teammate to kill
-
-**Example**:
-```javascript
-force_kill_teammate({ team_name: "my-team", agent_name: "security-bot" })
-```
-
----
 
 ### process_shutdown_approved
 
@@ -207,6 +221,76 @@ Initiate orderly shutdown for a finished teammate.
 ```javascript
 process_shutdown_approved({ team_name: "my-team", agent_name: "security-bot" })
 ```
+
+---
+
+## Shared Memory & Skills
+
+### write_shared_memory
+
+Write or replace a team-shared memory entry. Use this for durable coordination facts within the team, such as decisions, API contracts, known risks, or handoff notes.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `key` (required): Memory key
+- `value` (required): Memory value
+
+### read_shared_memory
+
+Read one shared memory entry by key, or list all entries when `key` is omitted.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `key` (optional): Memory key
+
+### delete_shared_memory
+
+Delete one shared memory entry by key.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `key` (required): Memory key
+
+### use_skill
+
+Load a named skill file into the current agent context. It searches the project `skills/` folder and the Pi agent skills folder.
+
+**Parameters**:
+- `name` (required): Skill name, for example `teams`
+
+---
+
+## File Claims
+
+File claims coordinate write intent between cooperative write agents. They are stored in a lock-protected team `claims.json` file and prevent two granted claims for the same normalized repository-relative path.
+
+Important limitation: file claims are advisory protocol state, not OS-level or tool-level sandbox enforcement. A write agent can technically edit without a claim if it ignores instructions. pi-extended-teams enforces the protocol through write-agent prompts, exclusive claim grants, blocked-task metadata for conflicts, and automatic claim release on `report_and_exit`, teammate shutdown, and watchdog reap.
+
+### claim_file
+
+Claim one or more repository-relative paths before editing them. Available only to write-agent teammates.
+
+**Parameters**:
+- `paths` (required): Repository-relative file paths to claim. Empty, absolute, root, and parent-traversal paths are rejected.
+
+**Behavior**:
+- Grants paths that are unclaimed or already held by the same agent
+- Returns conflicts for paths held by another agent
+- Marks the agent's open owned tasks blocked when conflicts occur
+
+### release_file
+
+Release one or more claims held by the current write agent.
+
+**Parameters**:
+- `paths` (required): Repository-relative file paths to release
+
+### list_file_claims
+
+List current claims for a team. Intended for the lead.
+
+**Parameters**:
+- `team_name` (optional): Team name. Defaults to current team context when available.
 
 ---
 
@@ -252,7 +336,7 @@ task_list({ team_name: "my-team" })
 
 ---
 
-### task_get
+### task_read
 
 Get full details of a specific task.
 
@@ -269,7 +353,7 @@ Get full details of a specific task.
 
 **Example**:
 ```javascript
-task_get({ team_name: "my-team", task_id: "task_abc123" })
+task_read({ team_name: "my-team", task_id: "1" })
 ```
 
 ---
@@ -448,17 +532,19 @@ When a teammate is spawned, they automatically:
 
 ---
 
-### Idle Polling
+### Idle Polling and Lead Wakeup
 
 If a teammate is idle (has no active work), they automatically check for new messages every **30 seconds**.
 
-This ensures teammates stay responsive to new tasks, messages, and task reassignments without manual intervention.
+The lead session also watches the lead inbox while idle. When unread teammate reports arrive, the extension updates the team UI and injects a lead turn to process the reports. Leads should not use shell sleeps or ad hoc `LoopCreate` polling just to wait for team completion.
+
+This ensures teammates stay responsive and the lead is woken when results are ready without manual intervention.
 
 ---
 
 ### Automated Hooks
 
-When a task's status changes to `completed`, pi-teams automatically executes:
+When a task's status changes to `completed`, pi-extended-teams automatically executes:
 
 `.pi/team-hooks/task_completed.sh`
 
@@ -515,7 +601,7 @@ Task is removed from the active task list. Still preserved in data history.
 
 ### Data Storage
 
-All pi-teams data is stored in your home directory under `~/.pi/`:
+All pi-extended-teams data is stored in your home directory under `~/.pi/`:
 
 ```
 ~/.pi/
@@ -598,8 +684,8 @@ All pi-teams data is stored in your home directory under `~/.pi/`:
 You can customize how `list_available_models` orders providers after preferred models are listed first.
 
 Supported config locations:
-- Global: `~/.pi/pi-teams.json`
-- Project-local: `.pi/pi-teams.json`
+- Global: `~/.pi/pi-extended-teams.json`
+- Project-local: `.pi/pi-extended-teams.json`
 
 Project-local config overrides global config.
 
@@ -622,11 +708,11 @@ Fields:
 
 ## Environment Variables
 
-pi-teams respects the following environment variables:
+pi-extended-teams respects the following environment variables:
 
-- `ZELLIJ`: Automatically detected when running inside Zellij. Enables Zellij pane management.
-- `TMUX`: Automatically detected when running inside tmux. Enables tmux pane management.
-- `PI_DEFAULT_THINKING_LEVEL`: Default thinking level for spawned teammates if not specified (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`).
+- `TMUX`: Required for write-agent pane management.
+- `PI_TEAM_NAME`: Set for spawned teammates so they know their team context.
+- `PI_AGENT_NAME`: Set for spawned teammates so they know their agent name.
 
 ---
 
@@ -634,26 +720,11 @@ pi-teams respects the following environment variables:
 
 ### tmux Detection
 
-If the `TMUX` environment variable is set, pi-teams uses `tmux split-window` to create panes.
+If the `TMUX` environment variable is set, pi-extended-teams uses `tmux split-window` to create write-agent panes.
 
-**Layout**: Large lead pane on the left, teammates stacked on the right.
+**Layout**: Large lead pane on the left, write agents stacked on the right. Read agents run in-process and do not open panes.
 
-### Zellij Detection
-
-If the `ZELLIJ` environment variable is set, pi-teams uses `zellij run` to create panes.
-
-**Layout**: Same as tmux - large lead pane on left, teammates on right.
-
-### iTerm2 Detection
-
-If neither tmux nor Zellij is detected, and you're on macOS with iTerm2, pi-teams uses AppleScript to split the window.
-
-**Layout**: Same as tmux/Zellij - large lead pane on left, teammates on right.
-
-**Requirements**:
-- macOS
-- iTerm2 terminal
-- Not inside tmux or Zellij
+pi-extended-teams is tmux-only for write agents. Zellij and iTerm2 pane backends are not supported.
 
 ---
 
@@ -661,7 +732,7 @@ If neither tmux nor Zellij is detected, and you're on macOS with iTerm2, pi-team
 
 ### Lock Files
 
-pi-teams uses lock files to prevent concurrent modifications:
+pi-extended-teams uses lock files to prevent concurrent modifications:
 
 ```
 ~/.pi/teams/<team-name>/.lock
@@ -690,7 +761,7 @@ rm ~/.pi/teams/my-team/.lock
 
 ### Idle Polling Overhead
 
-Teammates poll their inboxes every 30 seconds when idle. This is minimal overhead (one file read per poll).
+Teammates poll their inboxes every 30 seconds when idle. The lead session also checks the lead inbox every 30 seconds while idle so it can wake itself when reports are ready. This is minimal overhead (one file read per poll).
 
 ### Lock Timeout
 

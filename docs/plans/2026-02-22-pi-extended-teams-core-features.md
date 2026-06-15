@@ -1,8 +1,8 @@
-# pi-teams Core Features Implementation Plan
+# pi-extended-teams Core Features Implementation Plan
 
 > **REQUIRED SUB-SKILL:** Use the executing-plans skill to implement this plan task-by-task.
 
-**Goal:** Implement Plan Approval Mode, Broadcast Messaging, and Quality Gate Hooks for the `pi-teams` repository to achieve functional parity with Claude Code Agent Teams.
+**Goal:** Implement Plan Approval Mode, Broadcast Messaging, and Quality Gate Hooks for the `pi-extended-teams` repository to achieve functional parity with Claude Code Agent Teams.
 
 **Architecture:**
 -   **Plan Approval**: Add a `planning` status to `TaskFile.status`. Create `task_submit_plan` and `task_evaluate_plan` tools. Lead can approve/reject.

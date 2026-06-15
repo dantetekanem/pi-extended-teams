@@ -40,6 +40,18 @@ export function configPath(teamName: string) {
   return path.join(teamDir(teamName), "config.json");
 }
 
+export function claimsPath(teamName: string) {
+  return path.join(teamDir(teamName), "claims.json");
+}
+
+export function writeQueuePath(teamName: string) {
+  return path.join(teamDir(teamName), "write-queue.json");
+}
+
+export function sharedMemoryPath(teamName: string) {
+  return path.join(teamDir(teamName), "shared-memory.json");
+}
+
 export function leadSessionPath(teamName: string) {
   return path.join(teamDir(teamName), "lead-session.json");
 }

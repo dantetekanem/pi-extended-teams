@@ -909,7 +909,8 @@ export default function (pi: ExtensionAPI) {
           `You are read-only investigator '${member.name}' on team '${readTeamName}', running in-process in the lead session.`,
           "You have the full toolset and may run any read-only shell command you need to investigate — git status/log/diff/show, grep/rg, ls, cat, running tests or builds, etc.",
           "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
-          "When finished, answer with a concise final report for the team lead: summary, evidence, files inspected, risks, and next recommended action.",
+          "NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.",
+          "When finished, produce your final report and stop. Do not wait for the lead to kill you — report and exit cleanly.",
         ],
       });
       await loader.reload();
@@ -1146,7 +1147,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       let modelInfo = "";
-      let fileClaimGuidance = "";
+      let roleSpecificGuidance = "";
       let rosterInfo = "";
       if (teamName) {
         try {
@@ -1160,7 +1161,9 @@ export default function (pi: ExtensionAPI) {
             modelInfo += `. When reporting your model or thinking level, use these exact values.`;
           }
           if ((member?.role ?? "write") === "write") {
-            fileClaimGuidance = `\n\nWrite-agent file-claim rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead. The owned task is marked blocked by that file claim.\n- Release claims with release_file as soon as you are done editing those paths.\n- Send your final report with report_and_exit; it releases any remaining file claims automatically before shutting you down.`;
+            roleSpecificGuidance = `\n\nWrite-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.\n- Release claims with release_file as soon as you are done editing those paths.\n- When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you.`;
+          } else {
+            roleSpecificGuidance = `\n\nRead-agent rules:\n- You are read-only: investigate and report. Do not edit files or make any mutating changes.\n- When finished, produce your final report and stop. Do not wait for the lead to kill you.`;
           }
           rosterInfo = `\n\n${formatRosterForPrompt(await buildRoster(teamName))}\nUse list_teammates when you need an updated roster; do not poll check_teammate unless diagnosing liveness.`;
         } catch (e) {
@@ -1169,7 +1172,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       return {
-        systemPrompt: event.systemPrompt + `\n\nYou are teammate '${agentName}' on team '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}${fileClaimGuidance}${rosterInfo}\nStart by calling read_inbox(team_name="${teamName}") to get your initial instructions.`,
+        systemPrompt: event.systemPrompt + `\n\nYou are teammate '${agentName}' on team '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}\n\nCore rules for every teammate:\n- NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.\n- When your work is done, report and exit cleanly. Do not wait for the lead to shut you down.${roleSpecificGuidance}${rosterInfo}\nStart by calling read_inbox(team_name="${teamName}") to get your initial instructions.`,
       };
     }
   });

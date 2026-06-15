@@ -1,6 +1,6 @@
 ---
 name: teams
-description: Multiply a coding session with parallel read-only agents (and optional isolated write agents) via pi-extended-teams. Use whenever the user asks to investigate, review, test, audit, validate, or get parallel coverage on code — or when a build/fix has isolated independent chunks worth farming out. The lead stays the implementer; agents are the multiplier.
+description: Multiply a coding session with parallel read-only agents (and optional isolated write agents) via pi-extended-teams. Use whenever the user asks to investigate, review, test, audit, validate, or get parallel coverage on code — or when a build/fix has isolated independent chunks worth farming out. Trigger on hot words like "agents", "spawn agents", "use agents", "send agents", or any request to parallelize investigation/review/testing. The lead stays the implementer; agents are the multiplier.
 ---
 
 # pi-extended-teams
@@ -37,11 +37,15 @@ spawn_teammate(team_name="review", name="fix-typos", role="write",
   prompt="Fix the typos listed in docs/guide.md only. Claim that file, keep the diff tiny.")
 ```
 
+## Hot-word trigger: "agents"
+
+When the user says "agents", "use agents", "spawn agents", "send agents", "agents to investigate/review/test", or any phrase meaning "delegate investigation to parallel helpers", create a team and spawn read agents — do not wait for a more specific instruction. The user should never have to explain how to use agents. Default: team_create with 2-3 focused read agents, each with a bounded mission and report shape.
+
 ## Defaults the lead should follow
 
 - Infer the workflow from ordinary requests. The user should not have to say "use read agents" or "open /team". For investigate / review / test / validate / "show me agents working", spawn read agents by default and keep the team read-only.
 - Do the implementation yourself unless a chunk is genuinely isolated and parallelizable — then, and only then, spawn a write agent for it.
-- Never sleep, busy-wait, or poll to wait for reports. The extension delivers them and wakes you. Do not use `check_teammate` as a status habit — it is only for a suspected stall.
+- NEVER sleep, busy-wait, or poll to wait for reports. Do not use bash `sleep`, `while true`, or any wait loop. The extension delivers reports and wakes you. Do not use `check_teammate` as a status habit — it is only for a suspected stall.
 - When the user asks to investigate/diagnose, stay read-only and report; ask before applying any fix.
 - Never commit, push, deploy, install packages, or start services unless the user authorizes it.
 - Shut the team down when the work is done (`team_shutdown`); finished write agents self-exit, read agents clear themselves.
@@ -71,6 +75,8 @@ Give each agent a bounded mission, the relevant scope or files, and the report s
 ## When you are spawned as a teammate
 
 - You start by reading your initial instructions and begin work; if idle, the extension wakes you when new messages arrive.
+- NEVER sleep, busy-wait, or poll. Do not use bash `sleep`, `while true`, or any wait/poll loop. The extension delivers messages and wakes you.
+- When your work is done, exit cleanly. Do NOT wait for the lead to kill you.
+- Write agents: call `report_and_exit` when finished — it sends your final report, releases all file claims, and shuts you down. Read agents: produce your final report and stop.
 - Report progress to `team-lead` with `send_message`; record durable facts in shared memory if the team uses it.
 - Write agents: `claim_file` every path before editing, `release_file` when done, keep diffs small.
-- When finished, send your final report and call `report_and_exit` (releases your claims and shuts you down). Read agents report and clear automatically.

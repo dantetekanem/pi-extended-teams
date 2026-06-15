@@ -81,7 +81,12 @@ Use automated hooks to ensure standards.
 - **Parallel Testing**: Running different test suites in parallel.
 - **Code Review**: Having one agent write code and another (specialized) agent review it.
 
+## 🎯 Hot-word trigger: "agents"
+When the user says "agents", "use agents", "spawn agents", "send agents", or any phrase meaning "delegate to parallel helpers", create a team and spawn read agents immediately — do not wait for a more specific instruction. Default: team_create with 2-3 focused read agents.
+
 ## ⚠️ Best Practices
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.
 - **Clear Prompts**: Be specific about the teammate's role and boundaries when spawning.
 - **Check-ins**: Use `task_list` regularly to see the "big picture" of your team's progress.
+- **NEVER sleep, busy-wait, or poll**: Do not use bash `sleep`, `while true`, or any wait/poll loop to check for messages or agent completion. The extension delivers reports and wakes you.
+- **Agents self-exit**: Write agents call `report_and_exit` when done; read agents report and stop. Do not manually kill agents unless they stall.

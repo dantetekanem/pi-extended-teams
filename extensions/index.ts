@@ -1451,10 +1451,9 @@ export default function (pi: ExtensionAPI) {
           const rightWidth = Math.max(20, usable - leftWidth - 3);
           const sep = dimAnsi(" │ ");
 
-          // Bound output to the viewport. Returning more lines than the terminal
-          // has rows corrupts the differential renderer's line accounting, which
-          // leaves the input bar misplaced after the overlay closes.
-          const maxRows = Math.max(10, (tui.terminal?.rows ?? 24) - 1);
+          // Fixed panel height (the overlay clips at maxHeight). A stable line
+          // count keeps the floating panel from resizing as the transcript grows.
+          const maxRows = Math.max(8, Math.floor((tui.terminal?.rows ?? 24) * 0.82));
           const bodyHeight = Math.max(3, maxRows - lines.length);
 
           const leftRows = buildLeftRows();
@@ -1468,7 +1467,9 @@ export default function (pi: ExtensionAPI) {
             lines.push(`${left}${sep}${right}`);
           }
 
-          return lines;
+          // Pad every line to the full panel width so it renders as a solid
+          // floating box — no transcript bleeding through the gaps.
+          return lines.map((line) => truncateToWidth(line, usable, "", true));
         };
 
         return {
@@ -1497,6 +1498,11 @@ export default function (pi: ExtensionAPI) {
             }
           },
         };
+      }, {
+        // Float over the transcript so the running main agent's streaming output
+        // underneath never repositions or flickers the panel.
+        overlay: true,
+        overlayOptions: { width: "92%", maxHeight: "84%", anchor: "center" },
       });
     },
   });

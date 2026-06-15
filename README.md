@@ -1,8 +1,8 @@
 # pi-extended-teams 🚀
 
-**pi-extended-teams** turns your single Pi agent into a coordinated, self-managing software engineering team. The lead **divides work to conquer it**: read-only agents investigate in-process in the background while write agents implement in **tmux** panes — with file-write coordination, a 3-writer cap, a watchdog that reaps anything stale, and agents that clean themselves up when their work is reported back.
+**pi-extended-teams** multiplies a single Pi session with helper agents. The **main agent stays the implementer** and keeps doing the real work; **read agents** run in-process to investigate, review, and test in parallel (unlimited, full toolset, directed read-only) and report straight back to the main window; **write agents** are an opt-in for isolated, independent edit work in **tmux** panes — with file-write coordination, a 3-writer cap, a watchdog that reaps anything stale, and agents that clean themselves up when their work is reported back.
 
-> **tmux is the only supported backend for write agents.** Read-only agents run in-process and do not open panes.
+> **tmux is the only supported backend for write agents.** Read agents run in-process and do not open panes.
 
 ### 🖥️ pi-extended-teams in Action
 
@@ -26,35 +26,37 @@ To use write agents after installation, launch Pi inside a **tmux** session.
 
 ## 🚀 Quick Start
 
+Usually you just describe the work and the lead does the rest — one call creates
+the team and spawns its agents, they run, and their reports come back collapsed in
+your main window for the lead to synthesize. No manual tasks, polling, or inbox
+reading.
+
 ```bash
-# 1. See available fully qualified models first
-"List available models for team creation"
+# Investigate / review in parallel (read agents, the default)
+"Review the current changes with a couple of agents and summarize the findings."
 
-# 2. Start a team (inside tmux)
-"Create a team named 'my-team' using 'openai-codex/gpt-5.4'"
+# Equivalent explicit one-call form the lead uses under the hood:
+"Create a team 'review' with agents: git-check (inspect diffs, report risks) and
+ test-gaps (find missing coverage)."
 
-# 3. Spawn teammates
-"Spawn 'security-bot' to scan for vulnerabilities"
-"Spawn 'frontend-dev' using 'claude-agent-sdk/claude-sonnet-4-6' for quick iterations"
+# Watch them live (floating overlay; ↑/↓ to switch views)
+/team
 
-# 4. Create and assign tasks
-"Create a task for security-bot: 'Audit auth endpoints'"
-
-# 5. Review and approve work
-"List all tasks and approve any pending plans"
+# Opt in to a write agent only for isolated, independent edit work
+"Spawn a write agent to fix only the typos in docs/guide.md."
 ```
 
 ## 🌟 What can it do?
 
 ### Core Features
-- **Spawn Specialists**: Create agents like "Security Expert" or "Frontend Pro" to handle sub-tasks in parallel.
-- **Shared Task Board**: Keep everyone on the same page with a persistent list of tasks and their status.
-- **Agent Messaging**: Agents can send direct messages to each other and to you (the Team Lead) to report progress.
-- **Autonomous Work**: Teammates automatically read their instructions and poll their inboxes for new work while idle; the lead session watches for teammate reports and wakes itself when results are ready, so leads do not need sleeps or ad hoc polling loops.
-- **Readable Team UI**: `/team` opens an organized teammate overview; status bars stay compact and avoid raw noisy dumps.
-- **Write-Agent Queue**: At most 3 write agents run by default; overflow is queued and starts when a slot frees.
-- **Beautiful Write-Agent UI**: Optimized vertical splits in `tmux` with clear labels for write agents.
-- **Advisory File Claims**: Write agents coordinate file ownership through `claim_file`, `release_file`, and `list_file_claims`. Claims are lock-protected protocol state, not filesystem sandbox enforcement; cooperative agents must claim before editing.
+- **One-call teams**: `team_create` with inline `agents` creates the team and spawns them running — no separate task/spawn ceremony.
+- **Read agents as the multiplier**: in-process, unlimited, parallel, with the full toolset (read, run commands, search) but directed to investigate and report rather than edit.
+- **Auto-delivered reports**: each finished agent's report lands in the main window as a collapsed one-line entry (name · elapsed · tokens, `ctrl+o` to expand) and the lead synthesizes it automatically — no polling, no inbox reading.
+- **Floating `/team` view**: switch between the main session and each agent (↑/↓); read agents show their live transcript with model and thinking level, write agents point to their pane. Renders as an overlay that floats over a streaming session without flicker.
+- **Move to a pane**: `promote_teammate` moves a running read agent into its own tmux pane to watch or interact with it.
+- **Write-Agent Queue**: write agents are opt-in for isolated work; at most 3 run by default and overflow is queued, starting when a slot frees.
+- **Advisory File Claims**: write agents coordinate file ownership through `claim_file`, `release_file`, and `list_file_claims`. Claims are lock-protected protocol state, not filesystem sandbox enforcement; cooperative agents must claim before editing.
+- **No sleeps or polling**: the extension watches the lead inbox while idle and wakes the lead when results are ready.
 
 ### Advanced Features
 - **Predefined Teams**: Define team templates in `teams.yaml` and spawn entire teams with a single command.
@@ -63,7 +65,7 @@ To use write agents after installation, launch Pi inside a **tmux** session.
 - **Plan Approval Mode**: Require teammates to submit their implementation plans for your approval before they touch any code.
 - **Broadcast Messaging**: Send a message to the entire team at once for global coordination and announcements.
 - **Quality Gate Hooks**: Automated shell scripts run when tasks are completed (e.g., to run tests or linting).
-- **Thinking Level Control**: Set per-teammate thinking levels (`off`, `minimal`, `low`, `medium`, `high`) to balance speed vs. reasoning depth.
+- **Thinking Level Control**: Set per-teammate thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`) to balance speed vs. reasoning depth.
 
 ## 💬 Key Examples
 
@@ -93,7 +95,7 @@ If you provide a model that is not fully qualified or not available, pi-extended
 
 **Configuring model-list ordering:**
 You can customize the order shown by `list_available_models` globally with `~/.pi/pi-extended-teams.json` or per-project with `.pi/pi-extended-teams.json`.
-Project-local config overrides global config. Legacy `pi-teams.json` files are still read at lower priority for compatibility.
+Project-local config overrides global config.
 
 ```json
 {
@@ -283,8 +285,8 @@ tmux   # Start a tmux session
 pi     # Start pi inside tmux
 ```
 
-> Read-only agents run **in-process** (no tmux pane) and are surfaced in a status
-> line above the input bar. Only write agents occupy panes.
+> Read agents run **in-process** (no tmux pane) and are surfaced in a compact
+> status line and the `/team` overlay. Only write agents occupy panes.
 
 ## 📜 Credits & Attribution
 

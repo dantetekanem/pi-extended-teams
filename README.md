@@ -10,7 +10,7 @@
 
 ## 🛠 Installation
 
-pi-extended-teams is not published on npm. Install it directly from GitHub:
+Install pi-extended-teams directly from GitHub:
 
 ```bash
 pi install git:github.com/dantetekanem/pi-extended-teams

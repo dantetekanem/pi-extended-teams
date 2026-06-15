@@ -10,11 +10,19 @@
 
 ## 🛠 Installation
 
-You must be running inside a **tmux** session. Open your Pi terminal and type:
+pi-extended-teams is not published on npm. Install it directly from GitHub:
 
 ```bash
-pi install npm:pi-extended-teams
+pi install git:github.com/dantetekanem/pi-extended-teams
 ```
+
+You can also install from a local checkout while developing:
+
+```bash
+pi install /absolute/path/to/pi-extended-teams
+```
+
+To use write agents after installation, launch Pi inside a **tmux** session.
 
 ## 🚀 Quick Start
 

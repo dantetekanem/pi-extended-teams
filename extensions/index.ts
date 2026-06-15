@@ -1016,14 +1016,18 @@ export default function (pi: ExtensionAPI) {
 
     setInterval(async () => {
       if (!teamName) return;
-      try {
-        const unread = await messaging.readInbox(teamName, agentName, true, false);
-        await renderLeadInboxStatus();
-        wakeLeadForInboxReports(unread);
-      } catch {
-        // Ignore errors for lead polling
+      if (sessionCtx.isIdle()) {
+        try {
+          const unread = await messaging.readInbox(teamName, agentName, true, false);
+          await renderLeadInboxStatus();
+          // Retry any wake that was deferred while the lead was busy. Internal
+          // gating ensures a batch of reports nudges at most once.
+          wakeLeadForInboxReports(unread);
+        } catch {
+          // Ignore errors for lead polling
+        }
       }
-    }, 15000);
+    }, 30000);
   }
 
   // Make this session the active lead for `name`: set the current team, register

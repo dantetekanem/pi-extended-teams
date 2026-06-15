@@ -46,7 +46,7 @@ export interface WriteAgentsConfig {
 }
 
 export interface ExtensionsConfig {
-  /** Extensions loaded into spawned agents (e.g. "pi-emote", "ada"). */
+  /** Extensions loaded into spawned agents (e.g. "pi-emote"). */
   allow: string[];
   /** Extensions explicitly kept out of spawned agents. */
   block: string[];
@@ -264,7 +264,7 @@ export function resolveModel(
  *
  * Spawned agents launch with `--no-extensions` (nothing auto-discovered) plus
  * the pi-extended-teams extension itself. This returns the additional extension
- * sources to load (e.g. "npm:pi-emote", "ada"), honoring the allow list minus
+ * sources to load (e.g. "npm:pi-emote"), honoring the allow list minus
  * anything in the block list.
  */
 export function resolveAllowedExtensions(settings: PiExtendedTeamsSettings): string[] {

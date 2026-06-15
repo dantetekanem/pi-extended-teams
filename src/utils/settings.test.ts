@@ -59,14 +59,14 @@ describe("loadSettings", () => {
       watchdog: { bufferSeconds: 45 },
       writeAgents: { maxConcurrent: 5, queueOverflow: false },
       roles: { write: { thinking: "high" } },
-      extensions: { allow: ["pi-emote", "ada"] },
+      extensions: { allow: ["pi-emote", "my-ext"] },
     });
     const s = loadSettings({ homeDir, projectDir });
     expect(s.watchdog.bufferSeconds).toBe(45);
     expect(s.writeAgents.maxConcurrent).toBe(5);
     expect(s.writeAgents.queueOverflow).toBe(false);
     expect(s.roles.write.thinking).toBe("high");
-    expect(s.extensions.allow).toEqual(["pi-emote", "ada"]);
+    expect(s.extensions.allow).toEqual(["pi-emote", "my-ext"]);
   });
 
   it("lets project settings override global", () => {
@@ -184,9 +184,9 @@ describe("resolveModel", () => {
 describe("resolveAllowedExtensions", () => {
   it("returns allow minus block", () => {
     const s = structuredClone(DEFAULT_SETTINGS);
-    s.extensions.allow = ["pi-emote", "ada", "noisy"];
+    s.extensions.allow = ["pi-emote", "my-ext", "noisy"];
     s.extensions.block = ["noisy"];
-    expect(resolveAllowedExtensions(s)).toEqual(["pi-emote", "ada"]);
+    expect(resolveAllowedExtensions(s)).toEqual(["pi-emote", "my-ext"]);
   });
 
   it("is empty by default", () => {

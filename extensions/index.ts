@@ -6,7 +6,7 @@ import {
   type AgentSession,
   type ExtensionAPI,
 } from "@mariozechner/pi-coding-agent";
-import { Key, matchesKey, Text, truncateToWidth } from "@mariozechner/pi-tui";
+import { Key, matchesKey, Text, truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as paths from "../src/utils/paths";
 import * as teams from "../src/utils/teams";
@@ -197,7 +197,16 @@ interface RunningReadAgent {
   tokensUsed: number;
   status: "starting" | "running" | "finishing";
   recentEvents: string[];
+  model?: string;
+  thinking?: string;
   session?: AgentSession;
+}
+
+// Compact "provider/model · thinking" label for status/panel display.
+function formatModelLabel(model?: string, thinking?: string): string {
+  const shortModel = model ? model.split("/").pop() || model : "";
+  const t = thinking && thinking !== "off" ? ` · ${thinking}` : "";
+  return shortModel ? `${shortModel}${t}` : "";
 }
 
 function formatElapsed(ms: number): string {
@@ -218,22 +227,48 @@ function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
   agent.recentEvents = agent.recentEvents.slice(-12);
 }
 
-function getLastAssistantText(messages: any[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (message?.role !== "assistant") continue;
-    const content = message.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      const text = content
-        .filter((part: any) => part?.type === "text" && typeof part.text === "string")
-        .map((part: any) => part.text)
-        .join("\n")
-        .trim();
-      if (text) return text;
-    }
+function extractTextParts(content: any): string {
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      .map((part: any) => part.text)
+      .join("\n")
+      .trim();
   }
   return "";
+}
+
+function getLastAssistantText(messages: any[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== "assistant") continue;
+    const text = extractTextParts(messages[i].content);
+    if (text) return text;
+  }
+  return "";
+}
+
+// Flatten a read agent's in-process session into compact transcript lines for
+// the /team viewer: user prompts, assistant text, terse tool calls/results.
+// Thinking blocks are omitted to keep the pane quiet.
+function formatTranscriptLines(messages: any[]): string[] {
+  const out: string[] = [];
+  for (const message of messages || []) {
+    if (message?.role === "user") {
+      const text = extractTextParts(message.content);
+      if (text) out.push(`${pink("user ▸")} ${text}`);
+    } else if (message?.role === "assistant") {
+      for (const part of Array.isArray(message.content) ? message.content : []) {
+        if (part?.type === "text" && part.text?.trim()) out.push(part.text.trim());
+        else if (part?.type === "toolCall") out.push(purple(`⚙ ${part.name}`));
+      }
+    } else if (message?.role === "toolResult") {
+      const text = extractTextParts(message.content);
+      const head = text.split("\n").find((line: string) => line.trim()) || "(no output)";
+      out.push(dimAnsi(`  ↳ ${message.toolName || "tool"}: ${head}`));
+    }
+  }
+  return out;
 }
 
 function summarizeInboxMessage(message: any): string {
@@ -517,15 +552,64 @@ export default function (pi: ExtensionAPI) {
   const runningReadAgents = new Map<string, RunningReadAgent>();
   let readAgentStatusTimer: NodeJS.Timeout | null = null;
   let leadInboxUnreadCount = 0;
+  // Highest unread count we've already nudged the lead about, so we wake once per
+  // new batch of reports (not every poll) and re-wake when more arrive.
+  let leadWakeNotifiedCount = 0;
   let writeQueueDraining = false;
   let leadWatchdogStarted = false;
 
-  function wakeLeadForInboxReports(unread: any[]): void {
-    if (!teamName || unread.length === 0 || !sessionCtx?.isIdle?.()) return;
+  // Quietly nudge this agent's loop without cluttering the transcript. A custom
+  // message with display:false still reaches the model as a user turn (see
+  // convertToLlm) but is never rendered, so team coordination stays silent.
+  // Falls back to a visible user message on older pi builds without sendMessage.
+  function quietTrigger(content: string): void {
+    const api = pi as any;
+    if (typeof api.sendMessage === "function") {
+      api.sendMessage(
+        { customType: "pi-extended-teams-wake", content, display: false },
+        { triggerTurn: true, deliverAs: "followUp" }
+      );
+    } else {
+      pi.sendUserMessage(content);
+    }
+  }
 
-    const reportText = unread.length === 1 ? "1 unread team report is" : `${unread.length} unread team reports are`;
-    pi.sendUserMessage(
-      `${reportText} ready for ${teamName}. Read the lead inbox, process blockers/final reports, update team tasks and ADA if relevant, and shut down completed teammates. Do not use sleeps or ad hoc polling loops.`
+  // Deliver a finished agent's report straight into the lead's main window: a
+  // collapsed one-line entry (name · elapsed · tokens) that ctrl+o expands to the
+  // full report. display:true also feeds the report into the lead's context as a
+  // user turn (see convertToLlm), and triggerTurn makes the lead synthesize it
+  // automatically — no read_inbox, no manual polling.
+  function emitAgentReport(name: string, startedAt: number, tokens: number, report: string, ok: boolean): void {
+    const api = pi as any;
+    const details = { name, elapsedMs: Date.now() - startedAt, tokens, ok };
+    if (typeof api.sendMessage === "function") {
+      api.sendMessage(
+        { customType: "pi-extended-teams-report", content: report, display: true, details },
+        { triggerTurn: true, deliverAs: "followUp" }
+      );
+    } else {
+      pi.sendUserMessage(`Report from ${name}:\n${report}`);
+    }
+  }
+
+  function wakeLeadForInboxReports(unread: any[]): void {
+    if (!teamName) return;
+    const count = unread.length;
+
+    // Track reads/decreases so a fresh batch of reports re-triggers a wake.
+    if (count <= leadWakeNotifiedCount) {
+      leadWakeNotifiedCount = count;
+      return;
+    }
+    // Reports grew but the lead is busy: leave the notified count untouched so the
+    // next poll (when idle) or completion retries the wake instead of dropping it.
+    if (!sessionCtx?.isIdle?.()) return;
+
+    leadWakeNotifiedCount = count;
+    const label = count === 1 ? "1 team report" : `${count} team reports`;
+    const it = count === 1 ? "it" : "them";
+    quietTrigger(
+      `${label} ready in your inbox for ${teamName}. Read ${it} now with read_inbox, summarize the findings for the user, act on any blockers, and shut down finished teammates. If you are mid-task you may finish that first. Do not sleep or poll.`
     );
   }
 
@@ -543,13 +627,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    sessionCtx.ui.setStatus?.("01-pi-extended-teams-read", undefined);
     const lines = [pink(`▣ read agents running (${agents.length})  /team`)];
     for (const agent of agents.sort((a, b) => a.name.localeCompare(b.name))) {
       const elapsed = formatElapsed(Date.now() - agent.startedAt);
       const lastEvent = agent.recentEvents.at(-1)?.replace(/^\S+\s+/, "") || agent.status;
+      const modelLabel = formatModelLabel(agent.model, agent.thinking);
+      const detail = [modelLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, lastEvent].filter(Boolean).join(" · ");
       lines.push(
-        `${purple("  ├─")} ${pink(agent.name)} ${purple(agent.status)} ${dimAnsi(`${elapsed} · ${formatTokenCount(agent.tokensUsed)} tok · ${lastEvent}`)}`
+        `${purple("  ├─")} ${pink(agent.name)} ${purple(agent.status)} ${dimAnsi(detail)}`
       );
     }
     lines[lines.length - 1] = lines[lines.length - 1].replace("├─", "└─");
@@ -564,14 +649,20 @@ export default function (pi: ExtensionAPI) {
 
   async function renderLeadInboxStatus() {
     if (!sessionCtx?.ui) return;
-    if (leadInboxUnreadCount <= 0 || !teamName) {
-      sessionCtx.ui.setStatus?.("02-pi-extended-teams-inbox", undefined);
+    if (!teamName) {
       sessionCtx.ui.setWidget?.("02-pi-extended-teams-inbox", undefined);
       return;
     }
 
-    sessionCtx.ui.setStatus?.("02-pi-extended-teams-inbox", undefined);
+    // Authoritative: read actual unread, keep the count in sync, and clear the
+    // widget when there is nothing pending so finished reports leave the bar.
     const unread = await messaging.readInbox(teamName, agentName, true, false).catch(() => []);
+    leadInboxUnreadCount = unread.length;
+    if (unread.length === 0) {
+      sessionCtx.ui.setWidget?.("02-pi-extended-teams-inbox", undefined);
+      return;
+    }
+
     const lines = [pink(`▣ team reports ready (${unread.length})  read_inbox`)];
     for (const message of unread.slice(-5)) {
       const from = String(message.from || "unknown");
@@ -775,6 +866,8 @@ export default function (pi: ExtensionAPI) {
       tokensUsed: 0,
       status: "starting",
       recentEvents: [],
+      model: member.model,
+      thinking: member.thinking,
     };
     runningReadAgents.set(member.name, state);
     ensureReadAgentStatusTicker();
@@ -813,9 +906,9 @@ export default function (pi: ExtensionAPI) {
         noPromptTemplates: true,
         noThemes: true,
         appendSystemPrompt: [
-          `You are read-only teammate '${member.name}' on team '${readTeamName}'.`,
-          "You run in-process in the lead session, not in a tmux pane.",
-          "Use only read/search/listing tools. Do not write files, edit files, run commands, install packages, start services, commit, push, deploy, or broaden scope.",
+          `You are read-only investigator '${member.name}' on team '${readTeamName}', running in-process in the lead session.`,
+          "You have the full toolset and may run any read-only shell command you need to investigate — git status/log/diff/show, grep/rg, ls, cat, running tests or builds, etc.",
+          "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
           "When finished, answer with a concise final report for the team lead: summary, evidence, files inspected, risks, and next recommended action.",
         ],
       });
@@ -826,7 +919,7 @@ export default function (pi: ExtensionAPI) {
         model,
         thinkingLevel: member.thinking as any,
         modelRegistry: ctx.modelRegistry,
-        tools: ["read", "grep", "find", "ls"],
+        tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
         resourceLoader: loader,
         sessionManager: SessionManager.inMemory(member.cwd),
       });
@@ -863,32 +956,19 @@ export default function (pi: ExtensionAPI) {
       renderReadAgentStatus();
 
       const report = getLastAssistantText(session.messages) || "Read agent completed, but produced no assistant text.";
-      await messaging.sendPlainMessage(
-        readTeamName,
-        member.name,
-        "team-lead",
-        report,
-        `Read agent ${member.name} completed`,
-        member.color
-      );
       if (!isTeammate && teamName === readTeamName) {
-        leadInboxUnreadCount = (await messaging.readInbox(readTeamName, agentName, true, false).catch(() => [])).length;
-        await renderLeadInboxStatus();
-        sessionCtx?.ui?.notify?.(`Read agent ${member.name} completed and reported back.`, "info");
+        // In-process reader in the lead session: deliver the report straight to
+        // the main window (collapsed, auto-synthesized). No inbox, no polling.
+        emitAgentReport(member.name, state.startedAt, state.tokensUsed, report, true);
+      } else {
+        await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", report, `Read agent ${member.name} completed`, member.color);
       }
     } catch (e) {
-      await messaging.sendPlainMessage(
-        readTeamName,
-        member.name,
-        "team-lead",
-        `Read agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`,
-        `Read agent ${member.name} failed`,
-        "red"
-      );
+      const failureReport = `Read agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
       if (!isTeammate && teamName === readTeamName) {
-        leadInboxUnreadCount = (await messaging.readInbox(readTeamName, agentName, true, false).catch(() => [])).length;
-        await renderLeadInboxStatus();
-        sessionCtx?.ui?.notify?.(`Read agent ${member.name} failed and reported back.`, "warning");
+        emitAgentReport(member.name, state.startedAt, state.tokensUsed, failureReport, false);
+      } else {
+        await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", failureReport, `Read agent ${member.name} failed`, "red");
       }
       try {
         await runtime.writeRuntimeStatus(readTeamName, member.name, {
@@ -938,20 +1018,46 @@ export default function (pi: ExtensionAPI) {
       if (sessionCtx.isIdle()) {
         try {
           const unread = await messaging.readInbox(teamName, agentName, true, false);
-          if (unread.length !== leadInboxUnreadCount) {
-            const previousUnreadCount = leadInboxUnreadCount;
-            leadInboxUnreadCount = unread.length;
-            await renderLeadInboxStatus();
-            if (unread.length > previousUnreadCount) {
-              wakeLeadForInboxReports(unread);
-            }
-          }
+          await renderLeadInboxStatus();
+          // Retry any wake that was deferred while the lead was busy. Internal
+          // gating ensures a batch of reports nudges at most once.
+          wakeLeadForInboxReports(unread);
         } catch {
           // Ignore errors for lead polling
         }
       }
     }, 30000);
   }
+
+  // Make this session the active lead for `name`: set the current team, register
+  // the lead session, and start quiet background maintenance. Idempotent. Without
+  // this, operating on an existing/reconnected team leaves `teamName` unset, which
+  // silently breaks /team, the inbox poll, and report wakeups.
+  function adoptTeamAsLead(name: string): void {
+    if (isTeammate || !name) return;
+    if (teamName !== name) {
+      teamName = name;
+      registerLeadSession(name);
+    }
+    startLeadInboxPolling();
+    startLeadWatchdog();
+  }
+
+  // Collapsed, ctrl+o-expandable report entries delivered to the lead's main window.
+  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, options: any, theme: any) => {
+    const d = message.details || {};
+    const meta = [
+      d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
+      typeof d.tokens === "number" ? `${formatTokenCount(d.tokens)} tok` : "",
+    ].filter(Boolean).join(" · ");
+    const mark = d.ok === false ? theme.fg("warning", "✗") : theme.fg("success", "✓");
+    const headline = `${mark} ${d.name || "agent"} reported${meta ? ` · ${meta}` : ""}`;
+    if (!options.expanded) {
+      return new Text(`${headline}  ${theme.fg("dim", "(ctrl+o to expand)")}`, 0, 0);
+    }
+    const body = typeof message.content === "string" ? message.content : "";
+    return new Text(`${theme.bold(headline)}\n\n${body}`, 0, 0);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     paths.ensureDirs();
@@ -984,7 +1090,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       setTimeout(() => {
-        pi.sendUserMessage(`I am starting my work as '${agentName}' on team '${teamName}'. Checking my inbox for instructions...`);
+        quietTrigger(`read_inbox(team_name="${teamName}") to get your instructions, then begin your work.`);
       }, 1000);
 
       // Inbox polling for teammates
@@ -997,7 +1103,7 @@ export default function (pi: ExtensionAPI) {
                 lastHeartbeatAt: Date.now(),
               });
               if (unread.length > 0) {
-                pi.sendUserMessage(`I have ${unread.length} new message(s) in my inbox. Reading them now...`);
+                quietTrigger(`You have ${unread.length} new inbox message(s). Read them with read_inbox and act.`);
               }
             } catch (e) {
               await runtime.writeRuntimeStatus(teamName!, agentName, {
@@ -1182,6 +1288,8 @@ export default function (pi: ExtensionAPI) {
       name: string;
       role: string;
       status: string;
+      model?: string;
+      thinking?: string;
       unreadCount: number;
       elapsedMs: number;
       tokensUsed: number;
@@ -1206,6 +1314,8 @@ export default function (pi: ExtensionAPI) {
         name: member.name,
         role,
         status,
+        model: member.model,
+        thinking: member.thinking,
         unreadCount,
         elapsedMs: Date.now() - startedAt,
         tokensUsed: readState?.tokensUsed || 0,
@@ -1223,7 +1333,7 @@ export default function (pi: ExtensionAPI) {
 
   // Commands
   pi.registerCommand("team", {
-    description: "Open the pi-extended-teams teammate overview.",
+    description: "Switch between the main session and each teammate's live view (↑/↓).",
     handler: async (args, ctx) => {
       const panelTeamName = args.trim() || teamName;
       if (!panelTeamName) {
@@ -1232,17 +1342,27 @@ export default function (pi: ExtensionAPI) {
       }
 
       let items = await buildTeamPanelItems(panelTeamName);
+      // Entry 0 is the "main" lead session, like Claude Code's agent switcher:
+      // press ↓ to move main → agent → next agent and the right pane changes.
       let selectedIndex = 0;
       let loading = false;
 
+      // pi's ExtensionAPI has no API to swap the primary transcript view, so this
+      // lives in a focused custom() overlay. Read agents run in-process, so their
+      // live transcript is rendered on the right; write agents run in their own
+      // tmux pane, so we point the user there instead.
       await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+        const entryCount = () => items.length + 1;
+        // Re-render while open so an in-process read agent's transcript streams live.
+        const liveTimer = setInterval(() => tui.requestRender(), 1000);
+
         const refresh = () => {
           loading = true;
           tui.requestRender();
           void buildTeamPanelItems(panelTeamName)
             .then((nextItems) => {
               items = nextItems;
-              selectedIndex = Math.min(selectedIndex, Math.max(0, items.length - 1));
+              selectedIndex = Math.min(selectedIndex, Math.max(0, entryCount() - 1));
             })
             .finally(() => {
               loading = false;
@@ -1250,66 +1370,120 @@ export default function (pi: ExtensionAPI) {
             });
         };
 
+        const buildLeftRows = (): string[] => {
+          const rows: string[] = [purple("views")];
+          const mainSelected = selectedIndex === 0;
+          rows.push(`${mainSelected ? pink("▸") : " "} ${mainSelected ? pink("main") : "main"}  ${dimAnsi("lead")}`);
+          for (const [index, item] of items.entries()) {
+            const selected = index + 1 === selectedIndex;
+            const pointer = selected ? pink("▸") : " ";
+            const role = item.role === "read" ? pink("read") : purple("write");
+            const health = item.status.includes("dead") ? "dead" : item.status;
+            rows.push(`${pointer} ${selected ? pink(item.name) : item.name}  ${role}  ${dimAnsi(health)}`);
+          }
+          return rows;
+        };
+
+        const buildRightRows = (width: number): string[] => {
+          const wrap = (text: string) => wrapTextWithAnsi(text, Math.max(10, width));
+          const rows: string[] = [];
+
+          if (selectedIndex === 0) {
+            const readers = items.filter((item) => item.role === "read");
+            const writers = items.filter((item) => item.role !== "read");
+            rows.push(pink(`main · ${panelTeamName}`));
+            rows.push("");
+            rows.push(`${purple("read agents")}   ${readers.length} (in-process)`);
+            rows.push(`${purple("write agents")}  ${writers.length} (tmux panes)`);
+            rows.push(`${purple("lead inbox")}    ${leadInboxUnreadCount} unread`);
+            rows.push("");
+            rows.push(dimAnsi("This is your lead session. Select an agent on the left to inspect it."));
+            return rows.flatMap(wrap);
+          }
+
+          const item = items[selectedIndex - 1];
+          if (!item) return [dimAnsi("No teammates.")];
+
+          rows.push(pink(item.name));
+          rows.push(`${purple("role")} ${item.role}   ${purple("status")} ${item.status}   ${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
+          rows.push(`${purple("model")} ${item.model || "(inherited)"}${item.thinking && item.thinking !== "off" ? `   ${purple("thinking")} ${item.thinking}` : ""}`);
+          if (item.role === "read") rows.push(dimAnsi("in-process · promote_teammate moves it into a tmux pane"));
+          if (item.taskSubjects.length > 0) rows.push(dimAnsi(`tasks: ${item.taskSubjects.slice(0, 4).join(" · ")}`));
+          if (item.claimPaths.length > 0) rows.push(dimAnsi(`claims: ${item.claimPaths.slice(0, 4).join(" · ")}`));
+          if (item.runtimeStatus?.lastError?.message) rows.push(theme.fg("warning", `error: ${item.runtimeStatus.lastError.message}`));
+          rows.push("");
+
+          if (item.role === "read") {
+            const session = runningReadAgents.get(item.name)?.session;
+            const transcript = session ? formatTranscriptLines(session.messages) : [];
+            if (transcript.length > 0) {
+              rows.push(purple("transcript"));
+              for (const line of transcript) rows.push(line);
+            } else if (item.recentEvents.length > 0) {
+              rows.push(purple("recent"));
+              for (const event of item.recentEvents.slice(-12)) rows.push(`  ${event}`);
+            } else {
+              rows.push(dimAnsi("Waiting for the read agent's first turn…"));
+            }
+          } else {
+            rows.push(dimAnsi(`Write agent runs in tmux pane ${item.runtimeStatus?.pid ? `(pid ${item.runtimeStatus.pid})` : ""}.`));
+            rows.push(dimAnsi("Switch to that pane to see its full transcript."));
+            if (item.recentEvents.length > 0) {
+              rows.push("");
+              rows.push(purple("recent"));
+              for (const event of item.recentEvents.slice(-12)) rows.push(`  ${event}`);
+            }
+          }
+
+          const wrapped = rows.flatMap(wrap);
+          // Show the tail so the latest activity stays in view.
+          return wrapped.length > 200 ? wrapped.slice(-200) : wrapped;
+        };
+
         const render = (width: number): string[] => {
           const usable = Math.max(50, width - 2);
           const lines: string[] = [];
-          lines.push(pink(`▣ team ${panelTeamName}`));
-          lines.push(dimAnsi("↑/↓ or j/k: select   r: refresh   esc: close"));
-          if (loading) lines.push(purple("refreshing…"));
+          lines.push(pink(`▣ team ${panelTeamName}`) + (loading ? purple("  refreshing…") : ""));
+          lines.push(dimAnsi("↑/↓ or j/k: switch view   r: refresh   esc: close"));
           lines.push("");
 
-          if (items.length === 0) {
-            lines.push(dimAnsi("No teammates."));
-            return lines.map((line) => truncateToWidth(line, usable));
+          const leftWidth = Math.min(30, Math.max(20, Math.floor(usable * 0.34)));
+          const rightWidth = Math.max(20, usable - leftWidth - 3);
+          const sep = dimAnsi(" │ ");
+
+          // Bound output to the viewport. Returning more lines than the terminal
+          // has rows corrupts the differential renderer's line accounting, which
+          // leaves the input bar misplaced after the overlay closes.
+          const maxRows = Math.max(10, (tui.terminal?.rows ?? 24) - 1);
+          const bodyHeight = Math.max(3, maxRows - lines.length);
+
+          const leftRows = buildLeftRows();
+          const rightRows = buildRightRows(rightWidth);
+          // Pin the left list to the top; show the transcript's tail so the
+          // latest activity stays in view within the fixed body height.
+          const rightTail = rightRows.length > bodyHeight ? rightRows.slice(-bodyHeight) : rightRows;
+          for (let i = 0; i < bodyHeight; i++) {
+            const left = truncateToWidth(leftRows[i] ?? "", leftWidth, "…", true);
+            const right = truncateToWidth(rightTail[i] ?? "", rightWidth);
+            lines.push(`${left}${sep}${right}`);
           }
 
-          lines.push(purple("agents"));
-          for (const [index, item] of items.entries()) {
-            const selected = index === selectedIndex;
-            const pointer = selected ? pink("▸") : dimAnsi(" ");
-            const role = item.role === "read" ? pink("read") : purple("write");
-            const health = item.status.includes("dead") ? "dead" : item.status;
-            const row = `${pointer} ${selected ? pink(item.name) : item.name}  ${role}  ${health}  ${formatElapsed(item.elapsedMs)}  inbox:${item.unreadCount}`;
-            lines.push(row);
-          }
-
-          const item = items[selectedIndex];
-          lines.push("");
-          lines.push(pink(`inspect ${item.name}`));
-          lines.push(`${purple("role")}       ${item.role}`);
-          lines.push(`${purple("status")}     ${item.status}`);
-          lines.push(`${purple("elapsed")}    ${formatElapsed(item.elapsedMs)}`);
-          lines.push(`${purple("tokens")}     ${formatTokenCount(item.tokensUsed)}`);
-          lines.push(`${purple("inbox")}      ${item.unreadCount} unread`);
-          if (item.taskSubjects.length > 0) {
-            lines.push(purple("tasks"));
-            for (const task of item.taskSubjects.slice(0, 6)) lines.push(`  ${task}`);
-          }
-          if (item.claimPaths.length > 0) {
-            lines.push(purple("claims"));
-            for (const claim of item.claimPaths.slice(0, 6)) lines.push(`  ${claim}`);
-          }
-          if (item.recentEvents.length > 0) {
-            lines.push(purple("recent"));
-            for (const event of item.recentEvents.slice(-10)) lines.push(`  ${event}`);
-          }
-          if (item.runtimeStatus?.lastError?.message) {
-            lines.push(`${purple("last error")} ${item.runtimeStatus.lastError.message}`);
-          }
-
-          return lines.map((line) => truncateToWidth(line, usable));
+          return lines;
         };
 
         return {
           render,
           invalidate() {},
+          dispose() {
+            clearInterval(liveTimer);
+          },
           handleInput(data: string) {
             if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || data === "q" || data === "Q") {
               done();
               return;
             }
             if (isDownInput(data)) {
-              selectedIndex = Math.min(items.length - 1, selectedIndex + 1);
+              selectedIndex = Math.min(entryCount() - 1, selectedIndex + 1);
               tui.requestRender();
               return;
             }
@@ -1387,14 +1561,123 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Shared spawn path used by spawn_teammate and team_create's inline agents.
+  // Assumes the team exists and the lead has adopted it.
+  async function spawnTeammate(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
+    const safeName = paths.sanitizeName(params.name);
+    const safeTeamName = paths.sanitizeName(params.team_name);
+    const cwd = params.cwd || ctx.cwd;
+
+    const teamConfig = await teams.readConfig(safeTeamName);
+
+    // If a teammate with this name already exists, replace it (handles restarts).
+    const existingMember = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
+    if (existingMember) {
+      await killTeammate(safeTeamName, existingMember);
+      await teams.removeMember(safeTeamName, safeName);
+    }
+
+    const settings = loadSettings({ projectDir: cwd });
+    const role: AgentRole = resolveRole(settings, params.role ?? "read", params.category);
+
+    const currentModelHint = getCurrentQualifiedModel(ctx);
+    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint].filter(Boolean) as string[]);
+
+    const resolved = resolveModel(settings, {
+      role,
+      category: params.category,
+      explicitModel: params.model,
+      explicitThinking: params.thinking,
+      teamDefaultModel: teamConfig.defaultModel,
+      currentModel: currentModelHint,
+    });
+
+    const chosenModel = requireQualifiedKnownModel(resolved.model ?? undefined, availableModels, "resolved model");
+    if (!chosenModel) {
+      throw new Error(
+        "No model could be resolved. Pass a fully qualified model, configure a category/role default in settings.json, create the team with a default_model, or ensure the current session has an active model."
+      );
+    }
+
+    const chosenThinking = (resolved.thinking ?? undefined) as Member["thinking"];
+
+    if (role === "write" && !terminal) {
+      throw new Error("pi-extended-teams requires running inside tmux for write agents.");
+    }
+
+    const member: Member = {
+      agentId: `${safeName}@${safeTeamName}`,
+      name: safeName,
+      agentType: "teammate",
+      role,
+      category: params.category,
+      model: chosenModel,
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd,
+      subscriptions: [],
+      prompt: params.prompt,
+      color: role === "read" ? "cyan" : "blue",
+      thinking: chosenThinking,
+      planModeRequired: params.plan_mode_required,
+    };
+
+    if (role === "read") {
+      await teams.addMember(safeTeamName, member);
+      void runReadAgentInProcess(safeTeamName, member, params.prompt, ctx);
+      return {
+        content: [{ type: "text", text: `Read teammate ${params.name} started in-process.` }],
+        details: { agentId: member.agentId, role, mode: "in-process", terminalId: null },
+      };
+    }
+
+    await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
+    const activeWriteCount = await countWriteMembers(safeTeamName);
+    if (activeWriteCount >= settings.writeAgents.maxConcurrent) {
+      if (!settings.writeAgents.queueOverflow) {
+        throw new Error(`Write-agent capacity reached (${activeWriteCount}/${settings.writeAgents.maxConcurrent}) and queueOverflow is disabled.`);
+      }
+      const queued = await writeQueue.enqueueWriteSpawn(safeTeamName, {
+        name: safeName,
+        prompt: params.prompt,
+        cwd,
+        category: params.category,
+        model: chosenModel,
+        thinking: chosenThinking,
+        planModeRequired: params.plan_mode_required,
+        color: "blue",
+      });
+      const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
+      return {
+        content: [{ type: "text", text: `Write teammate ${params.name} queued at position ${queuedItems.findIndex(item => item.id === queued.id) + 1}; capacity is ${activeWriteCount}/${settings.writeAgents.maxConcurrent}.` }],
+        details: { agentId: member.agentId, role, queued: true, queueId: queued.id, queuePosition: queuedItems.findIndex(item => item.id === queued.id) + 1 },
+      };
+    }
+
+    const terminalId = await startWriteAgent(safeTeamName, member, params.prompt);
+    return {
+      content: [{ type: "text", text: `Teammate ${params.name} spawned in pane ${terminalId}.` }],
+      details: { agentId: member.agentId, role, terminalId, queued: false },
+    };
+  }
+
   pi.registerTool({
     name: "team_create",
     label: "Create Team",
-    description: "Create a new agent team. If you specify default_model, it must be a fully qualified provider/model string from list_available_models. If omitted, the current active model is used.",
+    description: "Create a team and (optionally) spawn its agents in one call. Pass `agents` to spawn them immediately — they start running and report back on their own; you do not need to create tasks, poll, or read an inbox. Agents default to read-only (investigation/review/testing); use role 'write' only for isolated independent edit work. If default_model is given it must be a fully qualified provider/model from list_available_models; otherwise the current model is used.",
     parameters: Type.Object({
       team_name: Type.String(),
       description: Type.Optional(Type.String()),
       default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). Use list_available_models first. If omitted, the current active model is used." })),
+      agents: Type.Optional(Type.Array(Type.Object({
+        name: Type.String(),
+        prompt: Type.String({ description: "The agent's mission and the report shape you want back." }),
+        role: Type.Optional(StringEnum(["read", "write"], { description: "Defaults to 'read'. Use 'write' only for isolated independent edit work." })),
+        cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead's cwd." })),
+        category: Type.Optional(Type.String()),
+        model: Type.Optional(Type.String({ description: "Fully qualified provider/model." })),
+        thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
+      }, { description: "An agent to spawn immediately." }), { description: "Agents to define and spawn as soon as the team is created." })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
@@ -1402,22 +1685,32 @@ export default function (pi: ExtensionAPI) {
       const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
       const defaultModel = explicitDefaultModel || currentModel;
 
-      // Auto-cleanup stale team if the previous lead process is dead
-      // This handles the case where a session was aborted and restarted
+      // Auto-cleanup stale team if the previous lead process is dead.
       if (teams.teamExists(params.team_name)) {
         cleanupStaleTeam(params.team_name, terminal);
       }
 
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, defaultModel);
-      // Register this session as the lead so it can receive inbox messages
-      registerLeadSession(params.team_name);
-      // Update teamName and start quiet background maintenance for the lead
-      teamName = params.team_name;
-      startLeadInboxPolling();
-      startLeadWatchdog();
+      adoptTeamAsLead(paths.sanitizeName(params.team_name));
+
+      const lines = [`Team ${params.team_name} created.`];
+      const spawned: any[] = [];
+      for (const agent of (params.agents ?? [])) {
+        try {
+          const result = await spawnTeammate({ ...agent, team_name: params.team_name }, ctx);
+          spawned.push(result.details);
+          lines.push(`- ${result.content?.[0]?.text ?? agent.name}`);
+        } catch (e) {
+          lines.push(`- ${agent.name}: failed to spawn — ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (spawned.length > 0) {
+        lines.push("", "Agents are running. Their reports will arrive here automatically (collapsed; ctrl+o to expand) and you will synthesize them — no polling needed.");
+      }
+
       return {
-        content: [{ type: "text", text: `Team ${params.team_name} created.` }],
-        details: { config },
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { config, spawned },
       };
     },
   });
@@ -1425,119 +1718,79 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_teammate",
     label: "Spawn Teammate",
-    description: "Spawn a new teammate in a tmux pane. Set role to 'write' (default, can edit files) or 'read' (read-only investigation). Model resolves from explicit arg -> category -> role default -> team default -> current model, using settings.json. Any explicit model must be a fully qualified provider/model from list_available_models.",
+    description: "Spawn one teammate. Default role is 'read' (read-only, in-process, unlimited, parallel — for investigation/review/testing). Use role 'write' only for isolated, independent edit work that should run in its own tmux pane; the lead normally writes itself. Model resolves from explicit arg -> category -> role default -> team default -> current model. Any explicit model must be a fully qualified provider/model from list_available_models.",
     parameters: Type.Object({
       team_name: Type.String(),
       name: Type.String(),
       prompt: Type.String(),
-      cwd: Type.String(),
-      role: Type.Optional(StringEnum(["read", "write"], { description: "Agent role. 'write' agents spawn in tmux and can edit files (default). 'read' agents are read-only. Defaults to 'write'." })),
+      cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead's cwd." })),
+      role: Type.Optional(StringEnum(["read", "write"], { description: "Agent role. 'read' (default) is read-only and in-process. 'write' spawns in tmux and can edit files — use only for isolated independent work." })),
       category: Type.Optional(Type.String({ description: "Optional category preset name from settings.json (bundles role + model + thinking)." })),
       model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first. If omitted, the category/role/team default or current model is used." })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
       plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const safeName = paths.sanitizeName(params.name);
       const safeTeamName = paths.sanitizeName(params.team_name);
-
       if (!teams.teamExists(safeTeamName)) {
         throw new Error(`Team ${params.team_name} does not exist`);
       }
+      adoptTeamAsLead(safeTeamName);
+      return spawnTeammate(params, ctx);
+    },
+  });
 
-      const teamConfig = await teams.readConfig(safeTeamName);
-
-      // Check if a teammate with this name already exists - kill them first
-      // This handles the case where the user aborts mid-execution and restarts
-      const existingMember = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
-      if (existingMember) {
-        await killTeammate(safeTeamName, existingMember);
-        await teams.removeMember(safeTeamName, safeName);
+  pi.registerTool({
+    name: "promote_teammate",
+    label: "Move Teammate to tmux pane",
+    description: "Move a running in-process read agent into its own tmux pane so you can watch and interact with it there. Stops the in-process session and re-spawns the same mission as a tmux teammate. Requires running inside tmux.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      name: Type.String(),
+      prompt: Type.Optional(Type.String({ description: "Optional updated mission. Defaults to the agent's original mission." })),
+    }),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const safeTeamName = paths.sanitizeName(params.team_name);
+      const safeName = paths.sanitizeName(params.name);
+      if (!teams.teamExists(safeTeamName)) {
+        throw new Error(`Team ${params.team_name} does not exist`);
+      }
+      adoptTeamAsLead(safeTeamName);
+      if (!terminal) {
+        throw new Error("pi-extended-teams requires running inside tmux to move an agent into a pane.");
       }
 
-      const settings = loadSettings({ projectDir: ctx.cwd });
-      const role: AgentRole = resolveRole(settings, params.role ?? "write", params.category);
-
-      const currentModelHint = getCurrentQualifiedModel(ctx);
-      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint].filter(Boolean) as string[]);
-
-      const resolved = resolveModel(settings, {
-        role,
-        category: params.category,
-        explicitModel: params.model,
-        explicitThinking: params.thinking,
-        teamDefaultModel: teamConfig.defaultModel,
-        currentModel: currentModelHint,
-      });
-
-      const chosenModel = requireQualifiedKnownModel(resolved.model ?? undefined, availableModels, "resolved model");
-
-      if (!chosenModel) {
-        throw new Error(
-          "No model could be resolved. Pass a fully qualified model, configure a category/role default in settings.json, create the team with a default_model, or ensure the current session has an active model."
-        );
+      const config = await teams.readConfig(safeTeamName);
+      const member = config.members.find(m => m.name === safeName);
+      const state = runningReadAgents.get(safeName);
+      const prompt = params.prompt || member?.prompt;
+      if (!prompt) {
+        throw new Error(`No mission found for ${params.name}; pass prompt to set one.`);
       }
 
-      const chosenThinking = (resolved.thinking ?? undefined) as Member["thinking"];
-
-      if (role === "write" && !terminal) {
-        throw new Error("pi-extended-teams requires running inside tmux for write agents.");
+      // Stop the in-process session and clear its runtime state.
+      if (state?.session) {
+        try { await state.session.abort(); } catch { /* already stopping */ }
+        state.session.dispose();
       }
+      runningReadAgents.delete(safeName);
+      renderReadAgentStatus();
+      await runtime.deleteRuntimeStatus(safeTeamName, safeName).catch(() => {});
+      if (member) await teams.removeMember(safeTeamName, safeName).catch(() => {});
 
-      const member: Member = {
-        agentId: `${safeName}@${safeTeamName}`,
+      const result = await spawnTeammate({
+        team_name: safeTeamName,
         name: safeName,
-        agentType: "teammate",
-        role,
-        category: params.category,
-        model: chosenModel,
-        joinedAt: Date.now(),
-        tmuxPaneId: "",
-        cwd: params.cwd,
-        subscriptions: [],
-        prompt: params.prompt,
-        color: role === "read" ? "cyan" : "blue",
-        thinking: chosenThinking,
-        planModeRequired: params.plan_mode_required,
-      };
-
-      if (role === "read") {
-        await teams.addMember(safeTeamName, member);
-        void runReadAgentInProcess(safeTeamName, member, params.prompt, ctx);
-        return {
-          content: [{ type: "text", text: `Read teammate ${params.name} started in-process. No tmux pane was created.` }],
-          details: { agentId: member.agentId, mode: "in-process", terminalId: null },
-        };
-      }
-
-      await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
-      const activeWriteCount = await countWriteMembers(safeTeamName);
-      if (activeWriteCount >= settings.writeAgents.maxConcurrent) {
-        if (!settings.writeAgents.queueOverflow) {
-          throw new Error(`Write-agent capacity reached (${activeWriteCount}/${settings.writeAgents.maxConcurrent}) and queueOverflow is disabled.`);
-        }
-        const queued = await writeQueue.enqueueWriteSpawn(safeTeamName, {
-          name: safeName,
-          prompt: params.prompt,
-          cwd: params.cwd,
-          category: params.category,
-          model: chosenModel,
-          thinking: chosenThinking,
-          planModeRequired: params.plan_mode_required,
-          color: "blue",
-        });
-        const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
-        return {
-          content: [{ type: "text", text: `Write teammate ${params.name} queued at position ${queuedItems.findIndex(item => item.id === queued.id) + 1}; capacity is ${activeWriteCount}/${settings.writeAgents.maxConcurrent}.` }],
-          details: { agentId: member.agentId, queued: true, queueId: queued.id, queuePosition: queuedItems.findIndex(item => item.id === queued.id) + 1 },
-        };
-      }
-
-      const terminalId = await startWriteAgent(safeTeamName, member, params.prompt);
+        prompt,
+        role: "write",
+        model: member?.model,
+        thinking: member?.thinking,
+        cwd: member?.cwd,
+      }, ctx);
 
       return {
-        content: [{ type: "text", text: `Teammate ${params.name} spawned in pane ${terminalId}.` }],
-        details: { agentId: member.agentId, terminalId, queued: false },
+        content: [{ type: "text", text: `Moved ${params.name} into a tmux pane. ${result.content?.[0]?.text ?? ""}`.trim() }],
+        details: { ...result.details, promoted: true },
       };
     },
   });
@@ -1550,6 +1803,7 @@ export default function (pi: ExtensionAPI) {
       team_name: Type.String(),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      if (teams.teamExists(paths.sanitizeName(params.team_name))) adoptTeamAsLead(paths.sanitizeName(params.team_name));
       const roster = await buildRoster(params.team_name);
       return {
         content: [{ type: "text", text: formatRosterForPrompt(roster) }],
@@ -1872,6 +2126,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const targetAgent = params.agent_name || agentName;
+      if (!isTeammate && teams.teamExists(paths.sanitizeName(params.team_name))) adoptTeamAsLead(paths.sanitizeName(params.team_name));
       const msgs = await messaging.readInbox(params.team_name, targetAgent, params.unread_only);
 
       if (isTeammate && teamName && params.team_name === teamName && targetAgent === agentName) {
@@ -1884,7 +2139,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (!isTeammate && params.team_name === teamName && targetAgent === agentName) {
-        leadInboxUnreadCount = 0;
+        // Lead read its own inbox: refresh the widget (clears when empty) and
+        // reset the wake gate so the next batch of reports nudges again.
+        leadWakeNotifiedCount = 0;
         await renderLeadInboxStatus();
       }
 
@@ -2243,10 +2500,7 @@ export default function (pi: ExtensionAPI) {
 
       // Create the team
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
-      registerLeadSession(params.team_name);
-      // Update teamName and start inbox polling for the lead
-      teamName = params.team_name;
-      startLeadInboxPolling();
+      adoptTeamAsLead(paths.sanitizeName(params.team_name));
 
       const agentDefinitions = predefined.getAllAgentDefinitions(projectDir);
       const spawnResults: Array<{ name: string; status: string; error?: string }> = [];

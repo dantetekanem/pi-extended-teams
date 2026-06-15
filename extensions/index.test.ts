@@ -74,6 +74,7 @@ async function setupExtension(env: Record<string, string | undefined> = {}) {
       eventHandlers.set(eventName, [...(eventHandlers.get(eventName) || []), handler]);
     }),
     sendUserMessage: vi.fn(),
+    sendMessage: vi.fn(),
   };
 
   extension(pi as any);
@@ -91,6 +92,28 @@ describe("extension integration", () => {
     vi.restoreAllMocks();
     vi.doUnmock("../src/adapters/terminal-registry");
     if (fs.existsSync(testRoot)) fs.rmSync(testRoot, { recursive: true });
+  });
+
+  it("spawns inline agents in one team_create call", async () => {
+    const setup = await setupExtension();
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+
+    const result = await setup.tools.get("team_create")!.execute("1", {
+      team_name: "team",
+      default_model: "provider/model",
+      agents: [
+        { name: "w1", role: "write", prompt: "work 1", cwd: setup.root },
+        { name: "w2", role: "write", prompt: "work 2", cwd: setup.root },
+      ],
+    }, abort, undefined, ctx);
+
+    expect(setup.terminal.spawn).toHaveBeenCalledTimes(2);
+    expect(result.details.spawned).toHaveLength(2);
+
+    const config = await setup.teams.readConfig("team");
+    expect(config.members.map((member: any) => member.name).sort()).toEqual(["team-lead", "w1", "w2"]);
+    setup.restoreEnv();
   });
 
   it("queues the fourth write agent and drains FIFO when a writer shuts down", async () => {
@@ -157,12 +180,20 @@ describe("extension integration", () => {
 
       await vi.advanceTimersByTimeAsync(30000);
 
-      expect(setup.pi.sendUserMessage).toHaveBeenCalledTimes(1);
-      expect(setup.pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("1 unread team report is ready for team"));
-      expect(setup.pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("Do not use sleeps or ad hoc polling loops"));
+      // Lead is woken via a hidden custom message (display:false), not a visible
+      // user turn, so coordination stays quiet in the transcript.
+      expect(setup.pi.sendUserMessage).not.toHaveBeenCalled();
+      expect(setup.pi.sendMessage).toHaveBeenCalledTimes(1);
+      expect(setup.pi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          display: false,
+          content: expect.stringContaining("1 team report ready in your inbox for team"),
+        }),
+        expect.objectContaining({ triggerTurn: true }),
+      );
 
       await vi.advanceTimersByTimeAsync(30000);
-      expect(setup.pi.sendUserMessage).toHaveBeenCalledTimes(1);
+      expect(setup.pi.sendMessage).toHaveBeenCalledTimes(1);
     } finally {
       setup.restoreEnv();
       vi.useRealTimers();

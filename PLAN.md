@@ -7,6 +7,15 @@ This document is the single source of truth for the migration and the new
 feature set. Check items off as they land. Each phase has acceptance criteria
 so "done" is unambiguous.
 
+> **Status reconciliation (2026-06-15).** Phases 0–3, 5, 6, 7, 9 are
+> implemented and covered by `vitest` (130 tests green, `tsc` clean). Phase 4
+> (watchdog) ships its core loop and reaping but still lacks the explicit
+> `working/idle/stalled/dead` state machine, re-spawn recovery, and dedicated
+> tests. Phase 8 ships `list_teammates`, peer messaging, roster injection, and
+> `broadcast_message`, but not automatic join/leave broadcasts. Remaining doc
+> work lives in Phase 10. Items below are checked to match shipped code; `[~]`
+> marks partial.
+
 ---
 
 ## Guiding principles
@@ -141,12 +150,12 @@ Goal: an internal background loop that confirms agents are still working. Adds a
 configurable buffer (default 30s) on top of heartbeats; if an agent misses its
 ping, a background check confirms whether it is truly stale.
 
-- [ ] Read `watchdog.bufferSeconds` (default 30) from settings
-- [ ] Lead-side loop iterates all members; "expected ping" = last heartbeat + interval + buffer
-- [ ] On a missed ping, run a **background** liveness check (tmux pane alive? PID alive? runtime file fresh?) before declaring stale
+- [x] Read `watchdog.bufferSeconds` (default 30) from settings (`runWatchdogOnce`)
+- [x] Lead-side loop iterates all members; "expected ping" = last heartbeat + interval + buffer (`startLeadWatchdog` every 30s)
+- [x] On a missed ping, run a liveness check (tmux pane alive? runtime file fresh?) before declaring stale
 - [ ] Distinguish `working` / `idle` / `stalled` / `dead`; only `dead`+`stalled` trigger recovery
-- [ ] Recovery: notify lead, optionally re-spawn or reap the member (write agents reaped from tmux; read agents removed from status line)
-- [ ] Replace the hard-coded `HEARTBEAT_STALE_MS` / `STARTUP_STALL_MS` with values derived from settings
+- [~] Recovery: notify lead and reap the member (write agents reaped from tmux; read agents removed from status line). Auto re-spawn not implemented
+- [~] Replace the hard-coded `HEARTBEAT_STALE_MS` / `STARTUP_STALL_MS` with values derived from settings (buffer added on top of the constant; constants not yet fully derived)
 - [ ] Tests: missed-ping-but-alive ⇒ not stale; missed-ping-and-dead ⇒ stale
 
 **Acceptance:** killing a teammate's pane is detected within
@@ -161,9 +170,9 @@ Nothing is left stale or idle.
 
 - [x] Add a `report_and_exit` tool: sends final message to `team-lead`, releases claims, removes the member from team config, clears runtime status, then triggers self-shutdown for write agents
 - [x] Update `before_agent_start` teammate system prompt to mandate `report_and_exit` as the final step for write agents
-- [ ] Lead-side reaper confirms the pane/PID is gone after a completion message; force-kills if it lingers
-- [ ] Release any held file write-claims (Phase 7) on exit
-- [ ] Tests: after `report_and_exit`, no pane, no PID file, no runtime status, claims released
+- [x] Lead-side reaper confirms the pane/PID is gone after a completion message; force-kills if it lingers (watchdog `reapTeammate`)
+- [x] Release any held file write-claims (Phase 7) on exit
+- [x] Tests: after `report_and_exit`, no pane, no PID file, no runtime status, claims released (`extensions/index.test.ts`)
 
 **Acceptance:** a finished agent leaves zero residue; `team_shutdown` becomes a
 rare safety net rather than routine cleanup.
@@ -175,12 +184,12 @@ rare safety net rather than routine cleanup.
 Goal: at most 3 write agents running at any time; read agents unlimited.
 Overflow is **queued**, not rejected.
 
-- [ ] Count active write members before starting a `spawn_teammate(role:"write")`
-- [ ] If at `writeAgents.maxConcurrent` (default 3), enqueue the spawn request (persisted under the team dir) instead of rejecting
-- [ ] When a write agent exits (`report_and_exit` / watchdog reap), dequeue and auto-spawn the next pending writer
-- [ ] Lead can inspect the write queue (`list_write_queue`) and cancel pending entries
-- [ ] Read-agent spawns bypass the cap and the queue entirely
-- [ ] Tests: 4th writer is queued (not refused); a writer exiting auto-starts the next; queue order preserved (FIFO)
+- [x] Count active write members before starting a `spawn_teammate(role:"write")` (`countWriteMembers`)
+- [x] If at `writeAgents.maxConcurrent` (default 3), enqueue the spawn request (persisted under the team dir) instead of rejecting
+- [x] When a write agent exits (`report_and_exit` / watchdog reap), dequeue and auto-spawn the next pending writer (`drainWriteQueue`)
+- [x] Lead can inspect the write queue (`list_write_queue`) and cancel pending entries (`cancel_write_queue`)
+- [x] Read-agent spawns bypass the cap and the queue entirely
+- [x] Tests: 4th writer is queued (not refused); a writer exiting auto-starts the next; queue order preserved (FIFO) (`write-queue.test.ts`, `index.test.ts`)
 
 **Acceptance:** requesting a 4th writer queues it; when a slot frees, the queued
 writer spawns automatically without lead intervention.
@@ -208,10 +217,10 @@ stale claims from dead agents are reclaimed automatically.
 Goal: agents know who else is running and can talk to each other directly (not
 only via the lead).
 
-- [ ] `list_teammates` tool: returns live roster with role, status, current task, held claims
-- [ ] Allow peer-to-peer `send_message` (already routes by recipient; ensure read agents have inbox parity in-process)
-- [ ] Inject the live roster into each teammate's context on turn start so they know their peers
-- [ ] Broadcast roster changes (join/leave) to active members
+- [x] `list_teammates` tool: returns live roster with role, status, current task, held claims
+- [x] Allow peer-to-peer `send_message` (routes by recipient)
+- [x] Inject the live roster into each teammate's context on turn start so they know their peers (`before_agent_start` roster)
+- [~] Broadcast roster changes (join/leave) to active members (`broadcast_message` exists; automatic join/leave broadcast not wired)
 - [ ] Tests: a spawned agent can enumerate peers and message one directly
 
 **Acceptance:** any agent can list peers and message a specific teammate; roster
@@ -221,26 +230,25 @@ stays current as agents come and go.
 
 ## Phase 9 — Shared memory, extension orchestration & frictionless skills
 
-Goal: agents share memory, can use **other** pi extensions (Ada artifacts,
-pi-emote, …) without this extension reimplementing them, and load skills by name
-with one call.
+Goal: agents share memory, can use the user's **own** pi extensions (e.g.
+pi-emote) without this extension reimplementing or depending on any specific
+one, and load skills by name with one call.
 
-- [ ] Shared memory store under the team dir (`shared/memory/*.md`), with `memory_write` / `memory_read` / `memory_list` tools (lock-guarded)
-- [x] **Extension orchestration (not reimplementation):** `buildPiCommand` keeps `--no-extensions` as the isolation baseline and adds one `--extension <source>` per entry in `resolveAllowedExtensions(settings)` (allow minus block) for spawned write agents — Ada + pi-emote come from the user's own extensions. Wired into `spawn_teammate` and `create_predefined_team`; tested in `settings.test.ts`
-- [ ] Spawned agents are told (system prompt / skill doc) which extensions are available and how to use them — including Ada for artifacts
-- [ ] `use_skill(name)` tool: resolves a skill by name from the skills path and loads it into the calling agent's context — just "use this skill name"
-- [ ] Document the shared-memory conventions and the extension allow/block model in the skill doc
-- [ ] Tests: write→read round-trip on shared memory; `use_skill` loads a known skill; allow-list controls which extensions a spawned agent loads
+- [x] Shared memory store under the team dir (`shared/memory/*.md`), with `write_shared_memory` / `read_shared_memory` / `delete_shared_memory` tools (lock-guarded; `shared-memory.test.ts`)
+- [x] **Extension orchestration (not reimplementation):** `buildPiCommand` keeps `--no-extensions` as the isolation baseline and adds one `--extension <source>` per entry in `resolveAllowedExtensions(settings)` (allow minus block) for spawned write agents — extensions come from the user's own settings, allow-list empty by default. Wired into `spawn_teammate` and `create_predefined_team`; tested in `settings.test.ts`
+- [~] Spawned agents are told (system prompt / skill doc) which extensions are available and how to use them (extensions are loaded; system prompt does not yet enumerate them)
+- [x] `use_skill(name)` tool: resolves a skill by name from the skills path and loads it into the calling agent's context — just "use this skill name"
+- [x] Document the shared-memory conventions and the extension allow/block model in the skill doc (`skills/teams.md`)
+- [~] Tests: write→read round-trip on shared memory (`shared-memory.test.ts`); allow-list controls which extensions a spawned agent loads (`settings.test.ts`); `use_skill` loading not yet tested
 
 **Acceptance:** one agent writes a memo, another reads it; a spawned write agent
-loads `pi-emote` + the user's `ada` extension per settings, while blocked
-extensions stay out; `use_skill("teams")` injects the skill without ceremony.
+loads the user's allow-listed extensions per settings, while blocked extensions
+stay out; `use_skill("teams")` injects the skill without ceremony.
 
-> Decision (from user): "Ada artifacts" = the user's **own `ada` extension**,
-> not something this package implements. pi-extended-teams must know how to *use*
+> Decision (from user): this package is extension-agnostic — it does not
+> implement or hard-depend on any specific extension. It must know how to *use*
 > other extensions and let the user **allow/block which extensions spawned write
-> agents load**, configured in settings.json (pi-emote and other already-filtered
-> ones remain available).
+> agents load**, configured in settings.json (allow-list empty by default).
 
 ---
 

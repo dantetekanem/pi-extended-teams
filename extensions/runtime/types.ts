@@ -6,8 +6,11 @@ export interface RunningReadAgent {
   teamName: string;
   startedAt: number;
   tokensUsed: number;
-  status: "starting" | "running" | "finishing";
+  status: "starting" | "thinking" | "working" | "finishing";
   recentEvents: string[];
+  lastActivityAt: number;
+  activeToolName?: string;
+  idleNudgeLevel?: "soft" | "hard";
   model?: string;
   thinking?: string;
   session?: AgentSession;

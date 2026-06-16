@@ -26,8 +26,30 @@ export interface RunReadAgentOptions {
 }
 
 function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
-  agent.recentEvents.push(`${new Date().toLocaleTimeString()} ${text}`);
+  agent.recentEvents.push(text);
   agent.recentEvents = agent.recentEvents.slice(-12);
+}
+
+function markReadAgentActivity(
+  agent: RunningReadAgent,
+  text: string,
+  status: RunningReadAgent["status"],
+  activeToolName?: string
+): void {
+  agent.status = status;
+  agent.lastActivityAt = Date.now();
+  agent.activeToolName = activeToolName;
+  agent.idleNudgeLevel = undefined;
+  pushReadAgentEvent(agent, text);
+}
+
+function refreshReadAgentStats(agent: RunningReadAgent, session: AgentSession): void {
+  const tokensUsed = session.getSessionStats().tokens.total;
+  if (tokensUsed !== agent.tokensUsed) {
+    agent.lastActivityAt = Date.now();
+    agent.idleNudgeLevel = undefined;
+  }
+  agent.tokensUsed = tokensUsed;
 }
 
 export async function shutdownReadAgentSession(session: AgentSession | undefined): Promise<void> {
@@ -59,6 +81,7 @@ export async function runReadAgentInProcess(
     tokensUsed: 0,
     status: "starting",
     recentEvents: [],
+    lastActivityAt: Date.now(),
     model: member.model,
     thinking: member.thinking,
   };
@@ -119,17 +142,32 @@ export async function runReadAgentInProcess(
     });
 
     state.session = session;
-    state.status = "running";
-    pushReadAgentEvent(state, "started");
+    markReadAgentActivity(state, "started", "thinking");
     options.renderReadAgentStatus();
 
     session.subscribe((event: any) => {
-      if (event.type === "tool_execution_start") pushReadAgentEvent(state, `tool ${event.toolName}`);
-      if (event.type === "turn_end") pushReadAgentEvent(state, "turn complete");
+      if (event.type === "agent_start" || event.type === "turn_start") {
+        markReadAgentActivity(state, "thinking", "thinking");
+      }
+      if (event.type === "message_start" && event.message?.role === "assistant") {
+        markReadAgentActivity(state, "thinking", "thinking");
+      }
+      if (event.type === "message_update") {
+        markReadAgentActivity(state, "thinking", "thinking");
+      }
+      if (event.type === "tool_execution_start") {
+        markReadAgentActivity(state, `working: ${event.toolName}`, "working", event.toolName);
+      }
+      if (event.type === "tool_execution_update") {
+        markReadAgentActivity(state, `working: ${event.toolName}`, "working", event.toolName);
+      }
+      if (event.type === "tool_execution_end") {
+        markReadAgentActivity(state, "thinking", "thinking");
+      }
       if (event.type === "agent_end") pushReadAgentEvent(state, "agent complete");
-      if (event.type === "message_end" || event.type === "turn_end" || event.type === "agent_end") {
+      if (event.type === "message_update" || event.type === "message_end" || event.type === "turn_end" || event.type === "agent_end") {
         try {
-          state.tokensUsed = session.getSessionStats().tokens.total;
+          refreshReadAgentStats(state, session);
           options.renderReadAgentStatus();
         } catch {
           // Ignore stats races while the nested session is shutting down.
@@ -139,8 +177,9 @@ export async function runReadAgentInProcess(
 
     await session.prompt(prompt, { source: "extension" as any });
     state.status = "finishing";
-    state.tokensUsed = session.getSessionStats().tokens.total;
-    pushReadAgentEvent(state, "sending report");
+    state.activeToolName = undefined;
+    refreshReadAgentStats(state, session);
+    markReadAgentActivity(state, "sending report", "finishing");
     options.renderReadAgentStatus();
 
     if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) return;

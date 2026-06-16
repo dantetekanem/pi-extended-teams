@@ -1,6 +1,7 @@
 import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { findLeadTeamForSession, registerLeadSession, resolveSkillFile } from "./internal/session-files.js";
 import { dimAnsi, pink, purple } from "./ui/ansi.js";
+import { buildReadAgentIdleNudgeMessage, describeReadAgentStatus, shouldNudgeReadAgentIdle, type ReadAgentStatusDescription } from "./ui/read-agent-status.js";
 import { bottomStatusWidget } from "./ui/status-widget.js";
 import { runReadAgentInProcess } from "./agents/read-agent.js";
 import { createWriteAgentRuntime } from "./agents/write-agent.js";
@@ -126,6 +127,15 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  function wakeLeadForIdleReadAgent(agent: RunningReadAgent, status: ReadAgentStatusDescription): void {
+    if (status.idleLevel === "none") return;
+    if (!shouldNudgeReadAgentIdle(agent.idleNudgeLevel, status.idleLevel)) return;
+    if (sessionCtx?.isIdle && !sessionCtx.isIdle()) return;
+
+    quietTrigger(buildReadAgentIdleNudgeMessage(agent, status));
+    agent.idleNudgeLevel = status.idleLevel;
+  }
+
   function renderReadAgentStatus() {
     if (!sessionCtx?.ui) return;
 
@@ -141,13 +151,25 @@ export default function (pi: ExtensionAPI) {
     }
 
     const lines = [pink(`▣ read agents running (${agents.length})  /team`)];
+    const now = Date.now();
     for (const agent of agents.sort((a, b) => a.name.localeCompare(b.name))) {
-      const elapsed = formatElapsed(Date.now() - agent.startedAt);
-      const lastEvent = agent.recentEvents.at(-1)?.replace(/^\S+\s+/, "") || agent.status;
+      try {
+        const tokensUsed = agent.session?.getSessionStats().tokens.total;
+        if (typeof tokensUsed === "number" && tokensUsed !== agent.tokensUsed) {
+          agent.tokensUsed = tokensUsed;
+          agent.lastActivityAt = now;
+          agent.idleNudgeLevel = undefined;
+        }
+      } catch {
+        // Ignore stats races while the nested session is shutting down.
+      }
+      const elapsed = formatElapsed(now - agent.startedAt);
+      const status = describeReadAgentStatus(agent, now);
+      wakeLeadForIdleReadAgent(agent, status);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
-      const detail = [modelLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, lastEvent].filter(Boolean).join(" · ");
+      const detail = [modelLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
       lines.push(
-        `${purple("  ├─")} ${pink(agent.name)} ${purple(agent.status)} ${dimAnsi(detail)}`
+        `${purple("  ├─")} ${pink(agent.name)} ${purple(status.label)} ${dimAnsi(detail)}`
       );
     }
     lines[lines.length - 1] = lines[lines.length - 1].replace("├─", "└─");

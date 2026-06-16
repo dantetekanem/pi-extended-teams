@@ -116,6 +116,41 @@ describe("extension integration", () => {
     setup.restoreEnv();
   });
 
+  it("writes write-agent spawn debug events when debug mode is enabled", async () => {
+    const setup = await setupExtension({ PI_EXTENDED_TEAMS_DEBUG: "1" });
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+
+    try {
+      await setup.tools.get("team_create")!.execute("1", {
+        team_name: "team",
+        default_model: "provider/model",
+      }, abort, undefined, ctx);
+
+      const result = await setup.tools.get("spawn_teammate")!.execute("spawn", {
+        team_name: "team",
+        name: "writer",
+        prompt: "work",
+        cwd: setup.root,
+        role: "write",
+      }, abort, undefined, ctx);
+
+      const debugLogPath = path.join(setup.paths.teamDir("team"), "debug.log");
+      const events = fs.readFileSync(debugLogPath, "utf-8").trim().split("\n").map(line => JSON.parse(line));
+
+      expect(result.details.debugLogPath).toBe(debugLogPath);
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ event: "write-agent.spawn.request", agentName: "writer", activeWriteCount: 0 }),
+        expect.objectContaining({ event: "write-agent.spawn.prepare", agentName: "writer", cwd: setup.root }),
+        expect.objectContaining({ event: "write-agent.spawn.success", agentName: "writer", terminalId: "%1" }),
+      ]));
+      expect(events.find(event => event.event === "write-agent.spawn.prepare")?.command).toContain("--extension");
+      expect(events.find(event => event.event === "write-agent.spawn.prepare")?.extensionSource.replace(/\\/g, "/")).toContain("/extensions/index.");
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("queues the fourth write agent and drains FIFO when a writer shuts down", async () => {
     const setup = await setupExtension();
     const ctx = makeCtx(setup.root);

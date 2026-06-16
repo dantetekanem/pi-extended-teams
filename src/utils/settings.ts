@@ -52,12 +52,18 @@ export interface ExtensionsConfig {
   block: string[];
 }
 
+export interface DebugConfig {
+  /** Write spawn decisions and terminal launch results to the team debug log. */
+  enabled: boolean;
+}
+
 export interface PiExtendedTeamsSettings {
   watchdog: WatchdogConfig;
   writeAgents: WriteAgentsConfig;
   roles: Record<AgentRole, RoleModelConfig>;
   categories: Record<string, CategoryConfig>;
   extensions: ExtensionsConfig;
+  debug: DebugConfig;
 }
 
 export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
@@ -69,6 +75,7 @@ export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
   },
   categories: {},
   extensions: { allow: [], block: [] },
+  debug: { enabled: false },
 };
 
 export function globalSettingsPath(homeDir: string = os.homedir()): string {
@@ -158,6 +165,12 @@ function applyLayer(acc: PiExtendedTeamsSettings, raw: any): void {
     const block = toStringList(raw.extensions.block);
     if (allow) acc.extensions.allow = allow;
     if (block) acc.extensions.block = block;
+  }
+
+  if (typeof raw.debug === "boolean") {
+    acc.debug.enabled = raw.debug;
+  } else if (raw.debug && typeof raw.debug === "object" && typeof raw.debug.enabled === "boolean") {
+    acc.debug.enabled = raw.debug.enabled;
   }
 }
 

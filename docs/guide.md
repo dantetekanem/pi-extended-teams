@@ -375,6 +375,17 @@ You can manually inspect these JSON files to debug issues.
 
 pi-extended-teams is tmux-only for write-agent panes. Zellij and iTerm2 pane backends are not supported.
 
+**Debug mode**:
+Set `PI_EXTENDED_TEAMS_DEBUG=1` before starting Pi, or add this to `~/.pi/agent/pi-extended-teams/settings.json` or `<project>/.pi/pi-extended-teams.json`:
+
+```json
+{
+  "debug": { "enabled": true }
+}
+```
+
+When debug mode is enabled, write-agent spawn requests, queue decisions, launch commands, terminal pane IDs, and spawn failures are appended as JSON lines to `~/.pi/teams/<team-name>/debug.log`. Successful `spawn_teammate` results also include the debug log path.
+
 ---
 
 ## Inter-Agent Communication

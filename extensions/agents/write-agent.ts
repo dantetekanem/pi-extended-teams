@@ -4,7 +4,8 @@ import * as messaging from "../../src/utils/messaging";
 import * as writeQueue from "../../src/utils/write-queue";
 import { loadSettings, resolveAllowedExtensions } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
-import { buildPiCommand, getPiLaunchCommand } from "../internal/pi-command";
+import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
+import { buildPiCommand, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
 import { countWriteMembers } from "../team/roster";
 
 export interface WriteAgentRuntimeOptions {
@@ -23,7 +24,10 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
     await messaging.sendPlainMessage(teamName, "team-lead", member.name, prompt, "Initial prompt");
 
     const settings = loadSettings({ projectDir: member.cwd });
+    const debugEnabled = isTeamsDebugEnabled(settings);
+    const debugLogPath = debugEnabled ? teamDebugLogPath(teamName) : undefined;
     const piBinary = getPiLaunchCommand();
+    const extensionSource = getPiExtendedTeamsExtensionSource();
     const allowedExtensions = resolveAllowedExtensions(settings);
     const piCmd = buildPiCommand(piBinary, member.model, member.thinking, allowedExtensions);
 
@@ -32,6 +36,18 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       PI_TEAM_NAME: teamName,
       PI_AGENT_NAME: member.name,
     };
+
+    await writeTeamsDebugEvent(teamName, "write-agent.spawn.prepare", {
+      agentName: member.name,
+      cwd: member.cwd,
+      model: member.model,
+      thinking: member.thinking ?? null,
+      piBinary,
+      extensionSource,
+      allowedExtensions,
+      command: piCmd,
+      debugLogPath: debugLogPath ?? null,
+    }, settings);
 
     try {
       const teamConfig = await teams.readConfig(teamName);
@@ -45,10 +61,23 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
         anchorPaneId,
       });
       await teams.updateMember(teamName, member.name, { tmuxPaneId: terminalId });
+      await writeTeamsDebugEvent(teamName, "write-agent.spawn.success", {
+        agentName: member.name,
+        terminalId,
+        anchorPaneId: anchorPaneId ?? null,
+        debugLogPath: debugLogPath ?? null,
+      }, settings);
       return terminalId;
     } catch (e) {
+      await writeTeamsDebugEvent(teamName, "write-agent.spawn.failure", {
+        agentName: member.name,
+        error: e instanceof Error ? e.message : String(e),
+        stack: e instanceof Error ? e.stack ?? null : null,
+        debugLogPath: debugLogPath ?? null,
+      }, settings);
       await teams.removeMember(teamName, member.name);
-      throw new Error(`Failed to spawn tmux pane: ${e}`);
+      const debugHint = debugLogPath ? ` (debug log: ${debugLogPath})` : "";
+      throw new Error(`Failed to spawn tmux pane: ${e}${debugHint}`);
     }
   }
 

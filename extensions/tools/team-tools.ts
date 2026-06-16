@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "../internal/schema";
+import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
 import { getCurrentQualifiedModel, getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
 import { cleanupStaleTeam } from "../internal/session-files";
 import { shutdownReadAgentSession } from "../agents/read-agent";
@@ -57,8 +58,18 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     }
 
     const chosenThinking = (resolved.thinking ?? undefined) as Member["thinking"];
+    const debugLogPath = role === "write" && isTeamsDebugEnabled(settings) ? teamDebugLogPath(safeTeamName) : undefined;
     if (role === "write" && !options.terminal) {
-      throw new Error("pi-extended-teams requires running inside tmux for write agents.");
+      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.failure", {
+        agentName: safeName,
+        reason: "missing-terminal-adapter",
+        cwd,
+        model: chosenModel,
+        thinking: chosenThinking ?? null,
+        debugLogPath: debugLogPath ?? null,
+      }, settings);
+      const debugHint = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
+      throw new Error(`pi-extended-teams requires running inside tmux for write agents.${debugHint}`);
     }
 
     const member: Member = {
@@ -89,8 +100,30 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
 
     await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
     const activeWriteCount = await countWriteMembers(safeTeamName);
+    await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.request", {
+      agentName: safeName,
+      cwd,
+      category: params.category ?? null,
+      requestedRole: params.role ?? "read",
+      resolvedRole: role,
+      model: chosenModel,
+      modelSource: resolved.modelSource,
+      thinking: chosenThinking ?? null,
+      activeWriteCount,
+      maxConcurrent: settings.writeAgents.maxConcurrent,
+      queueOverflow: settings.writeAgents.queueOverflow,
+      debugLogPath: debugLogPath ?? null,
+    }, settings);
+
     if (activeWriteCount >= settings.writeAgents.maxConcurrent) {
       if (!settings.writeAgents.queueOverflow) {
+        await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.failure", {
+          agentName: safeName,
+          reason: "capacity-reached",
+          activeWriteCount,
+          maxConcurrent: settings.writeAgents.maxConcurrent,
+          debugLogPath: debugLogPath ?? null,
+        }, settings);
         throw new Error(`Write-agent capacity reached (${activeWriteCount}/${settings.writeAgents.maxConcurrent}) and queueOverflow is disabled.`);
       }
       const queued = await writeQueue.enqueueWriteSpawn(safeTeamName, {
@@ -105,16 +138,25 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       });
       const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
       const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
+      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.queued", {
+        agentName: safeName,
+        queueId: queued.id,
+        queuePosition,
+        activeWriteCount,
+        maxConcurrent: settings.writeAgents.maxConcurrent,
+        debugLogPath: debugLogPath ?? null,
+      }, settings);
       return {
         content: [{ type: "text", text: `Write teammate ${params.name} queued at position ${queuePosition}; capacity is ${activeWriteCount}/${settings.writeAgents.maxConcurrent}.` }],
-        details: { agentId: member.agentId, role, queued: true, queueId: queued.id, queuePosition },
+        details: { agentId: member.agentId, role, queued: true, queueId: queued.id, queuePosition, debugLogPath },
       };
     }
 
     const terminalId = await options.startWriteAgent(safeTeamName, member, params.prompt);
+    const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
     return {
-      content: [{ type: "text", text: `Teammate ${params.name} spawned in pane ${terminalId}.` }],
-      details: { agentId: member.agentId, role, terminalId, queued: false },
+      content: [{ type: "text", text: `Teammate ${params.name} spawned in pane ${terminalId}.${debugSuffix}` }],
+      details: { agentId: member.agentId, role, terminalId, queued: false, debugLogPath },
     };
   }
 

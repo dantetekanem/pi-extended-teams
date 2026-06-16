@@ -46,6 +46,7 @@ describe("loadSettings", () => {
     expect(s.writeAgents.queueOverflow).toBe(true);
     expect(s.roles.read.model).toBeNull();
     expect(s.extensions.allow).toEqual([]);
+    expect(s.debug.enabled).toBe(false);
   });
 
   it("does not mutate DEFAULT_SETTINGS", () => {
@@ -60,6 +61,7 @@ describe("loadSettings", () => {
       writeAgents: { maxConcurrent: 5, queueOverflow: false },
       roles: { write: { thinking: "high" } },
       extensions: { allow: ["pi-emote", "my-ext"] },
+      debug: { enabled: true },
     });
     const s = loadSettings({ homeDir, projectDir });
     expect(s.watchdog.bufferSeconds).toBe(45);
@@ -67,6 +69,7 @@ describe("loadSettings", () => {
     expect(s.writeAgents.queueOverflow).toBe(false);
     expect(s.roles.write.thinking).toBe("high");
     expect(s.extensions.allow).toEqual(["pi-emote", "my-ext"]);
+    expect(s.debug.enabled).toBe(true);
   });
 
   it("lets project settings override global", () => {
@@ -78,10 +81,17 @@ describe("loadSettings", () => {
   });
 
   it("ignores invalid values", () => {
-    writeGlobal({ watchdog: { bufferSeconds: -5 }, writeAgents: { maxConcurrent: 0 } });
+    writeGlobal({ watchdog: { bufferSeconds: -5 }, writeAgents: { maxConcurrent: 0 }, debug: "yes" });
     const s = loadSettings({ homeDir, projectDir });
     expect(s.watchdog.bufferSeconds).toBe(30);
     expect(s.writeAgents.maxConcurrent).toBe(3);
+    expect(s.debug.enabled).toBe(false);
+  });
+
+  it("supports boolean shorthand for debug mode", () => {
+    writeProject({ debug: true });
+    const s = loadSettings({ homeDir, projectDir });
+    expect(s.debug.enabled).toBe(true);
   });
 
   it("normalizes categories and rejects bad thinking levels", () => {

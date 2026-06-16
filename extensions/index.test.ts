@@ -155,6 +155,40 @@ describe("extension integration", () => {
     setup.restoreEnv();
   });
 
+  it("does not drain queued writers while shutting down the whole team", async () => {
+    const setup = await setupExtension();
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+
+    await setup.tools.get("team_create")!.execute("1", {
+      team_name: "team",
+      default_model: "provider/model",
+    }, abort, undefined, ctx);
+
+    for (const name of ["w1", "w2", "w3", "w4"]) {
+      await setup.tools.get("spawn_teammate")!.execute("spawn", {
+        team_name: "team",
+        name,
+        prompt: `work ${name}`,
+        cwd: setup.root,
+        role: "write",
+      }, abort, undefined, ctx);
+    }
+
+    expect(setup.terminal.spawn).toHaveBeenCalledTimes(3);
+    const queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
+    expect(queue.details.queue).toMatchObject([{ name: "w4" }]);
+
+    await setup.tools.get("team_shutdown")!.execute("shutdown", {
+      team_name: "team",
+    }, abort, undefined, ctx);
+
+    expect(setup.terminal.spawn).toHaveBeenCalledTimes(3);
+    expect(setup.terminal.kill).toHaveBeenCalledTimes(3);
+    expect(fs.existsSync(setup.paths.teamDir("team"))).toBe(false);
+    setup.restoreEnv();
+  });
+
   it("wakes the idle lead when team reports arrive", async () => {
     vi.useFakeTimers();
     const setup = await setupExtension();

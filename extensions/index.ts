@@ -6,7 +6,7 @@ import {
   type AgentSession,
   type ExtensionAPI,
 } from "@mariozechner/pi-coding-agent";
-import { Key, matchesKey, Text, truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as paths from "../src/utils/paths";
 import * as teams from "../src/utils/teams";
@@ -191,6 +191,7 @@ function buildPiCommand(
 }
 
 interface RunningReadAgent {
+  runId: string;
   name: string;
   teamName: string;
   startedAt: number;
@@ -200,6 +201,23 @@ interface RunningReadAgent {
   model?: string;
   thinking?: string;
   session?: AgentSession;
+  stopRequested?: boolean;
+}
+
+interface CompletedAgentReport {
+  name: string;
+  role: string;
+  status: "completed" | "failed";
+  report: string;
+  summary?: string;
+  completedAt: number;
+  startedAt?: number;
+  elapsedMs?: number;
+  tokensUsed?: number;
+  model?: string;
+  thinking?: string;
+  color?: string;
+  source: "read-agent" | "lead-inbox";
 }
 
 // Compact "provider/model · thinking" label for status/panel display.
@@ -336,12 +354,76 @@ function dimAnsi(text: string): string {
   return `${ANSI_DIM}${text}${ANSI_RESET}`;
 }
 
+const ANSI_PANEL_BG = "\x1b[48;5;235m";
+
+// Fill a line to `width` visible columns with the dark panel background. Every
+// full reset emitted by pink/purple/dimAnsi/theme.fg is followed by a fresh
+// background code so embedded foreground colors don't punch holes in the fill.
+export function panelBgFill(line: string, width: number): string {
+  const pad = Math.max(0, width - visibleWidth(line));
+  const reasserted = line.split(ANSI_RESET).join(ANSI_RESET + ANSI_PANEL_BG);
+  return `${ANSI_PANEL_BG}${reasserted}${" ".repeat(pad)}${ANSI_RESET}`;
+}
+
+// Wrap content lines in a rounded border with a dark interior. `innerWidth` is
+// the column count between the one-space padding inside each side border.
+export function framePanel(contentLines: string[], innerWidth: number): string[] {
+  const span = innerWidth + 2;
+  const rule = "─".repeat(span);
+  const border = (text: string) => `${ANSI_PANEL_BG}${ANSI_PURPLE}${text}${ANSI_RESET}`;
+  const out: string[] = [border(`╭${rule}╮`)];
+  for (const line of contentLines) {
+    const boundedLine = truncateToWidth(line, innerWidth, "…", true);
+    out.push(border("│") + panelBgFill(` ${boundedLine} `, span) + border("│"));
+  }
+  out.push(border(`╰${rule}╯`));
+  return out;
+}
+
+// Self-sizing frame for compact panels so each reads as a distinct dark card.
+export function frameWidget(contentLines: string[]): string[] {
+  const innerWidth = contentLines.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+  return framePanel(contentLines, innerWidth);
+}
+
+// Full-width frame for belowEditor status widgets. The returned lines consume
+// the whole render width so the bottom bar has no left/right gutters.
+export function frameWidgetFullWidth(contentLines: string[], width: number): string[] {
+  if (width <= 0) return [];
+  if (width < 4) {
+    return contentLines.map((line) => panelBgFill(truncateToWidth(line, width, "", true), width));
+  }
+  return framePanel(contentLines, width - 4);
+}
+
+function bottomStatusWidget(contentLines: string[]) {
+  return (_tui: any, _theme: any) => ({
+    render(width: number): string[] {
+      return frameWidgetFullWidth(contentLines, width);
+    },
+    invalidate() {},
+  });
+}
+
 function isDownInput(data: string): boolean {
   return matchesKey(data, Key.down) || data === "\x1b[B" || data === "j" || data === "J" || data === "\x0e";
 }
 
 function isUpInput(data: string): boolean {
   return matchesKey(data, Key.up) || data === "\x1b[A" || data === "k" || data === "K" || data === "\x10";
+}
+
+function isLeftInput(data: string): boolean {
+  return matchesKey(data, Key.left) || data === "\x1b[D" || data === "h" || data === "H";
+}
+
+function isRightInput(data: string): boolean {
+  return matchesKey(data, Key.right) || data === "\x1b[C" || data === "l" || data === "L";
+}
+
+export function logWindowStart(totalRows: number, viewportRows: number, offsetFromBottom: number): number {
+  const maxStart = Math.max(0, totalRows - viewportRows);
+  return Math.max(0, maxStart - Math.max(0, Math.min(offsetFromBottom, maxStart)));
 }
 
 function renderTeammateStatus(result: any, expanded: boolean, theme: any) {
@@ -550,6 +632,7 @@ export default function (pi: ExtensionAPI) {
   let leadPollingStarted = false;
   let sessionCtx: any = null;
   const runningReadAgents = new Map<string, RunningReadAgent>();
+  const completedAgentReports = new Map<string, CompletedAgentReport[]>();
   let readAgentStatusTimer: NodeJS.Timeout | null = null;
   let leadInboxUnreadCount = 0;
   // Highest unread count we've already nudged the lead about, so we wake once per
@@ -557,6 +640,24 @@ export default function (pi: ExtensionAPI) {
   let leadWakeNotifiedCount = 0;
   let writeQueueDraining = false;
   let leadWatchdogStarted = false;
+
+  function readAgentKey(targetTeamName: string, targetAgentName: string): string {
+    return `${targetTeamName}:${targetAgentName}`;
+  }
+
+  function isCurrentReadAgentRun(key: string, state: RunningReadAgent): boolean {
+    return runningReadAgents.get(key) === state;
+  }
+
+  function rememberCompletedAgentReport(teamName: string, report: CompletedAgentReport): void {
+    const current = completedAgentReports.get(teamName) ?? [];
+    const dedupeKey = `${report.source}:${report.name}:${report.completedAt}:${report.summary || ""}`;
+    const next = [
+      ...current.filter((item) => `${item.source}:${item.name}:${item.completedAt}:${item.summary || ""}` !== dedupeKey),
+      report,
+    ].sort((a, b) => b.completedAt - a.completedAt).slice(0, 50);
+    completedAgentReports.set(teamName, next);
+  }
 
   // Quietly nudge this agent's loop without cluttering the transcript. A custom
   // message with display:false still reaches the model as a user turn (see
@@ -638,7 +739,7 @@ export default function (pi: ExtensionAPI) {
       );
     }
     lines[lines.length - 1] = lines[lines.length - 1].replace("├─", "└─");
-    sessionCtx.ui.setWidget?.("01-pi-extended-teams-readers", lines, { placement: "belowEditor" });
+    sessionCtx.ui.setWidget?.("01-pi-extended-teams-readers", bottomStatusWidget(lines), { placement: "belowEditor" });
   }
 
   function ensureReadAgentStatusTicker() {
@@ -671,7 +772,7 @@ export default function (pi: ExtensionAPI) {
     }
     if (unread.length > 5) lines.push(`${purple("  ├─")} ${dimAnsi(`${unread.length - 5} older unread report(s)`)}`);
     lines[lines.length - 1] = lines[lines.length - 1].replace("├─", "└─");
-    sessionCtx.ui.setWidget?.("02-pi-extended-teams-inbox", lines, { placement: "belowEditor" });
+    sessionCtx.ui.setWidget?.("02-pi-extended-teams-inbox", bottomStatusWidget(lines), { placement: "belowEditor" });
   }
 
   function requireTeamContext(explicitTeamName?: string): string {
@@ -725,7 +826,7 @@ export default function (pi: ExtensionAPI) {
       const unreadCount = member.name === "team-lead" ? 0 : (await messaging.readInbox(teamName, member.name, true, false).catch(() => [])).length;
       const memberTasks = allTasks.filter((task: any) => task.owner === member.name && task.status !== "completed" && task.status !== "deleted");
       const memberClaims = allClaims.filter(claim => claim.agent === member.name);
-      const readState = runningReadAgents.get(member.name);
+      const readState = runningReadAgents.get(readAgentKey(teamName, member.name));
       const alive = member.name === "team-lead"
         ? true
         : role === "read"
@@ -859,7 +960,9 @@ export default function (pi: ExtensionAPI) {
     prompt: string,
     ctx: any
   ): Promise<void> {
+    const key = readAgentKey(readTeamName, member.name);
     const state: RunningReadAgent = {
+      runId: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
       name: member.name,
       teamName: readTeamName,
       startedAt: Date.now(),
@@ -869,7 +972,7 @@ export default function (pi: ExtensionAPI) {
       model: member.model,
       thinking: member.thinking,
     };
-    runningReadAgents.set(member.name, state);
+    runningReadAgents.set(key, state);
     ensureReadAgentStatusTicker();
 
     let heartbeatTimer: NodeJS.Timeout | null = null;
@@ -956,7 +1059,24 @@ export default function (pi: ExtensionAPI) {
       pushReadAgentEvent(state, "sending report");
       renderReadAgentStatus();
 
+      if (state.stopRequested || !isCurrentReadAgentRun(key, state)) return;
+
       const report = getLastAssistantText(session.messages) || "Read agent completed, but produced no assistant text.";
+      rememberCompletedAgentReport(readTeamName, {
+        name: member.name,
+        role: "read",
+        status: "completed",
+        report,
+        summary: `Read agent ${member.name} completed`,
+        completedAt: Date.now(),
+        startedAt: state.startedAt,
+        elapsedMs: Date.now() - state.startedAt,
+        tokensUsed: state.tokensUsed,
+        model: member.model,
+        thinking: member.thinking,
+        color: member.color,
+        source: "read-agent",
+      });
       if (!isTeammate && teamName === readTeamName) {
         // In-process reader in the lead session: deliver the report straight to
         // the main window (collapsed, auto-synthesized). No inbox, no polling.
@@ -965,41 +1085,56 @@ export default function (pi: ExtensionAPI) {
         await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", report, `Read agent ${member.name} completed`, member.color);
       }
     } catch (e) {
-      const failureReport = `Read agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
-      if (!isTeammate && teamName === readTeamName) {
-        emitAgentReport(member.name, state.startedAt, state.tokensUsed, failureReport, false);
-      } else {
-        await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", failureReport, `Read agent ${member.name} failed`, "red");
-      }
-      try {
-        await runtime.writeRuntimeStatus(readTeamName, member.name, {
-          lastHeartbeatAt: Date.now(),
-          lastError: runtime.createRuntimeError(e),
+      if (!state.stopRequested && isCurrentReadAgentRun(key, state)) {
+        const failureReport = `Read agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
+        rememberCompletedAgentReport(readTeamName, {
+          name: member.name,
+          role: "read",
+          status: "failed",
+          report: failureReport,
+          summary: `Read agent ${member.name} failed`,
+          completedAt: Date.now(),
+          startedAt: state.startedAt,
+          elapsedMs: Date.now() - state.startedAt,
+          tokensUsed: state.tokensUsed,
+          model: member.model,
+          thinking: member.thinking,
+          color: "red",
+          source: "read-agent",
         });
-      } catch {
-        // Ignore runtime cleanup races.
+        if (!isTeammate && teamName === readTeamName) {
+          emitAgentReport(member.name, state.startedAt, state.tokensUsed, failureReport, false);
+        } else {
+          await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", failureReport, `Read agent ${member.name} failed`, "red");
+        }
+        try {
+          await runtime.writeRuntimeStatus(readTeamName, member.name, {
+            lastHeartbeatAt: Date.now(),
+            lastError: runtime.createRuntimeError(e),
+          });
+        } catch {
+          // Ignore runtime cleanup races.
+        }
       }
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
-      try {
-        if (state.session?.isStreaming) {
-          await state.session.abort();
-        }
-      } catch {
-        // Ignore abort errors after normal completion.
+      if (state.session) {
+        await shutdownReadAgentSession(state.session);
       }
       state.session?.dispose();
-      runningReadAgents.delete(member.name);
-      await releaseAllClaimsForAgent(readTeamName, member.name);
-      try {
-        await runtime.deleteRuntimeStatus(readTeamName, member.name);
-      } catch {
-        // Ignore cleanup races.
-      }
-      try {
-        await teams.removeMember(readTeamName, member.name);
-      } catch {
-        // Ignore cleanup races.
+      if (isCurrentReadAgentRun(key, state)) {
+        runningReadAgents.delete(key);
+        await releaseAllClaimsForAgent(readTeamName, member.name);
+        try {
+          await runtime.deleteRuntimeStatus(readTeamName, member.name);
+        } catch {
+          // Ignore cleanup races.
+        }
+        try {
+          await teams.removeMember(readTeamName, member.name);
+        } catch {
+          // Ignore cleanup races.
+        }
       }
       renderReadAgentStatus();
     }
@@ -1177,22 +1312,51 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  async function shutdownReadAgentSession(session: AgentSession | undefined): Promise<void> {
+    if (!session?.abort) return;
+
+    try {
+      await Promise.race([
+        session.abort(),
+        new Promise<void>((resolve) => setTimeout(resolve, 2500)),
+      ]);
+    } catch {
+      // Ignore abort races: the read-agent should continue teardown regardless.
+    }
+  }
+
+  async function shutdownTeammate(
+    teamName: string,
+    member: Member,
+    options: { drainQueue?: boolean } = {}
+  ): Promise<void> {
+    if (member.name === "team-lead") return;
+
+    const drainQueue = options.drainQueue ?? true;
+    await releaseAllClaimsForAgent(teamName, member.name);
+    await killTeammate(teamName, member);
+    await teams.removeMember(teamName, member.name);
+    if (drainQueue && (member.role ?? "write") === "write") {
+      await drainWriteQueue(teamName);
+    }
+  }
+
   async function killTeammate(teamName: string, member: Member) {
     if (member.name === "team-lead") return;
 
-    await releaseAllClaimsForAgent(teamName, member.name);
-
     if (member.role === "read") {
-      const state = runningReadAgents.get(member.name);
+      const key = readAgentKey(teamName, member.name);
+      const state = runningReadAgents.get(key);
+      if (state) {
+        state.stopRequested = true;
+      }
       if (state?.session) {
-        try {
-          await state.session.abort();
-        } catch {
-          // Ignore abort errors during shutdown.
-        }
+        await shutdownReadAgentSession(state.session);
         state.session.dispose();
       }
-      runningReadAgents.delete(member.name);
+      if (state && isCurrentReadAgentRun(key, state)) {
+        runningReadAgents.delete(key);
+      }
       renderReadAgentStatus();
       await runtime.deleteRuntimeStatus(teamName, member.name);
       return;
@@ -1215,7 +1379,6 @@ export default function (pi: ExtensionAPI) {
 
     await runtime.deleteRuntimeStatus(teamName, member.name);
   }
-
   function teammateRuntimeIsStale(status: runtime.AgentRuntimeStatus | null, maxAgeMs: number): boolean {
     if (!status) return false;
     const lastActivity = status.lastHeartbeatAt || status.startedAt || 0;
@@ -1223,8 +1386,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function reapTeammate(teamName: string, member: Member, reason: string): Promise<void> {
-    await killTeammate(teamName, member);
-    await teams.removeMember(teamName, member.name);
+    await shutdownTeammate(teamName, member);
     await messaging.sendPlainMessage(
       teamName,
       "watchdog",
@@ -1233,9 +1395,6 @@ export default function (pi: ExtensionAPI) {
       `Watchdog reaped ${member.name}`,
       "yellow"
     );
-    if ((member.role ?? "write") === "write") {
-      await drainWriteQueue(teamName);
-    }
   }
 
   async function runWatchdogOnce(targetTeamName: string): Promise<void> {
@@ -1250,7 +1409,7 @@ export default function (pi: ExtensionAPI) {
       const runtimeStale = teammateRuntimeIsStale(runtimeStatus, staleMs);
 
       if (role === "read") {
-        if (runtimeStale && !runningReadAgents.has(member.name)) {
+        if (runtimeStale && !runningReadAgents.has(readAgentKey(targetTeamName, member.name))) {
           await reapTeammate(targetTeamName, member, "read-agent heartbeat is stale and no in-process session is running");
         }
         continue;
@@ -1287,6 +1446,7 @@ export default function (pi: ExtensionAPI) {
     const config = await teams.readConfig(panelTeamName);
     const allTasks = await tasks.listTasks(panelTeamName).catch(() => []);
     const allClaims = await claims.listClaims(panelTeamName).catch(() => []);
+    const activeNames = new Set(config.members.filter((m) => m.name !== "team-lead").map((m) => m.name));
     const items = [] as Array<{
       name: string;
       role: string;
@@ -1300,10 +1460,14 @@ export default function (pi: ExtensionAPI) {
       claimPaths: string[];
       recentEvents: string[];
       runtimeStatus: any;
+      completed: boolean;
+      completedAt?: number;
+      summary?: string;
+      reportText?: string;
     }>;
 
     for (const member of config.members.filter((m) => m.name !== "team-lead")) {
-      const readState = runningReadAgents.get(member.name);
+      const readState = runningReadAgents.get(readAgentKey(panelTeamName, member.name));
       const runtimeStatus = await runtime.readRuntimeStatus(panelTeamName, member.name).catch(() => null);
       const unreadCount = (await messaging.readInbox(panelTeamName, member.name, true, false).catch(() => [])).length;
       const role = member.role || "write";
@@ -1328,15 +1492,65 @@ export default function (pi: ExtensionAPI) {
         claimPaths: allClaims.filter((claim) => claim.agent === member.name).map((claim) => claim.path),
         recentEvents: readState?.recentEvents || [],
         runtimeStatus,
+        completed: false,
       });
     }
 
-    return items.sort((a, b) => a.name.localeCompare(b.name));
+    const leadInboxMessages = await messaging.readInbox(panelTeamName, "team-lead", false, false).catch(() => []);
+    const completedFromInbox: CompletedAgentReport[] = leadInboxMessages
+      .filter((message: any) => {
+        const from = String(message.from || "");
+        return from && from !== "team-lead" && from !== "system" && from !== "watchdog" && !activeNames.has(from);
+      })
+      .map((message: any) => ({
+        name: String(message.from),
+        role: "write",
+        status: "completed" as const,
+        report: String(message.text || ""),
+        summary: String(message.summary || "Final report"),
+        completedAt: message.timestamp ? new Date(message.timestamp).getTime() : Date.now(),
+        color: message.color,
+        source: "lead-inbox" as const,
+      }));
+
+    const completed = [...(completedAgentReports.get(panelTeamName) ?? []), ...completedFromInbox]
+      .filter((report) => report.report.trim().length > 0)
+      .sort((a, b) => b.completedAt - a.completedAt);
+    const seenCompleted = new Set<string>();
+    for (const report of completed) {
+      const dedupeKey = `${report.name}:${report.completedAt}:${report.summary || ""}`;
+      if (seenCompleted.has(dedupeKey)) continue;
+      seenCompleted.add(dedupeKey);
+      items.push({
+        name: report.name,
+        role: report.role,
+        status: report.status,
+        model: report.model,
+        thinking: report.thinking,
+        unreadCount: 0,
+        elapsedMs: report.elapsedMs ?? (report.startedAt ? report.completedAt - report.startedAt : 0),
+        tokensUsed: report.tokensUsed || 0,
+        taskSubjects: [],
+        claimPaths: [],
+        recentEvents: [],
+        runtimeStatus: null,
+        completed: true,
+        completedAt: report.completedAt,
+        summary: report.summary,
+        reportText: report.report,
+      });
+    }
+
+    return items.sort((a, b) => {
+      if (a.completed !== b.completed) return a.completed ? 1 : -1;
+      if (a.completed && b.completed) return (b.completedAt || 0) - (a.completedAt || 0);
+      return a.name.localeCompare(b.name);
+    });
   }
 
   // Commands
   pi.registerCommand("team", {
-    description: "Switch between the main session and each teammate's live view (↑/↓).",
+    description: "Switch between main + teammates (↑/↓), refresh (r), or stop selected teammate (x).",
     handler: async (args, ctx) => {
       const panelTeamName = args.trim() || teamName;
       if (!panelTeamName) {
@@ -1349,6 +1563,8 @@ export default function (pi: ExtensionAPI) {
       // press ↓ to move main → agent → next agent and the right pane changes.
       let selectedIndex = 0;
       let loading = false;
+      let focusedPane: "list" | "log" = "list";
+      let logOffsetFromBottom = 0;
 
       // pi's ExtensionAPI has no API to swap the primary transcript view, so this
       // lives in a focused custom() overlay. Read agents run in-process, so their
@@ -1366,6 +1582,7 @@ export default function (pi: ExtensionAPI) {
             .then((nextItems) => {
               items = nextItems;
               selectedIndex = Math.min(selectedIndex, Math.max(0, entryCount() - 1));
+              logOffsetFromBottom = 0;
             })
             .finally(() => {
               loading = false;
@@ -1374,14 +1591,20 @@ export default function (pi: ExtensionAPI) {
         };
 
         const buildLeftRows = (): string[] => {
-          const rows: string[] = [purple("views")];
+          const rows: string[] = [focusedPane === "list" ? pink("views ◂") : purple("views")];
           const mainSelected = selectedIndex === 0;
           rows.push(`${mainSelected ? pink("▸") : " "} ${mainSelected ? pink("main") : "main"}  ${dimAnsi("lead")}`);
+          let completedHeadingShown = false;
           for (const [index, item] of items.entries()) {
+            if (item.completed && !completedHeadingShown) {
+              rows.push("");
+              rows.push(purple("completed"));
+              completedHeadingShown = true;
+            }
             const selected = index + 1 === selectedIndex;
             const pointer = selected ? pink("▸") : " ";
-            const role = item.role === "read" ? pink("read") : purple("write");
-            const health = item.status.includes("dead") ? "dead" : item.status;
+            const role = item.completed ? dimAnsi("done") : item.role === "read" ? pink("read") : purple("write");
+            const health = item.completed ? item.status : item.status.includes("dead") ? "dead" : item.status;
             rows.push(`${pointer} ${selected ? pink(item.name) : item.name}  ${role}  ${dimAnsi(health)}`);
           }
           return rows;
@@ -1392,15 +1615,18 @@ export default function (pi: ExtensionAPI) {
           const rows: string[] = [];
 
           if (selectedIndex === 0) {
-            const readers = items.filter((item) => item.role === "read");
-            const writers = items.filter((item) => item.role !== "read");
+            const activeReaders = items.filter((item) => !item.completed && item.role === "read");
+            const activeWriters = items.filter((item) => !item.completed && item.role !== "read");
+            const completed = items.filter((item) => item.completed);
             rows.push(pink(`main · ${panelTeamName}`));
+            rows.push(focusedPane === "log" ? pink("log pane focused") : dimAnsi("press → to focus log pane"));
             rows.push("");
-            rows.push(`${purple("read agents")}   ${readers.length} (in-process)`);
-            rows.push(`${purple("write agents")}  ${writers.length} (tmux panes)`);
+            rows.push(`${purple("read agents")}   ${activeReaders.length} (in-process)`);
+            rows.push(`${purple("write agents")}  ${activeWriters.length} (tmux panes)`);
+            rows.push(`${purple("completed")}     ${completed.length}`);
             rows.push(`${purple("lead inbox")}    ${leadInboxUnreadCount} unread`);
             rows.push("");
-            rows.push(dimAnsi("This is your lead session. Select an agent on the left to inspect it."));
+            rows.push(dimAnsi("Select an active or completed agent on the left to inspect its live transcript or final output."));
             return rows.flatMap(wrap);
           }
 
@@ -1408,6 +1634,16 @@ export default function (pi: ExtensionAPI) {
           if (!item) return [dimAnsi("No teammates.")];
 
           rows.push(pink(item.name));
+          if (item.completed) {
+            rows.push(`${purple("status")} ${item.status}   ${purple("completed")} ${item.completedAt ? new Date(item.completedAt).toLocaleString() : "unknown"}`);
+            if (item.elapsedMs > 0 || item.tokensUsed > 0) rows.push(`${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
+            if (item.summary) rows.push(`${purple("summary")} ${item.summary}`);
+            rows.push("");
+            rows.push(purple("final output"));
+            rows.push(item.reportText || dimAnsi("(completed agent produced no output)"));
+            return rows.flatMap(wrap);
+          }
+
           rows.push(`${purple("role")} ${item.role}   ${purple("status")} ${item.status}   ${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
           rows.push(`${purple("model")} ${item.model || "(inherited)"}${item.thinking && item.thinking !== "off" ? `   ${purple("thinking")} ${item.thinking}` : ""}`);
           if (item.role === "read") rows.push(dimAnsi("in-process · promote_teammate moves it into a tmux pane"));
@@ -1417,7 +1653,7 @@ export default function (pi: ExtensionAPI) {
           rows.push("");
 
           if (item.role === "read") {
-            const session = runningReadAgents.get(item.name)?.session;
+            const session = runningReadAgents.get(readAgentKey(panelTeamName, item.name))?.session;
             const transcript = session ? formatTranscriptLines(session.messages) : [];
             if (transcript.length > 0) {
               rows.push(purple("transcript"));
@@ -1438,41 +1674,80 @@ export default function (pi: ExtensionAPI) {
             }
           }
 
-          const wrapped = rows.flatMap(wrap);
-          // Show the tail so the latest activity stays in view.
-          return wrapped.length > 200 ? wrapped.slice(-200) : wrapped;
+          return rows.flatMap(wrap);
+        };
+
+        const shutdownSelected = async () => {
+          if (selectedIndex === 0) {
+            ctx.ui.notify("Select a teammate (not main) to stop.", "warning");
+            return;
+          }
+          const item = items[selectedIndex - 1];
+          if (!item) {
+            ctx.ui.notify("No teammate is selected.", "warning");
+            return;
+          }
+          if (item.completed) {
+            ctx.ui.notify(`${item.name} is already completed.`, "info");
+            return;
+          }
+
+          loading = true;
+          tui.requestRender();
+          try {
+            const config = await teams.readConfig(panelTeamName);
+            const member = config.members.find((member) => member.name === item.name && member.name !== "team-lead");
+            if (!member) {
+              ctx.ui.notify(`Could not find member ${item.name} in team config.`, "warning");
+              return;
+            }
+            await shutdownTeammate(panelTeamName, member);
+            items = await buildTeamPanelItems(panelTeamName);
+            selectedIndex = Math.min(selectedIndex, Math.max(0, items.length));
+            ctx.ui.notify(`Stopped ${item.name}.`, "info");
+          } catch (error) {
+            ctx.ui.notify(`Failed to stop ${item.name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+          } finally {
+            loading = false;
+            tui.requestRender();
+          }
         };
 
         const render = (width: number): string[] => {
-          const usable = Math.max(50, width - 2);
-          const lines: string[] = [];
-          lines.push(pink(`▣ team ${panelTeamName}`) + (loading ? purple("  refreshing…") : ""));
-          lines.push(dimAnsi("↑/↓ or j/k: switch view   r: refresh   esc: close"));
-          lines.push("");
+          // Reserve the side borders and their one-space inner padding.
+          const innerWidth = Math.max(48, width - 4);
 
-          const leftWidth = Math.min(30, Math.max(20, Math.floor(usable * 0.34)));
-          const rightWidth = Math.max(20, usable - leftWidth - 3);
+          const header: string[] = [];
+          header.push(pink(`▣ team ${panelTeamName}`) + (loading ? purple("  refreshing…") : ""));
+          header.push(dimAnsi("←/→ or h/l: focus list/log   list ↑/↓: select   log ↑/↓: scroll 5   r: refresh   x: stop selected   esc: close"));
+
+          const leftWidth = Math.min(30, Math.max(20, Math.floor(innerWidth * 0.34)));
+          const rightWidth = Math.max(20, innerWidth - leftWidth - 3);
           const sep = dimAnsi(" │ ");
 
           // Fixed panel height (the overlay clips at maxHeight). A stable line
           // count keeps the floating panel from resizing as the transcript grows.
+          // Budget rows for the two header lines, the mid rule, and both borders.
           const maxRows = Math.max(8, Math.floor((tui.terminal?.rows ?? 24) * 0.82));
-          const bodyHeight = Math.max(3, maxRows - lines.length);
+          const bodyHeight = Math.max(3, maxRows - header.length - 3);
 
           const leftRows = buildLeftRows();
           const rightRows = buildRightRows(rightWidth);
-          // Pin the left list to the top; show the transcript's tail so the
-          // latest activity stays in view within the fixed body height.
-          const rightTail = rightRows.length > bodyHeight ? rightRows.slice(-bodyHeight) : rightRows;
+          const rightStart = logWindowStart(rightRows.length, bodyHeight, logOffsetFromBottom);
+          const rightWindow = rightRows.slice(rightStart, rightStart + bodyHeight);
+
+          // Header spans the full width; a mid rule separates it from the
+          // two-column body so the dark panel never blurs section boundaries.
+          const content: string[] = [...header, purple("─".repeat(innerWidth))];
           for (let i = 0; i < bodyHeight; i++) {
             const left = truncateToWidth(leftRows[i] ?? "", leftWidth, "…", true);
-            const right = truncateToWidth(rightTail[i] ?? "", rightWidth);
-            lines.push(`${left}${sep}${right}`);
+            const right = truncateToWidth(rightWindow[i] ?? "", rightWidth);
+            content.push(`${left}${sep}${right}`);
           }
 
-          // Pad every line to the full panel width so it renders as a solid
-          // floating box — no transcript bleeding through the gaps.
-          return lines.map((line) => truncateToWidth(line, usable, "", true));
+          // Border + dark fill paints every cell so the transcript underneath
+          // never bleeds through the floating panel.
+          return framePanel(content, innerWidth);
         };
 
         return {
@@ -1486,18 +1761,43 @@ export default function (pi: ExtensionAPI) {
               done();
               return;
             }
+            if (isRightInput(data)) {
+              focusedPane = "log";
+              tui.requestRender();
+              return;
+            }
+            if (isLeftInput(data)) {
+              focusedPane = "list";
+              tui.requestRender();
+              return;
+            }
             if (isDownInput(data)) {
-              selectedIndex = Math.min(entryCount() - 1, selectedIndex + 1);
+              if (focusedPane === "log") {
+                logOffsetFromBottom = Math.max(0, logOffsetFromBottom - 5);
+              } else {
+                selectedIndex = Math.min(entryCount() - 1, selectedIndex + 1);
+                logOffsetFromBottom = 0;
+              }
               tui.requestRender();
               return;
             }
             if (isUpInput(data)) {
-              selectedIndex = Math.max(0, selectedIndex - 1);
+              if (focusedPane === "log") {
+                logOffsetFromBottom += 5;
+              } else {
+                selectedIndex = Math.max(0, selectedIndex - 1);
+                logOffsetFromBottom = 0;
+              }
               tui.requestRender();
               return;
             }
             if (data === "r" || data === "R") {
               refresh();
+              return;
+            }
+            if (data === "x" || data === "X") {
+              void shutdownSelected();
+              return;
             }
           },
         };
@@ -1582,8 +1882,7 @@ export default function (pi: ExtensionAPI) {
     // If a teammate with this name already exists, replace it (handles restarts).
     const existingMember = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
     if (existingMember) {
-      await killTeammate(safeTeamName, existingMember);
-      await teams.removeMember(safeTeamName, safeName);
+      await shutdownTeammate(safeTeamName, existingMember);
     }
 
     const settings = loadSettings({ projectDir: cwd });
@@ -1771,18 +2070,24 @@ export default function (pi: ExtensionAPI) {
 
       const config = await teams.readConfig(safeTeamName);
       const member = config.members.find(m => m.name === safeName);
-      const state = runningReadAgents.get(safeName);
+      const key = readAgentKey(safeTeamName, safeName);
+      const state = runningReadAgents.get(key);
       const prompt = params.prompt || member?.prompt;
       if (!prompt) {
         throw new Error(`No mission found for ${params.name}; pass prompt to set one.`);
       }
 
       // Stop the in-process session and clear its runtime state.
+      if (state) {
+        state.stopRequested = true;
+      }
       if (state?.session) {
-        try { await state.session.abort(); } catch { /* already stopping */ }
+        await shutdownReadAgentSession(state.session);
         state.session.dispose();
       }
-      runningReadAgents.delete(safeName);
+      if (state && isCurrentReadAgentRun(key, state)) {
+        runningReadAgents.delete(key);
+      }
       renderReadAgentStatus();
       await runtime.deleteRuntimeStatus(safeTeamName, safeName).catch(() => {});
       if (member) await teams.removeMember(safeTeamName, safeName).catch(() => {});
@@ -2269,7 +2574,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const config = await teams.readConfig(teamName);
         for (const member of config.members) {
-          await killTeammate(teamName, member);
+          await shutdownTeammate(teamName, member, { drainQueue: false });
         }
         const dir = paths.teamDir(teamName);
         const tasksDir = paths.taskDir(teamName);
@@ -2351,7 +2656,7 @@ export default function (pi: ExtensionAPI) {
 
       let alive = false;
       if (member.role === "read") {
-        alive = runningReadAgents.has(member.name) || (!!runtimeStatus && hasRecentHeartbeat && member.isActive !== false);
+        alive = runningReadAgents.has(readAgentKey(params.team_name, member.name)) || (!!runtimeStatus && hasRecentHeartbeat && member.isActive !== false);
       } else if (member.tmuxPaneId && terminal) {
         alive = terminal.isAlive(member.tmuxPaneId);
       }
@@ -2411,9 +2716,7 @@ export default function (pi: ExtensionAPI) {
       const member = config.members.find(m => m.name === params.agent_name);
       if (!member) throw new Error(`Teammate ${params.agent_name} not found`);
 
-      await killTeammate(params.team_name, member);
-      await teams.removeMember(params.team_name, params.agent_name);
-      await drainWriteQueue(params.team_name);
+      await shutdownTeammate(params.team_name, member);
       return {
         content: [{ type: "text", text: `Teammate ${params.agent_name} has been shut down.` }],
         details: {},

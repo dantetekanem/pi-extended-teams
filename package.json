@@ -1,6 +1,6 @@
 {
   "name": "pi-extended-teams",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "tmux-only, self-managing, role-aware agent teams for pi", 
   "repository": {
     "type": "git",
@@ -43,7 +43,6 @@
     "@sinclair/typebox": "*"
   },
   "pi": {
-    "image": "https://raw.githubusercontent.com/dantetekanem/pi-extended-teams/main/pi-team-in-action.png",
     "extensions": [
       "extensions/index.ts"
     ],

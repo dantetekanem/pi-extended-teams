@@ -196,11 +196,28 @@ describe("resolveAllowedExtensions", () => {
     const s = structuredClone(DEFAULT_SETTINGS);
     s.extensions.allow = ["pi-emote", "my-ext", "noisy"];
     s.extensions.block = ["noisy"];
-    expect(resolveAllowedExtensions(s)).toEqual(["pi-emote", "my-ext"]);
+    expect(resolveAllowedExtensions(s, { homeDir })).toEqual(["pi-emote", "my-ext"]);
   });
 
   it("is empty by default", () => {
-    expect(resolveAllowedExtensions(structuredClone(DEFAULT_SETTINGS))).toEqual([]);
+    expect(resolveAllowedExtensions(structuredClone(DEFAULT_SETTINGS), { homeDir })).toEqual([]);
+  });
+
+  it("auto-loads an installed provider bootstrap extension", () => {
+    const bootstrap = path.join(homeDir, ".pi", "agent", "extensions", "shopify-proxy");
+    fs.mkdirSync(bootstrap, { recursive: true });
+
+    expect(resolveAllowedExtensions(structuredClone(DEFAULT_SETTINGS), { homeDir })).toEqual([bootstrap]);
+  });
+
+  it("blocks provider bootstrap extensions by name", () => {
+    const bootstrap = path.join(homeDir, ".pi", "agent", "extensions", "shopify-proxy");
+    fs.mkdirSync(bootstrap, { recursive: true });
+    const s = structuredClone(DEFAULT_SETTINGS);
+    s.extensions.allow = ["custom-ext"];
+    s.extensions.block = ["shopify-proxy"];
+
+    expect(resolveAllowedExtensions(s, { homeDir })).toEqual(["custom-ext"]);
   });
 });
 

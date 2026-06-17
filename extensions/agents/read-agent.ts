@@ -11,6 +11,7 @@ import * as teams from "../../src/utils/teams";
 import type { Member } from "../../src/utils/models";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { getLastAssistantText } from "../ui/renderers";
+import { createAgentCommunicationTools } from "../tools/agent-communication-tools";
 
 export interface RunReadAgentOptions {
   isTeammate: boolean;
@@ -23,6 +24,9 @@ export interface RunReadAgentOptions {
   rememberCompletedAgentReport(teamName: string, report: CompletedAgentReport): void;
   emitAgentReport(name: string, startedAt: number, tokens: number, report: string, ok: boolean): void;
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
+  agentName?: string;
+  quietTrigger?(content: string): void;
+  renderLeadInboxStatus?(): Promise<void>;
 }
 
 function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
@@ -62,6 +66,51 @@ export async function shutdownReadAgentSession(session: AgentSession | undefined
     ]);
   } catch {
     // Ignore abort races: the read-agent should continue teardown regardless.
+  }
+}
+
+async function hasRecentMessageFrom(teamName: string, fromName: string, toName: string, sinceMs: number): Promise<boolean> {
+  const messages = await messaging.readInbox(teamName, toName, false, false).catch(() => []);
+  return messages.some((message: any) => {
+    const timestamp = message.timestamp ? new Date(message.timestamp).getTime() : 0;
+    return message.from === fromName && timestamp >= sinceMs - 1000 && String(message.text || "").trim().length > 0;
+  });
+}
+
+async function ensureReadHelperCompletionMessages(
+  teamName: string,
+  member: Member,
+  startedAt: number,
+  report: string,
+  outcome: "completed" | "failed" = "completed",
+  color = member.color
+): Promise<void> {
+  if (!member.requestedBy) return;
+
+  const requesterHasReport = await hasRecentMessageFrom(teamName, member.name, member.requestedBy, startedAt);
+  if (!requesterHasReport) {
+    await messaging.sendPlainMessage(
+      teamName,
+      member.name,
+      member.requestedBy,
+      report,
+      outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
+      color
+    );
+  }
+
+  const leadHasNotice = await hasRecentMessageFrom(teamName, member.name, "team-lead", startedAt);
+  if (!leadHasNotice) {
+    await messaging.sendPlainMessage(
+      teamName,
+      member.name,
+      "team-lead",
+      outcome === "failed"
+        ? `Read helper ${member.name} failed for ${member.requestedBy}. Failure report sent to ${member.requestedBy}.`
+        : `Read helper ${member.name} completed for ${member.requestedBy}. Report sent to ${member.requestedBy}.`,
+      outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} done`,
+      color
+    );
   }
 }
 
@@ -125,18 +174,30 @@ export async function runReadAgentInProcess(
         `You are read-only investigator '${member.name}' on team '${readTeamName}', running in-process in the lead session.`,
         "You have the full toolset and may run any read-only shell command you need to investigate — git status/log/diff/show, grep/rg, ls, cat, running tests or builds, etc.",
         "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
+        "Use send_message, broadcast_message, and read_inbox to coordinate with the lead and other teammates when needed.",
+        member.requestedBy
+          ? `You are a read helper requested by '${member.requestedBy}'. When finished, you must call send_message to send your full report to '${member.requestedBy}', then call send_message to send only a short done notification to team-lead. After both messages are sent, write a brief final answer confirming the report was sent and stop. There is no exception to this rule.`
+          : "You cannot spawn, promote, or create other agents. If another agent is needed, call request_teammate to ask the team lead to decide and spawn it.",
         "NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.",
-        "When finished, produce your final report and stop. Do not wait for the lead to kill you — report and exit cleanly.",
+        "When finished, send or produce your final report as instructed, then stop. Do not wait for the lead to kill you — report and exit cleanly.",
       ],
     });
     await loader.reload();
+
+    const communicationTools = createAgentCommunicationTools({
+      isTeammate: true,
+      agentName: member.name,
+      getTeamName: () => readTeamName,
+    });
+    const communicationToolNames = communicationTools.map(tool => tool.name);
 
     const { session } = await createAgentSession({
       cwd: member.cwd,
       model,
       thinkingLevel: member.thinking as any,
       modelRegistry: ctx.modelRegistry,
-      tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+      tools: ["read", "bash", "edit", "write", "grep", "find", "ls", ...communicationToolNames],
+      customTools: communicationTools,
       resourceLoader: loader,
       sessionManager: SessionManager.inMemory(member.cwd),
     });
@@ -198,9 +259,16 @@ export async function runReadAgentInProcess(
       model: member.model,
       thinking: member.thinking,
       color: member.color,
+      requestedBy: member.requestedBy,
       source: "read-agent",
     });
-    if (!options.isTeammate && options.getTeamName() === readTeamName) {
+    if (member.requestedBy) {
+      await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
+      await options.renderLeadInboxStatus?.().catch(() => {});
+      if (member.requestedBy === options.agentName) {
+        options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox(team_name="${readTeamName}") and continue your task. Do not poll.`);
+      }
+    } else if (!options.isTeammate && options.getTeamName() === readTeamName) {
       options.emitAgentReport(member.name, state.startedAt, state.tokensUsed, report, true);
     } else {
       await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", report, `Read agent ${member.name} completed`, member.color);
@@ -221,9 +289,16 @@ export async function runReadAgentInProcess(
         model: member.model,
         thinking: member.thinking,
         color: "red",
+        requestedBy: member.requestedBy,
         source: "read-agent",
       });
-      if (!options.isTeammate && options.getTeamName() === readTeamName) {
+      if (member.requestedBy) {
+        await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, failureReport, "failed", "red");
+        await options.renderLeadInboxStatus?.().catch(() => {});
+        if (member.requestedBy === options.agentName) {
+          options.quietTrigger?.(`Read helper ${member.name} failed. Read the failure report with read_inbox(team_name="${readTeamName}") and continue or report the blocker. Do not poll.`);
+        }
+      } else if (!options.isTeammate && options.getTeamName() === readTeamName) {
         options.emitAgentReport(member.name, state.startedAt, state.tokensUsed, failureReport, false);
       } else {
         await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", failureReport, `Read agent ${member.name} failed`, "red");

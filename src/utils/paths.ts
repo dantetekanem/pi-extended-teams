@@ -48,6 +48,10 @@ export function writeQueuePath(teamName: string) {
   return path.join(teamDir(teamName), "write-queue.json");
 }
 
+export function readHelperQueuePath(teamName: string) {
+  return path.join(teamDir(teamName), "read-helper-queue.json");
+}
+
 export function sharedMemoryPath(teamName: string) {
   return path.join(teamDir(teamName), "shared-memory.json");
 }

@@ -12,6 +12,7 @@ import { loadSettings, resolveModel, resolveRole, type AgentRole } from "../../s
 import type { Member } from "../../src/utils/models";
 import { countWriteMembers, formatRosterForPrompt } from "../team/roster";
 import type { RunningReadAgent } from "../runtime/types";
+import { requestLeadForTeammateSpawn } from "./delegation-guard";
 
 export interface TeamToolsOptions {
   terminal: any;
@@ -23,8 +24,11 @@ export interface TeamToolsOptions {
   runReadAgentInProcess(teamName: string, member: Member, prompt: string, ctx: any, options: any): void;
   startWriteAgent(teamName: string, member: Member, prompt: string): Promise<string>;
   shutdownTeammate(teamName: string, member: Member, options?: { drainQueue?: boolean }): Promise<void>;
-  adoptTeamAsLead(teamName: string): void;
+  adoptTeamAsLead(teamName: string, ctx?: any): void;
   buildRoster(teamName: string): Promise<any>;
+  isTeammate: boolean;
+  agentName: string;
+  getTeamName(): string | null | undefined;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
@@ -99,7 +103,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     }
 
     await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
-    const activeWriteCount = await countWriteMembers(safeTeamName);
+    const activeWriteCount = await countWriteMembers(safeTeamName, options.terminal);
     await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.request", {
       agentName: safeName,
       cwd,
@@ -153,6 +157,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     }
 
     const terminalId = await options.startWriteAgent(safeTeamName, member, params.prompt);
+    options.renderReadAgentStatus();
     const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
     return {
       content: [{ type: "text", text: `Teammate ${params.name} spawned in pane ${terminalId}.${debugSuffix}` }],
@@ -179,6 +184,14 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       }, { description: "An agent to spawn immediately." }), { description: "Agents to define and spawn as soon as the team is created." })),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (options.isTeammate) {
+        return requestLeadForTeammateSpawn(options, {
+          action: "team_create",
+          params,
+          reason: "Teammate attempted to create a team or spawn inline agents.",
+        });
+      }
+
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
       const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
       const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
@@ -187,7 +200,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       if (teams.teamExists(params.team_name)) cleanupStaleTeam(params.team_name, options.terminal);
 
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, defaultModel);
-      options.adoptTeamAsLead(paths.sanitizeName(params.team_name));
+      options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
 
       const lines = [`Team ${params.team_name} created.`];
       const spawned: any[] = [];
@@ -224,9 +237,17 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (options.isTeammate) {
+        return requestLeadForTeammateSpawn(options, {
+          action: "spawn_teammate",
+          params,
+          reason: "Teammate attempted to spawn another agent directly.",
+        });
+      }
+
       const safeTeamName = paths.sanitizeName(params.team_name);
       if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
-      options.adoptTeamAsLead(safeTeamName);
+      options.adoptTeamAsLead(safeTeamName, ctx);
       return spawnTeammate(params, ctx);
     },
   });
@@ -241,10 +262,18 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       prompt: Type.Optional(Type.String({ description: "Optional updated mission. Defaults to the agent's original mission." })),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (options.isTeammate) {
+        return requestLeadForTeammateSpawn(options, {
+          action: "promote_teammate",
+          params,
+          reason: "Teammate attempted to move/spawn another agent into a pane.",
+        });
+      }
+
       const safeTeamName = paths.sanitizeName(params.team_name);
       const safeName = paths.sanitizeName(params.name);
       if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
-      options.adoptTeamAsLead(safeTeamName);
+      options.adoptTeamAsLead(safeTeamName, ctx);
       if (!options.terminal) throw new Error("pi-extended-teams requires running inside tmux to move an agent into a pane.");
 
       const config = await teams.readConfig(safeTeamName);
@@ -286,8 +315,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     label: "List Teammates",
     description: "List live team roster with roles, status, current tasks, held claims, unread inbox counts, and queued writers.",
     parameters: Type.Object({ team_name: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      if (teams.teamExists(paths.sanitizeName(params.team_name))) options.adoptTeamAsLead(paths.sanitizeName(params.team_name));
+    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (teams.teamExists(paths.sanitizeName(params.team_name))) options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
       const roster = await options.buildRoster(params.team_name);
       return { content: [{ type: "text", text: formatRosterForPrompt(roster) }], details: roster };
     },

@@ -8,6 +8,9 @@ import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import * as sharedMemory from "../../src/utils/shared-memory";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
+import { StringEnum } from "../internal/schema";
+import { requestLeadForTeammateSpawn } from "./delegation-guard";
+import { enqueueReadHelperRequest, listReadHelperQueue } from "../../src/utils/read-helper-queue";
 
 export interface CoordinationToolsOptions {
   agentName: string;
@@ -19,9 +22,34 @@ export interface CoordinationToolsOptions {
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
   drainWriteQueue(teamName: string): Promise<void>;
   resolveSkillFile(skillName: string, cwd: string): string;
-  adoptTeamAsLead(teamName: string): void;
+  adoptTeamAsLead(teamName: string, ctx?: any): void;
   renderLeadInboxStatus(): Promise<void>;
   resetLeadWakeNotifiedCount(): void;
+}
+
+export function buildReadHelperPrompt(teamName: string, requester: string, prompt: string): string {
+  return [
+    `You are a read-only helper requested by write agent '${requester}' on team '${teamName}'.`,
+    "Do not edit files, claim files, install packages, start services, commit, push, deploy, or make mutating changes.",
+    "Investigate only what the requester asked for. Keep the final report concise and evidence-backed.",
+    `When finished, you must call send_message to send your full report to '${requester}', then call send_message to send only a short done notification to team-lead. After both messages are sent, write a brief final answer confirming the report was sent and stop. There is no exception to this rule.`,
+    "Mission:",
+    prompt,
+  ].join("\n\n");
+}
+
+function uniqueGeneratedHelperName(teamConfig: any, requester: string, queuedNames: string[] = []): string {
+  const base = paths.sanitizeName(`${requester}-reader`);
+  const existingNames = new Set([
+    ...(teamConfig.members || []).map((member: any) => member.name),
+    ...queuedNames,
+  ]);
+  if (!existingNames.has(base)) return base;
+  for (let i = 2; i < 1000; i++) {
+    const candidate = `${base}-${i}`;
+    if (!existingNames.has(candidate)) return candidate;
+  }
+  return `${base}-${Date.now().toString(36)}`;
 }
 
 export function registerCoordinationTools(pi: any, options: CoordinationToolsOptions): void {
@@ -166,6 +194,93 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
   });
 
   pi.registerTool({
+    name: "request_read_helper",
+    label: "Request Read Helper",
+    description: "Queue a read-only helper request for the current write agent. The lead runtime starts the helper outside the writer process; the helper's full report is delivered back to the requester and team-lead receives only a short done notification.",
+    parameters: Type.Object({
+      team_name: Type.Optional(Type.String({ description: "Team name. Defaults to the current team context." })),
+      name: Type.Optional(Type.String({ description: "Optional helper name. Defaults to '<requester>-reader'." })),
+      prompt: Type.String({ description: "The read-only mission. The helper's final answer becomes the report sent back to the requester." }),
+      cwd: Type.Optional(Type.String({ description: "Working directory for the helper. Defaults to the requester cwd or current cwd." })),
+      model: Type.Optional(Type.String({ description: "Optional fully qualified provider/model. Defaults to the requester/team model." })),
+      thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const)),
+    }),
+    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      const targetTeamName = options.requireTeamContext(params.team_name);
+      if (!options.isTeammate) {
+        return {
+          content: [{ type: "text", text: "You are the team lead. Use spawn_teammate for general read agents, or ask a write agent to call request_read_helper when it needs a private helper report." }],
+          details: { leadOnly: true },
+        };
+      }
+
+      const config = await teams.readConfig(targetTeamName);
+      const requester = config.members.find(member => member.name === options.agentName);
+      if (!requester) throw new Error(`Requester ${options.agentName} is not a member of team ${targetTeamName}.`);
+      if ((requester.role ?? "write") !== "write") throw new Error("request_read_helper is only available to write agents.");
+
+      const pendingHelpers = await listReadHelperQueue(targetTeamName);
+      const queuedNames = pendingHelpers.map(item => item.name);
+      const safeName = params.name ? paths.sanitizeName(String(params.name)) : uniqueGeneratedHelperName(config, options.agentName, queuedNames);
+      const existingMember = config.members.find(member => member.name === safeName);
+      if (existingMember) throw new Error(`Teammate ${safeName} already exists in team ${targetTeamName}. Choose a different helper name.`);
+      if (queuedNames.includes(safeName)) throw new Error(`Read helper request ${safeName} is already queued for team ${targetTeamName}. Choose a different helper name.`);
+
+      const chosenModel = params.model || requester.model || config.defaultModel;
+      if (!chosenModel) throw new Error("No model available for read helper. Pass a fully qualified model or create the team with a default model.");
+      const [provider, modelId] = String(chosenModel).split("/", 2);
+      if (!provider || !modelId || !ctx.modelRegistry?.find?.(provider, modelId)) {
+        throw new Error(`Read helper model \"${chosenModel}\" is not available. Pass a fully qualified available model.`);
+      }
+
+      const queued = await enqueueReadHelperRequest(targetTeamName, {
+        requester: options.agentName,
+        name: safeName,
+        prompt: params.prompt,
+        cwd: params.cwd || requester.cwd || ctx.cwd,
+        model: chosenModel,
+        thinking: params.thinking || requester.thinking,
+      });
+
+      return {
+        content: [{ type: "text", text: `Read helper request ${safeName} accepted. Stop now and wait for the extension wake; do not call read_inbox until you are woken. The helper must send the full report to ${options.agentName}'s inbox before it stops.` }],
+        details: { queued: true, queueId: queued.id, teamName: targetTeamName, helperName: safeName, requester: options.agentName, reportRecipient: options.agentName, leadNotificationRecipient: "team-lead" },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "request_teammate",
+    label: "Request Teammate",
+    description: "Ask the team lead to spawn a teammate. Teammates cannot spawn, promote, or create agents directly.",
+    parameters: Type.Object({
+      team_name: Type.Optional(Type.String({ description: "Team name. Defaults to the current team context." })),
+      name: Type.Optional(Type.String({ description: "Suggested teammate name." })),
+      prompt: Type.String({ description: "The mission the lead should give the teammate if approved." }),
+      role: Type.Optional(StringEnum(["read", "write"] as const, { description: "Requested role. Defaults to read unless the lead chooses otherwise." })),
+      cwd: Type.Optional(Type.String({ description: "Working directory for the requested teammate." })),
+      category: Type.Optional(Type.String({ description: "Optional category preset name." })),
+      model: Type.Optional(Type.String({ description: "Optional fully qualified provider/model." })),
+      thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const)),
+      plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
+      reason: Type.Optional(Type.String({ description: "Why another teammate is needed." })),
+    }),
+    async execute(_toolCallId: string, params: any) {
+      if (!options.isTeammate) {
+        return {
+          content: [{ type: "text", text: "You are the team lead. Use spawn_teammate directly when you decide another agent is needed." }],
+          details: { leadOnly: true },
+        };
+      }
+      return requestLeadForTeammateSpawn(options, {
+        action: "spawn_teammate",
+        params,
+        reason: params.reason,
+      });
+    },
+  });
+
+  pi.registerTool({
     name: "write_shared_memory",
     label: "Write Shared Memory",
     description: "Write or replace a team-shared memory entry by key. Use for durable coordination facts within the current team.",
@@ -223,20 +338,38 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       agent_name: Type.Optional(Type.String({ description: "Whose inbox to read. Defaults to your own." })),
       unread_only: Type.Optional(Type.Boolean({ default: true })),
     }),
-    async execute(_toolCallId: string, params: any) {
+    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       const targetAgent = params.agent_name || options.agentName;
       if (!options.isTeammate && teams.teamExists(paths.sanitizeName(params.team_name))) {
-        options.adoptTeamAsLead(paths.sanitizeName(params.team_name));
+        options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
       }
+      const isSelfTeammateInbox = options.isTeammate && options.getTeamName() && params.team_name === options.getTeamName() && targetAgent === options.agentName;
+      const unreadBeforeRead = isSelfTeammateInbox
+        ? await messaging.readInbox(params.team_name, targetAgent, true, false).catch(() => [])
+        : [];
       const msgs = await messaging.readInbox(params.team_name, targetAgent, params.unread_only);
 
-      if (options.isTeammate && options.getTeamName() && params.team_name === options.getTeamName() && targetAgent === options.agentName) {
+      if (isSelfTeammateInbox) {
         await runtime.writeRuntimeStatus(options.getTeamName()!, options.agentName, {
           lastHeartbeatAt: Date.now(),
           lastInboxReadAt: Date.now(),
           ready: true,
+          currentAction: "thinking",
+          activeToolName: undefined,
           lastError: undefined,
         });
+        for (const message of unreadBeforeRead) {
+          const from = String(message.from || "");
+          if (!from || from === "team-lead" || from === "system" || from === "watchdog") continue;
+          await messaging.sendPlainMessage(
+            params.team_name,
+            options.agentName,
+            "team-lead",
+            `Received helper report from ${from}; continuing.`,
+            `${options.agentName} received helper report`,
+            "green"
+          ).catch(() => {});
+        }
       }
 
       if (!options.isTeammate && params.team_name === options.getTeamName() && targetAgent === options.agentName) {

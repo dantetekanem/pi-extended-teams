@@ -86,7 +86,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
     writeQueueDraining = true;
     try {
       const settings = loadSettings();
-      while (await countWriteMembers(teamName) < settings.writeAgents.maxConcurrent) {
+      while (await countWriteMembers(teamName, options.terminal) < settings.writeAgents.maxConcurrent) {
         const queued = await writeQueue.dequeueWriteSpawn(teamName);
         if (!queued) return;
 

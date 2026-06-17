@@ -27,6 +27,9 @@ export interface AgentRuntimeStatus {
   lastHeartbeatAt?: number;
   lastInboxReadAt?: number;
   ready?: boolean;
+  currentAction?: "starting" | "thinking" | "working" | "finishing" | "done";
+  activeToolName?: string;
+  tokensUsed?: number;
   lastError?: RuntimeError;
 }
 

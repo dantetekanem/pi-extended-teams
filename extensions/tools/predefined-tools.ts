@@ -8,10 +8,14 @@ import * as messaging from "../../src/utils/messaging";
 import * as paths from "../../src/utils/paths";
 import { loadSettings, resolveAllowedExtensions } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
+import { requestLeadForTeammateSpawn } from "./delegation-guard";
 
 export interface PredefinedToolsOptions {
   terminal: any;
-  adoptTeamAsLead(teamName: string): void;
+  adoptTeamAsLead(teamName: string, ctx?: any): void;
+  isTeammate: boolean;
+  agentName: string;
+  getTeamName(): string | null | undefined;
 }
 
 export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions): void {
@@ -59,6 +63,14 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
       default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model) for agents without a specified model. Use list_available_models first. If omitted, the current active model is used." })),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (options.isTeammate) {
+        return requestLeadForTeammateSpawn(options, {
+          action: "create_predefined_team",
+          params,
+          reason: "Teammate attempted to create a predefined team directly.",
+        });
+      }
+
       const projectDir = ctx.cwd;
       const predefinedTeam = predefined.getPredefinedTeam(params.predefined_team, projectDir);
       if (!predefinedTeam) {
@@ -74,7 +86,7 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
       const allowedExtensions = resolveAllowedExtensions(loadSettings({ projectDir: ctx.cwd }));
 
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
-      options.adoptTeamAsLead(paths.sanitizeName(params.team_name));
+      options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
 
       const agentDefinitions = predefined.getAllAgentDefinitions(projectDir);
       const spawnResults: Array<{ name: string; status: string; error?: string }> = [];

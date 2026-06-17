@@ -50,9 +50,16 @@ export async function releaseAllClaimsForAgent(teamName: string, agentName: stri
   }
 }
 
-export async function countWriteMembers(teamName: string): Promise<number> {
+export function isWriteMemberAlive(member: any, terminal: any): boolean {
+  return !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId));
+}
+
+export async function countWriteMembers(teamName: string, terminal?: any): Promise<number> {
   const config = await teams.readConfig(teamName);
-  return config.members.filter(member => member.agentType === "teammate" && (member.role ?? "write") === "write").length;
+  return config.members.filter(member => {
+    if (member.agentType !== "teammate" || (member.role ?? "write") !== "write") return false;
+    return terminal ? isWriteMemberAlive(member, terminal) : true;
+  }).length;
 }
 
 export async function buildRoster(teamName: string, options: BuildRosterOptions) {
@@ -72,7 +79,7 @@ export async function buildRoster(teamName: string, options: BuildRosterOptions)
       ? true
       : role === "read"
         ? !!readState || !!runtimeStatus?.ready
-        : !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
+        : isWriteMemberAlive(member, options.terminal);
 
     return {
       name: member.name,

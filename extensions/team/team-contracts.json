@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "updatedAt": "2026-06-17T00:00:00.000Z",
+  "source": "Leo Pereira session requirements",
+  "contracts": [
+    {
+      "id": "ui.old-bottom-status-kept",
+      "description": "Keep the old bottom-status style: a below-main boxed widget for live team activity. Completed reports arrive as messages/collapsed reports and do not create report-ready or waiting-confirmation status rows."
+    },
+    {
+      "id": "ui.active-reader-writer-info",
+      "description": "Active agent information remains available in the below-main status and /team for both readers and writers, including elapsed/running time, current status/action, model, thinking level, and token count when available. Duplicate active/history entries are preserved rather than hidden."
+    },
+    {
+      "id": "helpers.requested-by-writer",
+      "description": "A read helper spawned for a writer records and displays requestedBy metadata as requested by <writer>."
+    },
+    {
+      "id": "writers.request-only-lead-spawns",
+      "description": "Writer agents never spawn agents directly; they only request helpers/teammates, and the lead/main runtime performs the spawn."
+    },
+    {
+      "id": "messaging.push-on-completion",
+      "description": "Readers send completion messages to the lead; read helpers for writers send the full report to the writer and a short done notification to the lead. Messaging should push instead of requiring polling."
+    },
+    {
+      "id": "completion.remove-from-active-keep-history",
+      "description": "When a reader or writer is done it is removed from active UI/status, but its final report remains visible from /team history."
+    },
+    {
+      "id": "team-command.no-team-safe",
+      "description": "/team works without team_create initialization by showing a no-team/no-current-team message instead of breaking."
+    },
+    {
+      "id": "writers.tmux-closes-when-done",
+      "description": "Writer tmux panes close only after the writer sends its final report and completes cleanup."
+    }
+  ]
+}

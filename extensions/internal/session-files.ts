@@ -19,9 +19,15 @@ export function resolveSkillFile(skillName: string, cwd: string): string {
   return found;
 }
 
-export function findLeadTeamForSession(): string | null {
+export function getPiSessionId(ctx?: any): string | undefined {
+  const id = ctx?.sessionManager?.getSessionId?.();
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+export function findLeadTeamForSession(sessionId?: string): string | null {
+  if (!sessionId) return null;
   try {
-    const teamsDir = paths.TEAMS_DIR;
+    const teamsDir = path.dirname(paths.teamDir("__probe__"));
     if (!fs.existsSync(teamsDir)) return null;
 
     for (const teamDir of fs.readdirSync(teamsDir)) {
@@ -29,7 +35,7 @@ export function findLeadTeamForSession(): string | null {
       if (fs.existsSync(sessionFile)) {
         try {
           const session = JSON.parse(fs.readFileSync(sessionFile, "utf-8"));
-          if (session.pid === process.pid) {
+          if (session.sessionId === sessionId && session.pid === process.pid) {
             return teamDir;
           }
         } catch {
@@ -43,17 +49,19 @@ export function findLeadTeamForSession(): string | null {
   return null;
 }
 
-export function registerLeadSession(teamName: string) {
+export function registerLeadSession(teamName: string, sessionId?: string) {
   const sessionFile = paths.leadSessionPath(teamName);
   const dir = path.dirname(sessionFile);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(sessionFile, JSON.stringify({
     pid: process.pid,
+    sessionId,
     startedAt: Date.now(),
   }));
 }
 
 function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -62,61 +70,110 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-export function cleanupStaleTeam(teamName: string, terminal: any): boolean {
-  const sessionFile = paths.leadSessionPath(teamName);
-  const configFile = paths.configPath(teamName);
+function readJsonFile(filePath: string): any | null {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
 
-  if (!fs.existsSync(sessionFile) || !fs.existsSync(configFile)) {
-    return false;
+function killTeamMemberProcesses(teamName: string, config: any, terminal: any): void {
+  for (const member of config?.members || []) {
+    if (member.name === "team-lead") continue;
+
+    const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
+    if (fs.existsSync(pidFile)) {
+      try {
+        const pid = Number.parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+        if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) process.kill(pid, "SIGKILL");
+        fs.unlinkSync(pidFile);
+      } catch {}
+    }
+
+    if (terminal && member.tmuxPaneId) {
+      try { terminal.kill(member.tmuxPaneId); } catch {}
+    }
+  }
+}
+
+export function forceCleanupTeam(teamName: string, terminal: any): boolean {
+  const config = readJsonFile(paths.configPath(teamName));
+  killTeamMemberProcesses(teamName, config, terminal);
+
+  const teamDirectory = paths.teamDir(teamName);
+  const tasksDirectory = paths.taskDir(teamName);
+  let removed = false;
+  if (fs.existsSync(teamDirectory)) {
+    fs.rmSync(teamDirectory, { recursive: true, force: true });
+    removed = true;
+  }
+  if (fs.existsSync(tasksDirectory)) {
+    fs.rmSync(tasksDirectory, { recursive: true, force: true });
+    removed = true;
+  }
+  return removed;
+}
+
+function teamLastTouchedAt(teamName: string, teamDirectory: string): number {
+  const session = readJsonFile(paths.leadSessionPath(teamName));
+  if (typeof session?.startedAt === "number") return session.startedAt;
+
+  const config = readJsonFile(paths.configPath(teamName));
+  if (typeof config?.createdAt === "number") return config.createdAt;
+
+  try { return fs.statSync(teamDirectory).mtimeMs; } catch { return 0; }
+}
+
+export function cleanupStaleTeam(teamName: string, terminal: any): boolean {
+  const session = readJsonFile(paths.leadSessionPath(teamName));
+  if (!session?.pid) return false;
+  return isPidAlive(Number(session.pid)) ? false : forceCleanupTeam(teamName, terminal);
+}
+
+export interface CleanupOrphanedTeamsOptions {
+  /** How old a team folder without a live lead must be before removal. */
+  maxAgeMs?: number;
+  /** Test seam; defaults to ~/.pi/teams. */
+  teamsRoot?: string;
+  now?: number;
+}
+
+export function cleanupOrphanedTeams(
+  terminal: any,
+  options: CleanupOrphanedTeamsOptions = {}
+): number {
+  const teamsRoot = options.teamsRoot || paths.TEAMS_DIR;
+  if (!fs.existsSync(teamsRoot)) return 0;
+
+  const now = options.now ?? Date.now();
+  const maxAgeMs = options.maxAgeMs ?? 24 * 60 * 60 * 1000;
+  let cleaned = 0;
+
+  for (const dir of fs.readdirSync(teamsRoot)) {
+    const teamDirectory = path.join(teamsRoot, dir);
+    try {
+      if (!fs.statSync(teamDirectory).isDirectory()) continue;
+      paths.sanitizeName(dir);
+
+      const session = readJsonFile(paths.leadSessionPath(dir));
+      if (session?.pid && isPidAlive(Number(session.pid))) continue;
+
+      const missingLiveLead = !session?.pid || !isPidAlive(Number(session.pid));
+      const lastTouchedAt = teamLastTouchedAt(dir, teamDirectory);
+      const oldEnough = maxAgeMs <= 0 || (lastTouchedAt > 0 && (now - lastTouchedAt) > maxAgeMs);
+      const deadLeadPid = !!session?.pid && !isPidAlive(Number(session.pid));
+
+      if (deadLeadPid || (missingLiveLead && oldEnough)) {
+        if (forceCleanupTeam(dir, terminal)) cleaned++;
+      }
+    } catch {
+      // Ignore malformed team directories; cleanup should never disrupt startup.
+    }
   }
 
-  try {
-    const session = JSON.parse(fs.readFileSync(sessionFile, "utf-8"));
-
-    // Only cleanup if the lead PID is actually dead
-    if (session.pid && !isPidAlive(session.pid)) {
-      // Read config to get member info for cleanup
-      try {
-        const config = JSON.parse(fs.readFileSync(configFile, "utf-8"));
-
-        // Kill all teammate panes/windows
-        for (const member of config.members || []) {
-          if (member.name === "team-lead") continue;
-
-          // Kill via PID file
-          const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
-          if (fs.existsSync(pidFile)) {
-            try {
-              const pid = fs.readFileSync(pidFile, "utf-8").trim();
-              process.kill(parseInt(pid), "SIGKILL");
-              fs.unlinkSync(pidFile);
-            } catch {}
-          }
-
-          // Kill via terminal adapter
-          if (terminal && member.tmuxPaneId) {
-            try { terminal.kill(member.tmuxPaneId); } catch {}
-          }
-        }
-      } catch {}
-
-      // Delete entire team directory
-      const teamDirectory = paths.teamDir(teamName);
-      if (fs.existsSync(teamDirectory)) {
-        fs.rmSync(teamDirectory, { recursive: true });
-      }
-
-      // Delete tasks directory
-      const tasksDirectory = paths.taskDir(teamName);
-      if (fs.existsSync(tasksDirectory)) {
-        fs.rmSync(tasksDirectory, { recursive: true });
-      }
-
-      return true;
-    }
-  } catch {}
-
-  return false;
+  return cleaned;
 }
 
 export function cleanupAgentSessionFolders(maxAgeMs: number = 24 * 60 * 60 * 1000): number {

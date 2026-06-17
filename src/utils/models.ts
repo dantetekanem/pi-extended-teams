@@ -22,6 +22,10 @@ export interface Member {
   role?: "read" | "write";
   /** Optional category preset name from settings.json. */
   category?: string;
+  /** Agent that requested this read helper; final reports are delivered there. */
+  requestedBy?: string;
+  /** Marks extension-managed helper agents with special delivery/cleanup semantics. */
+  helperKind?: "read_helper";
 }
 
 export interface TeamConfig {

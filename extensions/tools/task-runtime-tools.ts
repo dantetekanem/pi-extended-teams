@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "../internal/schema";
-import { cleanupAgentSessionFolders } from "../internal/session-files";
+import { cleanupAgentSessionFolders, cleanupOrphanedTeams } from "../internal/session-files";
 import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
 import * as tasks from "../../src/utils/tasks";
@@ -100,9 +100,10 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
         if (fs.existsSync(tasksDir)) fs.rmSync(tasksDir, { recursive: true });
         if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
         const cleanedSessions = cleanupAgentSessionFolders(60 * 60 * 1000);
+        const cleanedTeams = cleanupOrphanedTeams(options.terminal, { maxAgeMs: 60 * 60 * 1000 });
         return {
-          content: [{ type: "text", text: `Team ${teamName} shut down.${cleanedSessions > 0 ? ` Cleaned up ${cleanedSessions} orphaned agent session folder(s).` : ""}` }],
-          details: { cleanedSessions },
+          content: [{ type: "text", text: `Team ${teamName} shut down.${cleanedSessions > 0 ? ` Cleaned up ${cleanedSessions} orphaned agent session folder(s).` : ""}${cleanedTeams > 0 ? ` Cleaned up ${cleanedTeams} orphaned team folder(s).` : ""}` }],
+          details: { cleanedSessions, cleanedTeams },
         };
       } catch (e) {
         throw new Error(`Failed to shutdown team: ${e}`);
@@ -119,7 +120,8 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
       const maxAgeHours = params.max_age_hours ?? 24;
       const maxAgeMs = maxAgeHours * 60 * 60 * 1000;
       const cleaned = cleanupAgentSessionFolders(maxAgeMs);
-      return { content: [{ type: "text", text: `Cleaned up ${cleaned} orphaned agent session folder(s) older than ${maxAgeHours} hour(s).` }], details: { cleaned, maxAgeHours } };
+      const cleanedTeams = cleanupOrphanedTeams(options.terminal, { maxAgeMs });
+      return { content: [{ type: "text", text: `Cleaned up ${cleaned} orphaned agent session folder(s) and ${cleanedTeams} orphaned team folder(s) older than ${maxAgeHours} hour(s).` }], details: { cleaned, cleanedTeams, maxAgeHours } };
     },
   });
 
@@ -158,9 +160,15 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
       const startupStalled = alive && unreadCount > 0 && (now - member.joinedAt) > runtime.STARTUP_STALL_MS && !(runtimeStatus?.ready);
       const health = !alive ? "dead" : startupStalled ? "stalled" : runtimeStatus?.ready ? (hasRecentHeartbeat ? "healthy" : "idle") : "starting";
       const releasedClaims = !alive ? await options.releaseAllClaimsForAgent(params.team_name, params.agent_name) : [];
-      const details = { agentName: params.agent_name, alive, unreadCount, health, agentLoopReady: !!runtimeStatus?.ready, hasRecentHeartbeat, startupStalled, runtime: runtimeStatus, releasedClaims };
+      const details = { agentName: params.agent_name, alive, unreadCount, health, agentLoopReady: !!runtimeStatus?.ready, hasRecentHeartbeat, startupStalled, runtime: runtimeStatus, releasedClaims, removedMember: false };
 
-      if (!alive && runtimeStatus) await runtime.deleteRuntimeStatus(params.team_name, params.agent_name);
+      if (!alive) {
+        await options.shutdownTeammate(params.team_name, member).catch(async () => {
+          if (runtimeStatus) await runtime.deleteRuntimeStatus(params.team_name, params.agent_name).catch(() => {});
+          await teams.removeMember(params.team_name, params.agent_name).catch(() => {});
+        });
+        details.removedMember = true;
+      }
       return { content: [{ type: "text", text: formatTeammateStatusForModel(params.agent_name, details) }], details };
     },
     renderResult(result: any, { expanded }: any, theme: any) {

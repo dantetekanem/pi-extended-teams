@@ -1,6 +1,6 @@
 {
   "name": "pi-extended-teams",
-  "version": "1.3.2",
+  "version": "1.3.4",
   "description": "tmux-only, self-managing, role-aware agent teams for pi", 
   "repository": {
     "type": "git",
@@ -24,7 +24,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:focused": "vitest run src/utils/claims.test.ts src/utils/tasks.test.ts src/utils/model-resolution.test.ts src/utils/settings.test.ts src/utils/write-queue.test.ts src/utils/shared-memory.test.ts extensions/index.test.ts",
+    "test:focused": "vitest run src/utils/claims.test.ts src/utils/tasks.test.ts src/utils/model-resolution.test.ts src/utils/settings.test.ts src/utils/write-queue.test.ts src/utils/shared-memory.test.ts extensions/index.test.ts extensions/events/register-events.test.ts extensions/internal/session-files.test.ts extensions/team/contracts.test.ts extensions/tools/delegation-guard.test.ts extensions/tools/agent-communication-tools.test.ts extensions/tools/read-helper.test.ts extensions/agents/read-agent.test.ts extensions/ui/team-panel.test.ts",
     "build": "tsc --noEmit"
   },
   "main": "extensions/index.ts",

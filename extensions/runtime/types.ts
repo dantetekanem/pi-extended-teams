@@ -30,5 +30,6 @@ export interface CompletedAgentReport {
   model?: string;
   thinking?: string;
   color?: string;
+  requestedBy?: string;
   source: "read-agent" | "lead-inbox";
 }

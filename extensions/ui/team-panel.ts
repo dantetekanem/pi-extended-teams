@@ -21,11 +21,16 @@ export interface TeamPanelOptions {
   shutdownTeammate(teamName: string, member: Member): Promise<void>;
 }
 
-async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOptions) {
+function inferRequestedBy(summary: string, text: string): string | undefined {
+  const source = `${summary}\n${text}`;
+  const match = source.match(/(?:completed|failed) for ([A-Za-z0-9_-]+)/);
+  return match?.[1];
+}
+
+export async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOptions) {
   const config = await teams.readConfig(panelTeamName);
   const allTasks = await tasks.listTasks(panelTeamName).catch(() => []);
   const allClaims = await claims.listClaims(panelTeamName).catch(() => []);
-  const activeNames = new Set(config.members.filter((m) => m.name !== "team-lead").map((m) => m.name));
   const items = [] as Array<{
     name: string;
     role: string;
@@ -39,10 +44,12 @@ async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOpti
     claimPaths: string[];
     recentEvents: string[];
     runtimeStatus: any;
+    tmuxPaneId?: string;
     completed: boolean;
     completedAt?: number;
     summary?: string;
     reportText?: string;
+    requestedBy?: string;
   }>;
 
   for (const member of config.members.filter((m) => m.name !== "team-lead")) {
@@ -53,8 +60,9 @@ async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOpti
     const alive = role === "read"
       ? !!readState || !!runtimeStatus?.ready
       : !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
-    const status = readState?.status || (alive ? "running" : "idle/dead");
+    const status = readState?.status || runtimeStatus?.currentAction || (alive ? "running" : "idle/dead");
     const startedAt = readState?.startedAt || runtimeStatus?.startedAt || member.joinedAt;
+    const tokensUsed = readState?.tokensUsed ?? runtimeStatus?.tokensUsed ?? 0;
 
     items.push({
       name: member.name,
@@ -64,14 +72,16 @@ async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOpti
       thinking: member.thinking,
       unreadCount,
       elapsedMs: Date.now() - startedAt,
-      tokensUsed: readState?.tokensUsed || 0,
+      tokensUsed,
       taskSubjects: allTasks
         .filter((task: any) => task.owner === member.name && task.status !== "completed" && task.status !== "deleted")
         .map((task: any) => `#${task.id} ${task.subject}`),
       claimPaths: allClaims.filter((claim) => claim.agent === member.name).map((claim) => claim.path),
       recentEvents: readState?.recentEvents || [],
       runtimeStatus,
+      tmuxPaneId: member.tmuxPaneId,
       completed: false,
+      requestedBy: member.requestedBy,
     });
   }
 
@@ -79,18 +89,24 @@ async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOpti
   const completedFromInbox: CompletedAgentReport[] = leadInboxMessages
     .filter((message: any) => {
       const from = String(message.from || "");
-      return from && from !== "team-lead" && from !== "system" && from !== "watchdog" && !activeNames.has(from);
+      return from && from !== "team-lead" && from !== "system" && from !== "watchdog";
     })
-    .map((message: any) => ({
-      name: String(message.from),
-      role: "write",
-      status: "completed" as const,
-      report: String(message.text || ""),
-      summary: String(message.summary || "Final report"),
-      completedAt: message.timestamp ? new Date(message.timestamp).getTime() : Date.now(),
-      color: message.color,
-      source: "lead-inbox" as const,
-    }));
+    .map((message: any) => {
+      const summary = String(message.summary || "Final report");
+      const text = String(message.text || "");
+      const role = summary.startsWith("Read helper ") || summary.startsWith("Read agent ") ? "read" : "write";
+      return {
+        name: String(message.from),
+        role,
+        status: "completed" as const,
+        report: text,
+        summary,
+        completedAt: message.timestamp ? new Date(message.timestamp).getTime() : Date.now(),
+        color: message.color,
+        requestedBy: inferRequestedBy(summary, text),
+        source: "lead-inbox" as const,
+      };
+    });
 
   const completed = [...(options.completedAgentReports.get(panelTeamName) ?? []), ...completedFromInbox]
     .filter((report) => report.report.trim().length > 0)
@@ -117,6 +133,7 @@ async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOpti
       completedAt: report.completedAt,
       summary: report.summary,
       reportText: report.report,
+      requestedBy: report.requestedBy,
     });
   }
 
@@ -145,22 +162,39 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
 
       await ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: () => void) => {
         const entryCount = () => items.length + 1;
-        const liveTimer = setInterval(() => tui.requestRender(), 1000);
+        let autoRefreshInFlight = false;
 
-        const refresh = () => {
-          loading = true;
-          tui.requestRender();
+        const applyItems = (nextItems: typeof items, resetLog: boolean) => {
+          const selectedName = selectedIndex > 0 ? items[selectedIndex - 1]?.name : undefined;
+          items = nextItems;
+          if (selectedName) {
+            const nextIndex = items.findIndex((item) => item.name === selectedName);
+            selectedIndex = nextIndex >= 0 ? nextIndex + 1 : Math.min(selectedIndex, Math.max(0, entryCount() - 1));
+          } else {
+            selectedIndex = Math.min(selectedIndex, Math.max(0, entryCount() - 1));
+          }
+          if (resetLog) logOffsetFromBottom = 0;
+        };
+
+        const refreshItems = (refreshOptions: { showLoading: boolean; resetLog: boolean }) => {
+          if (autoRefreshInFlight) return;
+          autoRefreshInFlight = true;
+          if (refreshOptions.showLoading) {
+            loading = true;
+            tui.requestRender();
+          }
           void buildTeamPanelItems(panelTeamName, options)
-            .then((nextItems) => {
-              items = nextItems;
-              selectedIndex = Math.min(selectedIndex, Math.max(0, entryCount() - 1));
-              logOffsetFromBottom = 0;
-            })
+            .then((nextItems) => applyItems(nextItems, refreshOptions.resetLog))
             .finally(() => {
+              autoRefreshInFlight = false;
               loading = false;
               tui.requestRender();
             });
         };
+
+        const liveTimer = setInterval(() => refreshItems({ showLoading: false, resetLog: false }), 1000);
+
+        const refresh = () => refreshItems({ showLoading: true, resetLog: true });
 
         const buildLeftRows = (): string[] => {
           const rows: string[] = [focusedPane === "list" ? pink("views ◂") : purple("views")];
@@ -177,7 +211,9 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             const pointer = selected ? pink("▸") : " ";
             const role = item.completed ? dimAnsi("done") : item.role === "read" ? pink("read") : purple("write");
             const health = item.completed ? item.status : item.status.includes("dead") ? "dead" : item.status;
-            rows.push(`${pointer} ${selected ? pink(item.name) : item.name}  ${role}  ${dimAnsi(health)}`);
+            const pane = !item.completed && item.role !== "read" && item.tmuxPaneId ? ` ${dimAnsi(item.tmuxPaneId)}` : "";
+            const requestedBy = item.requestedBy ? ` ${dimAnsi(`requested by ${item.requestedBy}`)}` : "";
+            rows.push(`${pointer} ${selected ? pink(item.name) : item.name}  ${role}${pane}  ${dimAnsi(health)}${requestedBy}`);
           }
           return rows;
         };
@@ -209,6 +245,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           if (item.completed) {
             rows.push(`${purple("status")} ${item.status}   ${purple("completed")} ${item.completedAt ? new Date(item.completedAt).toLocaleString() : "unknown"}`);
             if (item.elapsedMs > 0 || item.tokensUsed > 0) rows.push(`${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
+            if (item.requestedBy) rows.push(`${purple("requested by")} ${item.requestedBy}`);
             if (item.summary) rows.push(`${purple("summary")} ${item.summary}`);
             rows.push("");
             rows.push(purple("final output"));
@@ -216,8 +253,9 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             return rows.flatMap(wrap);
           }
 
-          rows.push(`${purple("role")} ${item.role}   ${purple("status")} ${item.status}   ${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
+          rows.push(`${purple("role")} ${item.role}${item.tmuxPaneId ? ` ${dimAnsi(item.tmuxPaneId)}` : ""}   ${purple("status")} ${item.status}   ${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
           rows.push(`${purple("model")} ${item.model || "(inherited)"}${item.thinking && item.thinking !== "off" ? `   ${purple("thinking")} ${item.thinking}` : ""}`);
+          if (item.requestedBy) rows.push(`${purple("requested by")} ${item.requestedBy}`);
           if (item.role === "read") rows.push(dimAnsi("in-process · promote_teammate moves it into a tmux pane"));
           if (item.taskSubjects.length > 0) rows.push(dimAnsi(`tasks: ${item.taskSubjects.slice(0, 4).join(" · ")}`));
           if (item.claimPaths.length > 0) rows.push(dimAnsi(`claims: ${item.claimPaths.slice(0, 4).join(" · ")}`));
@@ -237,7 +275,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
               rows.push(dimAnsi("Waiting for the read agent's first turn…"));
             }
           } else {
-            rows.push(dimAnsi(`Write agent runs in tmux pane ${item.runtimeStatus?.pid ? `(pid ${item.runtimeStatus.pid})` : ""}.`));
+            rows.push(dimAnsi(`Write agent runs in tmux pane ${item.tmuxPaneId || "(unknown)"}${item.runtimeStatus?.pid ? ` (pid ${item.runtimeStatus.pid})` : ""}.`));
             rows.push(dimAnsi("Switch to that pane to see its full transcript."));
             if (item.recentEvents.length > 0) {
               rows.push("");

@@ -10,6 +10,7 @@ import { createWriteAgentRuntime } from "./agents/write-agent.js";
 import { registerExtensionEvents } from "./events/register-events.js";
 import { createLifecycleRuntime } from "./team/lifecycle.js";
 import { buildRoster as buildTeamRoster, formatRosterForPrompt, releaseAllClaimsForAgent, requireTeamContext as resolveTeamContext, requireWriteAgentTeam as resolveWriteAgentTeam } from "./team/roster.js";
+import { registerWriterScreenShortcut } from "./team/writer-screens.js";
 import { registerTeamCommand } from "./ui/team-panel.js";
 import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordination-tools.js";
 import { registerModelTools } from "./tools/model-tools.js";
@@ -216,8 +217,9 @@ export default function (pi: ExtensionAPI) {
       const action = runtimeStatus?.activeToolName
         ? `${runtimeStatus.currentAction || "working"}: ${runtimeStatus.activeToolName}`
         : runtimeStatus?.currentAction || "running";
-      const detail = [member.tmuxPaneId, modelLabel, elapsed, tokens, action].filter(Boolean).join(" · ");
-      lines.push(`${purple("  ├─")} ${pink(member.name)} ${purple("write")} ${dimAnsi(detail)}`);
+      const screen = member.windowId ? `${member.windowId}/${member.tmuxPaneId}` : member.tmuxPaneId;
+      const detail = [screen, modelLabel, elapsed, tokens, action].filter(Boolean).join(" · ");
+      lines.push(`${purple("  ├─")} ${pink(member.name)} ${purple("write bg")} ${dimAnsi(detail)}`);
     }
 
     for (const agent of readAgents) {
@@ -475,6 +477,11 @@ export default function (pi: ExtensionAPI) {
     readAgentKey,
     terminal,
     shutdownTeammate,
+  });
+
+  registerWriterScreenShortcut(pi, {
+    getTeamName: getTeamPanelName,
+    terminal,
   });
 
   function readAgentOptions() {

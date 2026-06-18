@@ -37,7 +37,7 @@ describe("TmuxAdapter", () => {
     expect(adapter.detect()).toBe(true);
   });
 
-  it("should target the originating pane and its window when spawning", () => {
+  it("spawns a detached background window in the originating tmux session", () => {
     mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
       if (
         args[0] === "display-message" &&
@@ -49,7 +49,7 @@ describe("TmuxAdapter", () => {
         return { stdout: "%16", stderr: "", status: 0 };
       }
 
-      if (args[0] === "split-window") {
+      if (args[0] === "new-window") {
         return { stdout: "%42", stderr: "", status: 0 };
       }
 
@@ -77,10 +77,11 @@ describe("TmuxAdapter", () => {
     expect(mockExecCommand).toHaveBeenCalledWith(
       "tmux",
       [
-        "split-window",
-        "-h", "-dP",
+        "new-window",
+        "-dP",
         "-F", "#{pane_id}",
-        "-t", "%16",
+        "-n", "agent-1",
+        "-t", "@7",
         "-c", "/tmp/project",
         "env", "PI_TEAM_NAME=team-1", "PI_AGENT_NAME=agent-1",
         "sh", "-c", "pi",
@@ -88,11 +89,11 @@ describe("TmuxAdapter", () => {
     );
     expect(mockExecCommand).toHaveBeenCalledWith(
       "tmux",
-      ["set-window-option", "-t", "@7", "main-pane-width", "60%"]
+      ["select-pane", "-t", "%42", "-T", "agent-1"]
     );
-    expect(mockExecCommand).toHaveBeenCalledWith(
+    expect(mockExecCommand).not.toHaveBeenCalledWith(
       "tmux",
-      ["select-layout", "-t", "@7", "main-vertical"]
+      expect.arrayContaining(["select-layout"])
     );
   });
 
@@ -108,7 +109,7 @@ describe("TmuxAdapter", () => {
         return { stdout: "%3", stderr: "", status: 0 };
       }
 
-      if (args[0] === "split-window") {
+      if (args[0] === "new-window") {
         return { stdout: "%42", stderr: "", status: 0 };
       }
 
@@ -137,10 +138,11 @@ describe("TmuxAdapter", () => {
     expect(mockExecCommand).toHaveBeenCalledWith(
       "tmux",
       [
-        "split-window",
-        "-h", "-dP",
+        "new-window",
+        "-dP",
         "-F", "#{pane_id}",
-        "-t", "%3",
+        "-n", "agent-1",
+        "-t", "@9",
         "-c", "/tmp/project",
         "env", "PI_TEAM_NAME=team-1", "PI_AGENT_NAME=agent-1",
         "sh", "-c", "pi",
@@ -148,11 +150,7 @@ describe("TmuxAdapter", () => {
     );
     expect(mockExecCommand).toHaveBeenCalledWith(
       "tmux",
-      ["set-window-option", "-t", "@9", "main-pane-width", "60%"]
-    );
-    expect(mockExecCommand).toHaveBeenCalledWith(
-      "tmux",
-      ["select-layout", "-t", "@9", "main-vertical"]
+      ["select-pane", "-t", "%42", "-T", "agent-1"]
     );
   });
 
@@ -178,7 +176,7 @@ describe("TmuxAdapter", () => {
         return { stdout: "%16", stderr: "", status: 0 };
       }
 
-      if (args[0] === "split-window") {
+      if (args[0] === "new-window") {
         return { stdout: "%42", stderr: "", status: 0 };
       }
 
@@ -207,15 +205,46 @@ describe("TmuxAdapter", () => {
     expect(mockExecCommand).toHaveBeenCalledWith(
       "tmux",
       [
-        "split-window",
-        "-h", "-dP",
+        "new-window",
+        "-dP",
         "-F", "#{pane_id}",
-        "-t", "%16",
+        "-n", "agent-1",
+        "-t", "@7",
         "-c", "/tmp/project",
         "env", "PI_TEAM_NAME=team-1", "PI_AGENT_NAME=agent-1",
         "sh", "-c", "pi",
       ]
     );
+  });
+
+  it("focuses a pane by selecting its window and pane", () => {
+    mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
+      if (
+        args[0] === "display-message" &&
+        args[1] === "-p" &&
+        args[2] === "-t" &&
+        args[3] === "%42" &&
+        args[4] === "#{pane_id}"
+      ) {
+        return { stdout: "%42", stderr: "", status: 0 };
+      }
+
+      if (
+        args[0] === "display-message" &&
+        args[1] === "-p" &&
+        args[2] === "-t" &&
+        args[3] === "%42" &&
+        args[4] === "#{window_id}"
+      ) {
+        return { stdout: "@9", stderr: "", status: 0 };
+      }
+
+      return { stdout: "", stderr: "", status: 0 };
+    });
+
+    expect(adapter.focusPane("%42")).toBe(true);
+    expect(mockExecCommand).toHaveBeenCalledWith("tmux", ["select-window", "-t", "@9"]);
+    expect(mockExecCommand).toHaveBeenCalledWith("tmux", ["select-pane", "-t", "%42"]);
   });
 
   it("should target the current pane when setting the title", () => {

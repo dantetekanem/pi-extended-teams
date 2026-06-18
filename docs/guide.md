@@ -16,7 +16,7 @@ This guide provides detailed examples, patterns, and best practices for using pi
 
 ### Basic Team Setup
 
-First, make sure you're inside a tmux session. Write agents require tmux panes; read agents run in-process and do not open panes.
+First, make sure you're inside a tmux session. Write agents require background tmux screens; read agents run in-process and do not open tmux screens.
 
 ```bash
 tmux
@@ -297,9 +297,9 @@ Use manual checks only when you need explicit state or suspect a stall:
 3. Force kill and respawn if needed:
    > **You:** "Force kill security-bot and respawn them"
 
-### tmux Pane Issues
+### tmux Screen Issues
 
-**Problem**: tmux panes don't close when killing teammates.
+**Problem**: background tmux screens don't close when killing teammates.
 
 **Solution**: Make sure you started pi inside a tmux session. If you started pi outside tmux, it won't work properly.
 
@@ -364,16 +364,16 @@ All team data is stored in:
 
 You can manually inspect these JSON files to debug issues.
 
-### Write-Agent Panes Not Appearing
+### Write-Agent Screens Not Appearing
 
-**Problem**: write-agent tmux panes are not appearing.
+**Problem**: write-agent background tmux screens are not appearing.
 
 **Requirements**:
 1. Start Pi from inside a tmux session.
 2. Make sure `TMUX` is present in the environment.
-3. Use read agents for investigation when you do not need a pane.
+3. Use read agents for investigation when you do not need a live tmux screen.
 
-pi-extended-teams is tmux-only for write-agent panes. Zellij and iTerm2 pane backends are not supported.
+pi-extended-teams is tmux-only for write-agent screens. Zellij and iTerm2 pane backends are not supported.
 
 **Debug mode**:
 Set `PI_EXTENDED_TEAMS_DEBUG=1` before starting Pi, or add this to `~/.pi/agent/pi-extended-teams/settings.json` or `<project>/.pi/pi-extended-teams.json`:
@@ -384,7 +384,7 @@ Set `PI_EXTENDED_TEAMS_DEBUG=1` before starting Pi, or add this to `~/.pi/agent/
 }
 ```
 
-When debug mode is enabled, write-agent spawn requests, queue decisions, launch commands, terminal pane IDs, and spawn failures are appended as JSON lines to `~/.pi/teams/<team-name>/debug.log`. Successful `spawn_teammate` results also include the debug log path.
+When debug mode is enabled, write-agent spawn requests, queue decisions, launch commands, terminal window/pane IDs, and spawn failures are appended as JSON lines to `~/.pi/teams/<team-name>/debug.log`. Successful `spawn_teammate` results also include the debug log path.
 
 ---
 
@@ -410,7 +410,7 @@ To remove all team data, shut down the team:
 > "Shut down the team named 'my-team'"
 ```
 
-`team_shutdown` closes teammate panes, removes team/task state, and runs built-in stale session cleanup. Do not manually delete state unless you are recovering from a broken shutdown.
+`team_shutdown` closes teammate screens, removes team/task state, and runs built-in stale session cleanup. Do not manually delete state unless you are recovering from a broken shutdown.
 
 Or use the delete command:
 > **You:** "Delete the team named 'my-team'"

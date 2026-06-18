@@ -34,7 +34,7 @@ function panelOptions(overrides: any = {}) {
     runningReadAgents: new Map(),
     completedAgentReports: new Map(),
     readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
-    terminal: { isAlive: vi.fn(() => true) },
+    terminal: { isAlive: vi.fn(() => true), focusPane: vi.fn(() => true) },
     shutdownTeammate: vi.fn(),
     ...overrides,
   };
@@ -76,6 +76,52 @@ describe("team panel items", () => {
       status: "running",
       tmuxPaneId: "%42",
     });
+  });
+
+  it("attaches the selected background writer screen from /team", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "%42",
+      windowId: "@9",
+      cwd: root,
+      subscriptions: [],
+    });
+
+    let component: any;
+    const done = vi.fn();
+    const terminal = { isAlive: vi.fn(() => true), focusPane: vi.fn(() => true) };
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => {
+        pi.command = command;
+      }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, panelOptions({ terminal }));
+
+    await pi.command.handler("team", {
+      ui: {
+        notify: vi.fn(),
+        custom: vi.fn(async (factory: any) => {
+          component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, { fg: (_name: string, text: string) => text }, {}, done);
+        }),
+      },
+    });
+
+    component.handleInput("j");
+    const rendered = component.render(120).join("\n");
+    expect(rendered).toContain("background tmux screen @9/%42");
+    expect(rendered).toContain("Press enter/a to attach");
+
+    component.handleInput("\r");
+    expect(terminal.focusPane).toHaveBeenCalledWith("%42");
+    expect(done).toHaveBeenCalled();
+    component.dispose();
   });
 
   it("infers completed read-agent role from read helper lead inbox summaries", async () => {

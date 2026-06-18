@@ -116,7 +116,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
 
       const paneAlive = !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
       if (!paneAlive) {
-        await reapTeammate(targetTeamName, member, "tmux pane is gone");
+        await reapTeammate(targetTeamName, member, "tmux screen is gone");
         continue;
       }
 

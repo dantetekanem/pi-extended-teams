@@ -1,10 +1,10 @@
 # pi-extended-teams
 
-**pi-extended-teams** multiplies a single Pi session with helper agents while keeping the main agent in charge. Read agents run in-process for parallel investigation, review, and tests. Write agents are opt-in, tmux-backed panes for isolated edit work.
+**pi-extended-teams** multiplies a single Pi session with helper agents while keeping the main agent in charge. Read agents run in-process for parallel investigation, review, and tests. Write agents are opt-in, background tmux screens for isolated edit work.
 
-This package is intentionally narrower than the original pi-teams: tmux is the only supported write-agent backend, read agents do not open panes, and the preferred flow is one-call team creation with automatic report delivery.
+This package is intentionally narrower than the original pi-teams: tmux is the only supported write-agent screen backend, read agents do not open tmux screens, and the preferred flow is one-call team creation with automatic report delivery.
 
-> **tmux is required only for write agents.** Read agents run in-process and work without opening panes.
+> **tmux is required only for write agents.** Read agents run in-process and work without opening tmux screens.
 
 ## Installation
 
@@ -49,7 +49,7 @@ Watch active and completed agents:
 /team
 ```
 
-Spawn a write agent only when the work is isolated and safe to do in a tmux pane:
+Spawn a write agent only when the work is isolated and safe to run in a background tmux screen:
 
 ```text
 Spawn a write agent to fix only the typos in docs/guide.md.
@@ -60,14 +60,15 @@ Spawn a write agent to fix only the typos in docs/guide.md.
 - **One-call teams**: `team_create` can create a team and start inline agents immediately.
 - **Read agents as the default multiplier**: in-process, parallel, full read/test/search tool access, directed to report without editing.
 - **Auto-delivered reports**: finished read agents report back to the main session as collapsed entries that the lead can synthesize.
-- **`/team` overlay**: inspect the lead view, active read agents, write-agent panes, completed reports, models, thinking levels, tasks, and claims.
+- **`/team` overlay**: inspect the lead view, active read agents, background write-agent screens, completed reports, models, thinking levels, tasks, and claims.
+- **Writer screen cycling**: write agents spawn in detached tmux windows by default; press Alt/Option+Tab to cycle main + writer screens, or press Enter/a on a writer in `/team` to attach live.
 - **Write-agent queue**: write agents are opt-in, capped, queued, and tmux-backed.
 - **Advisory file claims**: write agents coordinate file ownership with `claim_file`, `release_file`, and `list_file_claims`.
 - **Teammate messaging**: send direct messages, broadcasts, and inbox reports between team members.
 - **Shared task board**: create, assign, plan, approve, update, and list team tasks.
 - **Plan approval mode**: require a teammate to submit a plan before it starts implementation.
 - **Model and thinking selection**: use fully qualified `provider/model` strings and optional thinking levels.
-- **Watchdog cleanup**: stale teammate runtime state and dead write-agent panes are cleaned up.
+- **Watchdog cleanup**: stale teammate runtime state and dead write-agent screens are cleaned up.
 
 ## Supported Workflow
 
@@ -119,7 +120,7 @@ Spawn a teammate named "security-bot" in the current folder. Tell it to scan for
 ### Promote a read agent into a write pane
 
 ```text
-Move teammate "docs-bot" into a tmux pane with the same mission.
+Move teammate "docs-bot" into a background tmux screen with the same mission.
 ```
 
 ### Use plan approval
@@ -170,7 +171,7 @@ Pi model settings still come from Pi settings (`defaultProvider`, `defaultModel`
 
 ## Terminal Requirements
 
-Write agents require tmux because they run in separate panes. Read agents run in-process.
+Write agents require tmux because they run in separate background screens. Read agents run in-process.
 
 Install tmux:
 

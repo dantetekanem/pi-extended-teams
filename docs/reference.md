@@ -56,7 +56,7 @@ team_create({ team_name: "research", default_model: "openai-codex/gpt-5.4" })
 
 ### team_shutdown
 
-Shut down a team, close its write-agent tmux panes, and remove team/task state.
+Shut down a team, close its write-agent background tmux screens, and remove team/task state.
 
 **Parameters**:
 - `team_name` (required): Name of the team to shut down
@@ -72,14 +72,14 @@ team_shutdown({ team_name: "my-team" })
 
 ### spawn_teammate
 
-Launch a teammate with a role and instructions. Read teammates run in-process without panes. Write teammates spawn into tmux panes; if the configured write-agent cap is full, overflow is queued when `writeAgents.queueOverflow` is enabled.
+Launch a teammate with a role and instructions. Read teammates run in-process without tmux screens. Write teammates spawn into detached background tmux screens; if the configured write-agent cap is full, overflow is queued when `writeAgents.queueOverflow` is enabled.
 
 **Parameters**:
 - `team_name` (required): Name of the team
 - `name` (required): Friendly name for the teammate (e.g., "security-bot")
 - `prompt` (required): Instructions for the teammate's role and initial task
 - `cwd` (required): Working directory for the teammate
-- `role` (optional): `read` for read-only in-process investigation, or `write` for a tmux write agent. Defaults to `write`.
+- `role` (optional): `read` for read-only in-process investigation, or `write` for a background tmux write agent. Defaults to `write`.
 - `category` (optional): Named preset from settings that can bundle role, model, and thinking.
 - `model` (optional): Fully qualified AI model for this teammate (overrides team/default settings)
 - `thinking` (optional): Thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`)
@@ -710,7 +710,7 @@ Fields:
 
 pi-extended-teams respects the following environment variables:
 
-- `TMUX`: Required for write-agent pane management.
+- `TMUX`: Required for write-agent background screen management.
 - `PI_TEAM_NAME`: Set for spawned teammates so they know their team context.
 - `PI_AGENT_NAME`: Set for spawned teammates so they know their agent name.
 
@@ -720,11 +720,11 @@ pi-extended-teams respects the following environment variables:
 
 ### tmux Detection
 
-If the `TMUX` environment variable is set, pi-extended-teams uses `tmux split-window` to create write-agent panes.
+If the `TMUX` environment variable is set, pi-extended-teams uses detached `tmux new-window` screens for write agents. They stay in the background by default, show status in `/team`, and can be attached live with Alt/Option+Tab or Enter/a from the `/team` overlay.
 
-**Layout**: Large lead pane on the left, write agents stacked on the right. Read agents run in-process and do not open panes.
+**Layout**: The lead window is left alone. Write agents run in detached tmux windows, so dozens of writers can run without changing the visible lead layout. Read agents run in-process and do not open tmux screens.
 
-pi-extended-teams is tmux-only for write agents. Zellij and iTerm2 pane backends are not supported.
+pi-extended-teams is tmux-only for write agents. Zellij and iTerm2 pane/window backends are not supported.
 
 ---
 

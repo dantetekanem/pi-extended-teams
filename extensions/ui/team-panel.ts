@@ -45,6 +45,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
     recentEvents: string[];
     runtimeStatus: any;
     tmuxPaneId?: string;
+    windowId?: string;
     completed: boolean;
     completedAt?: number;
     summary?: string;
@@ -80,6 +81,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
       recentEvents: readState?.recentEvents || [],
       runtimeStatus,
       tmuxPaneId: member.tmuxPaneId,
+      windowId: member.windowId,
       completed: false,
       requestedBy: member.requestedBy,
     });
@@ -146,7 +148,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
 
 export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
   pi.registerCommand("team", {
-    description: "Switch between main + teammates (↑/↓), refresh (r), or stop selected teammate (x).",
+    description: "Switch between main + teammates (↑/↓), attach writer (enter/a), refresh (r), or stop selected teammate (x).",
     handler: async (args: string, ctx: any) => {
       const panelTeamName = args.trim() || options.getTeamName();
       if (!panelTeamName) {
@@ -211,9 +213,11 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             const pointer = selected ? pink("▸") : " ";
             const role = item.completed ? dimAnsi("done") : item.role === "read" ? pink("read") : purple("write");
             const health = item.completed ? item.status : item.status.includes("dead") ? "dead" : item.status;
-            const pane = !item.completed && item.role !== "read" && item.tmuxPaneId ? ` ${dimAnsi(item.tmuxPaneId)}` : "";
+            const screen = !item.completed && item.role !== "read" && item.tmuxPaneId
+              ? ` ${dimAnsi(item.windowId ? `${item.windowId}/${item.tmuxPaneId}` : item.tmuxPaneId)}`
+              : "";
             const requestedBy = item.requestedBy ? ` ${dimAnsi(`requested by ${item.requestedBy}`)}` : "";
-            rows.push(`${pointer} ${selected ? pink(item.name) : item.name}  ${role}${pane}  ${dimAnsi(health)}${requestedBy}`);
+            rows.push(`${pointer} ${selected ? pink(item.name) : item.name}  ${role}${screen}  ${dimAnsi(health)}${requestedBy}`);
           }
           return rows;
         };
@@ -230,7 +234,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             rows.push(focusedPane === "log" ? pink("log pane focused") : dimAnsi("press → to focus log pane"));
             rows.push("");
             rows.push(`${purple("read agents")}   ${activeReaders.length} (in-process)`);
-            rows.push(`${purple("write agents")}  ${activeWriters.length} (tmux panes)`);
+            rows.push(`${purple("write agents")}  ${activeWriters.length} (background tmux screens)`);
             rows.push(`${purple("completed")}     ${completed.length}`);
             rows.push(`${purple("lead inbox")}    ${options.getLeadInboxUnreadCount()} unread`);
             rows.push("");
@@ -253,10 +257,11 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             return rows.flatMap(wrap);
           }
 
-          rows.push(`${purple("role")} ${item.role}${item.tmuxPaneId ? ` ${dimAnsi(item.tmuxPaneId)}` : ""}   ${purple("status")} ${item.status}   ${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
+          const screen = item.windowId ? `${item.windowId}/${item.tmuxPaneId}` : item.tmuxPaneId;
+          rows.push(`${purple("role")} ${item.role}${screen ? ` ${dimAnsi(screen)}` : ""}   ${purple("status")} ${item.status}   ${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
           rows.push(`${purple("model")} ${item.model || "(inherited)"}${item.thinking && item.thinking !== "off" ? `   ${purple("thinking")} ${item.thinking}` : ""}`);
           if (item.requestedBy) rows.push(`${purple("requested by")} ${item.requestedBy}`);
-          if (item.role === "read") rows.push(dimAnsi("in-process · promote_teammate moves it into a tmux pane"));
+          if (item.role === "read") rows.push(dimAnsi("in-process · promote_teammate moves it into a background tmux screen"));
           if (item.taskSubjects.length > 0) rows.push(dimAnsi(`tasks: ${item.taskSubjects.slice(0, 4).join(" · ")}`));
           if (item.claimPaths.length > 0) rows.push(dimAnsi(`claims: ${item.claimPaths.slice(0, 4).join(" · ")}`));
           if (item.runtimeStatus?.lastError?.message) rows.push(theme.fg("warning", `error: ${item.runtimeStatus.lastError.message}`));
@@ -275,8 +280,8 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
               rows.push(dimAnsi("Waiting for the read agent's first turn…"));
             }
           } else {
-            rows.push(dimAnsi(`Write agent runs in tmux pane ${item.tmuxPaneId || "(unknown)"}${item.runtimeStatus?.pid ? ` (pid ${item.runtimeStatus.pid})` : ""}.`));
-            rows.push(dimAnsi("Switch to that pane to see its full transcript."));
+            rows.push(dimAnsi(`Write agent runs in background tmux screen ${screen || "(unknown)"}${item.runtimeStatus?.pid ? ` (pid ${item.runtimeStatus.pid})` : ""}.`));
+            rows.push(dimAnsi("Press enter/a to attach, or Alt+Tab to cycle live writer screens without changing the main layout."));
             if (item.recentEvents.length > 0) {
               rows.push("");
               rows.push(purple("recent"));
@@ -285,6 +290,41 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           }
 
           return rows.flatMap(wrap);
+        };
+
+        const attachSelectedWriter = () => {
+          if (selectedIndex === 0) {
+            ctx.ui.notify("Select a writer screen to attach.", "warning");
+            return;
+          }
+          const item = items[selectedIndex - 1];
+          if (!item) {
+            ctx.ui.notify("No teammate is selected.", "warning");
+            return;
+          }
+          if (item.completed) {
+            ctx.ui.notify(`${item.name} is completed; final output is available in /team.`, "info");
+            return;
+          }
+          if (item.role === "read") {
+            ctx.ui.notify(`${item.name} is an in-process read agent; promote it first to watch in tmux.`, "info");
+            return;
+          }
+          if (!item.tmuxPaneId) {
+            ctx.ui.notify(`${item.name} does not have a tmux screen yet.`, "warning");
+            return;
+          }
+          if (!options.terminal?.focusPane) {
+            ctx.ui.notify("The active terminal adapter cannot focus tmux screens.", "warning");
+            return;
+          }
+
+          const focused = options.terminal.focusPane(item.tmuxPaneId);
+          if (!focused) {
+            ctx.ui.notify(`Could not attach ${item.name} (${item.tmuxPaneId}).`, "warning");
+            return;
+          }
+          done();
         };
 
         const shutdownSelected = async () => {
@@ -327,7 +367,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           const innerWidth = Math.max(48, width - 4);
           const header: string[] = [];
           header.push(pink(`▣ team ${panelTeamName}`) + (loading ? purple("  refreshing…") : ""));
-          header.push(dimAnsi("←/→ or h/l: focus list/log   list ↑/↓: select   log ↑/↓: scroll 5   r: refresh   x: stop selected   esc: close"));
+          header.push(dimAnsi("←/→ or h/l: focus list/log   list ↑/↓: select   log ↑/↓: scroll 5   enter/a: attach writer   r: refresh   x: stop selected   esc: close"));
 
           const leftWidth = Math.min(30, Math.max(20, Math.floor(innerWidth * 0.34)));
           const rightWidth = Math.max(20, innerWidth - leftWidth - 3);
@@ -390,6 +430,10 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
                 logOffsetFromBottom = 0;
               }
               tui.requestRender();
+              return;
+            }
+            if (matchesKey(data, Key.enter) || data === "a" || data === "A") {
+              attachSelectedWriter();
               return;
             }
             if (data === "r" || data === "R") {

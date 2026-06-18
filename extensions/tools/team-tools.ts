@@ -32,11 +32,56 @@ export interface TeamToolsOptions {
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
-  async function spawnTeammate(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
+  function operationMetadataFromParams(params: any): Record<string, any> | undefined {
+    const metadata = { ...(params.metadata || {}) };
+    if (params.operation_id) metadata.operationId = params.operation_id;
+    if (params.workflow_run_id) metadata.workflowRunId = params.workflow_run_id;
+    return Object.keys(metadata).length > 0 ? metadata : undefined;
+  }
+
+  function memberMatchesOperation(member: Member, params: any): boolean {
+    if (!params.operation_id) return false;
+    const operationId = member.metadata?.operationId || member.metadata?.orchestration?.operationId;
+    const workflowRunId = member.metadata?.workflowRunId || member.metadata?.orchestration?.workflowRunId;
+    return operationId === params.operation_id && (params.workflow_run_id === undefined || workflowRunId === params.workflow_run_id);
+  }
+
+  async function spawnTeammate(params: any, ctx: any, spawnOptions: { once?: boolean } = {}): Promise<{ content: any[]; details: any }> {
     const safeName = paths.sanitizeName(params.name);
     const safeTeamName = paths.sanitizeName(params.team_name);
     const cwd = params.cwd || ctx.cwd;
     const teamConfig = await teams.readConfig(safeTeamName);
+
+    if (spawnOptions.once) {
+      const existingOnceMember = teamConfig.members.find(m => m.agentType === "teammate" && (m.name === safeName || memberMatchesOperation(m, params)));
+      if (existingOnceMember) {
+        return {
+          content: [{ type: "text", text: `Teammate ${safeName} already exists; reusing existing member.` }],
+          details: {
+            agentId: existingOnceMember.agentId,
+            role: existingOnceMember.role,
+            existing: true,
+            idempotent: true,
+            queued: false,
+            terminalId: existingOnceMember.tmuxPaneId || null,
+          },
+        };
+      }
+
+      const queued = await writeQueue.findQueuedWriteSpawn(safeTeamName, {
+        name: safeName,
+        operationId: params.operation_id,
+        workflowRunId: params.workflow_run_id,
+      });
+      if (queued) {
+        const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
+        const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
+        return {
+          content: [{ type: "text", text: `Write teammate ${safeName} is already queued at position ${queuePosition}.` }],
+          details: { agentId: `${safeName}@${safeTeamName}`, role: "write", queued: true, queueId: queued.id, queuePosition, existing: true, idempotent: true },
+        };
+      }
+    }
 
     const existingMember = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
     if (existingMember) await options.shutdownTeammate(safeTeamName, existingMember);
@@ -91,6 +136,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       color: role === "read" ? "cyan" : "blue",
       thinking: chosenThinking,
       planModeRequired: params.plan_mode_required,
+      metadata: operationMetadataFromParams(params),
     };
 
     if (role === "read") {
@@ -139,6 +185,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
         thinking: chosenThinking,
         planModeRequired: params.plan_mode_required,
         color: "blue",
+        operationId: params.operation_id,
+        workflowRunId: params.workflow_run_id,
+        metadata: operationMetadataFromParams(params),
       });
       const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
       const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
@@ -160,7 +209,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     options.renderReadAgentStatus();
     const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
     return {
-      content: [{ type: "text", text: `Teammate ${params.name} spawned in pane ${terminalId}.${debugSuffix}` }],
+      content: [{ type: "text", text: `Teammate ${params.name} spawned in background tmux screen ${terminalId}.${debugSuffix}` }],
       details: { agentId: member.agentId, role, terminalId, queued: false, debugLogPath },
     };
   }
@@ -222,9 +271,86 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   });
 
   pi.registerTool({
+    name: "ensure_team",
+    label: "Ensure Team",
+    description: "Idempotently create a team if it does not exist; returns the existing team without cleanup or overwrite when it already exists.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      description: Type.Optional(Type.String()),
+      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). If omitted, the current active model is used for new teams." })),
+      operation_id: Type.Optional(Type.String()),
+      workflow_run_id: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (options.isTeammate) {
+        return requestLeadForTeammateSpawn(options, {
+          action: "team_create",
+          params,
+          reason: "Teammate attempted to ensure/create a team.",
+        });
+      }
+
+      const safeTeamName = paths.sanitizeName(params.team_name);
+      if (teams.teamExists(safeTeamName)) {
+        const config = await teams.readConfig(safeTeamName);
+        options.adoptTeamAsLead(safeTeamName, ctx);
+        return { content: [{ type: "text", text: `Team ${safeTeamName} already exists.` }], details: { config, created: false, idempotent: true } };
+      }
+
+      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
+      const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
+      const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
+      const defaultModel = explicitDefaultModel || currentModel;
+      const result = await teams.ensureTeam({
+        name: safeTeamName,
+        sessionId: "local-session",
+        leadAgentId: "lead-agent",
+        description: params.description,
+        defaultModel,
+        metadata: operationMetadataFromParams(params),
+      });
+      options.adoptTeamAsLead(safeTeamName, ctx);
+      return { content: [{ type: "text", text: `Team ${safeTeamName} created.` }], details: { config: result.config, created: result.created, idempotent: true } };
+    },
+  });
+
+  pi.registerTool({
+    name: "spawn_teammate_once",
+    label: "Spawn Teammate Once",
+    description: "Idempotently spawn a teammate using name and optional operation_id/workflow_run_id metadata. Existing or queued same-key teammates are returned instead of replaced.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      name: Type.String(),
+      prompt: Type.String(),
+      cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead's cwd." })),
+      role: Type.Optional(StringEnum(["read", "write"], { description: "Agent role. Defaults to read." })),
+      category: Type.Optional(Type.String({ description: "Optional category preset name from settings.json." })),
+      model: Type.Optional(Type.String({ description: "Fully qualified model." })),
+      thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
+      plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
+      operation_id: Type.Optional(Type.String()),
+      workflow_run_id: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (options.isTeammate) {
+        return requestLeadForTeammateSpawn(options, {
+          action: "spawn_teammate",
+          params,
+          reason: "Teammate attempted to spawn another agent directly.",
+        });
+      }
+
+      const safeTeamName = paths.sanitizeName(params.team_name);
+      if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
+      options.adoptTeamAsLead(safeTeamName, ctx);
+      return spawnTeammate(params, ctx, { once: true });
+    },
+  });
+
+  pi.registerTool({
     name: "spawn_teammate",
     label: "Spawn Teammate",
-    description: "Spawn one teammate. Default role is 'read' (read-only, in-process, unlimited, parallel — for investigation/review/testing). Use role 'write' only for isolated, independent edit work that should run in its own tmux pane; the lead normally writes itself. Model resolves from explicit arg -> category -> role default -> team default -> current model. Any explicit model must be a fully qualified provider/model from list_available_models.",
+    description: "Spawn one teammate. Default role is 'read' (read-only, in-process, unlimited, parallel — for investigation/review/testing). Use role 'write' only for isolated, independent edit work that should run in a background tmux screen; the lead normally writes itself. Model resolves from explicit arg -> category -> role default -> team default -> current model. Any explicit model must be a fully qualified provider/model from list_available_models.",
     parameters: Type.Object({
       team_name: Type.String(),
       name: Type.String(),
@@ -254,8 +380,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
 
   pi.registerTool({
     name: "promote_teammate",
-    label: "Move Teammate to tmux pane",
-    description: "Move a running in-process read agent into its own tmux pane so you can watch and interact with it there. Stops the in-process session and re-spawns the same mission as a tmux teammate. Requires running inside tmux.",
+    label: "Move Teammate to background tmux screen",
+    description: "Move a running in-process read agent into its own background tmux screen so you can watch and interact with it there. Stops the in-process session and re-spawns the same mission as a tmux teammate. Requires running inside tmux.",
     parameters: Type.Object({
       team_name: Type.String(),
       name: Type.String(),
@@ -304,7 +430,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       }, ctx);
 
       return {
-        content: [{ type: "text", text: `Moved ${params.name} into a tmux pane. ${result.content?.[0]?.text ?? ""}`.trim() }],
+        content: [{ type: "text", text: `Moved ${params.name} into a background tmux screen. ${result.content?.[0]?.text ?? ""}`.trim() }],
         details: { ...result.details, promoted: true },
       };
     },

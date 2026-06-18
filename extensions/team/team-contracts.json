@@ -33,7 +33,7 @@
     },
     {
       "id": "writers.tmux-closes-when-done",
-      "description": "Writer tmux panes close only after the writer sends its final report and completes cleanup."
+      "description": "Writer background tmux screens close only after the writer sends its final report and completes cleanup."
     }
   ]
 }

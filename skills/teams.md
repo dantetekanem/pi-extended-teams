@@ -13,7 +13,7 @@ The flow is meant to be seamless: **one call** creates the team and spawns its a
 
 - **The main agent (lead) is the implementer.** It plans and does the actual writing/editing itself, in the main window. Do not delegate the whole job to a swarm just because you can.
 - **Read agents are the multiplier — the default.** In-process, unlimited, parallel. They have the **full toolset** (read, search, run shell commands like git/grep/tests) but are *directed* to stay read-only — investigate and report, not edit. Spawn them freely to investigate, review, test, or get second opinions in parallel. This is the primary, cheap, safe path.
-- **Write agents are optional and rare.** A write agent runs in its own tmux pane and can edit files. Use one **only** when there is genuinely isolated, independent work that can run in parallel without colliding with the lead's own edits (file claims keep two writers off the same file). If the work is sequential or central, the lead just does it.
+- **Write agents are optional and rare.** A write agent runs in its own background tmux screen and can edit files. Use one **only** when there is genuinely isolated, independent work that can run in parallel without colliding with the lead's own edits (file claims keep two writers off the same file). If the work is sequential or central, the lead just does it.
 
 ## The one-call flow
 
@@ -30,7 +30,7 @@ That creates the team and starts both read agents (role defaults to `read`). The
 2. The lead synthesizes the reports for the user automatically — no `read_inbox`, no polling.
 3. Read agents are removed from the status bar when they finish; the lead is free to keep working or idle in between.
 
-Spawn more any time with `spawn_teammate`. Add a write agent only for isolated edit work:
+Spawn more any time with `spawn_teammate`. Add a write agent only for isolated edit work. Writers start in detached background tmux screens by default:
 
 ```text
 spawn_teammate(team_name="review", name="fix-typos", role="write",
@@ -52,10 +52,11 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 
 ## Watching and inspecting
 
-- `/team` switches between the main session and each agent (↑/↓): read agents show their live in-process transcript; write agents point to their tmux pane. Each agent shows its **model and thinking level**, elapsed time, and tokens.
+- `/team` switches between the main session and each agent (↑/↓): read agents show their live in-process transcript; write agents point to their background tmux screen. Press Enter/a on a selected writer to attach live. Each agent shows its **model and thinking level**, elapsed time, and tokens.
+- Alt/Option+Tab cycles main + live writer tmux screens without changing the lead layout.
 - Reports already arrive in the main window collapsed; `ctrl+o` expands any of them.
 - `list_teammates` gives the roster as tool data when you want it.
-- `promote_teammate(team_name, name)` moves a running in-process read agent into its own tmux pane when you want to watch or interact with it there.
+- `promote_teammate(team_name, name)` moves a running in-process read agent into its own background tmux screen when you want to watch or interact with it there.
 
 ## Optional tools (only when they add value)
 

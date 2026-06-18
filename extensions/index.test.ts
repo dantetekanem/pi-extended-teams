@@ -42,6 +42,9 @@ async function setupExtension(env: Record<string, string | undefined> = {}, opti
     kill: vi.fn(),
     isAlive: vi.fn(() => true),
     setTitle: vi.fn(),
+    focusPane: vi.fn(() => true),
+    getCurrentPaneId: vi.fn(() => process.env.TMUX_PANE || "%lead"),
+    getWindowIdForPane: vi.fn((paneId: string) => paneId ? `@${paneId.replace("%", "")}` : null),
   };
 
   vi.doMock("../src/adapters/terminal-registry", () => ({
@@ -80,11 +83,13 @@ async function setupExtension(env: Record<string, string | undefined> = {}, opti
   vi.spyOn(paths, "leadSessionPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lead-session.json"));
 
   const tools = new Map<string, RegisteredTool>();
+  const shortcuts = new Map<string, any>();
   const eventHandlers = new Map<string, Function[]>();
   const extensionEventHandlers = new Map<string, Function[]>();
   const pi = {
     registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
     registerCommand: vi.fn(),
+    registerShortcut: vi.fn((shortcut: string, options: any) => shortcuts.set(shortcut, options)),
     on: vi.fn((eventName: string, handler: Function) => {
       eventHandlers.set(eventName, [...(eventHandlers.get(eventName) || []), handler]);
     }),
@@ -100,7 +105,7 @@ async function setupExtension(env: Record<string, string | undefined> = {}, opti
 
   extension(pi as any);
 
-  return { root, terminal, tools, pi, eventHandlers, extensionEventHandlers, paths, teams, claims, readAgentMock, restoreEnv: () => { process.env = originalEnv; } };
+  return { root, terminal, tools, shortcuts, pi, eventHandlers, extensionEventHandlers, paths, teams, claims, readAgentMock, restoreEnv: () => { process.env = originalEnv; } };
 }
 
 describe("extension integration", () => {
@@ -212,6 +217,37 @@ describe("extension integration", () => {
 
     const config = await setup.teams.readConfig("team");
     expect(config.members.map((member: any) => member.name).sort()).toEqual(["team-lead", "w1", "w2"]);
+    setup.restoreEnv();
+  });
+
+  it("Alt+Tab cycles from main through background writer screens and back", async () => {
+    const setup = await setupExtension({ TMUX_PANE: "%lead" });
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+
+    await setup.tools.get("team_create")!.execute("1", {
+      team_name: "team",
+      default_model: "provider/model",
+      agents: [
+        { name: "w1", role: "write", prompt: "work 1", cwd: setup.root },
+        { name: "w2", role: "write", prompt: "work 2", cwd: setup.root },
+      ],
+    }, abort, undefined, ctx);
+
+    const shortcut = setup.shortcuts.get("alt+tab");
+    expect(shortcut).toBeTruthy();
+
+    setup.terminal.getCurrentPaneId.mockReturnValue("%lead");
+    await shortcut.handler(ctx);
+    expect(setup.terminal.focusPane).toHaveBeenLastCalledWith("%1");
+
+    setup.terminal.getCurrentPaneId.mockReturnValue("%1");
+    await shortcut.handler(ctx);
+    expect(setup.terminal.focusPane).toHaveBeenLastCalledWith("%2");
+
+    setup.terminal.getCurrentPaneId.mockReturnValue("%2");
+    await shortcut.handler(ctx);
+    expect(setup.terminal.focusPane).toHaveBeenLastCalledWith("%lead");
     setup.restoreEnv();
   });
 

@@ -14,12 +14,12 @@ export class TmuxAdapter implements TerminalAdapter {
     return !!process.env.TMUX;
   }
 
-  private getCurrentPaneId(): string | null {
+  getCurrentPaneId(): string | null {
     const paneId = process.env.TMUX_PANE?.trim();
     return paneId ? paneId : null;
   }
 
-  private getWindowIdForPane(paneId: string | null | undefined): string | null {
+  getWindowIdForPane(paneId: string | null | undefined): string | null {
     if (!paneId) return null;
 
     try {
@@ -63,14 +63,16 @@ export class TmuxAdapter implements TerminalAdapter {
       .map(([k, v]) => `${k}=${v}`);
 
     const originPaneId = this.getOriginPaneId(options.anchorPaneId);
+    const originWindowId = this.getWindowIdForPane(originPaneId);
     const tmuxArgs = [
-      "split-window",
-      "-h", "-dP",
+      "new-window",
+      "-dP",
       "-F", "#{pane_id}",
+      "-n", options.name,
     ];
 
-    if (originPaneId) {
-      tmuxArgs.push("-t", originPaneId);
+    if (originWindowId) {
+      tmuxArgs.push("-t", originWindowId);
     }
 
     tmuxArgs.push(
@@ -86,16 +88,8 @@ export class TmuxAdapter implements TerminalAdapter {
     }
 
     const newPaneId = result.stdout.trim();
-    const layoutTarget = this.getWindowIdForPane(originPaneId) ?? this.getWindowIdForPane(newPaneId);
-
-    // Apply layout to the exact window that contains the spawned pane so the
-    // split always stays anchored to the intended tmux window.
-    if (layoutTarget) {
-      execCommand("tmux", ["set-window-option", "-t", layoutTarget, "main-pane-width", "60%"]);
-      execCommand("tmux", ["select-layout", "-t", layoutTarget, "main-vertical"]);
-    } else {
-      execCommand("tmux", ["set-window-option", "main-pane-width", "60%"]);
-      execCommand("tmux", ["select-layout", "main-vertical"]);
+    if (newPaneId) {
+      execCommand("tmux", ["select-pane", "-t", newPaneId, "-T", options.name]);
     }
 
     return newPaneId;
@@ -115,6 +109,20 @@ export class TmuxAdapter implements TerminalAdapter {
     if (!paneId) return false;
     // A pane is alive if tmux still reports it as a valid pane id.
     return this.isPaneUsable(paneId.trim());
+  }
+
+  focusPane(paneId: string): boolean {
+    const targetPaneId = paneId?.trim();
+    if (!this.isPaneUsable(targetPaneId)) return false;
+
+    const windowId = this.getWindowIdForPane(targetPaneId);
+    if (windowId) {
+      const windowResult = execCommand("tmux", ["select-window", "-t", windowId]);
+      if (windowResult.status !== 0) return false;
+    }
+
+    const paneResult = execCommand("tmux", ["select-pane", "-t", targetPaneId]);
+    return paneResult.status === 0;
   }
 
   setTitle(title: string): void {

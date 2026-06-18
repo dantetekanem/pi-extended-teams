@@ -60,10 +60,12 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
         env,
         anchorPaneId,
       });
-      await teams.updateMember(teamName, member.name, { tmuxPaneId: terminalId });
+      const windowId = options.terminal.getWindowIdForPane?.(terminalId) ?? undefined;
+      await teams.updateMember(teamName, member.name, { tmuxPaneId: terminalId, windowId });
       await writeTeamsDebugEvent(teamName, "write-agent.spawn.success", {
         agentName: member.name,
         terminalId,
+        windowId: windowId ?? null,
         anchorPaneId: anchorPaneId ?? null,
         debugLogPath: debugLogPath ?? null,
       }, settings);
@@ -77,7 +79,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       }, settings);
       await teams.removeMember(teamName, member.name);
       const debugHint = debugLogPath ? ` (debug log: ${debugLogPath})` : "";
-      throw new Error(`Failed to spawn tmux pane: ${e}${debugHint}`);
+      throw new Error(`Failed to spawn background tmux screen: ${e}${debugHint}`);
     }
   }
 
@@ -110,7 +112,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
             teamName,
             "system",
             "team-lead",
-            `Queued writer ${queued.name} started in pane ${terminalId}.`,
+            `Queued writer ${queued.name} started in background tmux screen ${terminalId}.`,
             `Queued writer ${queued.name} started`,
             "green"
           );

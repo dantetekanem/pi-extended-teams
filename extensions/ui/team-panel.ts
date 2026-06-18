@@ -7,7 +7,7 @@ import * as runtime from "../../src/utils/runtime";
 import { dimAnsi, pink, purple } from "./ansi";
 import { framePanel, logWindowStart } from "./frame";
 import { isDownInput, isLeftInput, isRightInput, isUpInput } from "./input";
-import { formatElapsed, formatTokenCount, formatTranscriptLines } from "./renderers";
+import { formatElapsed, formatTokenCount, formatTranscriptLines, sanitizeTuiLine } from "./renderers";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import type { Member } from "../../src/utils/models";
 
@@ -345,7 +345,12 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             const right = truncateToWidth(rightWindow[i] ?? "", rightWidth);
             content.push(`${left}${sep}${right}`);
           }
-          return framePanel(content, innerWidth);
+          // Nested agent transcripts can contain terminal control sequences from
+          // tool output (carriage returns, cursor movement, clear-line, etc.).
+          // The overlay compositor treats render strings as terminal output, so
+          // sanitize every final line before framing to prevent redraw smearing
+          // when selection changes with ↑/↓.
+          return framePanel(content.map(sanitizeTuiLine), innerWidth);
         };
 
         return {

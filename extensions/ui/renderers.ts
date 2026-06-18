@@ -1,6 +1,22 @@
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { dimAnsi, pink, purple } from "./ansi";
 
+const ANSI_ESCAPE_SEQUENCE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|_[^\x07\x1b]*(?:\x07|\x1b\\)|[PX^][^\x1b]*(?:\x1b\\|\x07)|[@-Z\\-_])/g;
+const SAFE_SGR_SEQUENCE = /^\x1b\[[0-9;]*m$/;
+
+export function sanitizeTuiText(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/\t/g, "   ")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001A\u001C-\u001F\u007F-\u009F]/g, "")
+    .replace(ANSI_ESCAPE_SEQUENCE, (sequence) => SAFE_SGR_SEQUENCE.test(sequence) ? sequence : "")
+    .replace(/\x1b(?!\[[0-9;]*m)/g, "");
+}
+
+export function sanitizeTuiLine(text: string): string {
+  return sanitizeTuiText(text).replace(/\n/g, " ");
+}
+
 export function formatModelLabel(model?: string, thinking?: string): string {
   const shortModel = model ? model.split("/").pop() || model : "";
   const t = thinking && thinking !== "off" ? ` · ${thinking}` : "";
@@ -45,17 +61,17 @@ export function formatTranscriptLines(messages: any[]): string[] {
   const out: string[] = [];
   for (const message of messages || []) {
     if (message?.role === "user") {
-      const text = extractTextParts(message.content);
+      const text = sanitizeTuiText(extractTextParts(message.content));
       if (text) out.push(`${pink("user ▸")} ${text}`);
     } else if (message?.role === "assistant") {
       for (const part of Array.isArray(message.content) ? message.content : []) {
-        if (part?.type === "text" && part.text?.trim()) out.push(part.text.trim());
-        else if (part?.type === "toolCall") out.push(purple(`⚙ ${part.name}`));
+        if (part?.type === "text" && part.text?.trim()) out.push(sanitizeTuiText(part.text.trim()));
+        else if (part?.type === "toolCall") out.push(purple(`⚙ ${sanitizeTuiLine(String(part.name || "tool"))}`));
       }
     } else if (message?.role === "toolResult") {
-      const text = extractTextParts(message.content);
+      const text = sanitizeTuiText(extractTextParts(message.content));
       const head = text.split("\n").find((line: string) => line.trim()) || "(no output)";
-      out.push(dimAnsi(`  ↳ ${message.toolName || "tool"}: ${head}`));
+      out.push(dimAnsi(`  ↳ ${sanitizeTuiLine(String(message.toolName || "tool"))}: ${head}`));
     }
   }
   return out;

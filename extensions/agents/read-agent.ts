@@ -22,7 +22,7 @@ export interface RunReadAgentOptions {
   ensureReadAgentStatusTicker(): void;
   renderReadAgentStatus(): void;
   rememberCompletedAgentReport(teamName: string, report: CompletedAgentReport): void;
-  emitAgentReport(name: string, startedAt: number, tokens: number, report: string, ok: boolean): void;
+  emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean): void;
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
   agentName?: string;
   quietTrigger?(content: string): void;
@@ -268,8 +268,8 @@ export async function runReadAgentInProcess(
       if (member.requestedBy === options.agentName) {
         options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox(team_name="${readTeamName}") and continue your task. Do not poll.`);
       }
-    } else if (!options.isTeammate && options.getTeamName() === readTeamName) {
-      options.emitAgentReport(member.name, state.startedAt, state.tokensUsed, report, true);
+    } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
+      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
     } else {
       await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", report, `Read agent ${member.name} completed`, member.color);
     }
@@ -298,8 +298,8 @@ export async function runReadAgentInProcess(
         if (member.requestedBy === options.agentName) {
           options.quietTrigger?.(`Read helper ${member.name} failed. Read the failure report with read_inbox(team_name="${readTeamName}") and continue or report the blocker. Do not poll.`);
         }
-      } else if (!options.isTeammate && options.getTeamName() === readTeamName) {
-        options.emitAgentReport(member.name, state.startedAt, state.tokensUsed, failureReport, false);
+      } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
+        options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, failureReport, false);
       } else {
         await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", failureReport, `Read agent ${member.name} failed`, "red");
       }

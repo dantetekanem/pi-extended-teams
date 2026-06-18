@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import { buildTeamPanelItems, registerTeamCommand } from "./team-panel.js";
 import * as paths from "../../src/utils/paths.js";
 import * as teams from "../../src/utils/teams.js";
@@ -200,6 +201,72 @@ describe("team panel items", () => {
     expect(writerItems).toHaveLength(2);
     expect(writerItems.some(item => !item.completed && item.status === "running")).toBe(true);
     expect(writerItems.some(item => item.completed && item.reportText === "previous writer report")).toBe(true);
+  });
+
+  it("sanitizes unsafe transcript control sequences before overlay rendering", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    await teams.addMember("team", {
+      agentId: "reader@team",
+      name: "reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    });
+    runningReadAgents.set("team:reader", {
+      runId: "run-1",
+      name: "reader",
+      teamName: "team",
+      startedAt: Date.now(),
+      tokensUsed: 0,
+      status: "working",
+      recentEvents: [],
+      lastActivityAt: Date.now(),
+      model: "provider/model",
+      thinking: "high",
+      session: {
+        messages: [
+          { role: "user", content: [{ type: "text", text: "first\rOVERWRITE\nnext\x1b[2Jclear" }] },
+          { role: "assistant", content: [{ type: "text", text: "reply\x1b[999Dcursor\bbackspace" }] },
+          { role: "toolResult", toolName: "bash\x1b[K", content: [{ type: "text", text: "line\ragain" }] },
+        ],
+      } as any,
+    });
+
+    let component: any;
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => {
+        pi.command = command;
+      }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, panelOptions({ runningReadAgents }));
+
+    await pi.command.handler("team", {
+      ui: {
+        notify: vi.fn(),
+        custom: vi.fn(async (factory: any) => {
+          component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, { fg: (_name: string, text: string) => text }, {}, vi.fn());
+        }),
+      },
+    });
+
+    component.handleInput("j");
+    const rendered = component.render(120);
+    const output = rendered.join("\n");
+
+    expect(output).toContain("OVERWRITE");
+    expect(output).toContain("cursorbackspace");
+    expect(output).not.toContain("\r");
+    expect(output).not.toContain("\b");
+    expect(output).not.toContain("\x1b[2J");
+    expect(output).not.toContain("\x1b[999D");
+    expect(output).not.toContain("\x1b[K");
+    expect(rendered.every((line: string) => visibleWidth(line) <= 120)).toBe(true);
   });
 
   it("auto-refreshes an open team overlay when new read agents appear", async () => {

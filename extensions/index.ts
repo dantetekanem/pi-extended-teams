@@ -16,6 +16,7 @@ import { registerModelTools } from "./tools/model-tools.js";
 import { registerPredefinedTools } from "./tools/predefined-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools } from "./tools/team-tools.js";
+import { getCurrentQualifiedModel } from "./internal/model-selection.js";
 import { formatElapsed, formatModelLabel, formatTokenCount } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
@@ -49,6 +50,7 @@ export default function (pi: ExtensionAPI) {
   const runningReadAgents = new Map<string, RunningReadAgent>();
   const completedAgentReports = new Map<string, CompletedAgentReport[]>();
   let readAgentStatusTimer: NodeJS.Timeout | null = null;
+  let activePromptBuildTeamName: string | null = null;
   let leadInboxWidgetCleared = false;
   let leadInboxUnreadCount = 0;
   // Highest unread count we've already nudged the lead about, so we wake once per
@@ -69,6 +71,12 @@ export default function (pi: ExtensionAPI) {
 
   function readAgentKey(targetTeamName: string, targetAgentName: string): string {
     return `${targetTeamName}:${targetAgentName}`;
+  }
+
+  function getTeamPanelName(): string | undefined {
+    if (teamName) return teamName;
+    if (activePromptBuildTeamName && teams.teamExists(activePromptBuildTeamName)) return activePromptBuildTeamName;
+    return undefined;
   }
 
   function isCurrentReadAgentRun(key: string, state: RunningReadAgent): boolean {
@@ -106,9 +114,17 @@ export default function (pi: ExtensionAPI) {
   // full report. display:true also feeds the report into the lead's context as a
   // user turn (see convertToLlm), and triggerTurn makes the lead synthesize it
   // automatically — no read_inbox, no manual polling.
-  function emitAgentReport(name: string, startedAt: number, tokens: number, report: string, ok: boolean): void {
+  function emitAgentReport(reportTeamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean): void {
     const api = pi as any;
     const details = { name, elapsedMs: Date.now() - startedAt, tokens, ok };
+    pi.events?.emit?.("pi-extended-teams:agent-report", { teamName: reportTeamName, name, startedAt, tokens, report, ok, details });
+
+    // pi-prompt prompt-build teams are extension-controlled fanout jobs. Their
+    // reports are consumed by pi-prompt via the event above and must not be
+    // injected as visible user turns, otherwise the main agent starts answering
+    // each branch report and can ask unrelated follow-up questions.
+    if (reportTeamName.startsWith("prompt-build-")) return;
+
     if (typeof api.sendMessage === "function") {
       api.sendMessage(
         { customType: "pi-extended-teams-report", content: report, display: true, details },
@@ -163,7 +179,8 @@ export default function (pi: ExtensionAPI) {
     if (!sessionCtx?.ui) return;
 
     const now = Date.now();
-    const readAgents = Array.from(runningReadAgents.values()).sort((a, b) => a.name.localeCompare(b.name));
+    const readAgents = Array.from(runningReadAgents.values())
+      .sort((a, b) => a.name.localeCompare(b.name));
     const activeWriteMembers = teamName
       ? (await teams.readConfig(teamName).catch(() => null))?.members
         ?.filter(member => member.name !== "team-lead" && (member.role ?? "write") !== "read")
@@ -381,6 +398,56 @@ export default function (pi: ExtensionAPI) {
     startLeadWatchdog();
   }
 
+  pi.events?.on?.("pi-prompt:prompt-build:start", async (payload: any) => {
+    if (isTeammate || !sessionCtx) return;
+    const requestedTeamName = teamPaths.sanitizeName(payload?.teamName || `prompt-build-${Date.now()}`);
+
+    try {
+      const prompts = Array.isArray(payload?.prompts) ? payload.prompts : [];
+      activePromptBuildTeamName = requestedTeamName;
+      const cwd = payload?.cwd || sessionCtx.cwd;
+      const agentNamePrefix = teamPaths.sanitizeName(payload?.agentNamePrefix || "prompt-branch");
+      const model = getCurrentQualifiedModel(sessionCtx);
+      if (!model) {
+        pi.events?.emit?.("pi-prompt:prompt-build:error", { teamName: requestedTeamName, error: "No current model available for read agents." });
+        return;
+      }
+
+      if (!teams.teamExists(requestedTeamName)) {
+        teams.createTeam(requestedTeamName, getPiSessionId(sessionCtx) || "local-session", "lead-agent", payload?.description || "pi-prompt prompt-build", model);
+      }
+      // Prompt-build teams are private fanout jobs owned by pi-prompt. Do not
+      // adopt them as the lead's current team, or normal /team context and
+      // bottom-status widgets get hijacked by the prompt-building run.
+      pi.events?.emit?.("pi-prompt:prompt-build:progress", { teamName: requestedTeamName, status: "started", total: prompts.length, text: `building prompt — ${prompts.length} branches started` });
+
+      for (let i = 0; i < prompts.length; i += 1) {
+        const name = teamPaths.sanitizeName(`${agentNamePrefix}-${i + 1}`);
+        const prompt = String(prompts[i] ?? "");
+        const member: Member = {
+          agentId: `${name}@${requestedTeamName}`,
+          name,
+          agentType: "teammate",
+          role: "read",
+          model,
+          joinedAt: Date.now(),
+          tmuxPaneId: "",
+          cwd,
+          subscriptions: [],
+          prompt,
+          color: "cyan",
+          thinking: payload?.thinking || "high",
+        };
+        await teams.addMember(requestedTeamName, member);
+        void runReadAgentInProcess(requestedTeamName, member, prompt, sessionCtx, readAgentOptions());
+        pi.events?.emit?.("pi-prompt:prompt-build:progress", { teamName: requestedTeamName, status: "spawned", started: i + 1, total: prompts.length, text: `building prompt — ${i + 1}/${prompts.length} branches started` });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      pi.events?.emit?.("pi-prompt:prompt-build:error", { teamName: requestedTeamName, error: message });
+    }
+  });
+
   registerExtensionEvents(pi, {
     isTeammate,
     agentName,
@@ -401,7 +468,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerTeamCommand(pi, {
-    getTeamName: () => teamName,
+    getTeamName: getTeamPanelName,
     getLeadInboxUnreadCount: () => leadInboxUnreadCount,
     runningReadAgents,
     completedAgentReports,

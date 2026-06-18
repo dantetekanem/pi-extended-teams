@@ -30,6 +30,8 @@ function makeCtx(cwd: string, sessionId = "test-session") {
 async function setupExtension(env: Record<string, string | undefined> = {}, options: { mockReadAgent?: boolean } = {}) {
   vi.resetModules();
   const originalEnv = { ...process.env };
+  delete process.env.PI_TEAM_NAME;
+  delete process.env.PI_AGENT_NAME;
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -79,19 +81,26 @@ async function setupExtension(env: Record<string, string | undefined> = {}, opti
 
   const tools = new Map<string, RegisteredTool>();
   const eventHandlers = new Map<string, Function[]>();
+  const extensionEventHandlers = new Map<string, Function[]>();
   const pi = {
     registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
     registerCommand: vi.fn(),
     on: vi.fn((eventName: string, handler: Function) => {
       eventHandlers.set(eventName, [...(eventHandlers.get(eventName) || []), handler]);
     }),
+    events: {
+      on: vi.fn((eventName: string, handler: Function) => {
+        extensionEventHandlers.set(eventName, [...(extensionEventHandlers.get(eventName) || []), handler]);
+      }),
+      emit: vi.fn(),
+    },
     sendUserMessage: vi.fn(),
     sendMessage: vi.fn(),
   };
 
   extension(pi as any);
 
-  return { root, terminal, tools, pi, eventHandlers, paths, teams, claims, readAgentMock, restoreEnv: () => { process.env = originalEnv; } };
+  return { root, terminal, tools, pi, eventHandlers, extensionEventHandlers, paths, teams, claims, readAgentMock, restoreEnv: () => { process.env = originalEnv; } };
 }
 
 describe("extension integration", () => {
@@ -149,6 +158,39 @@ describe("extension integration", () => {
     expect(ctx.ui.custom).toHaveBeenCalled();
     setup.restoreEnv();
     vi.useRealTimers();
+  });
+
+  it("starts prompt-build fanout without adopting it as the lead team while letting /team inspect it", async () => {
+    const setup = await setupExtension({}, { mockReadAgent: true });
+    const ctx = makeCtx(setup.root, "current-session");
+
+    for (const handler of setup.eventHandlers.get("session_start") || []) {
+      await handler({}, ctx);
+    }
+
+    for (const handler of setup.extensionEventHandlers.get("pi-prompt:prompt-build:start") || []) {
+      await handler({
+        teamName: "prompt-build-test",
+        prompts: ["build options"],
+        cwd: setup.root,
+        thinking: "high",
+      });
+    }
+
+    expect(setup.teams.teamExists("prompt-build-test")).toBe(true);
+    expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledWith(
+      "prompt-build-test",
+      expect.objectContaining({ name: "prompt-branch-1", role: "read" }),
+      "build options",
+      ctx,
+      expect.any(Object),
+    );
+
+    const teamCommand = setup.pi.registerCommand.mock.calls.find((call: any[]) => call[0] === "team")?.[1];
+    await teamCommand.handler("", ctx);
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith("No current team. Pass a team name: /team <name>", "warning");
+    expect(ctx.ui.custom).toHaveBeenCalled();
+    setup.restoreEnv();
   });
 
   it("spawns inline agents in one team_create call", async () => {

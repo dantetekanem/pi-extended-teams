@@ -114,9 +114,49 @@ describe("in-process read agent tool wiring", () => {
     expect(promptText).toContain("call request_teammate to ask the team lead");
 
     expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
-    expect(options.emitAgentReport).toHaveBeenCalledWith("reader", expect.any(Number), 42, "final report", true);
+    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, "final report", true);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader");
     expect(runningReadAgents.size).toBe(0);
+  });
+
+  it("emits prompt-build reports even when prompt-build is not the adopted lead team", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "active-user-team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    };
+
+    await runReadAgentInProcess("prompt-build-123", {
+      agentId: "prompt-branch-1@prompt-build-123",
+      name: "prompt-branch-1",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "high",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "build prompt options",
+    }, "build prompt options", {
+      modelRegistry: {
+        find: vi.fn(() => ({ provider: "provider", id: "model" })),
+      },
+    }, options);
+
+    expect(options.emitAgentReport).toHaveBeenCalledWith("prompt-build-123", "prompt-branch-1", expect.any(Number), 42, "final report", true);
+    const leadInbox = await readInbox("prompt-build-123", "team-lead", false, false);
+    expect(leadInbox).toEqual([]);
   });
 
   it("lead-run read helpers require the helper to send the full report and only a done notice to lead", async () => {

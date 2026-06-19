@@ -1,3 +1,4 @@
+import { keyText } from "@mariozechner/pi-coding-agent";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { dimAnsi, pink, purple } from "./ansi";
 
@@ -144,5 +145,77 @@ export function renderTeammateStatus(result: any, expanded: boolean, theme: any)
   if (runtimeStatus.lastHeartbeatAt) lines.push(`last heartbeat: ${new Date(runtimeStatus.lastHeartbeatAt).toLocaleString()}`);
   if (details.startupStalled) lines.push(theme.fg("warning", "startup appears stalled"));
   if (details.releasedClaims?.length) lines.push(`released claims: ${details.releasedClaims.join(", ")}`);
+  return new Text(lines.join("\n"), 0, 0);
+}
+
+function expandKeyLabel(): string {
+  try {
+    return keyText("app.tools.expand") || "ctrl+o";
+  } catch {
+    return "ctrl+o";
+  }
+}
+
+function plural(count: number, label: string): string {
+  return `${count} ${label}${count === 1 ? "" : "s"}`;
+}
+
+function memberStatusLine(member: any): string {
+  const runtimeStatus = member.runtime || {};
+  const bits = [
+    member.role,
+    member.health,
+    `${member.unreadCount ?? 0} unread`,
+    member.agentLoopReady ? "ready" : "not ready",
+    member.hasRecentHeartbeat ? "fresh heartbeat" : "stale/no heartbeat",
+    runtimeStatus.currentAction,
+    runtimeStatus.activeToolName ? `tool: ${runtimeStatus.activeToolName}` : "",
+  ].filter(Boolean);
+  return `${member.agentName || member.member?.name || "teammate"}: ${bits.join(" · ")}`;
+}
+
+export function renderTeamObservation(result: any, expanded: boolean, theme: any) {
+  const details = result.details || {};
+  const members = Array.isArray(details.members) ? details.members : [];
+  const tasks = Array.isArray(details.tasks) ? details.tasks : [];
+  const claims = Array.isArray(details.claims) ? details.claims : [];
+  const writeQueue = Array.isArray(details.writeQueue) ? details.writeQueue : [];
+  const reports = Array.isArray(details.reports) ? details.reports : [];
+  const activeMembers = members.filter((member: any) => member.agentName !== "team-lead" && member.alive !== false);
+  const unread = members.reduce((sum: number, member: any) => sum + (Number(member.unreadCount) || 0), 0);
+  const troubled = members.filter((member: any) => member.health === "dead" || member.health === "stalled");
+  const teamName = details.teamName || "team";
+  const summary = [
+    plural(members.length, "member"),
+    plural(activeMembers.length, "active agent"),
+    unread ? plural(unread, "unread message") : "0 unread messages",
+    tasks.length ? plural(tasks.length, "task") : "0 tasks",
+    claims.length ? plural(claims.length, "claim") : "0 claims",
+    writeQueue.length ? `${writeQueue.length} queued writer${writeQueue.length === 1 ? "" : "s"}` : "0 queued writers",
+    reports.length ? plural(reports.length, "report") : "0 reports",
+  ].join(" · ");
+  const color = troubled.length > 0 ? "warning" : "success";
+  const headline = `${teamName}: ${summary}`;
+
+  if (!expanded) {
+    return new Text(`${theme.fg(color, headline)}  ${theme.fg("dim", `(${expandKeyLabel()} details)`)}`, 0, 0);
+  }
+
+  const lines = [theme.fg(color, theme.bold(headline))];
+  if (troubled.length > 0) lines.push(theme.fg("warning", `${troubled.length} member${troubled.length === 1 ? "" : "s"} need attention`));
+
+  if (members.length > 0) {
+    lines.push(theme.fg("muted", "members:"));
+    for (const member of members.slice(0, 12)) lines.push(`  ${memberStatusLine(member)}`);
+    if (members.length > 12) lines.push(theme.fg("dim", `  … ${members.length - 12} more`));
+  }
+
+  const sections = [
+    tasks.length ? `tasks: ${tasks.map((task: any) => task.id || task.subject || task.path || "task").slice(0, 5).join(", ")}${tasks.length > 5 ? `, … ${tasks.length - 5} more` : ""}` : "tasks: none",
+    claims.length ? `claims: ${claims.map((claim: any) => claim.path || claim.file || "claim").slice(0, 5).join(", ")}${claims.length > 5 ? `, … ${claims.length - 5} more` : ""}` : "claims: none",
+    writeQueue.length ? `write queue: ${writeQueue.map((item: any) => item.name || item.agentName || "writer").slice(0, 5).join(", ")}${writeQueue.length > 5 ? `, … ${writeQueue.length - 5} more` : ""}` : "write queue: empty",
+    reports.length ? `reports: ${reports.map((report: any) => report.name || report.agentName || report.summary || "report").slice(0, 5).join(", ")}${reports.length > 5 ? `, … ${reports.length - 5} more` : ""}` : "reports: none",
+  ];
+  lines.push(...sections.map((line) => theme.fg("muted", line)));
   return new Text(lines.join("\n"), 0, 0);
 }

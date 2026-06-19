@@ -2,9 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { findLeadTeamForSession, getPiSessionId, registerLeadSession, resolveSkillFile } from "./internal/session-files.js";
-import { dimAnsi, pink, purple } from "./ui/ansi.js";
 import { buildReadAgentIdleNudgeMessage, describeReadAgentStatus, shouldNudgeReadAgentIdle, type ReadAgentStatusDescription } from "./ui/read-agent-status.js";
-import { bottomStatusWidget } from "./ui/status-widget.js";
+import { teamActivityStatusWidget, type TeamActivityStatusEntry, type TeamActivityStatusSnapshot } from "./ui/status-widget.js";
 import { runReadAgentInProcess } from "./agents/read-agent.js";
 import { createWriteAgentRuntime } from "./agents/write-agent.js";
 import { registerExtensionEvents } from "./events/register-events.js";
@@ -51,6 +50,9 @@ export default function (pi: ExtensionAPI) {
   const runningReadAgents = new Map<string, RunningReadAgent>();
   const completedAgentReports = new Map<string, CompletedAgentReport[]>();
   let readAgentStatusTimer: NodeJS.Timeout | null = null;
+  let teamActivityStatusSnapshot: TeamActivityStatusSnapshot | null = null;
+  let teamActivityWidgetMounted = false;
+  let teamActivityWidgetTui: { requestRender?: () => void } | null = null;
   let activePromptBuildTeamName: string | null = null;
   let leadInboxWidgetCleared = false;
   let leadInboxUnreadCount = 0;
@@ -176,6 +178,36 @@ export default function (pi: ExtensionAPI) {
     void renderTeamActivityStatus();
   }
 
+  function isTeamActivityExpanded(): boolean {
+    return !!sessionCtx?.ui?.getToolsExpanded?.();
+  }
+
+  function mountTeamActivityWidget(): void {
+    if (teamActivityWidgetMounted || !sessionCtx?.ui?.setWidget) return;
+    teamActivityWidgetMounted = true;
+    sessionCtx.ui.setWidget(
+      "01-pi-extended-teams-readers",
+      (tui: any) => {
+        teamActivityWidgetTui = tui;
+        return teamActivityStatusWidget(() => teamActivityStatusSnapshot, isTeamActivityExpanded);
+      },
+      { placement: "aboveEditor" }
+    );
+  }
+
+  function updateTeamActivityWidget(snapshot: TeamActivityStatusSnapshot): void {
+    teamActivityStatusSnapshot = snapshot;
+    mountTeamActivityWidget();
+    teamActivityWidgetTui?.requestRender?.();
+  }
+
+  function clearTeamActivityWidget(): void {
+    teamActivityStatusSnapshot = null;
+    teamActivityWidgetMounted = false;
+    teamActivityWidgetTui = null;
+    sessionCtx?.ui?.setWidget?.("01-pi-extended-teams-readers", undefined);
+  }
+
   async function renderTeamActivityStatus() {
     if (!sessionCtx?.ui) return;
 
@@ -197,7 +229,7 @@ export default function (pi: ExtensionAPI) {
 
     if (readAgents.length === 0 && activeWriteMembers.length === 0) {
       sessionCtx.ui.setStatus?.("01-pi-extended-teams-read", undefined);
-      sessionCtx.ui.setWidget?.("01-pi-extended-teams-readers", undefined);
+      clearTeamActivityWidget();
       sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
       if (readAgentStatusTimer) {
         clearInterval(readAgentStatusTimer);
@@ -207,7 +239,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const activeCount = readAgents.length + activeWriteMembers.length;
-    const lines = [pink(`▣ team activity (${activeCount} active)  /team`)];
+    const entries: TeamActivityStatusEntry[] = [];
 
     for (const member of activeWriteMembers.sort((a, b) => a.name.localeCompare(b.name))) {
       const runtimeStatus = await runtime.readRuntimeStatus(teamName!, member.name).catch(() => null);
@@ -219,7 +251,7 @@ export default function (pi: ExtensionAPI) {
         : runtimeStatus?.currentAction || "running";
       const screen = member.windowId ? `${member.windowId}/${member.tmuxPaneId}` : member.tmuxPaneId;
       const detail = [screen, modelLabel, elapsed, tokens, action].filter(Boolean).join(" · ");
-      lines.push(`${purple("  ├─")} ${pink(member.name)} ${purple("write bg")} ${dimAnsi(detail)}`);
+      entries.push({ name: member.name, role: "write", status: "bg", detail });
     }
 
     for (const agent of readAgents) {
@@ -238,12 +270,18 @@ export default function (pi: ExtensionAPI) {
       wakeLeadForIdleReadAgent(agent, status);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
       const detail = [modelLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
-      lines.push(`${purple("  ├─")} ${pink(agent.name)} ${purple("read")} ${purple(status.label)} ${dimAnsi(detail)}`);
+      entries.push({ name: agent.name, role: "read", status: status.label, detail });
     }
 
-    lines[lines.length - 1] = lines[lines.length - 1].replace("├─", "└─");
     sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
-    sessionCtx.ui.setWidget?.("01-pi-extended-teams-readers", bottomStatusWidget(lines), { placement: "belowEditor" });
+    updateTeamActivityWidget({
+      activeCount,
+      readCount: readAgents.length,
+      writeCount: activeWriteMembers.length,
+      unreadCount: leadInboxUnreadCount,
+      entries,
+      updatedAt: now,
+    });
   }
 
   function ensureReadAgentStatusTicker() {

@@ -8,7 +8,7 @@ import * as tasks from "../../src/utils/tasks";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
 import { observeTeam, observeTeammate } from "../../src/orchestration";
-import { formatTeammateStatusForModel, renderTeammateStatus } from "../ui/renderers";
+import { formatTeammateStatusForModel, renderTeamObservation, renderTeammateStatus } from "../ui/renderers";
 import type { RunningReadAgent } from "../runtime/types";
 import type { Member, TaskFile } from "../../src/utils/models";
 
@@ -175,6 +175,9 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
         readAgentKey: options.readAgentKey,
       });
       return { content: [{ type: "text", text: JSON.stringify(observation, null, 2) }], details: observation };
+    },
+    renderResult(result: any, { expanded }: any, theme: any) {
+      return renderTeamObservation(result, expanded, theme);
     },
   });
 

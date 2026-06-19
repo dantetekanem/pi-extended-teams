@@ -4,12 +4,12 @@
   "source": "Leo Pereira session requirements",
   "contracts": [
     {
-      "id": "ui.old-bottom-status-kept",
-      "description": "Keep the old bottom-status style: a below-main boxed widget for live team activity. Completed reports arrive as messages/collapsed reports and do not create report-ready or waiting-confirmation status rows."
+      "id": "ui.team-activity-card",
+      "description": "Live team activity renders as an above-editor pi-emote-style card with a compact collapsed view and Ctrl+O-expanded details. It must not use a below-editor/bottom-bar text strip. Completed reports arrive as messages/collapsed reports and do not create report-ready or waiting-confirmation status rows."
     },
     {
       "id": "ui.active-reader-writer-info",
-      "description": "Active agent information remains available in the below-main status and /team for both readers and writers, including elapsed/running time, current status/action, model, thinking level, and token count when available. Duplicate active/history entries are preserved rather than hidden."
+      "description": "Active agent information remains available in the team activity card and /team for both readers and writers, including elapsed/running time, current status/action, model, thinking level, and token count when available. Duplicate active/history entries are preserved rather than hidden."
     },
     {
       "id": "helpers.requested-by-writer",

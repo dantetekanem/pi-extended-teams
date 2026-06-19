@@ -11,6 +11,7 @@ import * as reportEvents from "../../src/utils/report-events";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
 import { StringEnum } from "../internal/schema";
 import { requestLeadForTeammateSpawn } from "./delegation-guard";
+import { summarizeSessionUsage } from "../internal/session-usage";
 import { enqueueReadHelperRequest, listReadHelperQueue } from "../../src/utils/read-helper-queue";
 
 export interface CoordinationToolsOptions {
@@ -146,14 +147,31 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       const config = await teams.readConfig(targetTeamName);
       const member = config.members.find(m => m.name === options.agentName);
       const tmuxPaneId = member?.tmuxPaneId;
+      const runtimeStatus = await runtime.readRuntimeStatus(targetTeamName, options.agentName).catch(() => null);
+      const sessionUsage = summarizeSessionUsage(ctx);
+      const tokensUsed = typeof sessionUsage.tokensUsed === "number" ? sessionUsage.tokensUsed : runtimeStatus?.tokensUsed;
+      const costUsd = sessionUsage.costUsd;
+      const elapsedMs = runtimeStatus?.startedAt ? Date.now() - runtimeStatus.startedAt : undefined;
+      const reportMetadata = {
+        startedAt: runtimeStatus?.startedAt,
+        elapsedMs,
+        tokensUsed,
+        costUsd,
+        model: member?.model,
+        thinking: member?.thinking,
+      };
 
-      await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", params.content, params.summary || "Final report");
+      await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", params.content, params.summary || "Final report", undefined, { metadata: reportMetadata });
       await reportEvents.appendTeamReportEvent(targetTeamName, {
         agentName: options.agentName,
         role: member?.role || "write",
         status: "completed",
         report: params.content,
         summary: params.summary || "Final report",
+        startedAt: runtimeStatus?.startedAt,
+        elapsedMs,
+        tokensUsed,
+        costUsd,
         source: "write-agent",
         model: member?.model,
         thinking: member?.thinking,

@@ -96,6 +96,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
     .map((message: any) => {
       const summary = String(message.summary || "Final report");
       const text = String(message.text || "");
+      const metadata = message.metadata || {};
       const role = summary.startsWith("Read helper ") || summary.startsWith("Read agent ") ? "read" : "write";
       return {
         name: String(message.from),
@@ -104,6 +105,12 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
         report: text,
         summary,
         completedAt: message.timestamp ? new Date(message.timestamp).getTime() : Date.now(),
+        startedAt: typeof metadata.startedAt === "number" ? metadata.startedAt : undefined,
+        elapsedMs: typeof metadata.elapsedMs === "number" ? metadata.elapsedMs : undefined,
+        tokensUsed: typeof metadata.tokensUsed === "number" ? metadata.tokensUsed : undefined,
+        costUsd: typeof metadata.costUsd === "number" ? metadata.costUsd : undefined,
+        model: typeof metadata.model === "string" ? metadata.model : undefined,
+        thinking: typeof metadata.thinking === "string" ? metadata.thinking : undefined,
         color: message.color,
         requestedBy: inferRequestedBy(summary, text),
         source: "lead-inbox" as const,

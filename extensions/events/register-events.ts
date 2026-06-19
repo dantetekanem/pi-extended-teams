@@ -6,6 +6,7 @@ import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
 import * as teams from "../../src/utils/teams";
 import { cleanupAgentSessionFolders, cleanupOrphanedTeams } from "../internal/session-files";
+import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
 
 export interface RegisterEventsOptions {
@@ -38,6 +39,14 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       teammateInboxWakeTimer = null;
       void teammateWakeIfUnread?.();
     }, delayMs);
+  };
+
+  const teammateRuntimeUpdates = (ctx: any, updates: Partial<runtime.AgentRuntimeStatus>, currentAssistantMessage?: any) => {
+    const usage = summarizeSessionUsage(ctx, currentAssistantMessage);
+    return {
+      ...updates,
+      ...(typeof usage.tokensUsed === "number" ? { tokensUsed: usage.tokensUsed } : {}),
+    };
   };
 
   pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, renderOptions: any, theme: any) => {
@@ -161,45 +170,54 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       if ((ctx.ui as any).setTitle) (ctx.ui as any).setTitle(fullTitle);
       if (options.terminal) options.terminal.setTitle(fullTitle);
       if (teamName) {
-        await runtime.writeRuntimeStatus(teamName, options.agentName, {
+        await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
           lastHeartbeatAt: Date.now(),
           currentAction: "thinking",
           activeToolName: undefined,
-        });
+        }));
       }
     }
   });
 
-  pi.on("tool_execution_start", async (event: any) => {
+  pi.on("tool_execution_start", async (event: any, ctx: any) => {
     const teamName = options.getTeamName();
     if (options.isTeammate && teamName) {
-      await runtime.writeRuntimeStatus(teamName, options.agentName, {
+      await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
         lastHeartbeatAt: Date.now(),
         currentAction: "working",
         activeToolName: event?.toolName,
-      });
+      }));
     }
   });
 
-  pi.on("tool_execution_end", async () => {
+  pi.on("tool_execution_end", async (_event: any, ctx: any) => {
     const teamName = options.getTeamName();
     if (options.isTeammate && teamName) {
-      await runtime.writeRuntimeStatus(teamName, options.agentName, {
+      await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
         lastHeartbeatAt: Date.now(),
         currentAction: "thinking",
         activeToolName: undefined,
-      });
+      }));
     }
   });
 
-  pi.on("turn_end", async () => {
+  pi.on("message_end", async (event: any, ctx: any) => {
+    const teamName = options.getTeamName();
+    if (options.isTeammate && teamName && event.message?.role === "assistant") {
+      await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
+        lastHeartbeatAt: Date.now(),
+      }, event.message));
+    }
+  });
+
+  pi.on("turn_end", async (_event: any, ctx: any) => {
     const teamName = options.getTeamName();
     if (options.isTeammate && teamName) {
-      await runtime.writeRuntimeStatus(teamName, options.agentName, {
+      await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
         lastHeartbeatAt: Date.now(),
         currentAction: "thinking",
         activeToolName: undefined,
-      });
+      }));
     }
     if (options.isTeammate && teammatePendingInboxWake && teammateWakeIfUnread) {
       // Pi may emit turn_end before ctx.isIdle() flips to true. Defer the wake

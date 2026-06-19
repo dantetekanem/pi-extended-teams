@@ -120,6 +120,35 @@ describe("extension teammate inbox wake", () => {
     expect(afterTool).not.toHaveProperty("activeToolName");
   });
 
+  it("records writer token usage in runtime status for /team", async () => {
+    const { handlers, ctx } = setupEvents(() => true);
+    const assistantMessage = {
+      role: "assistant",
+      provider: "provider",
+      model: "model",
+      timestamp: 123,
+      stopReason: "toolUse",
+      content: [],
+      usage: {
+        input: 100,
+        output: 50,
+        cacheRead: 20,
+        cacheWrite: 5,
+        cost: { total: 0.123 },
+      },
+    };
+    (ctx as any).sessionManager = { getBranch: vi.fn(() => []) };
+
+    for (const handler of handlers.get("session_start") || []) {
+      await handler({}, ctx);
+    }
+    for (const handler of handlers.get("message_end") || []) {
+      await handler({ message: assistantMessage }, ctx);
+    }
+
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({ tokensUsed: 175 });
+  });
+
   it("defers the turn_end inbox wake until the writer session becomes idle", async () => {
     let idle = false;
     const { handlers, quietTrigger, ctx } = setupEvents(() => idle);

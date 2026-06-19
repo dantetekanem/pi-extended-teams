@@ -239,14 +239,17 @@ describe("team panel items", () => {
       cwd: root,
       subscriptions: [],
     });
-    await sendPlainMessage("team", "writer", "team-lead", "previous writer report", "Previous writer done", "green");
+    await sendPlainMessage("team", "writer", "team-lead", "previous writer report", "Previous writer done", "green", {
+      metadata: { tokensUsed: 321, elapsedMs: 4567, model: "provider/model", thinking: "xhigh" },
+    });
 
     const items = await buildTeamPanelItems("team", panelOptions());
     const writerItems = items.filter(item => item.name === "writer");
+    const completedWriter = writerItems.find(item => item.completed && item.reportText === "previous writer report");
 
     expect(writerItems).toHaveLength(2);
     expect(writerItems.some(item => !item.completed && item.status === "running")).toBe(true);
-    expect(writerItems.some(item => item.completed && item.reportText === "previous writer report")).toBe(true);
+    expect(completedWriter).toMatchObject({ tokensUsed: 321, elapsedMs: 4567, model: "provider/model", thinking: "xhigh" });
   });
 
   it("sanitizes unsafe transcript control sequences before overlay rendering", async () => {

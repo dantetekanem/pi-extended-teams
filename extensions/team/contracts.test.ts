@@ -11,7 +11,7 @@ describe("persisted team behavior contracts", () => {
 
     expect(contract.version).toBe(1);
     expect(contract.contracts).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: "ui.old-bottom-status-kept" }),
+      expect.objectContaining({ id: "ui.team-activity-card" }),
       expect.objectContaining({ id: "ui.active-reader-writer-info" }),
       expect.objectContaining({ id: "helpers.requested-by-writer" }),
       expect.objectContaining({ id: "writers.request-only-lead-spawns" }),
@@ -22,10 +22,11 @@ describe("persisted team behavior contracts", () => {
     ]));
 
     const byId = Object.fromEntries(contract.contracts.map((entry: any) => [entry.id, entry.description]));
-    expect(byId["ui.old-bottom-status-kept"]).not.toContain("writers are tmux agents and are not mirrored");
-    expect(byId["ui.old-bottom-status-kept"]).not.toContain("lead inbox reports");
-    expect(byId["ui.old-bottom-status-kept"]).toContain("reports arrive as messages");
-    expect(byId["ui.active-reader-writer-info"]).toContain("below-main status");
+    expect(byId["ui.team-activity-card"]).not.toContain("writers are tmux agents and are not mirrored");
+    expect(byId["ui.team-activity-card"]).not.toContain("lead inbox reports");
+    expect(byId["ui.team-activity-card"]).toContain("reports arrive as messages");
+    expect(byId["ui.team-activity-card"]).toContain("above-editor pi-emote-style card");
+    expect(byId["ui.active-reader-writer-info"]).toContain("team activity card");
     expect(byId["ui.active-reader-writer-info"]).toContain("readers and writers");
   });
 });

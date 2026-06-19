@@ -72,7 +72,8 @@ export class TmuxAdapter implements TerminalAdapter {
     ];
 
     if (originWindowId) {
-      tmuxArgs.push("-t", originWindowId);
+      // A bare `new-window -t @window` reuses the target window index; insert after it instead.
+      tmuxArgs.push("-a", "-t", originWindowId);
     }
 
     tmuxArgs.push(

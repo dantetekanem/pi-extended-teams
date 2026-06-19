@@ -6,6 +6,7 @@ import path from "node:path";
 type RegisteredTool = {
   name: string;
   execute: (toolCallId: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any>;
+  renderResult?: (result: any, options: any, theme: any) => { render(width: number): string[] };
 };
 
 const testRoot = path.join(os.tmpdir(), "pi-extended-teams-extension-" + Date.now());
@@ -21,7 +22,7 @@ function makeCtx(cwd: string, sessionId = "test-session") {
       getAvailable: vi.fn(async () => [{ provider: "provider", id: "model" }]),
       find: vi.fn(() => ({ provider: "provider", id: "model" })),
     },
-    ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn(), custom: vi.fn() },
+    ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn(), custom: vi.fn(), getToolsExpanded: vi.fn(() => false) },
     isIdle: vi.fn(() => true),
     shutdown: vi.fn(),
   };
@@ -506,6 +507,41 @@ describe("extension integration", () => {
     setup.restoreEnv();
   });
 
+  it("observe_team renders compact by default with expandable details", async () => {
+    const setup = await setupExtension();
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+
+    setup.teams.createTeam("team", "session", "lead", "", "provider/model");
+    await setup.teams.addMember("team", {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "%writer",
+      cwd: setup.root,
+      subscriptions: [],
+    });
+
+    const tool = setup.tools.get("observe_team")!;
+    const result = await tool.execute("observe", { team_name: "team" }, abort, undefined, ctx);
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+
+    const collapsed = tool.renderResult!(result, { expanded: false }, theme).render(160).join("\n");
+    expect(collapsed).toContain("team:");
+    expect(collapsed).toContain("members");
+    expect(collapsed).toContain("details");
+    expect(collapsed).not.toContain("members:\n");
+
+    const expanded = tool.renderResult!(result, { expanded: true }, theme).render(160).join("\n");
+    expect(expanded).toContain("members:");
+    expect(expanded).toContain("writer");
+    expect(expanded).toContain("write queue: empty");
+    setup.restoreEnv();
+  });
+
   it("dead write members do not consume write-agent capacity", async () => {
     const setup = await setupExtension();
     const ctx = makeCtx(setup.root);
@@ -598,7 +634,7 @@ describe("extension integration", () => {
     }
   });
 
-  it("bottom status tracks active write agents with tmux pane and model details", async () => {
+  it("team activity uses an above-editor pi-emote-style card with expandable agent details", async () => {
     vi.useFakeTimers();
     const setup = await setupExtension();
     const ctx = makeCtx(setup.root);
@@ -635,10 +671,19 @@ describe("extension integration", () => {
         .filter(([key, widget]: any[]) => key === "01-pi-extended-teams-readers" && typeof widget === "function")
         .at(-1);
       expect(widgetCall).toBeTruthy();
-      const rendered = widgetCall![1]({}, {}).render(120).join("\n");
-      expect(rendered).toContain("team activity");
-      expect(rendered).toContain("writer");
-      expect(rendered).toContain("write");
+      expect(widgetCall![2]).toMatchObject({ placement: "aboveEditor" });
+      const widget = widgetCall![1]({ requestRender: vi.fn() }, {});
+      const collapsed = widget.render(120);
+      expect(collapsed.length).toBeGreaterThan(1);
+      expect(collapsed[0]).toContain("─");
+      expect(collapsed.join("\n")).toContain("TEAM");
+      expect(collapsed.join("\n")).toContain("team activity");
+      expect(collapsed.join("\n")).toContain("writer");
+      expect(collapsed.join("\n")).toContain("write");
+      expect(collapsed.join("\n")).not.toContain("working: bash");
+
+      ctx.ui.getToolsExpanded.mockReturnValue(true);
+      const rendered = widget.render(120).join("\n");
       expect(rendered).toContain("%1");
       expect(rendered).toContain("model · xhigh");
       expect(rendered).not.toContain("provider/model");
@@ -860,6 +905,24 @@ describe("extension integration", () => {
       subscriptions: [],
     });
     await setup.claims.claimFiles("team", "writer", ["src/a.ts"]);
+    const runtime = await import("../src/utils/runtime.js");
+    await runtime.writeRuntimeStatus("team", "writer", { startedAt: Date.now() - 5000, tokensUsed: 7 });
+    const assistantMessage = {
+      role: "assistant",
+      provider: "provider",
+      model: "model",
+      timestamp: 123,
+      stopReason: "stop",
+      content: [],
+      usage: {
+        input: 30,
+        output: 10,
+        cacheRead: 2,
+        cacheWrite: 1,
+        cost: { total: 0.045 },
+      },
+    };
+    (ctx.sessionManager as any).getBranch = vi.fn(() => [{ type: "message", message: assistantMessage }]);
 
     await setup.tools.get("report_and_exit")!.execute("report", {
       team_name: "team",
@@ -873,7 +936,15 @@ describe("extension integration", () => {
 
     const inboxPath = setup.paths.inboxPath("team", "team-lead");
     const inbox = JSON.parse(fs.readFileSync(inboxPath, "utf-8"));
-    expect(inbox[0]).toMatchObject({ from: "writer", text: "done", summary: "done summary" });
+    expect(inbox[0]).toMatchObject({
+      from: "writer",
+      text: "done",
+      summary: "done summary",
+      metadata: { tokensUsed: 43, costUsd: 0.045, model: "provider/model" },
+    });
+    const reportEvents = await import("../src/utils/report-events.js");
+    const reports = await reportEvents.listTeamReportEvents("team");
+    expect(reports[0]).toMatchObject({ agentName: "writer", tokensUsed: 43, costUsd: 0.045, model: "provider/model" });
 
     await new Promise(resolve => setTimeout(resolve, 300));
     expect(setup.terminal.kill).toHaveBeenCalledWith("%99");

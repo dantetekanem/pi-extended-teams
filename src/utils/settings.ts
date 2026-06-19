@@ -276,13 +276,41 @@ export function resolveModel(
  * Resolve which extension sources spawned agents should load.
  *
  * Spawned agents launch with `--no-extensions` (nothing auto-discovered) plus
- * the pi-extended-teams extension itself. This returns the additional extension
- * sources to load (e.g. "npm:pi-emote"), honoring the allow list minus
- * anything in the block list.
+ * the pi-extended-teams extension itself. This returns provider bootstrap
+ * extensions plus any extra sources from the allow list, minus anything in the
+ * block list.
  */
-export function resolveAllowedExtensions(settings: PiExtendedTeamsSettings): string[] {
+const PROVIDER_BOOTSTRAP_EXTENSION_NAMES = ["shopify-proxy"];
+
+function isBlockedExtension(source: string, blocked: Set<string>): boolean {
+  const normalized = source.replace(/\\/g, "/");
+  return blocked.has(source) || blocked.has(normalized) || blocked.has(path.basename(normalized));
+}
+
+function resolveProviderBootstrapExtensions(options?: {
+  homeDir?: string;
+  fileSystem?: Pick<typeof fs, "existsSync">;
+}): string[] {
+  const homeDir = options?.homeDir ?? os.homedir();
+  const fileSystem = options?.fileSystem ?? fs;
+  const extensionDir = path.join(homeDir, ".pi", "agent", "extensions");
+
+  return PROVIDER_BOOTSTRAP_EXTENSION_NAMES
+    .map((name) => path.join(extensionDir, name))
+    .filter((source) => fileSystem.existsSync(source));
+}
+
+export function resolveAllowedExtensions(settings: PiExtendedTeamsSettings, options?: {
+  homeDir?: string;
+  fileSystem?: Pick<typeof fs, "existsSync">;
+}): string[] {
   const blocked = new Set(settings.extensions.block);
-  return settings.extensions.allow.filter((source) => !blocked.has(source));
+  const sources = [
+    ...resolveProviderBootstrapExtensions(options),
+    ...settings.extensions.allow,
+  ];
+
+  return Array.from(new Set(sources.filter((source) => !isBlockedExtension(source, blocked))));
 }
 
 /**

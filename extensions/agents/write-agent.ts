@@ -5,7 +5,7 @@ import * as writeQueue from "../../src/utils/write-queue";
 import { loadSettings, resolveAllowedExtensions } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
-import { buildPiCommand, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
+import { buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
 import { countWriteMembers } from "../team/roster";
 
 export interface WriteAgentRuntimeOptions {
@@ -20,16 +20,37 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       throw new Error("pi-extended-teams requires running inside tmux for write agents.");
     }
 
-    await teams.addMember(teamName, member);
-    await messaging.sendPlainMessage(teamName, "team-lead", member.name, prompt, "Initial prompt");
-
     const settings = loadSettings({ projectDir: member.cwd });
     const debugEnabled = isTeamsDebugEnabled(settings);
     const debugLogPath = debugEnabled ? teamDebugLogPath(teamName) : undefined;
     const piBinary = getPiLaunchCommand();
     const extensionSource = getPiExtendedTeamsExtensionSource();
     const allowedExtensions = resolveAllowedExtensions(settings);
-    const piCmd = buildPiCommand(piBinary, member.model, member.thinking, allowedExtensions);
+    const requestedModel = member.model;
+    const modelPreflight = checkChildPiModelAvailability(piBinary, requestedModel, allowedExtensions);
+    let launchModel = requestedModel;
+    let modelFallback: string | null = null;
+
+    if (modelPreflight.status === "missing") {
+      modelFallback = requestedModel ?? null;
+      launchModel = undefined;
+      member = { ...member, model: undefined };
+    }
+
+    const piCmd = buildPiCommand(piBinary, launchModel, member.thinking, allowedExtensions);
+
+    await teams.addMember(teamName, member);
+    await messaging.sendPlainMessage(teamName, "team-lead", member.name, prompt, "Initial prompt");
+    if (modelFallback) {
+      await messaging.sendPlainMessage(
+        teamName,
+        "system",
+        "team-lead",
+        `Write teammate ${member.name} could not use model ${modelFallback} in the child Pi process, so it was launched without --model and will use Pi's default model.`,
+        `Write teammate ${member.name} launched with default model`,
+        "yellow"
+      );
+    }
 
     const env: Record<string, string> = {
       ...process.env,
@@ -40,11 +61,19 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
     await writeTeamsDebugEvent(teamName, "write-agent.spawn.prepare", {
       agentName: member.name,
       cwd: member.cwd,
-      model: member.model,
+      model: requestedModel ?? null,
+      launchModel: launchModel ?? null,
       thinking: member.thinking ?? null,
       piBinary,
       extensionSource,
       allowedExtensions,
+      modelPreflight: {
+        status: modelPreflight.status,
+        command: modelPreflight.command,
+        exitStatus: modelPreflight.exitStatus,
+        stderr: modelPreflight.stderr.slice(0, 2000),
+        stdout: modelPreflight.stdout.slice(0, 2000),
+      },
       command: piCmd,
       debugLogPath: debugLogPath ?? null,
     }, settings);

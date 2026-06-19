@@ -11,6 +11,9 @@ importers:
       '@mariozechner/pi-coding-agent':
         specifier: '*'
         version: 0.73.1(ws@8.21.0)(zod@4.4.3)
+      '@mariozechner/pi-tui':
+        specifier: '*'
+        version: 0.73.1
       '@sinclair/typebox':
         specifier: '*'
         version: 0.34.49

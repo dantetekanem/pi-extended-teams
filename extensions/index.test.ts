@@ -28,11 +28,12 @@ function makeCtx(cwd: string, sessionId = "test-session") {
   };
 }
 
-async function setupExtension(env: Record<string, string | undefined> = {}, options: { mockReadAgent?: boolean } = {}) {
+async function setupExtension(env: Record<string, string | undefined> = {}, options: { mockReadAgent?: boolean; modelPreflight?: any } = {}) {
   vi.resetModules();
   const originalEnv = { ...process.env };
   delete process.env.PI_TEAM_NAME;
   delete process.env.PI_AGENT_NAME;
+  process.env.PI_EXTENDED_TEAMS_MODEL_PREFLIGHT = "0";
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -58,6 +59,16 @@ async function setupExtension(env: Record<string, string | undefined> = {}, opti
   };
   if (options.mockReadAgent) {
     vi.doMock("./agents/read-agent.js", () => readAgentMock);
+  }
+
+  if (options.modelPreflight) {
+    const modelPreflight = options.modelPreflight;
+    const piCommandMock = async (importOriginal: any) => {
+      const actual = await importOriginal();
+      return { ...actual, checkChildPiModelAvailability: vi.fn(() => modelPreflight) };
+    };
+    vi.doMock("./internal/pi-command.js", piCommandMock);
+    vi.doMock("./internal/pi-command", piCommandMock);
   }
 
   const extensionModule = await import("./index.js") as any;
@@ -119,6 +130,8 @@ describe("extension integration", () => {
     vi.restoreAllMocks();
     vi.doUnmock("../src/adapters/terminal-registry");
     vi.doUnmock("./agents/read-agent.js");
+    vi.doUnmock("./internal/pi-command.js");
+    vi.doUnmock("./internal/pi-command");
     if (fs.existsSync(testRoot)) fs.rmSync(testRoot, { recursive: true });
   });
 
@@ -282,6 +295,56 @@ describe("extension integration", () => {
       ]));
       expect(events.find(event => event.event === "write-agent.spawn.prepare")?.command).toContain("--extension");
       expect(events.find(event => event.event === "write-agent.spawn.prepare")?.extensionSource.replace(/\\/g, "/")).toContain("/extensions/index.");
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("falls back to Pi default when the child process cannot see the selected model", async () => {
+    const setup = await setupExtension({ PI_EXTENDED_TEAMS_DEBUG: "1" }, {
+      modelPreflight: {
+        status: "missing",
+        command: "pi --no-extensions --list-models",
+        stdout: "provider other-model context",
+        stderr: "",
+        exitStatus: 0,
+      },
+    });
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+
+    try {
+      await setup.tools.get("team_create")!.execute("1", {
+        team_name: "team",
+        default_model: "provider/model",
+      }, abort, undefined, ctx);
+
+      await setup.tools.get("spawn_teammate")!.execute("spawn", {
+        team_name: "team",
+        name: "writer",
+        prompt: "work",
+        cwd: setup.root,
+        role: "write",
+        thinking: "high",
+      }, abort, undefined, ctx);
+
+      const spawnCommand = (setup.terminal.spawn.mock.calls as any[])[0][0].command;
+      expect(spawnCommand).not.toContain("--model");
+      expect(spawnCommand).toContain("--thinking 'high'");
+
+      const config = await setup.teams.readConfig("team");
+      const writer = config.members.find((member: any) => member.name === "writer");
+      expect(writer?.model).toBeUndefined();
+
+      const leadInbox = JSON.parse(fs.readFileSync(setup.paths.inboxPath("team", "team-lead"), "utf-8"));
+      expect(leadInbox[0].text).toContain("could not use model provider/model");
+      expect(leadInbox[0].color).toBe("yellow");
+
+      const debugLogPath = path.join(setup.paths.teamDir("team"), "debug.log");
+      const events = fs.readFileSync(debugLogPath, "utf-8").trim().split("\n").map(line => JSON.parse(line));
+      const prepare = events.find(event => event.event === "write-agent.spawn.prepare");
+      expect(prepare).toMatchObject({ model: "provider/model", launchModel: null, modelPreflight: { status: "missing" } });
+      expect(prepare.command).not.toContain("--model");
     } finally {
       setup.restoreEnv();
     }

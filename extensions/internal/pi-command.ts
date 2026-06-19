@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import * as nodeFs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -40,6 +41,7 @@ export function shellQuote(value: string): string {
 }
 
 const EXTENSION_ENTRYPOINTS = ["index.ts", "index.js", "index.mjs", "index.cjs"];
+const DISABLED_PREFLIGHT_VALUES = new Set(["", "0", "false", "no", "off"]);
 
 interface ExtensionSourceFileSystem {
   existsSync(filePath: string): boolean;
@@ -170,4 +172,77 @@ export function buildPiCommand(
   }
 
   return `${piBinary} ${extensionArgs}`;
+}
+
+export type ChildPiModelAvailabilityStatus = "available" | "missing" | "unknown" | "skipped";
+
+export interface ChildPiModelAvailability {
+  status: ChildPiModelAvailabilityStatus;
+  command: string | null;
+  stdout: string;
+  stderr: string;
+  exitStatus: number | null;
+}
+
+export interface ChildPiModelAvailabilityOptions {
+  run?: (command: string) => { status: number | null; stdout: string; stderr: string };
+  timeoutMs?: number;
+}
+
+function defaultRun(command: string, timeoutMs: number): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("sh", ["-c", command], { encoding: "utf-8", timeout: timeoutMs });
+  return {
+    status: result.status,
+    stdout: result.stdout?.toString() ?? "",
+    stderr: result.stderr?.toString() ?? result.error?.message ?? "",
+  };
+}
+
+function parseModelSpecifier(model: string): { provider: string; model: string } | null {
+  const slashIndex = model.indexOf("/");
+  if (slashIndex === -1) return null;
+
+  const provider = model.slice(0, slashIndex).trim();
+  const modelId = model.slice(slashIndex + 1).trim();
+  if (!provider || !modelId) return null;
+
+  return { provider, model: modelId };
+}
+
+export function isModelListed(output: string, chosenModel: string): boolean {
+  const parsed = parseModelSpecifier(chosenModel);
+  if (!parsed) return false;
+
+  return output.split("\n").some((line) => {
+    const [provider, model] = line.trim().split(/\s+/);
+    return provider === parsed.provider && model === parsed.model;
+  });
+}
+
+export function checkChildPiModelAvailability(
+  piBinary: string,
+  chosenModel: string | undefined,
+  allowedExtensions: string[] = [],
+  options: ChildPiModelAvailabilityOptions = {}
+): ChildPiModelAvailability {
+  const preflightSetting = process.env.PI_EXTENDED_TEAMS_MODEL_PREFLIGHT ?? process.env.PI_TEAMS_MODEL_PREFLIGHT;
+  if (!chosenModel || DISABLED_PREFLIGHT_VALUES.has(preflightSetting?.trim().toLowerCase() ?? "enabled")) {
+    return { status: "skipped", command: null, stdout: "", stderr: "", exitStatus: null };
+  }
+
+  const command = `${piBinary} ${buildExtensionArgs(allowedExtensions)} --list-models`;
+  const run = options.run ?? ((cmd: string) => defaultRun(cmd, options.timeoutMs ?? 10000));
+  const result = run(command);
+  const modelListOutput = `${result.stdout}\n${result.stderr}`;
+  const status = result.status === 0
+    ? isModelListed(modelListOutput, chosenModel) ? "available" : "missing"
+    : "unknown";
+
+  return {
+    status,
+    command,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitStatus: result.status,
+  };
 }

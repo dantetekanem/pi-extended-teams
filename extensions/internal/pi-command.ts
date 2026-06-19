@@ -158,20 +158,22 @@ export function buildPiCommand(
   piBinary: string,
   chosenModel?: string,
   thinking?: string,
-  allowedExtensions: string[] = []
+  allowedExtensions: string[] = [],
+  noSkills = false
 ): string {
   const extensionArgs = buildExtensionArgs(allowedExtensions);
+  const governanceArgs = noSkills ? " --no-skills" : "";
 
   if (chosenModel) {
     const modelArg = thinking ? `${chosenModel}:${thinking}` : chosenModel;
-    return `${piBinary} ${extensionArgs} --model ${shellQuote(modelArg)}`;
+    return `${piBinary} ${extensionArgs}${governanceArgs} --model ${shellQuote(modelArg)}`;
   }
 
   if (thinking) {
-    return `${piBinary} ${extensionArgs} --thinking ${shellQuote(thinking)}`;
+    return `${piBinary} ${extensionArgs}${governanceArgs} --thinking ${shellQuote(thinking)}`;
   }
 
-  return `${piBinary} ${extensionArgs}`;
+  return `${piBinary} ${extensionArgs}${governanceArgs}`;
 }
 
 export type ChildPiModelAvailabilityStatus = "available" | "missing" | "unknown" | "skipped";

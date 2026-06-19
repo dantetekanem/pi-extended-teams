@@ -83,6 +83,10 @@ describe("pi command helpers", () => {
     expect(buildPiCommand("pi", "provider/model")).toContain("/extensions/index.");
   });
 
+  it("adds --no-skills when workflow governance disables ambient skill loading", () => {
+    expect(buildPiCommand("pi", "provider/model", "high", [], true)).toContain("--no-skills --model 'provider/model:high'");
+  });
+
   it("still honors explicit extension source environment overrides", () => {
     process.env.PI_EXTENDED_TEAMS_EXTENSION_SOURCE = "/tmp/custom-extension.ts";
     delete process.env.PI_TEAMS_EXTENSION_SOURCE;

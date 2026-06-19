@@ -30,6 +30,7 @@ export interface TeamToolsOptions {
   agentName: string;
   getTeamName(): string | null | undefined;
   getSessionCtx?(): any;
+  setSessionCtx?(ctx: any): void;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
@@ -52,6 +53,47 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     return operationId === params.operation_id && (params.workflow_run_id === undefined || workflowRunId === params.workflow_run_id);
   }
 
+  function memberResolutionDetails(member: Member, params: any, extras: Record<string, any> = {}): Record<string, any> {
+    const role = member.role ?? "write";
+    const category = member.category ?? null;
+    return {
+      agentId: member.agentId,
+      role,
+      requestedRole: params.role ?? "read",
+      resolvedRole: role,
+      requestedCategory: params.category ?? null,
+      category,
+      resolvedCategory: category,
+      model: member.model ?? null,
+      thinking: member.thinking ?? null,
+      ...extras,
+    };
+  }
+
+  function queuedResolutionDetails(safeTeamName: string, queued: writeQueue.QueuedWriteSpawn, params: any, extras: Record<string, any> = {}): Record<string, any> {
+    const category = queued.category ?? null;
+    return {
+      agentId: `${queued.name}@${safeTeamName}`,
+      role: "write",
+      requestedRole: params.role ?? "read",
+      resolvedRole: "write",
+      requestedCategory: params.category ?? null,
+      category,
+      resolvedCategory: category,
+      model: queued.model,
+      thinking: queued.thinking ?? null,
+      modelSource: "queued",
+      ...extras,
+    };
+  }
+
+  function spawnResolutionDetails(member: Member, params: any, resolved: ReturnType<typeof resolveModel>, extras: Record<string, any> = {}): Record<string, any> {
+    return {
+      ...memberResolutionDetails(member, params, extras),
+      modelSource: resolved.modelSource,
+    };
+  }
+
   async function spawnTeammate(params: any, ctx: any, spawnOptions: { once?: boolean } = {}): Promise<{ content: any[]; details: any }> {
     const safeName = paths.sanitizeName(params.name);
     const safeTeamName = paths.sanitizeName(params.team_name);
@@ -63,14 +105,13 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       if (existingOnceMember) {
         return {
           content: [{ type: "text", text: `Teammate ${safeName} already exists; reusing existing member.` }],
-          details: {
-            agentId: existingOnceMember.agentId,
-            role: existingOnceMember.role,
+          details: memberResolutionDetails(existingOnceMember, params, {
             existing: true,
             idempotent: true,
             queued: false,
             terminalId: existingOnceMember.tmuxPaneId || null,
-          },
+            modelSource: "existing",
+          }),
         };
       }
 
@@ -84,7 +125,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
         const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
         return {
           content: [{ type: "text", text: `Write teammate ${safeName} is already queued at position ${queuePosition}.` }],
-          details: { agentId: `${safeName}@${safeTeamName}`, role: "write", queued: true, queueId: queued.id, queuePosition, existing: true, idempotent: true },
+          details: queuedResolutionDetails(safeTeamName, queued, params, { queued: true, queueId: queued.id, queuePosition, existing: true, idempotent: true }),
         };
       }
     }
@@ -150,7 +191,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       void options.runReadAgentInProcess(safeTeamName, member, params.prompt, ctx, options.readAgentOptions());
       return {
         content: [{ type: "text", text: `Read teammate ${params.name} started in-process.` }],
-        details: { agentId: member.agentId, role, mode: "in-process", terminalId: null },
+        details: spawnResolutionDetails(member, params, resolved, { mode: "in-process", terminalId: null, queued: false }),
       };
     }
 
@@ -207,7 +248,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       }, settings);
       return {
         content: [{ type: "text", text: `Write teammate ${params.name} queued at position ${queuePosition}; capacity is ${activeWriteCount}/${settings.writeAgents.maxConcurrent}.` }],
-        details: { agentId: member.agentId, role, queued: true, queueId: queued.id, queuePosition, debugLogPath },
+        details: spawnResolutionDetails(member, params, resolved, { queued: true, queueId: queued.id, queuePosition, debugLogPath }),
       };
     }
 
@@ -216,7 +257,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
     return {
       content: [{ type: "text", text: `Teammate ${params.name} spawned in background tmux screen ${terminalId}.${debugSuffix}` }],
-      details: { agentId: member.agentId, role, terminalId, queued: false, debugLogPath },
+      details: spawnResolutionDetails(member, params, resolved, { terminalId, queued: false, debugLogPath }),
     };
   }
 
@@ -224,11 +265,13 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     const requestId = payload?.requestId;
     const type = String(payload?.type || "");
     const params = payload?.params || {};
-    const ctx = options.getSessionCtx?.();
+    const requestCtx = payload?.ctx;
+    const ctx = requestCtx || options.getSessionCtx?.();
+    if (requestCtx) options.setSessionCtx?.(requestCtx);
 
     try {
       if (options.isTeammate) throw new Error("Teammates cannot satisfy orchestration requests directly.");
-      if (!ctx) throw new Error("No active lead session context is available for orchestration request.");
+      if (!ctx) throw new Error("No active lead session context is available for orchestration request. If pi-extended-teams was registered after session_start, include the current Pi command context as payload.ctx.");
 
       if (type === "ensure_team") {
         const safeTeamName = paths.sanitizeName(params.team_name);
@@ -337,6 +380,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). If omitted, the current active model is used for new teams." })),
       operation_id: Type.Optional(Type.String()),
       workflow_run_id: Type.Optional(Type.String()),
+      metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       if (options.isTeammate) {
@@ -387,6 +431,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
       operation_id: Type.Optional(Type.String()),
       workflow_run_id: Type.Optional(Type.String()),
+      metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       if (options.isTeammate) {
@@ -418,6 +463,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first. If omitted, the category/role/team default or current model is used." })),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
       plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
+      metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       if (options.isTeammate) {

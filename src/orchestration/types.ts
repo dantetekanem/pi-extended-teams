@@ -73,11 +73,24 @@ export interface SpawnTeammateOnceRequest extends OrchestrationOperationMetadata
 }
 
 export type SpawnTeammateOnceStatus = "existing" | "queued" | "started" | "not_started";
+export type TeammateModelSource = "explicit" | "category" | "role" | "team" | "current" | "none" | "existing" | "queued";
+
+export interface TeammateResolutionDetails {
+  requestedRole?: "read" | "write";
+  role?: "read" | "write" | string;
+  resolvedRole?: "read" | "write" | string;
+  requestedCategory?: string | null;
+  category?: string | null;
+  resolvedCategory?: string | null;
+  model?: string | null;
+  thinking?: ThinkingLevel | string | null;
+  modelSource?: TeammateModelSource | string;
+}
 
 export interface SpawnTeammateOnceStartResult {
   member?: Member;
   queued?: QueuedWriteSpawn;
-  details?: Record<string, any>;
+  details?: TeammateResolutionDetails & Record<string, any>;
 }
 
 export interface SpawnTeammateOnceOptions {

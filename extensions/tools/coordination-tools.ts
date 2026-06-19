@@ -13,6 +13,7 @@ import { StringEnum } from "../internal/schema";
 import { requestLeadForTeammateSpawn } from "./delegation-guard";
 import { summarizeSessionUsage } from "../internal/session-usage";
 import { enqueueReadHelperRequest, listReadHelperQueue } from "../../src/utils/read-helper-queue";
+import { memberWorkflowRunId, workflowAllowsReadHelper, workflowAllowsSkill } from "../../src/utils/workflow-metadata";
 
 export interface CoordinationToolsOptions {
   agentName: string;
@@ -304,6 +305,10 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       const requester = config.members.find(member => member.name === options.agentName);
       if (!requester) throw new Error(`Requester ${options.agentName} is not a member of team ${targetTeamName}.`);
       if ((requester.role ?? "write") !== "write") throw new Error("request_read_helper is only available to write agents.");
+      if (!workflowAllowsReadHelper(requester)) {
+        const workflowRunId = memberWorkflowRunId(requester);
+        throw new Error(`request_read_helper is disabled for workflow-spawned agents${workflowRunId ? ` (workflow_run_id=${workflowRunId})` : ""}. Declare helper fanout in the workflow or ask team-lead to spawn an explicit workflow assignment.`);
+      }
 
       const pendingHelpers = await listReadHelperQueue(targetTeamName);
       const queuedNames = pendingHelpers.map(item => item.name);
@@ -409,6 +414,15 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
     description: "Load a named skill file into the current agent context.",
     parameters: Type.Object({ name: Type.String({ description: "Skill name, for example teams." }) }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (options.isTeammate) {
+        const targetTeamName = options.getTeamName();
+        const config = targetTeamName ? await teams.readConfig(targetTeamName).catch(() => null) : null;
+        const member = config?.members.find(item => item.name === options.agentName);
+        if (member && !workflowAllowsSkill(member, params.name)) {
+          const workflowRunId = memberWorkflowRunId(member);
+          throw new Error(`use_skill('${params.name}') is disabled for workflow-spawned agents${workflowRunId ? ` (workflow_run_id=${workflowRunId})` : ""} unless the workflow declares the skill in member metadata.`);
+        }
+      }
       const file = options.resolveSkillFile(params.name, ctx.cwd);
       const content = fs.readFileSync(file, "utf-8");
       return { content: [{ type: "text", text: `Loaded skill '${params.name}' from ${file}:\n\n${content}` }], details: { name: params.name, path: file } };

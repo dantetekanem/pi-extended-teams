@@ -54,12 +54,14 @@ async function createTeamWithMember(member: any) {
     tmuxPaneId: member.role === "write" ? "%1" : "",
     cwd: root,
     subscriptions: [],
+    metadata: member.metadata,
   });
 }
 
 function registerTools(agentName = "writer", isTeammate = true) {
   const tools = new Map<string, RegisteredTool>();
   const runReadAgentInProcess = vi.fn();
+  const resolveSkillFile = vi.fn();
   registerCoordinationTools({ registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool) }, {
     agentName,
     isTeammate,
@@ -69,12 +71,12 @@ function registerTools(agentName = "writer", isTeammate = true) {
     requireTeamContext: vi.fn((explicit?: string) => explicit || "team"),
     releaseAllClaimsForAgent: vi.fn(async () => []),
     drainWriteQueue: vi.fn(async () => {}),
-    resolveSkillFile: vi.fn(),
+    resolveSkillFile,
     adoptTeamAsLead: vi.fn(),
     renderLeadInboxStatus: vi.fn(async () => {}),
     resetLeadWakeNotifiedCount: vi.fn(),
   });
-  return { tools, runReadAgentInProcess };
+  return { tools, runReadAgentInProcess, resolveSkillFile };
 }
 
 describe("request_read_helper", () => {
@@ -125,6 +127,36 @@ describe("request_read_helper", () => {
       model: "provider/model",
       thinking: "high",
     });
+  });
+
+  it("rejects helper fanout from workflow-spawned writers by default", async () => {
+    await createTeamWithMember({ name: "writer", role: "write", metadata: { workflowRunId: "run-1" } });
+    const { tools } = registerTools("writer", true);
+
+    await expect(tools.get("request_read_helper")!.execute("helper", {
+      prompt: "Inspect the handoff contract.",
+    }, new AbortController().signal, undefined, makeCtx())).rejects.toThrow("request_read_helper is disabled for workflow-spawned agents");
+
+    expect(await listReadHelperQueue("team")).toEqual([]);
+  });
+
+  it("allows workflow-declared skills and rejects undeclared workflow skills", async () => {
+    await createTeamWithMember({ name: "writer", role: "write", metadata: { workflowRunId: "run-1", workflow: { skills: ["allowed-skill"] } } });
+    const { tools, resolveSkillFile } = registerTools("writer", true);
+    const skillPath = path.join(root, "allowed-skill", "SKILL.md");
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.writeFileSync(skillPath, "# Allowed Skill\n");
+    resolveSkillFile.mockReturnValue(skillPath);
+
+    await expect(tools.get("use_skill")!.execute("skill", {
+      name: "other-skill",
+    }, new AbortController().signal, undefined, makeCtx())).rejects.toThrow("use_skill('other-skill') is disabled for workflow-spawned agents");
+
+    const result = await tools.get("use_skill")!.execute("skill", {
+      name: "allowed-skill",
+    }, new AbortController().signal, undefined, makeCtx());
+    expect(result.details).toMatchObject({ name: "allowed-skill", path: skillPath });
+    expect(result.content[0].text).toContain("# Allowed Skill");
   });
 
   it("pushes a lead-visible acknowledgement when a writer reads a helper report", async () => {

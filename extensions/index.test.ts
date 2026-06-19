@@ -179,6 +179,79 @@ describe("extension integration", () => {
     vi.useRealTimers();
   });
 
+  it("accepts orchestration ctx for late registration after session_start", async () => {
+    vi.useFakeTimers();
+    const setup = await setupExtension();
+    try {
+      const ctx = makeCtx(setup.root, "late-session");
+      const handler = setup.extensionEventHandlers.get("pi-extended-teams:orchestration-request")?.[0];
+      expect(handler).toBeTruthy();
+
+      await handler!({
+        requestId: "req-1",
+        type: "ensure_team",
+        params: { team_name: "workflow-team", operation_id: "op-1", workflow_run_id: "run-1" },
+        ctx,
+      });
+
+      expect(setup.teams.teamExists("workflow-team")).toBe(true);
+      expect(setup.pi.events.emit).toHaveBeenCalledWith(
+        "pi-extended-teams:orchestration-response",
+        expect.objectContaining({ requestId: "req-1", type: "ensure_team", ok: true, details: expect.objectContaining({ created: true }) })
+      );
+    } finally {
+      setup.restoreEnv();
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns effective resolved role/model/category for spawned teammates", async () => {
+    const setup = await setupExtension({}, { mockReadAgent: true });
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+    fs.mkdirSync(path.join(setup.root, ".pi"), { recursive: true });
+    fs.writeFileSync(path.join(setup.root, ".pi", "pi-extended-teams.json"), JSON.stringify({
+      categories: { reviewer: { role: "read", model: "provider/model", thinking: "high" } },
+    }));
+
+    await setup.tools.get("team_create")!.execute("create", {
+      team_name: "team",
+      default_model: "provider/model",
+    }, abort, undefined, ctx);
+
+    const result = await setup.tools.get("spawn_teammate_once")!.execute("spawn", {
+      team_name: "team",
+      name: "reviewer",
+      prompt: "review",
+      cwd: setup.root,
+      role: "write",
+      category: "reviewer",
+      operation_id: "op-1",
+      workflow_run_id: "run-1",
+    }, abort, undefined, ctx);
+
+    expect(result.details).toMatchObject({
+      role: "read",
+      requestedRole: "write",
+      resolvedRole: "read",
+      requestedCategory: "reviewer",
+      category: "reviewer",
+      resolvedCategory: "reviewer",
+      model: "provider/model",
+      thinking: "high",
+      modelSource: "category",
+      queued: false,
+    });
+    expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledWith(
+      "team",
+      expect.objectContaining({ name: "reviewer", role: "read", category: "reviewer", model: "provider/model" }),
+      "review",
+      ctx,
+      expect.any(Object)
+    );
+    setup.restoreEnv();
+  });
+
   it("starts prompt-build fanout without adopting it as the lead team while letting /team inspect it", async () => {
     const setup = await setupExtension({}, { mockReadAgent: true });
     const ctx = makeCtx(setup.root, "current-session");

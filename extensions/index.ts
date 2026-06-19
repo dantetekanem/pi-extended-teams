@@ -488,17 +488,19 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  function setSessionCtx(ctx: any): void {
+    sessionCtx = ctx;
+    if (!isTeammate && !teamName) {
+      const foundTeam = findLeadTeamForSession(getPiSessionId(ctx));
+      if (foundTeam) adoptTeamAsLead(foundTeam, ctx);
+    }
+  }
+
   registerExtensionEvents(pi, {
     isTeammate,
     agentName,
     getTeamName: () => teamName,
-    setSessionCtx: (ctx: any) => {
-      sessionCtx = ctx;
-      if (!isTeammate && !teamName) {
-        const foundTeam = findLeadTeamForSession(getPiSessionId(ctx));
-        if (foundTeam) adoptTeamAsLead(foundTeam, ctx);
-      }
-    },
+    setSessionCtx,
     terminal,
     quietTrigger,
     startLeadInboxPolling,
@@ -557,6 +559,7 @@ export default function (pi: ExtensionAPI) {
     agentName,
     getTeamName: () => teamName,
     getSessionCtx: () => sessionCtx,
+    setSessionCtx,
   });
 
   registerCoordinationTools(pi, {

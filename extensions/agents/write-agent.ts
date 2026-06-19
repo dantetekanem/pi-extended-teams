@@ -7,6 +7,7 @@ import type { Member } from "../../src/utils/models";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
 import { buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
 import { countWriteMembers } from "../team/roster";
+import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
 
 export interface WriteAgentRuntimeOptions {
   terminal: any;
@@ -30,6 +31,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
     const modelPreflight = checkChildPiModelAvailability(piBinary, requestedModel, allowedExtensions);
     let launchModel = requestedModel;
     let modelFallback: string | null = null;
+    const noSkills = isWorkflowSpawnedMember(member);
 
     if (modelPreflight.status === "missing") {
       modelFallback = requestedModel ?? null;
@@ -37,7 +39,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       member = { ...member, model: undefined };
     }
 
-    const piCmd = buildPiCommand(piBinary, launchModel, member.thinking, allowedExtensions);
+    const piCmd = buildPiCommand(piBinary, launchModel, member.thinking, allowedExtensions, noSkills);
 
     await teams.addMember(teamName, member);
     await messaging.sendPlainMessage(teamName, "team-lead", member.name, prompt, "Initial prompt");
@@ -67,6 +69,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       piBinary,
       extensionSource,
       allowedExtensions,
+      noSkills,
       modelPreflight: {
         status: modelPreflight.status,
         command: modelPreflight.command,

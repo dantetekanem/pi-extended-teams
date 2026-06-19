@@ -8,6 +8,7 @@ import * as teams from "../../src/utils/teams";
 import { cleanupAgentSessionFolders, cleanupOrphanedTeams } from "../internal/session-files";
 import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
+import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
 
 export interface RegisterEventsOptions {
   isTeammate: boolean;
@@ -255,7 +256,10 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             modelInfo += `. When reporting your model or thinking level, use these exact values.`;
           }
           if ((member?.role ?? "write") === "write") {
-            roleSpecificGuidance = `\n\nWrite-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.\n- For read-only help, call request_read_helper instead of spawn_teammate. The helper's full report comes back to your inbox; team-lead receives only a short done notification.\n- Release claims with release_file as soon as you are done editing those paths.\n- When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you.`;
+            const workflowGuard = member && isWorkflowSpawnedMember(member)
+              ? "\n- Workflow mode: do not call request_read_helper or use_skill unless the workflow explicitly declared that capability in your member metadata. Ask team-lead for an explicit workflow assignment instead of creating undeclared helper fanout."
+              : "\n- For read-only help, call request_read_helper instead of spawn_teammate. The helper's full report comes back to your inbox; team-lead receives only a short done notification.";
+            roleSpecificGuidance = `\n\nWrite-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.${workflowGuard}\n- Release claims with release_file as soon as you are done editing those paths.\n- When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you.`;
           } else {
             roleSpecificGuidance = `\n\nRead-agent rules:\n- You are read-only: investigate and report. Do not edit files or make any mutating changes.\n- When finished, produce your final report and stop. Do not wait for the lead to kill you.`;
           }

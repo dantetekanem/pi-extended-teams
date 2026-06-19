@@ -87,7 +87,63 @@ describe("orchestration primitives", () => {
 
     expect(result.status).toBe("existing");
     expect(result.member?.name).toBe("reader");
+    expect(result.details).toMatchObject({
+      existing: true,
+      idempotent: true,
+      queued: false,
+      role: "read",
+      requestedRole: "read",
+      resolvedRole: "read",
+      category: null,
+      model: "provider/model",
+      modelSource: "existing",
+    });
     expect(start).not.toHaveBeenCalled();
+  });
+
+  it("synthesizes effective spawn details from start callback results", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    const startedMember = {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write" as const,
+      category: "impl",
+      model: "provider/model",
+      thinking: "xhigh" as const,
+      joinedAt: Date.now(),
+      tmuxPaneId: "%1",
+      cwd: root,
+      subscriptions: [],
+    };
+
+    const result = await spawnTeammateOnce({
+      teamName: "team",
+      name: "writer",
+      prompt: "write",
+      cwd: root,
+      role: "read",
+      category: "impl",
+      operationId: "op-2",
+      workflowRunId: "run-1",
+    }, {
+      start: vi.fn(async () => ({ member: startedMember, details: { queued: false, terminalId: "%1", modelSource: "category" } })),
+    });
+
+    expect(result.status).toBe("started");
+    expect(result.details).toMatchObject({
+      role: "write",
+      requestedRole: "read",
+      resolvedRole: "write",
+      requestedCategory: "impl",
+      category: "impl",
+      resolvedCategory: "impl",
+      model: "provider/model",
+      thinking: "xhigh",
+      modelSource: "category",
+      queued: false,
+      terminalId: "%1",
+    });
   });
 
   it("replays durable report events through observeTeam", async () => {

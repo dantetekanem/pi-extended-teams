@@ -16,6 +16,7 @@ import type {
   SpawnTeammateOnceRequest,
   SpawnTeammateOnceResponse,
   TeamObservation,
+  TeammateResolutionDetails,
   TeammateHealth,
   TeammateObservation,
 } from "./types";
@@ -46,6 +47,40 @@ function metadataForOperation(request: { operationId?: string; workflowRunId?: s
   if (request.operationId) metadata.operationId = request.operationId;
   if (request.workflowRunId) metadata.workflowRunId = request.workflowRunId;
   return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+function memberResolutionDetails(member: Member, request: Partial<SpawnTeammateOnceRequest>, extras: Record<string, any> = {}): TeammateResolutionDetails & Record<string, any> {
+  const role = member.role ?? "write";
+  const category = member.category ?? null;
+  return {
+    agentId: member.agentId,
+    role,
+    requestedRole: request.role ?? "read",
+    resolvedRole: role,
+    requestedCategory: request.category ?? null,
+    category,
+    resolvedCategory: category,
+    model: member.model ?? null,
+    thinking: member.thinking ?? null,
+    ...extras,
+  };
+}
+
+function queuedResolutionDetails(teamName: string, queued: writeQueue.QueuedWriteSpawn, request: Partial<SpawnTeammateOnceRequest>, extras: Record<string, any> = {}): TeammateResolutionDetails & Record<string, any> {
+  const category = queued.category ?? null;
+  return {
+    agentId: `${queued.name}@${teamName}`,
+    role: "write",
+    requestedRole: request.role ?? "read",
+    resolvedRole: "write",
+    requestedCategory: request.category ?? null,
+    category,
+    resolvedCategory: category,
+    model: queued.model,
+    thinking: queued.thinking ?? null,
+    modelSource: "queued",
+    ...extras,
+  };
 }
 
 export async function observeTeammate(
@@ -143,23 +178,40 @@ export async function spawnTeammateOnce(
   const existing = config.members.find((member) =>
     member.agentType === "teammate" && (member.name === request.name || memberMatchesOperation(member, request))
   );
-  if (existing) return { status: "existing", member: existing, details: { idempotent: true } };
+  if (existing) {
+    return {
+      status: "existing",
+      member: existing,
+      details: memberResolutionDetails(existing, request, { existing: true, idempotent: true, queued: false, modelSource: "existing" }),
+    };
+  }
 
   const queued = await writeQueue.findQueuedWriteSpawn(request.teamName, {
     name: request.name,
     operationId: request.operationId,
     workflowRunId: request.workflowRunId,
   }).catch(() => null);
-  if (queued) return { status: "queued", queued, details: { idempotent: true } };
+  if (queued) {
+    return {
+      status: "queued",
+      queued,
+      details: queuedResolutionDetails(request.teamName, queued, request, { existing: true, idempotent: true, queued: true }),
+    };
+  }
 
-  if (!options.start) return { status: "not_started", details: { reason: "No spawn start callback supplied" } };
+  if (!options.start) return { status: "not_started", details: { reason: "No spawn start callback supplied", requestedRole: request.role ?? "read", requestedCategory: request.category ?? null, model: request.model ?? null, thinking: request.thinking ?? null } };
 
   const started = await options.start({ ...request, metadata: metadataForOperation(request) });
+  const baseDetails = started.member
+    ? memberResolutionDetails(started.member, request)
+    : started.queued
+      ? queuedResolutionDetails(request.teamName, started.queued, request)
+      : {};
   return {
     status: started.queued ? "queued" : "started",
     member: started.member,
     queued: started.queued,
-    details: started.details,
+    details: { ...baseDetails, ...started.details },
   };
 }
 

@@ -676,8 +676,8 @@ describe("extension integration", () => {
       const collapsed = widget.render(120);
       expect(collapsed.length).toBeGreaterThan(1);
       expect(collapsed[0]).toContain("─");
-      expect(collapsed.join("\n")).toContain("TEAM");
       expect(collapsed.join("\n")).toContain("team activity");
+      expect(collapsed.join("\n")).toContain("opt+tab switch agents");
       expect(collapsed.join("\n")).toContain("writer");
       expect(collapsed.join("\n")).toContain("write");
       expect(collapsed.join("\n")).not.toContain("working: bash");

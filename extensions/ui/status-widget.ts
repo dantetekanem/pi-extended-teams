@@ -1,5 +1,5 @@
 import { keyText } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth } from "@mariozechner/pi-tui";
 import { dimAnsi, pink, purple } from "./ansi";
 
 export interface TeamActivityStatusEntry {
@@ -20,7 +20,6 @@ export interface TeamActivityStatusSnapshot {
 
 const MAX_COLLAPSED_ENTRIES = 2;
 const MAX_EXPANDED_ENTRIES = 10;
-const BADGE_WIDTH = 8;
 
 function toolExpandKey(): string {
   try {
@@ -57,44 +56,25 @@ function formatExpandedEntry(entry: TeamActivityStatusEntry): string {
   return `${pink(entry.name)} ${purple(entry.role)}${status}${detail}`;
 }
 
-function padVisible(value: string, width: number): string {
-  const pad = Math.max(0, width - visibleWidth(value));
-  return `${value}${" ".repeat(pad)}`;
-}
-
-function row(left: string, body: string, width: number): string {
-  if (width < 56) return truncateToWidth(`${left ? `${left} ` : ""}${body}`, width, "…", true);
-  const leftCell = padVisible(left, BADGE_WIDTH);
-  const prefix = `${leftCell} ${purple("│")} `;
-  const bodyWidth = Math.max(1, width - visibleWidth(prefix));
-  return `${prefix}${truncateToWidth(body, bodyWidth, "…", true)}`;
-}
-
-function badgeLines(snapshot: TeamActivityStatusSnapshot): string[] {
-  const count = Math.min(99, Math.max(0, snapshot.activeCount)).toString().padStart(2, "0");
-  return [
-    purple("╭────╮"),
-    purple("│") + pink("TEAM") + purple("│"),
-    purple("│ ") + pink(count) + purple(" │"),
-    purple("╰────╯"),
-  ];
+function formatHeader(snapshot: TeamActivityStatusSnapshot): string {
+  const summary = `${formatCountSummary(snapshot)} · /team · opt+tab switch agents`;
+  return `${pink("team activity")}  ${dimAnsi(summary)}`;
 }
 
 function collapsedRows(snapshot: TeamActivityStatusSnapshot): string[] {
   const key = toolExpandKey();
   return [
-    `${pink("team activity")}  ${dimAnsi(formatCountSummary(snapshot))}`,
+    formatHeader(snapshot),
     formatCollapsedPreview(snapshot),
-    dimAnsi(`reports land collapsed in chat · full panel: /team`),
-    dimAnsi(`${key} details`),
+    dimAnsi(`reports land collapsed in chat · ${key} details`),
   ];
 }
 
 function expandedRows(snapshot: TeamActivityStatusSnapshot): string[] {
   const key = toolExpandKey();
   const lines = [
-    `${pink("team activity")}  ${dimAnsi(formatCountSummary(snapshot))}`,
-    dimAnsi(`${key} collapse · full panel: /team`),
+    formatHeader(snapshot),
+    dimAnsi(`${key} collapse`),
   ];
 
   const entries = snapshot.entries.slice(0, MAX_EXPANDED_ENTRIES);
@@ -119,14 +99,7 @@ export function teamActivityStatusWidget(
 
       const border = purple("─".repeat(Math.max(0, width)));
       const bodyRows = getExpanded() ? expandedRows(snapshot) : collapsedRows(snapshot);
-      const badge = badgeLines(snapshot);
-      const rendered = [border];
-
-      for (const [index, body] of bodyRows.entries()) {
-        rendered.push(row(badge[index] ?? "", body, width));
-      }
-
-      return rendered;
+      return [border, ...bodyRows.map((body) => truncateToWidth(body, width, "…", true))];
     },
     invalidate() {},
   };

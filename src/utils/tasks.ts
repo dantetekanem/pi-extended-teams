@@ -32,6 +32,68 @@ import { teamExists } from "./teams";
 import { withLock } from "./lock";
 import { runHook } from "./hooks";
 
+export interface GuardedTaskUpdateOptions {
+  expectedStatus?: TaskFile["status"];
+  expectedOwner?: string | null;
+  expectedVersion?: number;
+  expectedUpdatedAt?: string;
+  operationId?: string;
+}
+
+export interface GuardedTaskUpdateResult {
+  task: TaskFile;
+  updated: boolean;
+  idempotent: boolean;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function nextTaskState(task: TaskFile, updates: Partial<TaskFile>, operationId?: string): TaskFile {
+  const now = nowIso();
+  const metadata = { ...(task.metadata || {}), ...(updates.metadata || {}) };
+  if (operationId) {
+    metadata.lastOperationId = operationId;
+    metadata.appliedOperationIds = {
+      ...(task.metadata?.appliedOperationIds || {}),
+      ...(updates.metadata?.appliedOperationIds || {}),
+      [operationId]: true,
+    };
+  }
+
+  return {
+    ...task,
+    ...updates,
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+    version: (task.version || 0) + 1,
+    updatedAt: now,
+  };
+}
+
+function taskOperationMatches(task: TaskFile, operationId?: string): boolean {
+  if (!operationId) return false;
+  return task.metadata?.lastOperationId === operationId || task.metadata?.appliedOperationIds?.[operationId] === true;
+}
+
+function assertGuardMatches(task: TaskFile, guard: GuardedTaskUpdateOptions): void {
+  if (guard.expectedStatus !== undefined && task.status !== guard.expectedStatus) {
+    throw new Error(`Task ${task.id} status guard failed: expected ${guard.expectedStatus}, got ${task.status}`);
+  }
+
+  if (guard.expectedOwner !== undefined && (task.owner ?? null) !== guard.expectedOwner) {
+    throw new Error(`Task ${task.id} owner guard failed: expected ${guard.expectedOwner ?? "<none>"}, got ${task.owner ?? "<none>"}`);
+  }
+
+  if (guard.expectedVersion !== undefined && (task.version || 0) !== guard.expectedVersion) {
+    throw new Error(`Task ${task.id} version guard failed: expected ${guard.expectedVersion}, got ${task.version || 0}`);
+  }
+
+  if (guard.expectedUpdatedAt !== undefined && task.updatedAt !== guard.expectedUpdatedAt) {
+    throw new Error(`Task ${task.id} updatedAt guard failed: expected ${guard.expectedUpdatedAt}, got ${task.updatedAt ?? "<none>"}`);
+  }
+}
+
 export function getTaskId(teamName: string): string {
   const dir = taskDir(teamName);
   const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
@@ -60,6 +122,7 @@ export async function createTask(
 
   return await withLock(lockPath, async () => {
     const id = getTaskId(teamName);
+    const createdAt = nowIso();
     const task: TaskFile = {
       id,
       subject,
@@ -68,6 +131,9 @@ export async function createTask(
       status: "pending",
       blocks: [],
       blockedBy: [],
+      version: 1,
+      createdAt,
+      updatedAt: createdAt,
       metadata,
     };
     fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(task, null, 2));
@@ -86,7 +152,7 @@ export async function updateTask(
   return await withLock(p, async () => {
     if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
     const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
-    const updated = { ...task, ...updates };
+    const updated = nextTaskState(task, updates);
 
     if (updates.status === "deleted") {
       fs.unlinkSync(p);
@@ -110,6 +176,41 @@ export async function updateTask(
  * @param plan The content of the plan
  * @returns The updated task
  */
+export async function updateTaskGuarded(
+  teamName: string,
+  taskId: string,
+  updates: Partial<TaskFile>,
+  guard: GuardedTaskUpdateOptions,
+  retries?: number
+): Promise<GuardedTaskUpdateResult> {
+  const p = getTaskPath(teamName, taskId);
+
+  return await withLock(p, async () => {
+    if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
+    const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
+
+    if (taskOperationMatches(task, guard.operationId)) {
+      return { task, updated: false, idempotent: true };
+    }
+
+    assertGuardMatches(task, guard);
+    const updated = nextTaskState(task, updates, guard.operationId);
+
+    if (updates.status === "deleted") {
+      fs.unlinkSync(p);
+      return { task: updated, updated: true, idempotent: false };
+    }
+
+    fs.writeFileSync(p, JSON.stringify(updated, null, 2));
+
+    if (updates.status === "completed") {
+      await runHook(teamName, "task_completed", updated);
+    }
+
+    return { task: updated, updated: true, idempotent: false };
+  }, retries);
+}
+
 export async function submitPlan(teamName: string, taskId: string, plan: string): Promise<TaskFile> {
   if (!plan || !plan.trim()) throw new Error("Plan must not be empty");
   return await updateTask(teamName, taskId, { status: "planning", plan });
@@ -160,7 +261,7 @@ export async function evaluatePlan(
       ? { status: "in_progress", planFeedback: "" }
       : { status: "planning", planFeedback: feedback };
 
-    const updated = { ...task, ...updates };
+    const updated = nextTaskState(task, updates);
     fs.writeFileSync(p, JSON.stringify(updated, null, 2));
     return updated;
   }, retries);

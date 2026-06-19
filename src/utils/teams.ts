@@ -14,7 +14,8 @@ export function createTeam(
   leadAgentId: string,
   description = "",
   defaultModel?: string,
-  separateWindows?: boolean
+  separateWindows?: boolean,
+  metadata?: Record<string, any>
 ): TeamConfig {
   const dir = teamDir(name);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -41,6 +42,7 @@ export function createTeam(
     members: [leadMember],
     defaultModel,
     separateWindows,
+    metadata,
   };
 
   fs.writeFileSync(configPath(name), JSON.stringify(config, null, 2));
@@ -57,6 +59,38 @@ export async function readConfig(teamName: string): Promise<TeamConfig> {
   return await withLock(p, async () => {
     return readConfigRaw(p);
   });
+}
+
+export interface EnsureTeamOptions {
+  name: string;
+  sessionId?: string;
+  leadAgentId?: string;
+  description?: string;
+  defaultModel?: string;
+  separateWindows?: boolean;
+  metadata?: Record<string, any>;
+}
+
+export interface EnsureTeamResult {
+  config: TeamConfig;
+  created: boolean;
+}
+
+export async function ensureTeam(options: EnsureTeamOptions): Promise<EnsureTeamResult> {
+  if (teamExists(options.name)) {
+    return { config: await readConfig(options.name), created: false };
+  }
+
+  const config = createTeam(
+    options.name,
+    options.sessionId || "local-session",
+    options.leadAgentId || "lead-agent",
+    options.description || "",
+    options.defaultModel,
+    options.separateWindows,
+    options.metadata
+  );
+  return { config, created: true };
 }
 
 export async function addMember(teamName: string, member: Member) {

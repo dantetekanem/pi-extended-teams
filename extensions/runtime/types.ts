@@ -27,6 +27,7 @@ export interface CompletedAgentReport {
   startedAt?: number;
   elapsedMs?: number;
   tokensUsed?: number;
+  costUsd?: number;
   model?: string;
   thinking?: string;
   color?: string;

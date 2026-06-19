@@ -7,9 +7,10 @@ import * as teams from "../../src/utils/teams";
 import * as tasks from "../../src/utils/tasks";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
+import { observeTeam, observeTeammate } from "../../src/orchestration";
 import { formatTeammateStatusForModel, renderTeammateStatus } from "../ui/renderers";
 import type { RunningReadAgent } from "../runtime/types";
-import type { Member } from "../../src/utils/models";
+import type { Member, TaskFile } from "../../src/utils/models";
 
 export interface TaskRuntimeToolsOptions {
   terminal: any;
@@ -78,9 +79,35 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
       task_id: Type.String(),
       status: Type.Optional(StringEnum(["pending", "planning", "in_progress", "completed", "deleted"])),
       owner: Type.Optional(Type.String()),
+      expected_status: Type.Optional(StringEnum(["pending", "planning", "in_progress", "completed", "deleted"])),
+      expected_owner: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+      expected_version: Type.Optional(Type.Number()),
+      expected_updated_at: Type.Optional(Type.String()),
+      operation_id: Type.Optional(Type.String()),
     }),
     async execute(_toolCallId: string, params: any) {
-      const updated = await tasks.updateTask(params.team_name, params.task_id, { status: params.status as any, owner: params.owner });
+      const updates: Partial<TaskFile> = {};
+      if (Object.prototype.hasOwnProperty.call(params, "status")) updates.status = params.status as any;
+      if (Object.prototype.hasOwnProperty.call(params, "owner")) updates.owner = params.owner;
+
+      const hasGuard = params.expected_status !== undefined
+        || Object.prototype.hasOwnProperty.call(params, "expected_owner")
+        || params.expected_version !== undefined
+        || params.expected_updated_at !== undefined
+        || params.operation_id !== undefined;
+
+      if (hasGuard) {
+        const result = await tasks.updateTaskGuarded(params.team_name, params.task_id, updates, {
+          expectedStatus: params.expected_status,
+          expectedOwner: Object.prototype.hasOwnProperty.call(params, "expected_owner") ? params.expected_owner : undefined,
+          expectedVersion: params.expected_version,
+          expectedUpdatedAt: params.expected_updated_at,
+          operationId: params.operation_id,
+        });
+        return { content: [{ type: "text", text: result.idempotent ? `Task ${params.task_id} update already applied.` : `Task ${params.task_id} updated.` }], details: { task: result.task, updated: result.updated, idempotent: result.idempotent } };
+      }
+
+      const updated = await tasks.updateTask(params.team_name, params.task_id, updates);
       return { content: [{ type: "text", text: `Task ${params.task_id} updated.` }], details: { task: updated } };
     },
   });
@@ -133,6 +160,39 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
     async execute(_toolCallId: string, params: any) {
       const task = await tasks.readTask(params.team_name, params.task_id);
       return { content: [{ type: "text", text: JSON.stringify(task, null, 2) }], details: { task } };
+    },
+  });
+
+  pi.registerTool({
+    name: "observe_team",
+    label: "Observe Team",
+    description: "Purely observe a team without marking inbox messages read, releasing claims, removing members, draining queues, or shutting down teammates.",
+    parameters: Type.Object({ team_name: Type.String() }),
+    async execute(_toolCallId: string, params: any) {
+      const observation = await observeTeam(params.team_name, {
+        terminal: options.terminal,
+        runningReadAgents: options.runningReadAgents,
+        readAgentKey: options.readAgentKey,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(observation, null, 2) }], details: observation };
+    },
+  });
+
+  pi.registerTool({
+    name: "observe_teammate",
+    label: "Observe Teammate",
+    description: "Purely observe one teammate without marking inbox messages read, releasing claims, removing members, draining queues, or shutting down the teammate.",
+    parameters: Type.Object({ team_name: Type.String(), agent_name: Type.String() }),
+    async execute(_toolCallId: string, params: any) {
+      const observation = await observeTeammate(params.team_name, params.agent_name, {
+        terminal: options.terminal,
+        runningReadAgents: options.runningReadAgents,
+        readAgentKey: options.readAgentKey,
+      });
+      return { content: [{ type: "text", text: formatTeammateStatusForModel(params.agent_name, observation) }], details: observation };
+    },
+    renderResult(result: any, { expanded }: any, theme: any) {
+      return renderTeammateStatus(result, expanded, theme);
     },
   });
 

@@ -8,6 +8,7 @@ import {
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
 import * as teams from "../../src/utils/teams";
+import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { getLastAssistantText } from "../ui/renderers";
@@ -75,6 +76,45 @@ async function hasRecentMessageFrom(teamName: string, fromName: string, toName: 
     const timestamp = message.timestamp ? new Date(message.timestamp).getTime() : 0;
     return message.from === fromName && timestamp >= sinceMs - 1000 && String(message.text || "").trim().length > 0;
   });
+}
+
+function operationMetadataFromMember(member: Member): { operationId?: string; workflowRunId?: string } {
+  return {
+    operationId: member.metadata?.operationId || member.metadata?.orchestration?.operationId,
+    workflowRunId: member.metadata?.workflowRunId || member.metadata?.orchestration?.workflowRunId,
+  };
+}
+
+async function recordReadAgentReportEvent(
+  teamName: string,
+  member: Member,
+  status: "completed" | "failed",
+  report: string,
+  summary: string,
+  startedAt: number,
+  tokensUsed: number,
+  costUsd?: number,
+  color?: string
+): Promise<void> {
+  const operation = operationMetadataFromMember(member);
+  await reportEvents.appendTeamReportEvent(teamName, {
+    agentName: member.name,
+    role: "read",
+    status,
+    report,
+    summary,
+    startedAt,
+    elapsedMs: Date.now() - startedAt,
+    tokensUsed,
+    costUsd,
+    model: member.model,
+    thinking: member.thinking,
+    color: color || member.color,
+    requestedBy: member.requestedBy,
+    source: "read-agent",
+    operationId: operation.operationId,
+    workflowRunId: operation.workflowRunId,
+  }).catch(() => {});
 }
 
 async function ensureReadHelperCompletionMessages(
@@ -246,6 +286,7 @@ export async function runReadAgentInProcess(
     if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) return;
 
     const report = getLastAssistantText(session.messages) || "Read agent completed, but produced no assistant text.";
+    const completionStats = session.getSessionStats();
     options.rememberCompletedAgentReport(readTeamName, {
       name: member.name,
       role: "read",
@@ -256,12 +297,14 @@ export async function runReadAgentInProcess(
       startedAt: state.startedAt,
       elapsedMs: Date.now() - state.startedAt,
       tokensUsed: state.tokensUsed,
+      costUsd: completionStats.cost,
       model: member.model,
       thinking: member.thinking,
       color: member.color,
       requestedBy: member.requestedBy,
       source: "read-agent",
     });
+    await recordReadAgentReportEvent(readTeamName, member, "completed", report, `Read agent ${member.name} completed`, state.startedAt, state.tokensUsed, completionStats.cost);
     if (member.requestedBy) {
       await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
       await options.renderLeadInboxStatus?.().catch(() => {});
@@ -276,6 +319,7 @@ export async function runReadAgentInProcess(
   } catch (e) {
     if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
       const failureReport = `Read agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
+      const failureStats = state.session?.getSessionStats();
       options.rememberCompletedAgentReport(readTeamName, {
         name: member.name,
         role: "read",
@@ -286,12 +330,14 @@ export async function runReadAgentInProcess(
         startedAt: state.startedAt,
         elapsedMs: Date.now() - state.startedAt,
         tokensUsed: state.tokensUsed,
+        costUsd: failureStats?.cost,
         model: member.model,
         thinking: member.thinking,
         color: "red",
         requestedBy: member.requestedBy,
         source: "read-agent",
       });
+      await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, `Read agent ${member.name} failed`, state.startedAt, state.tokensUsed, failureStats?.cost, "red");
       if (member.requestedBy) {
         await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, failureReport, "failed", "red");
         await options.renderLeadInboxStatus?.().catch(() => {});

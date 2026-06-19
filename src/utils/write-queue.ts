@@ -15,6 +15,9 @@ export interface QueuedWriteSpawn {
   thinking?: Member["thinking"];
   planModeRequired?: boolean;
   color?: string;
+  operationId?: string;
+  workflowRunId?: string;
+  metadata?: Record<string, any>;
   requestedAt: number;
 }
 
@@ -57,6 +60,9 @@ export async function enqueueWriteSpawn(
       thinking: request.thinking,
       planModeRequired: request.planModeRequired,
       color: request.color,
+      operationId: request.operationId,
+      workflowRunId: request.workflowRunId,
+      metadata: request.metadata,
       requestedAt: request.requestedAt || Date.now(),
     };
     queue.push(queued);
@@ -98,6 +104,23 @@ export async function cancelQueuedWriteSpawn(teamName: string, id: string): Prom
   });
 }
 
+export async function findQueuedWriteSpawn(
+  teamName: string,
+  criteria: { name?: string; operationId?: string; workflowRunId?: string }
+): Promise<QueuedWriteSpawn | null> {
+  const queuePath = ensureQueueDir(teamName);
+  return await withLock(queuePath, async () => {
+    const queue = readQueueRaw(queuePath);
+    return queue.find(item => {
+      const nameMatches = criteria.name !== undefined && item.name === criteria.name;
+      const operationMatches = criteria.operationId !== undefined
+        && (item.operationId || item.metadata?.operationId) === criteria.operationId
+        && (criteria.workflowRunId === undefined || (item.workflowRunId || item.metadata?.workflowRunId) === criteria.workflowRunId);
+      return nameMatches || operationMatches;
+    }) || null;
+  });
+}
+
 export function queuedWriteSpawnToMember(teamName: string, queued: QueuedWriteSpawn): Member {
   return {
     agentId: `${queued.name}@${teamName}`,
@@ -114,5 +137,10 @@ export function queuedWriteSpawnToMember(teamName: string, queued: QueuedWriteSp
     color: queued.color || "blue",
     thinking: queued.thinking,
     planModeRequired: queued.planModeRequired,
+    metadata: {
+      ...(queued.metadata || {}),
+      ...(queued.operationId ? { operationId: queued.operationId } : {}),
+      ...(queued.workflowRunId ? { workflowRunId: queued.workflowRunId } : {}),
+    },
   };
 }

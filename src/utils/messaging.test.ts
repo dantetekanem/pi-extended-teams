@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { appendMessage, readInbox, sendPlainMessage, broadcastMessage } from "./messaging";
+import { appendMessage, readInbox, sendPlainMessage, broadcastMessage, peekInbox, sendPlainMessageOnce } from "./messaging";
 import * as paths from "./paths";
 
 // Mock the paths to use a temporary directory
@@ -68,6 +68,30 @@ describe("Messaging Utilities", () => {
     const all = await readInbox("test-team", "receiver", false, false);
     expect(all.length).toBe(2);
     expect(all.every(m => m.read)).toBe(true);
+  });
+
+  it("should peek without marking messages as read", async () => {
+    await sendPlainMessage("test-team", "sender", "receiver", "msg1", "summary1");
+
+    const peeked = await peekInbox("test-team", "receiver", true);
+    expect(peeked.length).toBe(1);
+    expect(peeked[0].read).toBe(false);
+
+    const unread = await readInbox("test-team", "receiver", true, false);
+    expect(unread.length).toBe(1);
+    expect(unread[0].read).toBe(false);
+  });
+
+  it("should send operation messages once", async () => {
+    const first = await sendPlainMessageOnce("test-team", "sender", "receiver", "msg1", "summary1", { operationId: "op-1" });
+    const second = await sendPlainMessageOnce("test-team", "sender", "receiver", "msg2", "summary2", { operationId: "op-1" });
+
+    expect(first.delivered).toBe(true);
+    expect(second.delivered).toBe(false);
+    expect(second.message.text).toBe("msg1");
+
+    const inbox = await readInbox("test-team", "receiver", false, false);
+    expect(inbox.length).toBe(1);
   });
 
   it("should broadcast message to all members except the sender", async () => {

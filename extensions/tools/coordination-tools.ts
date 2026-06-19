@@ -7,6 +7,7 @@ import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import * as sharedMemory from "../../src/utils/shared-memory";
+import * as reportEvents from "../../src/utils/report-events";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
 import { StringEnum } from "../internal/schema";
 import { requestLeadForTeammateSpawn } from "./delegation-guard";
@@ -147,6 +148,19 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       const tmuxPaneId = member?.tmuxPaneId;
 
       await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", params.content, params.summary || "Final report");
+      await reportEvents.appendTeamReportEvent(targetTeamName, {
+        agentName: options.agentName,
+        role: member?.role || "write",
+        status: "completed",
+        report: params.content,
+        summary: params.summary || "Final report",
+        source: "write-agent",
+        model: member?.model,
+        thinking: member?.thinking,
+        color: member?.color,
+        operationId: member?.metadata?.operationId || member?.metadata?.orchestration?.operationId,
+        workflowRunId: member?.metadata?.workflowRunId || member?.metadata?.orchestration?.workflowRunId,
+      }).catch(() => {});
       const releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);
       await runtime.deleteRuntimeStatus(targetTeamName, options.agentName);
       await teams.removeMember(targetTeamName, options.agentName);
@@ -190,6 +204,60 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
     async execute(_toolCallId: string, params: any) {
       await messaging.broadcastMessage(params.team_name, options.agentName, params.content, params.summary, params.color);
       return { content: [{ type: "text", text: `Message broadcasted to all team members.` }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "send_message_once",
+    label: "Send Message Once",
+    description: "Idempotently send a message to a teammate using operation_id/workflow_run_id metadata.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      recipient: Type.String(),
+      content: Type.String(),
+      summary: Type.String(),
+      operation_id: Type.String(),
+      workflow_run_id: Type.Optional(Type.String()),
+      color: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId: string, params: any) {
+      const result = await messaging.sendPlainMessageOnce(params.team_name, options.agentName, params.recipient, params.content, params.summary, {
+        operationId: params.operation_id,
+        workflowRunId: params.workflow_run_id,
+        color: params.color,
+        metadata: { operationId: params.operation_id, ...(params.workflow_run_id ? { workflowRunId: params.workflow_run_id } : {}) },
+      });
+      return {
+        content: [{ type: "text", text: result.delivered ? `Message sent to ${params.recipient}.` : `Message for operation ${params.operation_id} was already delivered to ${params.recipient}.` }],
+        details: { delivered: result.delivered, message: result.message, recipient: params.recipient },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "broadcast_message_once",
+    label: "Broadcast Message Once",
+    description: "Idempotently broadcast a message using operation_id/workflow_run_id metadata.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      content: Type.String(),
+      summary: Type.String(),
+      operation_id: Type.String(),
+      workflow_run_id: Type.Optional(Type.String()),
+      color: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId: string, params: any) {
+      const results = await messaging.broadcastMessageOnce(params.team_name, options.agentName, params.content, params.summary, {
+        operationId: params.operation_id,
+        workflowRunId: params.workflow_run_id,
+        color: params.color,
+        metadata: { operationId: params.operation_id, ...(params.workflow_run_id ? { workflowRunId: params.workflow_run_id } : {}) },
+      });
+      const deliveredCount = results.filter(result => result.delivered).length;
+      return {
+        content: [{ type: "text", text: `Broadcast delivered to ${deliveredCount}/${results.length} recipient(s); existing messages were reused for the rest.` }],
+        details: { results },
+      };
     },
   });
 
@@ -337,19 +405,21 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       team_name: Type.String(),
       agent_name: Type.Optional(Type.String({ description: "Whose inbox to read. Defaults to your own." })),
       unread_only: Type.Optional(Type.Boolean({ default: true })),
+      mark_as_read: Type.Optional(Type.Boolean({ default: true, description: "Set false to peek without marking messages read or updating runtime readiness." })),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       const targetAgent = params.agent_name || options.agentName;
+      const markAsRead = params.mark_as_read !== false;
       if (!options.isTeammate && teams.teamExists(paths.sanitizeName(params.team_name))) {
         options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
       }
       const isSelfTeammateInbox = options.isTeammate && options.getTeamName() && params.team_name === options.getTeamName() && targetAgent === options.agentName;
-      const unreadBeforeRead = isSelfTeammateInbox
+      const unreadBeforeRead = isSelfTeammateInbox && markAsRead
         ? await messaging.readInbox(params.team_name, targetAgent, true, false).catch(() => [])
         : [];
-      const msgs = await messaging.readInbox(params.team_name, targetAgent, params.unread_only);
+      const msgs = await messaging.readInbox(params.team_name, targetAgent, params.unread_only, markAsRead);
 
-      if (isSelfTeammateInbox) {
+      if (isSelfTeammateInbox && markAsRead) {
         await runtime.writeRuntimeStatus(options.getTeamName()!, options.agentName, {
           lastHeartbeatAt: Date.now(),
           lastInboxReadAt: Date.now(),
@@ -372,12 +442,12 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         }
       }
 
-      if (!options.isTeammate && params.team_name === options.getTeamName() && targetAgent === options.agentName) {
+      if (markAsRead && !options.isTeammate && params.team_name === options.getTeamName() && targetAgent === options.agentName) {
         options.resetLeadWakeNotifiedCount();
         await options.renderLeadInboxStatus();
       }
 
-      return { content: [{ type: "text", text: formatInboxMessagesForModel(msgs) }], details: { messages: msgs, targetAgent } };
+      return { content: [{ type: "text", text: formatInboxMessagesForModel(msgs) }], details: { messages: msgs, targetAgent, markAsRead } };
     },
     renderResult(result: any, { expanded }: any, theme: any) {
       return renderInboxMessages(result, expanded, theme);

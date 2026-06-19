@@ -29,9 +29,15 @@ export interface TeamToolsOptions {
   isTeammate: boolean;
   agentName: string;
   getTeamName(): string | null | undefined;
+  getSessionCtx?(): any;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
+  function emitOrchestrationResponse(requestId: string | undefined, type: string, payload: Record<string, any>): void {
+    if (!requestId) return;
+    pi.events?.emit?.("pi-extended-teams:orchestration-response", { requestId, type, ...payload });
+  }
+
   function operationMetadataFromParams(params: any): Record<string, any> | undefined {
     const metadata = { ...(params.metadata || {}) };
     if (params.operation_id) metadata.operationId = params.operation_id;
@@ -213,6 +219,57 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       details: { agentId: member.agentId, role, terminalId, queued: false, debugLogPath },
     };
   }
+
+  pi.events?.on?.("pi-extended-teams:orchestration-request", async (payload: any) => {
+    const requestId = payload?.requestId;
+    const type = String(payload?.type || "");
+    const params = payload?.params || {};
+    const ctx = options.getSessionCtx?.();
+
+    try {
+      if (options.isTeammate) throw new Error("Teammates cannot satisfy orchestration requests directly.");
+      if (!ctx) throw new Error("No active lead session context is available for orchestration request.");
+
+      if (type === "ensure_team") {
+        const safeTeamName = paths.sanitizeName(params.team_name);
+        if (teams.teamExists(safeTeamName)) {
+          const config = await teams.readConfig(safeTeamName);
+          options.adoptTeamAsLead(safeTeamName, ctx);
+          emitOrchestrationResponse(requestId, type, { ok: true, details: { config, created: false, idempotent: true } });
+          return;
+        }
+
+        const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
+        const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
+        const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
+        const defaultModel = explicitDefaultModel || currentModel;
+        const result = await teams.ensureTeam({
+          name: safeTeamName,
+          sessionId: "local-session",
+          leadAgentId: "lead-agent",
+          description: params.description,
+          defaultModel,
+          metadata: operationMetadataFromParams(params),
+        });
+        options.adoptTeamAsLead(safeTeamName, ctx);
+        emitOrchestrationResponse(requestId, type, { ok: true, details: { config: result.config, created: result.created, idempotent: true } });
+        return;
+      }
+
+      if (type === "spawn_teammate_once") {
+        const safeTeamName = paths.sanitizeName(params.team_name);
+        if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
+        options.adoptTeamAsLead(safeTeamName, ctx);
+        const result = await spawnTeammate(params, ctx, { once: true });
+        emitOrchestrationResponse(requestId, type, { ok: true, details: result.details, content: result.content });
+        return;
+      }
+
+      throw new Error(`Unsupported orchestration request type: ${type}`);
+    } catch (error) {
+      emitOrchestrationResponse(requestId, type, { ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
 
   pi.registerTool({
     name: "team_create",

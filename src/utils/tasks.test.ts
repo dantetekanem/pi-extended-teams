@@ -12,6 +12,7 @@ import {
   evaluatePlan,
   markOwnerTasksBlockedByFileClaims,
   clearOwnerFileClaimBlocks,
+  updateTaskGuarded,
 } from "./tasks";
 import * as paths from "./paths";
 import * as teams from "./teams";
@@ -51,6 +52,37 @@ describe("Tasks Utilities", () => {
     
     const taskData = JSON.parse(fs.readFileSync(path.join(testDir, "1.json"), "utf-8"));
     expect(taskData.status).toBe("in_progress");
+  });
+
+  it("should guard task updates by version and operation id", async () => {
+    const task = await createTask("test-team", "Guarded", "Description");
+    const result = await updateTaskGuarded(
+      "test-team",
+      task.id,
+      { status: "in_progress" },
+      { expectedStatus: "pending", expectedVersion: task.version, operationId: "op-1" }
+    );
+
+    expect(result.updated).toBe(true);
+    expect(result.idempotent).toBe(false);
+    expect(result.task.status).toBe("in_progress");
+
+    const replay = await updateTaskGuarded(
+      "test-team",
+      task.id,
+      { status: "completed" },
+      { expectedStatus: "pending", expectedVersion: task.version, operationId: "op-1" }
+    );
+    expect(replay.updated).toBe(false);
+    expect(replay.idempotent).toBe(true);
+    expect(replay.task.status).toBe("in_progress");
+
+    await expect(updateTaskGuarded(
+      "test-team",
+      task.id,
+      { status: "completed" },
+      { expectedStatus: "pending", expectedVersion: task.version }
+    )).rejects.toThrow(/status guard failed/);
   });
 
   it("should submit a plan successfully", async () => {

@@ -518,6 +518,7 @@ export default function (pi: ExtensionAPI) {
     isTeammate,
     agentName,
     getTeamName: () => teamName,
+    getSessionCtx: () => sessionCtx,
   });
 
   registerCoordinationTools(pi, {

@@ -28,6 +28,15 @@
     "build": "tsc --noEmit"
   },
   "main": "extensions/index.ts",
+  "exports": {
+    ".": "./extensions/index.ts",
+    "./orchestration": "./src/orchestration/index.ts",
+    "./orchestration/types": "./src/orchestration/types.ts",
+    "./extensions/*": "./extensions/*",
+    "./src/*": "./src/*",
+    "./skills/*": "./skills/*",
+    "./package.json": "./package.json"
+  },
   "files": [
     "extensions",
     "skills",

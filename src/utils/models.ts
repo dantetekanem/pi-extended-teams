@@ -18,6 +18,8 @@ export interface Member {
   planModeRequired?: boolean;
   backendType?: string;
   isActive?: boolean;
+  /** Optional programmatic orchestration/idempotency metadata. */
+  metadata?: Record<string, any>;
   /** "read" agents run in-process (no pane); "write" agents spawn in tmux. */
   role?: "read" | "write";
   /** Optional category preset name from settings.json. */
@@ -37,6 +39,8 @@ export interface TeamConfig {
   members: Member[];
   defaultModel?: string;
   separateWindows?: boolean;
+  /** Optional programmatic orchestration/idempotency metadata. */
+  metadata?: Record<string, any>;
 }
 
 export interface TaskFile {
@@ -50,14 +54,45 @@ export interface TaskFile {
   blocks: string[];
   blockedBy: string[];
   owner?: string;
+  /** Monotonic task version for guarded programmatic updates. */
+  version?: number;
+  createdAt?: string;
+  updatedAt?: string;
   metadata?: Record<string, any>;
 }
 
 export interface InboxMessage {
+  id?: string;
   from: string;
   text: string;
   timestamp: string;
   read: boolean;
   summary?: string;
   color?: string;
+  operationId?: string;
+  workflowRunId?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface TeamReportEvent {
+  id: string;
+  teamName: string;
+  agentName: string;
+  role?: string;
+  status: "completed" | "failed";
+  report: string;
+  summary?: string;
+  createdAt: number;
+  startedAt?: number;
+  elapsedMs?: number;
+  tokensUsed?: number;
+  costUsd?: number;
+  model?: string;
+  thinking?: string;
+  color?: string;
+  requestedBy?: string;
+  source: "read-agent" | "write-agent" | "lead-inbox" | "tool" | "workflow";
+  operationId?: string;
+  workflowRunId?: string;
+  metadata?: Record<string, any>;
 }

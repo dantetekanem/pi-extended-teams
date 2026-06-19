@@ -56,6 +56,10 @@ export function sharedMemoryPath(teamName: string) {
   return path.join(teamDir(teamName), "shared-memory.json");
 }
 
+export function reportEventsPath(teamName: string) {
+  return path.join(teamDir(teamName), "reports.json");
+}
+
 export function leadSessionPath(teamName: string) {
   return path.join(teamDir(teamName), "lead-session.json");
 }

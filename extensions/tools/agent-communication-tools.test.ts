@@ -137,6 +137,19 @@ describe("read-agent communication tools", () => {
     expect(typeof status?.lastInboxReadAt).toBe("number");
   });
 
+  it("read_inbox can peek without marking read or updating readiness", async () => {
+    await sendPlainMessage("team", "team-lead", "reader", "Initial instructions", "assignment");
+    const tools = makeTools("team", "reader");
+
+    const result = await tools.get("read_inbox")!.execute("read", { unread_only: true, mark_as_read: false });
+
+    expect(result.content[0].text).toContain("Initial instructions");
+    expect(result.details.markAsRead).toBe(false);
+    const inbox = await readInbox("team", "reader", false, false);
+    expect(inbox[0].read).toBe(false);
+    expect(await readRuntimeStatus("team", "reader")).toBeNull();
+  });
+
   it("request_teammate sends a lead-owned spawn request", async () => {
     const tools = makeTools("team", "reader");
 

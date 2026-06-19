@@ -65,17 +65,21 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
       parameters: Type.Object({
         team_name: Type.Optional(Type.String({ description: "Team name. Defaults to the current team context." })),
         unread_only: Type.Optional(Type.Boolean({ default: true })),
+        mark_as_read: Type.Optional(Type.Boolean({ default: true, description: "Set false to peek without marking messages read or updating runtime readiness." })),
       }),
       async execute(_toolCallId: string, params: any) {
         const teamName = requireTeamName(options, params.team_name);
-        const msgs = await messaging.readInbox(teamName, options.agentName, params.unread_only);
-        await runtime.writeRuntimeStatus(teamName, options.agentName, {
-          lastHeartbeatAt: Date.now(),
-          lastInboxReadAt: Date.now(),
-          ready: true,
-          lastError: undefined,
-        }).catch(() => {});
-        return { content: [{ type: "text", text: formatInboxMessagesForModel(msgs) }], details: { teamName, targetAgent: options.agentName, messages: msgs } };
+        const markAsRead = params.mark_as_read !== false;
+        const msgs = await messaging.readInbox(teamName, options.agentName, params.unread_only, markAsRead);
+        if (markAsRead) {
+          await runtime.writeRuntimeStatus(teamName, options.agentName, {
+            lastHeartbeatAt: Date.now(),
+            lastInboxReadAt: Date.now(),
+            ready: true,
+            lastError: undefined,
+          }).catch(() => {});
+        }
+        return { content: [{ type: "text", text: formatInboxMessagesForModel(msgs) }], details: { teamName, targetAgent: options.agentName, messages: msgs, markAsRead } };
       },
     },
     {

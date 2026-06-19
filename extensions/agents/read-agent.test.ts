@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import * as paths from "../../src/utils/paths.js";
 import { readInbox, sendPlainMessage } from "../../src/utils/messaging.js";
+import { listTeamReportEvents } from "../../src/utils/report-events.js";
 
 const piMocks = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
@@ -157,6 +158,111 @@ describe("in-process read agent tool wiring", () => {
     expect(options.emitAgentReport).toHaveBeenCalledWith("prompt-build-123", "prompt-branch-1", expect.any(Number), 42, "final report", true);
     const leadInbox = await readInbox("prompt-build-123", "team-lead", false, false);
     expect(leadInbox).toEqual([]);
+  });
+
+  it("suppresses lead report injection for workflow-spawned read agents while persisting report events", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    };
+
+    await runReadAgentInProcess("team", {
+      agentId: "workflow-reader@team",
+      name: "workflow-reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "high",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "workflow branch",
+      metadata: { operationId: "op-1", workflowRunId: "run-1" },
+    }, "workflow branch", {
+      modelRegistry: {
+        find: vi.fn(() => ({ provider: "provider", id: "model" })),
+      },
+    }, options);
+
+    expect(options.emitAgentReport).not.toHaveBeenCalled();
+    const leadInbox = await readInbox("team", "team-lead", false, false);
+    expect(leadInbox).toEqual([]);
+
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      agentName: "workflow-reader",
+      status: "completed",
+      report: "final report",
+      operationId: "op-1",
+      workflowRunId: "run-1",
+      source: "read-agent",
+    });
+  });
+
+  it("suppresses failed workflow read-agent injection while persisting failure events", async () => {
+    const session = makeSession();
+    session.prompt.mockRejectedValue(new Error("branch failed"));
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    };
+
+    await runReadAgentInProcess("team", {
+      agentId: "workflow-reader@team",
+      name: "workflow-reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "high",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "workflow branch",
+      metadata: { orchestration: { operationId: "op-1", workflowRunId: "run-1" } },
+    }, "workflow branch", {
+      modelRegistry: {
+        find: vi.fn(() => ({ provider: "provider", id: "model" })),
+      },
+    }, options);
+
+    expect(options.emitAgentReport).not.toHaveBeenCalled();
+    const leadInbox = await readInbox("team", "team-lead", false, false);
+    expect(leadInbox).toEqual([]);
+
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      agentName: "workflow-reader",
+      status: "failed",
+      report: "Read agent workflow-reader failed: branch failed",
+      operationId: "op-1",
+      workflowRunId: "run-1",
+      source: "read-agent",
+    });
   });
 
   it("lead-run read helpers require the helper to send the full report and only a done notice to lead", async () => {

@@ -104,6 +104,8 @@ export interface SpawnTeammateOnceResponse {
   details?: Record<string, any>;
 }
 
+export type SpawnTeammatesOnceResponse = SpawnTeammateOnceResponse[];
+
 export interface SendMessageOnceRequest extends OrchestrationOperationMetadata {
   teamName: string;
   fromName: string;

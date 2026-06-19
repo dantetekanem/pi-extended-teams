@@ -49,10 +49,16 @@ export default function (pi: ExtensionAPI) {
   let sessionCtx: any = null;
   const runningReadAgents = new Map<string, RunningReadAgent>();
   const completedAgentReports = new Map<string, CompletedAgentReport[]>();
+  const TEAM_ACTIVITY_RENDER_DEBOUNCE_MS = 75;
   let readAgentStatusTimer: NodeJS.Timeout | null = null;
   let teamActivityStatusSnapshot: TeamActivityStatusSnapshot | null = null;
+  let teamActivityStatusSnapshotSignature: string | null = null;
   let teamActivityWidgetMounted = false;
   let teamActivityWidgetTui: { requestRender?: () => void } | null = null;
+  let teamActivityRenderInFlight = false;
+  let teamActivityRenderDirty = false;
+  let teamActivityRenderTimer: NodeJS.Timeout | null = null;
+  const teamActivityRenderWaiters: Array<{ resolve(): void; reject(error: unknown): void }> = [];
   let activePromptBuildTeamName: string | null = null;
   let leadInboxWidgetCleared = false;
   let leadInboxUnreadCount = 0;
@@ -159,13 +165,26 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  function wakeLeadForIdleReadAgent(agent: RunningReadAgent, status: ReadAgentStatusDescription): void {
-    if (status.idleLevel === "none") return;
-    if (!shouldNudgeReadAgentIdle(agent.idleNudgeLevel, status.idleLevel)) return;
-    if (sessionCtx?.isIdle && !sessionCtx.isIdle()) return;
+  function getIdleReadAgentNudgeMessage(agent: RunningReadAgent, status: ReadAgentStatusDescription): string | null {
+    if (status.idleLevel === "none") return null;
+    if (!shouldNudgeReadAgentIdle(agent.idleNudgeLevel, status.idleLevel)) return null;
+    if (sessionCtx?.isIdle && !sessionCtx.isIdle()) return null;
 
-    quietTrigger(buildReadAgentIdleNudgeMessage(agent, status));
     agent.idleNudgeLevel = status.idleLevel;
+    return buildReadAgentIdleNudgeMessage(agent, status);
+  }
+
+  function wakeLeadForIdleReadAgents(messages: string[]): void {
+    if (messages.length === 0) return;
+    if (messages.length === 1) {
+      quietTrigger(messages[0]);
+      return;
+    }
+
+    quietTrigger([
+      `${messages.length} read agents need attention:`,
+      ...messages.map((message) => `- ${message}`),
+    ].join("\n"));
   }
 
   function clearLeadInboxWidgetOnce(): void {
@@ -175,7 +194,70 @@ export default function (pi: ExtensionAPI) {
   }
 
   function renderReadAgentStatus() {
-    void renderTeamActivityStatus();
+    markTeamActivityStatusDirty();
+  }
+
+  function waitForTeamActivityRender(): Promise<void> {
+    return new Promise((resolve, reject) => teamActivityRenderWaiters.push({ resolve, reject }));
+  }
+
+  function settleTeamActivityRenderWaiters(error?: unknown): void {
+    const waiters = teamActivityRenderWaiters.splice(0);
+    for (const waiter of waiters) {
+      if (error) waiter.reject(error);
+      else waiter.resolve();
+    }
+  }
+
+  function queueTeamActivityStatusRender(delayMs = TEAM_ACTIVITY_RENDER_DEBOUNCE_MS): void {
+    if (teamActivityRenderTimer || teamActivityRenderInFlight) return;
+    teamActivityRenderTimer = setTimeout(() => {
+      teamActivityRenderTimer = null;
+      void flushTeamActivityStatusRender();
+    }, Math.max(0, delayMs));
+  }
+
+  function markTeamActivityStatusDirty(delayMs = TEAM_ACTIVITY_RENDER_DEBOUNCE_MS): void {
+    teamActivityRenderDirty = true;
+    queueTeamActivityStatusRender(delayMs);
+  }
+
+  async function renderTeamActivityStatus(): Promise<void> {
+    teamActivityRenderDirty = true;
+    if (teamActivityRenderTimer) {
+      clearTimeout(teamActivityRenderTimer);
+      teamActivityRenderTimer = null;
+    }
+    const promise = waitForTeamActivityRender();
+    void flushTeamActivityStatusRender();
+    return promise;
+  }
+
+  async function flushTeamActivityStatusRender(): Promise<void> {
+    if (teamActivityRenderInFlight) return;
+    if (!teamActivityRenderDirty) {
+      settleTeamActivityRenderWaiters();
+      return;
+    }
+
+    teamActivityRenderInFlight = true;
+    let renderError: unknown;
+    try {
+      teamActivityRenderDirty = false;
+      await renderTeamActivityStatusNow();
+    } catch (error) {
+      renderError = error;
+    } finally {
+      teamActivityRenderInFlight = false;
+      if (renderError) {
+        teamActivityRenderDirty = false;
+        settleTeamActivityRenderWaiters(renderError);
+      } else if (teamActivityRenderDirty) {
+        queueTeamActivityStatusRender();
+      } else {
+        settleTeamActivityRenderWaiters();
+      }
+    }
   }
 
   function isTeamActivityExpanded(): boolean {
@@ -195,31 +277,50 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  function getTeamActivitySnapshotSignature(snapshot: TeamActivityStatusSnapshot): string {
+    return JSON.stringify({
+      activeCount: snapshot.activeCount,
+      readCount: snapshot.readCount,
+      writeCount: snapshot.writeCount,
+      unreadCount: snapshot.unreadCount,
+      statusCounts: snapshot.statusCounts ?? {},
+      entries: snapshot.entries,
+    });
+  }
+
   function updateTeamActivityWidget(snapshot: TeamActivityStatusSnapshot): void {
+    const nextSignature = getTeamActivitySnapshotSignature(snapshot);
+    const changed = nextSignature !== teamActivityStatusSnapshotSignature;
     teamActivityStatusSnapshot = snapshot;
+    teamActivityStatusSnapshotSignature = nextSignature;
     mountTeamActivityWidget();
-    teamActivityWidgetTui?.requestRender?.();
+    if (changed) teamActivityWidgetTui?.requestRender?.();
   }
 
   function clearTeamActivityWidget(): void {
     teamActivityStatusSnapshot = null;
+    teamActivityStatusSnapshotSignature = null;
     teamActivityWidgetMounted = false;
     teamActivityWidgetTui = null;
     sessionCtx?.ui?.setWidget?.("01-pi-extended-teams-readers", undefined);
   }
 
-  async function renderTeamActivityStatus() {
+  async function renderTeamActivityStatusNow() {
     if (!sessionCtx?.ui) return;
 
     const now = Date.now();
-    const readAgents = Array.from(runningReadAgents.values())
-      .sort((a, b) => a.name.localeCompare(b.name));
-    const activeWriteMembers = teamName
-      ? (await teams.readConfig(teamName).catch(() => null))?.members
+    const activityTeamName = teamName || null;
+    const readAgents = activityTeamName
+      ? Array.from(runningReadAgents.values())
+        .filter(agent => agent.teamName === activityTeamName)
+        .sort((a, b) => a.name.localeCompare(b.name))
+      : [];
+    const activeWriteMembers = activityTeamName
+      ? (await teams.readConfig(activityTeamName).catch(() => null))?.members
         ?.filter(member => member.name !== "team-lead" && (member.role ?? "write") !== "read")
         ?.filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId))) ?? []
       : [];
-    const unreadLeadMessages = teamName ? await messaging.readInbox(teamName, agentName, true, false).catch(() => []) : [];
+    const unreadLeadMessages = activityTeamName ? await messaging.readInbox(activityTeamName, agentName, true, false).catch(() => []) : [];
     leadInboxUnreadCount = unreadLeadMessages.length;
     clearLeadInboxWidgetOnce();
 
@@ -240,9 +341,15 @@ export default function (pi: ExtensionAPI) {
 
     const activeCount = readAgents.length + activeWriteMembers.length;
     const entries: TeamActivityStatusEntry[] = [];
+    const statusCounts: Record<string, number> = {};
+    const idleNudgeMessages: string[] = [];
+    const countStatus = (status: string | undefined) => {
+      if (!status) return;
+      statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+    };
 
     for (const member of activeWriteMembers.sort((a, b) => a.name.localeCompare(b.name))) {
-      const runtimeStatus = await runtime.readRuntimeStatus(teamName!, member.name).catch(() => null);
+      const runtimeStatus = await runtime.readRuntimeStatus(activityTeamName!, member.name).catch(() => null);
       const elapsed = formatElapsed(now - (runtimeStatus?.startedAt || member.joinedAt));
       const modelLabel = formatModelLabel(member.model, member.thinking);
       const tokens = typeof runtimeStatus?.tokensUsed === "number" ? `${formatTokenCount(runtimeStatus.tokensUsed)} tok` : "0 tok";
@@ -251,6 +358,7 @@ export default function (pi: ExtensionAPI) {
         : runtimeStatus?.currentAction || "running";
       const screen = member.windowId ? `${member.windowId}/${member.tmuxPaneId}` : member.tmuxPaneId;
       const detail = [screen, modelLabel, elapsed, tokens, action].filter(Boolean).join(" · ");
+      countStatus("bg");
       entries.push({ name: member.name, role: "write", status: "bg", detail });
     }
 
@@ -267,11 +375,15 @@ export default function (pi: ExtensionAPI) {
       }
       const elapsed = formatElapsed(now - agent.startedAt);
       const status = describeReadAgentStatus(agent, now);
-      wakeLeadForIdleReadAgent(agent, status);
+      const idleNudgeMessage = getIdleReadAgentNudgeMessage(agent, status);
+      if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
       const detail = [modelLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
+      countStatus(status.label);
       entries.push({ name: agent.name, role: "read", status: status.label, detail });
     }
+
+    wakeLeadForIdleReadAgents(idleNudgeMessages);
 
     sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
     updateTeamActivityWidget({
@@ -280,6 +392,7 @@ export default function (pi: ExtensionAPI) {
       writeCount: activeWriteMembers.length,
       unreadCount: leadInboxUnreadCount,
       entries,
+      statusCounts,
       updatedAt: now,
     });
   }

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "../internal/schema";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
@@ -21,7 +22,7 @@ export interface TeamToolsOptions {
   isCurrentReadAgentRun(key: string, state: RunningReadAgent): boolean;
   renderReadAgentStatus(): void;
   readAgentOptions(): any;
-  runReadAgentInProcess(teamName: string, member: Member, prompt: string, ctx: any, options: any): void;
+  runReadAgentInProcess(teamName: string, member: Member, prompt: string, ctx: any, options: any): Promise<void> | void;
   startWriteAgent(teamName: string, member: Member, prompt: string): Promise<string>;
   shutdownTeammate(teamName: string, member: Member, options?: { drainQueue?: boolean }): Promise<void>;
   adoptTeamAsLead(teamName: string, ctx?: any): void;
@@ -31,6 +32,17 @@ export interface TeamToolsOptions {
   getTeamName(): string | null | undefined;
   getSessionCtx?(): any;
   setSessionCtx?(ctx: any): void;
+}
+
+interface QueuedReadSpawn {
+  id: string;
+  teamName: string;
+  member: Member;
+  prompt: string;
+  params: any;
+  resolved: ReturnType<typeof resolveModel>;
+  ctx: any;
+  requestedAt: number;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
@@ -94,6 +106,99 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     };
   }
 
+  const queuedReadSpawnsByTeam = new Map<string, QueuedReadSpawn[]>();
+  const readQueueDrainingTeams = new Set<string>();
+
+  function activeReadCount(teamName: string): number {
+    let count = 0;
+    for (const agent of options.runningReadAgents.values()) {
+      if (agent.teamName === teamName) count += 1;
+    }
+    return count;
+  }
+
+  function readQueue(teamName: string): QueuedReadSpawn[] {
+    return queuedReadSpawnsByTeam.get(teamName) ?? [];
+  }
+
+  function setReadQueue(teamName: string, queue: QueuedReadSpawn[]): void {
+    if (queue.length > 0) queuedReadSpawnsByTeam.set(teamName, queue);
+    else queuedReadSpawnsByTeam.delete(teamName);
+  }
+
+  function findQueuedReadSpawn(teamName: string, params: any): QueuedReadSpawn | undefined {
+    return readQueue(teamName).find((queued) => queued.member.name === params.name || memberMatchesOperation(queued.member, params));
+  }
+
+  function removeQueuedReadSpawnsByName(teamName: string, name: string): QueuedReadSpawn[] {
+    const queue = readQueue(teamName);
+    const removed = queue.filter((queued) => queued.member.name === name);
+    if (removed.length === 0) return [];
+    setReadQueue(teamName, queue.filter((queued) => queued.member.name !== name));
+    return removed;
+  }
+
+  function queuedReadResolutionDetails(queued: QueuedReadSpawn, params: any, extras: Record<string, any> = {}): Record<string, any> {
+    return spawnResolutionDetails(queued.member, params, queued.resolved, {
+      mode: "in-process",
+      terminalId: null,
+      queued: true,
+      queueId: queued.id,
+      ...extras,
+    });
+  }
+
+  async function startReadAgentMember(teamName: string, member: Member, prompt: string, ctx: any): Promise<void> {
+    await teams.addMember(teamName, member);
+    const result = options.runReadAgentInProcess(teamName, member, prompt, ctx, options.readAgentOptions());
+    void Promise.resolve(result)
+      .catch(() => {})
+      .finally(() => { void drainQueuedReadSpawns(teamName); });
+  }
+
+  function enqueueReadSpawn(teamName: string, member: Member, prompt: string, params: any, resolved: ReturnType<typeof resolveModel>, ctx: any): QueuedReadSpawn {
+    const queued: QueuedReadSpawn = {
+      id: crypto.randomUUID(),
+      teamName,
+      member,
+      prompt,
+      params,
+      resolved,
+      ctx,
+      requestedAt: Date.now(),
+    };
+    setReadQueue(teamName, [...readQueue(teamName), queued]);
+    return queued;
+  }
+
+  async function drainQueuedReadSpawns(teamName: string): Promise<void> {
+    if (readQueueDrainingTeams.has(teamName)) return;
+    readQueueDrainingTeams.add(teamName);
+    try {
+      while (true) {
+        const next = readQueue(teamName)[0];
+        if (!next) return;
+        const settings = loadSettings({ projectDir: next.member.cwd });
+        if (activeReadCount(teamName) >= settings.readAgents.maxConcurrent) return;
+
+        const queue = readQueue(teamName);
+        const queued = queue[0];
+        if (!queued) return;
+        setReadQueue(teamName, queue.slice(1));
+        try {
+          const config = await teams.readConfig(teamName);
+          if (config.members.some((member) => member.name === queued.member.name)) continue;
+          queued.member.joinedAt = Date.now();
+          await startReadAgentMember(teamName, queued.member, queued.prompt, queued.ctx);
+        } catch {
+          // Drop invalid queued read spawns rather than blocking the rest of the queue.
+        }
+      }
+    } finally {
+      readQueueDrainingTeams.delete(teamName);
+    }
+  }
+
   async function spawnTeammate(params: any, ctx: any, spawnOptions: { once?: boolean } = {}): Promise<{ content: any[]; details: any }> {
     const safeName = paths.sanitizeName(params.name);
     const safeTeamName = paths.sanitizeName(params.team_name);
@@ -112,6 +217,15 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
             terminalId: existingOnceMember.tmuxPaneId || null,
             modelSource: "existing",
           }),
+        };
+      }
+
+      const queuedRead = findQueuedReadSpawn(safeTeamName, { ...params, name: safeName });
+      if (queuedRead) {
+        const queuePosition = readQueue(safeTeamName).findIndex((item) => item.id === queuedRead.id) + 1;
+        return {
+          content: [{ type: "text", text: `Read teammate ${safeName} is already queued at position ${queuePosition}.` }],
+          details: queuedReadResolutionDetails(queuedRead, params, { queuePosition, existing: true, idempotent: true }),
         };
       }
 
@@ -187,78 +301,125 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     };
 
     if (role === "read") {
-      await teams.addMember(safeTeamName, member);
-      void options.runReadAgentInProcess(safeTeamName, member, params.prompt, ctx, options.readAgentOptions());
+      removeQueuedReadSpawnsByName(safeTeamName, safeName);
+      const currentReadCount = activeReadCount(safeTeamName);
+      if (currentReadCount >= settings.readAgents.maxConcurrent) {
+        if (!settings.readAgents.queueOverflow) {
+          throw new Error(`Read-agent capacity reached (${currentReadCount}/${settings.readAgents.maxConcurrent}) and queueOverflow is disabled.`);
+        }
+        const queued = enqueueReadSpawn(safeTeamName, member, params.prompt, params, resolved, ctx);
+        const queuePosition = readQueue(safeTeamName).findIndex((item) => item.id === queued.id) + 1;
+        return {
+          content: [{ type: "text", text: `Read teammate ${params.name} queued at position ${queuePosition}; capacity is ${currentReadCount}/${settings.readAgents.maxConcurrent}.` }],
+          details: queuedReadResolutionDetails(queued, params, { queuePosition }),
+        };
+      }
+
+      await startReadAgentMember(safeTeamName, member, params.prompt, ctx);
       return {
         content: [{ type: "text", text: `Read teammate ${params.name} started in-process.` }],
         details: spawnResolutionDetails(member, params, resolved, { mode: "in-process", terminalId: null, queued: false }),
       };
     }
 
-    await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
-    const activeWriteCount = await countWriteMembers(safeTeamName, options.terminal);
-    await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.request", {
-      agentName: safeName,
-      cwd,
-      category: params.category ?? null,
-      requestedRole: params.role ?? "read",
-      resolvedRole: role,
-      model: chosenModel,
-      modelSource: resolved.modelSource,
-      thinking: chosenThinking ?? null,
-      activeWriteCount,
-      maxConcurrent: settings.writeAgents.maxConcurrent,
-      queueOverflow: settings.writeAgents.queueOverflow,
-      debugLogPath: debugLogPath ?? null,
-    }, settings);
+    return await writeQueue.withWriteQueueCapacityLock(safeTeamName, async () => {
+      if (spawnOptions.once) {
+        const latestConfig = await teams.readConfig(safeTeamName);
+        const existingOnceMember = latestConfig.members.find(m => m.agentType === "teammate" && (m.name === safeName || memberMatchesOperation(m, params)));
+        if (existingOnceMember) {
+          return {
+            content: [{ type: "text", text: `Teammate ${safeName} already exists; reusing existing member.` }],
+            details: memberResolutionDetails(existingOnceMember, params, {
+              existing: true,
+              idempotent: true,
+              queued: false,
+              terminalId: existingOnceMember.tmuxPaneId || null,
+              modelSource: "existing",
+            }),
+          };
+        }
 
-    if (activeWriteCount >= settings.writeAgents.maxConcurrent) {
-      if (!settings.writeAgents.queueOverflow) {
-        await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.failure", {
+        const queued = await writeQueue.findQueuedWriteSpawn(safeTeamName, {
+          name: safeName,
+          operationId: params.operation_id,
+          workflowRunId: params.workflow_run_id,
+        });
+        if (queued) {
+          const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
+          const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
+          return {
+            content: [{ type: "text", text: `Write teammate ${safeName} is already queued at position ${queuePosition}.` }],
+            details: queuedResolutionDetails(safeTeamName, queued, params, { queued: true, queueId: queued.id, queuePosition, existing: true, idempotent: true }),
+          };
+        }
+      } else {
+        await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
+      }
+
+      const activeWriteCount = await countWriteMembers(safeTeamName, options.terminal);
+      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.request", {
+        agentName: safeName,
+        cwd,
+        category: params.category ?? null,
+        requestedRole: params.role ?? "read",
+        resolvedRole: role,
+        model: chosenModel,
+        modelSource: resolved.modelSource,
+        thinking: chosenThinking ?? null,
+        activeWriteCount,
+        maxConcurrent: settings.writeAgents.maxConcurrent,
+        queueOverflow: settings.writeAgents.queueOverflow,
+        debugLogPath: debugLogPath ?? null,
+      }, settings);
+
+      if (activeWriteCount >= settings.writeAgents.maxConcurrent) {
+        if (!settings.writeAgents.queueOverflow) {
+          await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.failure", {
+            agentName: safeName,
+            reason: "capacity-reached",
+            activeWriteCount,
+            maxConcurrent: settings.writeAgents.maxConcurrent,
+            debugLogPath: debugLogPath ?? null,
+          }, settings);
+          throw new Error(`Write-agent capacity reached (${activeWriteCount}/${settings.writeAgents.maxConcurrent}) and queueOverflow is disabled.`);
+        }
+        const queued = await writeQueue.enqueueWriteSpawn(safeTeamName, {
+          name: safeName,
+          prompt: params.prompt,
+          cwd,
+          category: params.category,
+          model: chosenModel,
+          thinking: chosenThinking,
+          planModeRequired: params.plan_mode_required,
+          color: "blue",
+          operationId: params.operation_id,
+          workflowRunId: params.workflow_run_id,
+          metadata: operationMetadataFromParams(params),
+        });
+        const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
+        const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
+        await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.queued", {
           agentName: safeName,
-          reason: "capacity-reached",
+          queueId: queued.id,
+          queuePosition,
           activeWriteCount,
           maxConcurrent: settings.writeAgents.maxConcurrent,
           debugLogPath: debugLogPath ?? null,
         }, settings);
-        throw new Error(`Write-agent capacity reached (${activeWriteCount}/${settings.writeAgents.maxConcurrent}) and queueOverflow is disabled.`);
+        return {
+          content: [{ type: "text", text: `Write teammate ${params.name} queued at position ${queuePosition}; capacity is ${activeWriteCount}/${settings.writeAgents.maxConcurrent}.` }],
+          details: spawnResolutionDetails(member, params, resolved, { queued: true, queueId: queued.id, queuePosition, debugLogPath }),
+        };
       }
-      const queued = await writeQueue.enqueueWriteSpawn(safeTeamName, {
-        name: safeName,
-        prompt: params.prompt,
-        cwd,
-        category: params.category,
-        model: chosenModel,
-        thinking: chosenThinking,
-        planModeRequired: params.plan_mode_required,
-        color: "blue",
-        operationId: params.operation_id,
-        workflowRunId: params.workflow_run_id,
-        metadata: operationMetadataFromParams(params),
-      });
-      const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
-      const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
-      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.queued", {
-        agentName: safeName,
-        queueId: queued.id,
-        queuePosition,
-        activeWriteCount,
-        maxConcurrent: settings.writeAgents.maxConcurrent,
-        debugLogPath: debugLogPath ?? null,
-      }, settings);
-      return {
-        content: [{ type: "text", text: `Write teammate ${params.name} queued at position ${queuePosition}; capacity is ${activeWriteCount}/${settings.writeAgents.maxConcurrent}.` }],
-        details: spawnResolutionDetails(member, params, resolved, { queued: true, queueId: queued.id, queuePosition, debugLogPath }),
-      };
-    }
 
-    const terminalId = await options.startWriteAgent(safeTeamName, member, params.prompt);
-    options.renderReadAgentStatus();
-    const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
-    return {
-      content: [{ type: "text", text: `Teammate ${params.name} spawned in background tmux screen ${terminalId}.${debugSuffix}` }],
-      details: spawnResolutionDetails(member, params, resolved, { terminalId, queued: false, debugLogPath }),
-    };
+      const terminalId = await options.startWriteAgent(safeTeamName, member, params.prompt);
+      options.renderReadAgentStatus();
+      const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
+      return {
+        content: [{ type: "text", text: `Teammate ${params.name} spawned in background tmux screen ${terminalId}.${debugSuffix}` }],
+        details: spawnResolutionDetails(member, params, resolved, { terminalId, queued: false, debugLogPath }),
+      };
+    });
   }
 
   pi.events?.on?.("pi-extended-teams:orchestration-request", async (payload: any) => {

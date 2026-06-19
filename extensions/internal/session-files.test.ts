@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cleanupOrphanedTeams, cleanupStaleTeam, findLeadTeamForSession, forceCleanupTeam, registerLeadSession } from "./session-files.js";
+import { cleanupOrphanedTeams, cleanupPidFileProcess, cleanupStaleTeam, findLeadTeamForSession, forceCleanupTeam, registerLeadSession } from "./session-files.js";
 import * as paths from "../../src/utils/paths.js";
 
 let root: string;
@@ -62,6 +62,22 @@ describe("session file cleanup", () => {
     expect(fs.existsSync(paths.teamDir("dead-team"))).toBe(false);
     expect(fs.existsSync(paths.taskDir("dead-team"))).toBe(false);
     expect(terminal.kill).toHaveBeenCalledWith("%9");
+  });
+
+  it("unlinks stale pid files even when process kill fails", () => {
+    const killError = Object.assign(new Error("process is gone"), { code: "ESRCH" });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((() => {
+      throw killError;
+    }) as typeof process.kill);
+    const pidFile = path.join(paths.teamDir("pid-team"), "writer.pid");
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, "99999999");
+
+    const result = cleanupPidFileProcess(pidFile);
+
+    expect(result).toMatchObject({ pid: 99999999, killed: false, unlinked: true, killError });
+    expect(fs.existsSync(pidFile)).toBe(false);
+    expect(killSpy).toHaveBeenCalledWith(99999999, "SIGKILL");
   });
 
   it("cleanupStaleTeam removes teams whose recorded lead pid is gone", () => {

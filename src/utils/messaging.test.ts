@@ -2,11 +2,27 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { appendMessage, readInbox, sendPlainMessage, broadcastMessage, peekInbox, sendPlainMessageOnce } from "./messaging";
+import {
+  appendMessage,
+  broadcastMessage,
+  findInboxMessageByOperation,
+  peekInbox,
+  readInbox,
+  readInboxTail,
+  sendPlainMessage,
+  sendPlainMessageOnce,
+} from "./messaging";
+import type { InboxMessage } from "./models";
 import * as paths from "./paths";
 
 // Mock the paths to use a temporary directory
 const testDir = path.join(os.tmpdir(), "pi-extended-teams-test-" + Date.now());
+
+function writeInbox(agentName: string, messages: InboxMessage[]) {
+  const inboxFilePath = path.join(testDir, "inboxes", `${agentName}.json`);
+  fs.mkdirSync(path.dirname(inboxFilePath), { recursive: true });
+  fs.writeFileSync(inboxFilePath, JSON.stringify(messages, null, 2));
+}
 
 describe("Messaging Utilities", () => {
   beforeEach(() => {
@@ -70,6 +86,67 @@ describe("Messaging Utilities", () => {
     expect(all.every(m => m.read)).toBe(true);
   });
 
+  it("should mark large unread inboxes as read", async () => {
+    const numMessages = 5000;
+    const messages = Array.from({ length: numMessages }, (_, index) => ({
+      from: "sender",
+      text: `msg-${index}`,
+      timestamp: `time-${index}`,
+      read: index % 3 === 0,
+    }));
+    const expectedUnread = messages.filter((message) => !message.read).length;
+    writeInbox("receiver", messages);
+
+    const unread = await readInbox("test-team", "receiver", true, true);
+    expect(unread.length).toBe(expectedUnread);
+    expect(unread.every((message) => message.read)).toBe(true);
+
+    const all = await readInbox("test-team", "receiver", false, false);
+    expect(all.length).toBe(numMessages);
+    expect(all.every((message) => message.read)).toBe(true);
+  });
+
+  it("should read a bounded unread tail and mark only selected messages", async () => {
+    writeInbox("receiver", [
+      { from: "sender", text: "old-unread", timestamp: "time-1", read: false },
+      { from: "sender", text: "already-read", timestamp: "time-2", read: true },
+      { from: "sender", text: "middle-unread", timestamp: "time-3", read: false },
+      { from: "sender", text: "new-unread", timestamp: "time-4", read: false },
+    ]);
+
+    const tail = await readInboxTail("test-team", "receiver", 2, { unreadOnly: true, markAsRead: true });
+    expect(tail.map((message) => message.text)).toEqual(["middle-unread", "new-unread"]);
+    expect(tail.every((message) => message.read)).toBe(true);
+
+    const all = await readInbox("test-team", "receiver", false, false);
+    expect(all.map((message) => [message.text, message.read])).toEqual([
+      ["old-unread", false],
+      ["already-read", true],
+      ["middle-unread", true],
+      ["new-unread", true],
+    ]);
+  });
+
+  it("should isolate returned inbox messages from persisted inbox state", async () => {
+    writeInbox("receiver", [
+      {
+        from: "sender",
+        text: "original",
+        timestamp: "time-1",
+        read: false,
+        metadata: { operationId: "op-1" },
+      },
+    ]);
+
+    const inbox = await readInbox("test-team", "receiver", false, false);
+    inbox[0].text = "mutated";
+    inbox[0].metadata!.operationId = "mutated";
+
+    const persisted = await readInbox("test-team", "receiver", false, false);
+    expect(persisted[0].text).toBe("original");
+    expect(persisted[0].metadata?.operationId).toBe("op-1");
+  });
+
   it("should peek without marking messages as read", async () => {
     await sendPlainMessage("test-team", "sender", "receiver", "msg1", "summary1");
 
@@ -92,6 +169,34 @@ describe("Messaging Utilities", () => {
 
     const inbox = await readInbox("test-team", "receiver", false, false);
     expect(inbox.length).toBe(1);
+  });
+
+  it("should find operation messages in top-level and metadata fields", async () => {
+    writeInbox("receiver", [
+      {
+        from: "sender",
+        text: "metadata operation",
+        timestamp: "time-1",
+        read: false,
+        metadata: { operationId: "op-1", workflowRunId: "wf-1" },
+      },
+      {
+        from: "sender",
+        text: "top-level operation",
+        timestamp: "time-2",
+        read: false,
+        operationId: "op-2",
+      },
+    ]);
+
+    const metadataMessage = await findInboxMessageByOperation("test-team", "receiver", "op-1", "wf-1");
+    expect(metadataMessage?.text).toBe("metadata operation");
+
+    const topLevelMessage = await findInboxMessageByOperation("test-team", "receiver", "op-2");
+    expect(topLevelMessage?.text).toBe("top-level operation");
+
+    const mismatchedWorkflow = await findInboxMessageByOperation("test-team", "receiver", "op-1", "other-workflow");
+    expect(mismatchedWorkflow).toBeUndefined();
   });
 
   it("should broadcast message to all members except the sender", async () => {

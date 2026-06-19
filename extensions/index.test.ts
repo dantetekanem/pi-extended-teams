@@ -28,7 +28,31 @@ function makeCtx(cwd: string, sessionId = "test-session") {
   };
 }
 
-async function setupExtension(env: Record<string, string | undefined> = {}, options: { mockReadAgent?: boolean; modelPreflight?: any } = {}) {
+function writeProjectSettings(root: string, settings: unknown) {
+  fs.mkdirSync(path.join(root, ".pi"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".pi", "pi-extended-teams.json"), JSON.stringify(settings));
+}
+
+function addMockRunningReadAgent(readTeamName: string, member: any, options: any) {
+  const state = {
+    runId: `test-${readTeamName}-${member.name}`,
+    name: member.name,
+    teamName: readTeamName,
+    startedAt: Date.now(),
+    tokensUsed: 0,
+    status: "thinking",
+    recentEvents: [],
+    lastActivityAt: Date.now(),
+    model: member.model,
+    thinking: member.thinking,
+    session: { getSessionStats: () => ({ tokens: { total: 0 } }) },
+  };
+  options.runningReadAgents.set(options.readAgentKey(readTeamName, member.name), state);
+  options.ensureReadAgentStatusTicker();
+  return state;
+}
+
+async function setupExtension(env: Record<string, string | undefined> = {}, options: { mockReadAgent?: boolean; readAgentImplementation?: (...args: any[]) => any; modelPreflight?: any } = {}) {
   vi.resetModules();
   const originalEnv = { ...process.env };
   delete process.env.PI_TEAM_NAME;
@@ -57,6 +81,9 @@ async function setupExtension(env: Record<string, string | undefined> = {}, opti
     runReadAgentInProcess: vi.fn(),
     shutdownReadAgentSession: vi.fn(async () => {}),
   };
+  if (options.readAgentImplementation) {
+    readAgentMock.runReadAgentInProcess.mockImplementation(options.readAgentImplementation);
+  }
   if (options.mockReadAgent) {
     vi.doMock("./agents/read-agent.js", () => readAgentMock);
   }
@@ -427,6 +454,7 @@ describe("extension integration", () => {
     const setup = await setupExtension();
     const ctx = makeCtx(setup.root);
     const abort = new AbortController().signal;
+    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 3 } });
 
     await setup.tools.get("team_create")!.execute("1", {
       team_name: "team",
@@ -462,10 +490,146 @@ describe("extension integration", () => {
     setup.restoreEnv();
   });
 
+  it("defaults to a high write-agent cap and queues only after 100 writers", async () => {
+    const setup = await setupExtension();
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+
+    await setup.tools.get("team_create")!.execute("1", {
+      team_name: "team",
+      default_model: "provider/model",
+    }, abort, undefined, ctx);
+
+    for (const name of Array.from({ length: 101 }, (_, index) => `w${index + 1}`)) {
+      await setup.tools.get("spawn_teammate")!.execute("spawn", {
+        team_name: "team",
+        name,
+        prompt: `work ${name}`,
+        cwd: setup.root,
+        role: "write",
+      }, abort, undefined, ctx);
+    }
+
+    expect(setup.terminal.spawn).toHaveBeenCalledTimes(100);
+    const queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
+    expect(queue.details.queue).toMatchObject([{ name: "w101" }]);
+    setup.restoreEnv();
+  });
+
+  it("keeps concurrent write spawns within capacity and queues overflow", async () => {
+    const setup = await setupExtension();
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 100 } });
+
+    await setup.tools.get("team_create")!.execute("1", {
+      team_name: "team",
+      default_model: "provider/model",
+    }, abort, undefined, ctx);
+
+    const results = await Promise.all(Array.from({ length: 125 }, (_value, index) => {
+      const name = `w${index + 1}`;
+      return setup.tools.get("spawn_teammate")!.execute(`spawn-${name}`, {
+        team_name: "team",
+        name,
+        prompt: `work ${name}`,
+        cwd: setup.root,
+        role: "write",
+      }, abort, undefined, ctx);
+    }));
+
+    expect(setup.terminal.spawn).toHaveBeenCalledTimes(100);
+    expect(results.filter((result: any) => result.details.queued).length).toBe(25);
+    const queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
+    expect(queue.details.queue).toHaveLength(25);
+
+    const config = await setup.teams.readConfig("team");
+    const writeMembers = config.members.filter((member: any) => member.agentType === "teammate" && member.role === "write");
+    expect(writeMembers).toHaveLength(100);
+    const allWriterNames = [...writeMembers.map((member: any) => member.name), ...queue.details.queue.map((item: any) => item.name)];
+    expect(new Set(allWriterNames)).toEqual(new Set(Array.from({ length: 125 }, (_value, index) => `w${index + 1}`)));
+    setup.restoreEnv();
+  }, 15_000);
+
+  it("deduplicates concurrent idempotent write spawns that overflow into the queue", async () => {
+    const setup = await setupExtension();
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 1 } });
+
+    await setup.tools.get("team_create")!.execute("1", {
+      team_name: "team",
+      default_model: "provider/model",
+    }, abort, undefined, ctx);
+
+    await setup.tools.get("spawn_teammate")!.execute("spawn-active", {
+      team_name: "team",
+      name: "active-writer",
+      prompt: "active work",
+      cwd: setup.root,
+      role: "write",
+    }, abort, undefined, ctx);
+
+    const results = await Promise.all(Array.from({ length: 25 }, (_value, index) => (
+      setup.tools.get("spawn_teammate_once")!.execute(`spawn-once-${index}`, {
+        team_name: "team",
+        name: "queued-writer",
+        prompt: "queued work",
+        cwd: setup.root,
+        role: "write",
+        operation_id: "op-queued",
+        workflow_run_id: "run-1",
+      }, abort, undefined, ctx)
+    )));
+
+    expect(setup.terminal.spawn).toHaveBeenCalledTimes(1);
+    const queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
+    expect(queue.details.queue).toMatchObject([{ name: "queued-writer" }]);
+    expect(new Set(results.map((result: any) => result.details.queueId))).toEqual(new Set([queue.details.queue[0].id]));
+    setup.restoreEnv();
+  }, 15_000);
+
+  it("drains queued writers only up to the configured project cap", async () => {
+    const setup = await setupExtension();
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 3 } });
+
+    await setup.tools.get("team_create")!.execute("1", {
+      team_name: "team",
+      default_model: "provider/model",
+    }, abort, undefined, ctx);
+
+    for (const name of ["w1", "w2", "w3", "w4", "w5", "w6"]) {
+      await setup.tools.get("spawn_teammate")!.execute("spawn", {
+        team_name: "team",
+        name,
+        prompt: `work ${name}`,
+        cwd: setup.root,
+        role: "write",
+      }, abort, undefined, ctx);
+    }
+
+    expect(setup.terminal.spawn).toHaveBeenCalledTimes(3);
+    let queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
+    expect(queue.details.queue.map((item: any) => item.name)).toEqual(["w4", "w5", "w6"]);
+
+    await setup.tools.get("process_shutdown_approved")!.execute("shutdown", {
+      team_name: "team",
+      agent_name: "w1",
+    }, abort, undefined, ctx);
+
+    expect(setup.terminal.spawn).toHaveBeenCalledTimes(4);
+    queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
+    expect(queue.details.queue.map((item: any) => item.name)).toEqual(["w5", "w6"]);
+    setup.restoreEnv();
+  });
+
   it("does not drain queued writers while shutting down the whole team", async () => {
     const setup = await setupExtension();
     const ctx = makeCtx(setup.root);
     const abort = new AbortController().signal;
+    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 3 } });
 
     await setup.tools.get("team_create")!.execute("1", {
       team_name: "team",
@@ -825,6 +989,113 @@ describe("extension integration", () => {
       expect(rendered).not.toContain("provider/model");
       expect(rendered).toContain("88 tok");
       expect(rendered).toContain("working: bash");
+    } finally {
+      setup.restoreEnv();
+      vi.useRealTimers();
+    }
+  });
+
+  it("debounces read-agent status storms into one activity widget render", async () => {
+    vi.useFakeTimers();
+    const requestRender = vi.fn();
+    const setup = await setupExtension({}, {
+      mockReadAgent: true,
+      readAgentImplementation: (readTeamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        addMockRunningReadAgent(readTeamName, member, options);
+        for (let index = 0; index < 25; index += 1) {
+          options.renderReadAgentStatus();
+        }
+      },
+    });
+    const ctx = makeCtx(setup.root);
+    const abort = new AbortController().signal;
+    ctx.ui.setWidget.mockImplementation((key: string, widget: any) => {
+      if (key === "01-pi-extended-teams-readers" && typeof widget === "function") {
+        widget({ requestRender }, {});
+      }
+    });
+
+    try {
+      for (const handler of setup.eventHandlers.get("session_start") || []) {
+        await handler({}, ctx);
+      }
+
+      await setup.tools.get("team_create")!.execute("1", {
+        team_name: "team",
+        default_model: "provider/model",
+      }, abort, undefined, ctx);
+      await setup.tools.get("spawn_teammate")!.execute("spawn", {
+        team_name: "team",
+        name: "reader",
+        prompt: "research",
+        cwd: setup.root,
+        role: "read",
+        thinking: "high",
+      }, abort, undefined, ctx);
+
+      expect(requestRender).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(75);
+      await Promise.resolve();
+
+      expect(requestRender).toHaveBeenCalledTimes(1);
+    } finally {
+      setup.restoreEnv();
+      vi.useRealTimers();
+    }
+  });
+
+  it("filters prompt-build read agents out of the normal team activity widget", async () => {
+    vi.useFakeTimers();
+    let activityWidget: { render(width: number): string[] } | undefined;
+    const setup = await setupExtension({}, {
+      mockReadAgent: true,
+      readAgentImplementation: (readTeamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        addMockRunningReadAgent(readTeamName, member, options);
+        options.renderReadAgentStatus();
+      },
+    });
+    const ctx = makeCtx(setup.root, "current-session");
+    const abort = new AbortController().signal;
+    ctx.ui.setWidget.mockImplementation((key: string, widget: any) => {
+      if (key === "01-pi-extended-teams-readers" && typeof widget === "function") {
+        activityWidget = widget({ requestRender: vi.fn() }, {}) as any;
+      }
+    });
+
+    try {
+      for (const handler of setup.eventHandlers.get("session_start") || []) {
+        await handler({}, ctx);
+      }
+
+      await setup.tools.get("team_create")!.execute("1", {
+        team_name: "team",
+        default_model: "provider/model",
+      }, abort, undefined, ctx);
+      await setup.tools.get("spawn_teammate")!.execute("spawn", {
+        team_name: "team",
+        name: "writer",
+        prompt: "work",
+        cwd: setup.root,
+        role: "write",
+        thinking: "xhigh",
+      }, abort, undefined, ctx);
+      await vi.advanceTimersByTimeAsync(75);
+
+      for (const handler of setup.extensionEventHandlers.get("pi-prompt:prompt-build:start") || []) {
+        await handler({
+          teamName: "prompt-build-test",
+          prompts: ["build options"],
+          cwd: setup.root,
+          thinking: "high",
+        });
+      }
+      await vi.advanceTimersByTimeAsync(75);
+
+      expect(activityWidget).toBeTruthy();
+      const rendered = activityWidget!.render(120).join("\n");
+      expect(rendered).toContain("1 active");
+      expect(rendered).toContain("writer");
+      expect(rendered).not.toContain("prompt-branch-1");
     } finally {
       setup.restoreEnv();
       vi.useRealTimers();

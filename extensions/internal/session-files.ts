@@ -79,18 +79,58 @@ function readJsonFile(filePath: string): any | null {
   }
 }
 
+export interface CleanupPidFileResult {
+  pid?: number;
+  killed: boolean;
+  unlinked: boolean;
+  killError?: unknown;
+}
+
+export function unlinkPidFile(pidFile: string): boolean {
+  if (!fs.existsSync(pidFile)) return false;
+  try {
+    fs.unlinkSync(pidFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function cleanupPidFileProcess(
+  pidFile: string,
+  options: { signal?: NodeJS.Signals | number; skipPid?: number } = {}
+): CleanupPidFileResult {
+  const result: CleanupPidFileResult = { killed: false, unlinked: false };
+  if (!fs.existsSync(pidFile)) return result;
+
+  try {
+    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+    if (Number.isFinite(pid) && pid > 0) {
+      result.pid = pid;
+      if (pid !== options.skipPid) {
+        try {
+          process.kill(pid, options.signal ?? "SIGKILL");
+          result.killed = true;
+        } catch (error) {
+          result.killError = error;
+        }
+      }
+    }
+  } catch {
+    // Keep cleanup best-effort: unreadable/corrupt pid files should still be unlinked.
+  } finally {
+    result.unlinked = unlinkPidFile(pidFile);
+  }
+
+  return result;
+}
+
 function killTeamMemberProcesses(teamName: string, config: any, terminal: any): void {
   for (const member of config?.members || []) {
     if (member.name === "team-lead") continue;
 
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
-    if (fs.existsSync(pidFile)) {
-      try {
-        const pid = Number.parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
-        if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) process.kill(pid, "SIGKILL");
-        fs.unlinkSync(pidFile);
-      } catch {}
-    }
+    cleanupPidFileProcess(pidFile, { skipPid: process.pid });
 
     if (terminal && member.tmuxPaneId) {
       try { terminal.kill(member.tmuxPaneId); } catch {}

@@ -15,6 +15,7 @@ import type {
   SpawnTeammateOnceOptions,
   SpawnTeammateOnceRequest,
   SpawnTeammateOnceResponse,
+  SpawnTeammatesOnceResponse,
   TeamObservation,
   TeammateResolutionDetails,
   TeammateHealth,
@@ -22,9 +23,22 @@ import type {
 } from "./types";
 
 export * from "./types";
-export { appendTeamReportEvent, listTeamReportEvents } from "../utils/report-events";
+export { listTeamReportEvents } from "../utils/report-events";
 export { peekInbox } from "../utils/messaging";
 export { updateTaskGuarded } from "../utils/tasks";
+
+const reportAppendQueues = new Map<string, Promise<unknown>>();
+
+export async function appendTeamReportEvent(teamName: string, event: reports.NewTeamReportEvent) {
+  const previous = reportAppendQueues.get(teamName) || Promise.resolve();
+  const next = previous.catch(() => undefined).then(() => reports.appendTeamReportEvent(teamName, event));
+  let queued: Promise<unknown>;
+  queued = next.catch(() => undefined).finally(() => {
+    if (reportAppendQueues.get(teamName) === queued) reportAppendQueues.delete(teamName);
+  });
+  reportAppendQueues.set(teamName, queued);
+  return await next;
+}
 
 function readAgentIsKnownRunning(teamName: string, agentName: string, options: ObserveRuntimeOptions): boolean {
   const key = options.readAgentKey?.(teamName, agentName) || `${teamName}:${agentName}`;
@@ -33,13 +47,6 @@ function readAgentIsKnownRunning(teamName: string, agentName: string, options: O
 
 function operationValue(source: { operationId?: string; workflowRunId?: string; metadata?: Record<string, any> }, key: "operationId" | "workflowRunId"): string | undefined {
   return source[key] || source.metadata?.[key] || source.metadata?.orchestration?.[key];
-}
-
-function memberMatchesOperation(member: Member, request: { operationId?: string; workflowRunId?: string }): boolean {
-  if (!request.operationId) return false;
-  const operationId = operationValue(member, "operationId");
-  const workflowRunId = operationValue(member, "workflowRunId");
-  return operationId === request.operationId && (request.workflowRunId === undefined || workflowRunId === request.workflowRunId);
 }
 
 function metadataForOperation(request: { operationId?: string; workflowRunId?: string; metadata?: Record<string, any> }): Record<string, any> | undefined {
@@ -83,15 +90,153 @@ function queuedResolutionDetails(teamName: string, queued: writeQueue.QueuedWrit
   };
 }
 
-export async function observeTeammate(
+type OperationSource = { operationId?: string; workflowRunId?: string; metadata?: Record<string, any> };
+
+interface IndexedCandidate<T extends OperationSource> {
+  item: T;
+  order: number;
+  operationId?: string;
+  workflowRunId?: string;
+}
+
+interface SpawnOnceTeamState {
+  membersByName: Map<string, IndexedCandidate<Member>>;
+  membersByOperation: Map<string, Array<IndexedCandidate<Member>>>;
+  queuedByName: Map<string, IndexedCandidate<writeQueue.QueuedWriteSpawn>>;
+  queuedByOperation: Map<string, Array<IndexedCandidate<writeQueue.QueuedWriteSpawn>>>;
+  nextMemberOrder: number;
+  nextQueuedOrder: number;
+}
+
+function makeIndexedCandidate<T extends OperationSource>(item: T, order: number, fallback?: OperationSource): IndexedCandidate<T> {
+  return {
+    item,
+    order,
+    operationId: operationValue(item, "operationId") || (fallback ? operationValue(fallback, "operationId") : undefined),
+    workflowRunId: operationValue(item, "workflowRunId") || (fallback ? operationValue(fallback, "workflowRunId") : undefined),
+  };
+}
+
+function indexOperationCandidate<T extends OperationSource>(index: Map<string, Array<IndexedCandidate<T>>>, candidate: IndexedCandidate<T>): void {
+  if (!candidate.operationId) return;
+  const existing = index.get(candidate.operationId) || [];
+  existing.push(candidate);
+  index.set(candidate.operationId, existing);
+}
+
+function registerMemberCandidate(state: SpawnOnceTeamState, member: Member, order: number, fallback?: OperationSource): void {
+  if (member.agentType !== "teammate") return;
+  const candidate = makeIndexedCandidate(member, order, fallback);
+  if (!state.membersByName.has(member.name)) state.membersByName.set(member.name, candidate);
+  indexOperationCandidate(state.membersByOperation, candidate);
+}
+
+function registerQueuedCandidate(state: SpawnOnceTeamState, queued: writeQueue.QueuedWriteSpawn, order: number, fallback?: OperationSource): void {
+  const candidate = makeIndexedCandidate(queued, order, fallback);
+  if (!state.queuedByName.has(queued.name)) state.queuedByName.set(queued.name, candidate);
+  indexOperationCandidate(state.queuedByOperation, candidate);
+}
+
+function findOperationCandidate<T extends OperationSource>(
+  index: Map<string, Array<IndexedCandidate<T>>>,
+  request: OperationSource
+): IndexedCandidate<T> | undefined {
+  const operationId = operationValue(request, "operationId");
+  if (!operationId) return undefined;
+  const workflowRunId = operationValue(request, "workflowRunId");
+  return index.get(operationId)?.find((candidate) => workflowRunId === undefined || candidate.workflowRunId === workflowRunId);
+}
+
+function earlierCandidate<T extends OperationSource>(left?: IndexedCandidate<T>, right?: IndexedCandidate<T>): IndexedCandidate<T> | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  return left.order <= right.order ? left : right;
+}
+
+function findExistingMemberCandidate(state: SpawnOnceTeamState, request: SpawnTeammateOnceRequest): IndexedCandidate<Member> | undefined {
+  return earlierCandidate(
+    state.membersByName.get(request.name),
+    findOperationCandidate(state.membersByOperation, request)
+  );
+}
+
+function findQueuedCandidate(state: SpawnOnceTeamState, request: SpawnTeammateOnceRequest): IndexedCandidate<writeQueue.QueuedWriteSpawn> | undefined {
+  return earlierCandidate(
+    state.queuedByName.get(request.name),
+    findOperationCandidate(state.queuedByOperation, request)
+  );
+}
+
+function buildSpawnOnceTeamState(config: { members: Member[] }, queue: writeQueue.QueuedWriteSpawn[]): SpawnOnceTeamState {
+  const state: SpawnOnceTeamState = {
+    membersByName: new Map(),
+    membersByOperation: new Map(),
+    queuedByName: new Map(),
+    queuedByOperation: new Map(),
+    nextMemberOrder: config.members.length,
+    nextQueuedOrder: queue.length,
+  };
+
+  config.members.forEach((member, order) => registerMemberCandidate(state, member, order));
+  queue.forEach((queued, order) => registerQueuedCandidate(state, queued, order));
+  return state;
+}
+
+async function loadSpawnOnceTeamState(teamName: string): Promise<SpawnOnceTeamState> {
+  const config = await teams.readConfig(teamName);
+  const queue = await writeQueue.listWriteQueue(teamName).catch(() => []);
+  return buildSpawnOnceTeamState(config, queue);
+}
+
+function notStartedSpawnResponse(request: SpawnTeammateOnceRequest): SpawnTeammateOnceResponse {
+  return {
+    status: "not_started",
+    details: {
+      reason: "No spawn start callback supplied",
+      requestedRole: request.role ?? "read",
+      requestedCategory: request.category ?? null,
+      model: request.model ?? null,
+      thinking: request.thinking ?? null,
+    },
+  };
+}
+
+function responseFromStartedSpawn(
   teamName: string,
-  agentName: string,
+  request: SpawnTeammateOnceRequest,
+  started: Awaited<ReturnType<NonNullable<SpawnTeammateOnceOptions["start"]>>>
+): SpawnTeammateOnceResponse {
+  const baseDetails = started.member
+    ? memberResolutionDetails(started.member, request)
+    : started.queued
+      ? queuedResolutionDetails(teamName, started.queued, request)
+      : {};
+  return {
+    status: started.queued ? "queued" : "started",
+    member: started.member,
+    queued: started.queued,
+    details: { ...baseDetails, ...started.details },
+  };
+}
+
+async function startSpawnTeammateOnce(
+  state: SpawnOnceTeamState,
+  request: SpawnTeammateOnceRequest,
+  options: SpawnTeammateOnceOptions
+): Promise<SpawnTeammateOnceResponse> {
+  if (!options.start) return notStartedSpawnResponse(request);
+
+  const started = await options.start({ ...request, metadata: metadataForOperation(request) });
+  if (started.member) registerMemberCandidate(state, started.member, state.nextMemberOrder++, request);
+  if (started.queued) registerQueuedCandidate(state, started.queued, state.nextQueuedOrder++, request);
+  return responseFromStartedSpawn(request.teamName, request, started);
+}
+
+async function observeKnownTeammate(
+  teamName: string,
+  member: Member,
   options: ObserveRuntimeOptions = {}
 ): Promise<TeammateObservation> {
-  const config = await teams.readConfig(teamName);
-  const member = config.members.find((item) => item.name === agentName);
-  if (!member) throw new Error(`Teammate ${agentName} not found`);
-
   const role = member.role ?? (member.name === "team-lead" ? "lead" : "write");
   const unreadCount = (await messaging.peekInbox(teamName, member.name, true).catch(() => [])).length;
   const runtimeStatus = member.name === "team-lead" ? null : await runtime.readRuntimeStatus(teamName, member.name).catch(() => null);
@@ -133,6 +278,17 @@ export async function observeTeammate(
   };
 }
 
+export async function observeTeammate(
+  teamName: string,
+  agentName: string,
+  options: ObserveRuntimeOptions = {}
+): Promise<TeammateObservation> {
+  const config = await teams.readConfig(teamName);
+  const member = config.members.find((item) => item.name === agentName);
+  if (!member) throw new Error(`Teammate ${agentName} not found`);
+  return observeKnownTeammate(teamName, member, options);
+}
+
 export async function observeTeam(
   teamName: string,
   options: ObserveRuntimeOptions = {}
@@ -144,7 +300,7 @@ export async function observeTeam(
     writeQueue.listWriteQueue(teamName).catch(() => []),
     reports.listTeamReportEvents(teamName, { limit: options.reportLimit }).catch(() => []),
   ]);
-  const members = await Promise.all(config.members.map((member) => observeTeammate(teamName, member.name, options)));
+  const members = await Promise.all(config.members.map((member) => observeKnownTeammate(teamName, member, options)));
 
   return {
     teamName,
@@ -174,45 +330,51 @@ export async function spawnTeammateOnce(
   request: SpawnTeammateOnceRequest,
   options: SpawnTeammateOnceOptions = {}
 ): Promise<SpawnTeammateOnceResponse> {
-  const config = await teams.readConfig(request.teamName);
-  const existing = config.members.find((member) =>
-    member.agentType === "teammate" && (member.name === request.name || memberMatchesOperation(member, request))
-  );
-  if (existing) {
-    return {
-      status: "existing",
-      member: existing,
-      details: memberResolutionDetails(existing, request, { existing: true, idempotent: true, queued: false, modelSource: "existing" }),
-    };
+  const [result] = await spawnTeammatesOnce([request], options);
+  return result;
+}
+
+export async function spawnTeammatesOnce(
+  requests: SpawnTeammateOnceRequest[],
+  options: SpawnTeammateOnceOptions = {}
+): Promise<SpawnTeammatesOnceResponse> {
+  if (requests.length === 0) return [];
+
+  const stateByTeam = new Map<string, SpawnOnceTeamState>();
+  const uniqueTeamNames = [...new Set(requests.map((request) => request.teamName))];
+  await Promise.all(uniqueTeamNames.map(async (teamName) => {
+    stateByTeam.set(teamName, await loadSpawnOnceTeamState(teamName));
+  }));
+
+  const results: SpawnTeammateOnceResponse[] = [];
+  for (const request of requests) {
+    const state = stateByTeam.get(request.teamName);
+    if (!state) throw new Error(`Team ${request.teamName} not found`);
+
+    const existing = findExistingMemberCandidate(state, request)?.item;
+    if (existing) {
+      results.push({
+        status: "existing",
+        member: existing,
+        details: memberResolutionDetails(existing, request, { existing: true, idempotent: true, queued: false, modelSource: "existing" }),
+      });
+      continue;
+    }
+
+    const queued = findQueuedCandidate(state, request)?.item;
+    if (queued) {
+      results.push({
+        status: "queued",
+        queued,
+        details: queuedResolutionDetails(request.teamName, queued, request, { existing: true, idempotent: true, queued: true }),
+      });
+      continue;
+    }
+
+    results.push(await startSpawnTeammateOnce(state, request, options));
   }
 
-  const queued = await writeQueue.findQueuedWriteSpawn(request.teamName, {
-    name: request.name,
-    operationId: request.operationId,
-    workflowRunId: request.workflowRunId,
-  }).catch(() => null);
-  if (queued) {
-    return {
-      status: "queued",
-      queued,
-      details: queuedResolutionDetails(request.teamName, queued, request, { existing: true, idempotent: true, queued: true }),
-    };
-  }
-
-  if (!options.start) return { status: "not_started", details: { reason: "No spawn start callback supplied", requestedRole: request.role ?? "read", requestedCategory: request.category ?? null, model: request.model ?? null, thinking: request.thinking ?? null } };
-
-  const started = await options.start({ ...request, metadata: metadataForOperation(request) });
-  const baseDetails = started.member
-    ? memberResolutionDetails(started.member, request)
-    : started.queued
-      ? queuedResolutionDetails(request.teamName, started.queued, request)
-      : {};
-  return {
-    status: started.queued ? "queued" : "started",
-    member: started.member,
-    queued: started.queued,
-    details: { ...baseDetails, ...started.details },
-  };
+  return results;
 }
 
 export async function sendMessageOnce(request: SendMessageOnceRequest) {

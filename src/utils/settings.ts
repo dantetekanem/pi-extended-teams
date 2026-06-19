@@ -39,9 +39,23 @@ export interface WatchdogConfig {
 }
 
 export interface WriteAgentsConfig {
-  /** Maximum concurrent write agents. Read agents are unlimited. */
+  /** Maximum concurrent write agents. */
   maxConcurrent: number;
   /** When at capacity, queue the spawn instead of rejecting it. */
+  queueOverflow: boolean;
+}
+
+export interface ReadAgentsConfig {
+  /** Maximum concurrent in-process read agents for a team. */
+  maxConcurrent: number;
+  /** When at capacity, queue the spawn instead of rejecting it. */
+  queueOverflow: boolean;
+}
+
+export interface ReadHelpersConfig {
+  /** Maximum concurrent lead-run read helpers for a team. */
+  maxConcurrent: number;
+  /** When at capacity, keep helper requests queued instead of rejecting them. */
   queueOverflow: boolean;
 }
 
@@ -60,15 +74,23 @@ export interface DebugConfig {
 export interface PiExtendedTeamsSettings {
   watchdog: WatchdogConfig;
   writeAgents: WriteAgentsConfig;
+  readAgents: ReadAgentsConfig;
+  readHelpers: ReadHelpersConfig;
   roles: Record<AgentRole, RoleModelConfig>;
   categories: Record<string, CategoryConfig>;
   extensions: ExtensionsConfig;
   debug: DebugConfig;
 }
 
+export const DEFAULT_WRITE_AGENT_MAX_CONCURRENT = 100;
+export const DEFAULT_READ_AGENT_MAX_CONCURRENT = 25;
+export const DEFAULT_READ_HELPER_MAX_CONCURRENT = 10;
+
 export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
   watchdog: { bufferSeconds: 30 },
-  writeAgents: { maxConcurrent: 3, queueOverflow: true },
+  writeAgents: { maxConcurrent: DEFAULT_WRITE_AGENT_MAX_CONCURRENT, queueOverflow: true },
+  readAgents: { maxConcurrent: DEFAULT_READ_AGENT_MAX_CONCURRENT, queueOverflow: true },
+  readHelpers: { maxConcurrent: DEFAULT_READ_HELPER_MAX_CONCURRENT, queueOverflow: true },
   roles: {
     read: { model: null, thinking: null },
     write: { model: null, thinking: null },
@@ -141,6 +163,22 @@ function applyLayer(acc: PiExtendedTeamsSettings, raw: any): void {
     if (Number.isFinite(m) && m >= 1) acc.writeAgents.maxConcurrent = Math.floor(m);
     if (typeof raw.writeAgents.queueOverflow === "boolean") {
       acc.writeAgents.queueOverflow = raw.writeAgents.queueOverflow;
+    }
+  }
+
+  if (raw.readAgents && typeof raw.readAgents === "object") {
+    const m = Number(raw.readAgents.maxConcurrent);
+    if (Number.isFinite(m) && m >= 1) acc.readAgents.maxConcurrent = Math.floor(m);
+    if (typeof raw.readAgents.queueOverflow === "boolean") {
+      acc.readAgents.queueOverflow = raw.readAgents.queueOverflow;
+    }
+  }
+
+  if (raw.readHelpers && typeof raw.readHelpers === "object") {
+    const m = Number(raw.readHelpers.maxConcurrent);
+    if (Number.isFinite(m) && m >= 1) acc.readHelpers.maxConcurrent = Math.floor(m);
+    if (typeof raw.readHelpers.queueOverflow === "boolean") {
+      acc.readHelpers.queueOverflow = raw.readHelpers.queueOverflow;
     }
   }
 

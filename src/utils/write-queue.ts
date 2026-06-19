@@ -35,7 +35,47 @@ function readQueueRaw(queuePath: string): QueuedWriteSpawn[] {
 }
 
 function writeQueueRaw(queuePath: string, queue: QueuedWriteSpawn[]): void {
-  fs.writeFileSync(queuePath, JSON.stringify(queue, null, 2));
+  const dir = path.dirname(queuePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.${path.basename(queuePath)}.${process.pid}.${Date.now()}.${crypto.randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(queue, null, 2));
+    fs.renameSync(tmpPath, queuePath);
+  } catch (e) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // Ignore cleanup errors; preserve the original write/rename failure.
+    }
+    throw e;
+  }
+}
+
+function operationIdFor(item: Pick<QueuedWriteSpawn, "operationId" | "metadata">): string | undefined {
+  return item.operationId || item.metadata?.operationId;
+}
+
+function workflowRunIdFor(item: Pick<QueuedWriteSpawn, "workflowRunId" | "metadata">): string | undefined {
+  return item.workflowRunId || item.metadata?.workflowRunId;
+}
+
+function matchesQueuedIdentity(
+  item: QueuedWriteSpawn,
+  request: Partial<QueuedWriteSpawn> & Pick<QueuedWriteSpawn, "name">
+): boolean {
+  if (request.id && item.id === request.id) return true;
+  if (item.name === request.name) return true;
+
+  const operationId = operationIdFor(request);
+  if (!operationId || operationIdFor(item) !== operationId) return false;
+
+  const workflowRunId = workflowRunIdFor(request);
+  return workflowRunId === undefined || workflowRunIdFor(item) === workflowRunId;
+}
+
+export async function withWriteQueueCapacityLock<T>(teamName: string, fn: () => Promise<T>): Promise<T> {
+  const queuePath = ensureQueueDir(teamName);
+  return await withLock(`${queuePath}.capacity`, fn);
 }
 
 export async function listWriteQueue(teamName: string): Promise<QueuedWriteSpawn[]> {
@@ -50,6 +90,9 @@ export async function enqueueWriteSpawn(
   const queuePath = ensureQueueDir(teamName);
   return await withLock(queuePath, async () => {
     const queue = readQueueRaw(queuePath);
+    const existing = queue.find(item => matchesQueuedIdentity(item, request));
+    if (existing) return existing;
+
     const queued: QueuedWriteSpawn = {
       id: request.id || crypto.randomUUID(),
       name: request.name,
@@ -66,19 +109,28 @@ export async function enqueueWriteSpawn(
       requestedAt: request.requestedAt || Date.now(),
     };
     queue.push(queued);
+    queue.sort((a, b) => a.requestedAt - b.requestedAt);
     writeQueueRaw(queuePath, queue);
     return queued;
   });
 }
 
-export async function dequeueWriteSpawn(teamName: string): Promise<QueuedWriteSpawn | null> {
+export async function dequeueWriteSpawns(teamName: string, count: number): Promise<QueuedWriteSpawn[]> {
+  const take = Math.max(0, Math.floor(count));
+  if (take < 1) return [];
+
   const queuePath = ensureQueueDir(teamName);
   return await withLock(queuePath, async () => {
     const queue = readQueueRaw(queuePath);
-    const next = queue.shift() || null;
-    writeQueueRaw(queuePath, queue);
+    const next = queue.splice(0, take);
+    if (next.length > 0) writeQueueRaw(queuePath, queue);
     return next;
   });
+}
+
+export async function dequeueWriteSpawn(teamName: string): Promise<QueuedWriteSpawn | null> {
+  const [queued] = await dequeueWriteSpawns(teamName, 1);
+  return queued || null;
 }
 
 export async function removeQueuedWriteSpawnsByName(teamName: string, name: string): Promise<QueuedWriteSpawn[]> {

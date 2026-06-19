@@ -13,6 +13,7 @@ import type { Member } from "../../src/utils/models";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { getLastAssistantText } from "../ui/renderers";
 import { createAgentCommunicationTools } from "../tools/agent-communication-tools";
+import { shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 
 export interface RunReadAgentOptions {
   isTeammate: boolean;
@@ -305,12 +306,16 @@ export async function runReadAgentInProcess(
       source: "read-agent",
     });
     await recordReadAgentReportEvent(readTeamName, member, "completed", report, `Read agent ${member.name} completed`, state.startedAt, state.tokensUsed, completionStats.cost);
+    const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
     if (member.requestedBy) {
       await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
       await options.renderLeadInboxStatus?.().catch(() => {});
       if (member.requestedBy === options.agentName) {
         options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox(team_name="${readTeamName}") and continue your task. Do not poll.`);
       }
+    } else if (suppressLeadReportInjection) {
+      // Workflow orchestrators consume full reports from TeamReportEvent storage.
+      // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
     } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
       options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
     } else {
@@ -338,12 +343,16 @@ export async function runReadAgentInProcess(
         source: "read-agent",
       });
       await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, `Read agent ${member.name} failed`, state.startedAt, state.tokensUsed, failureStats?.cost, "red");
+      const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
       if (member.requestedBy) {
         await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, failureReport, "failed", "red");
         await options.renderLeadInboxStatus?.().catch(() => {});
         if (member.requestedBy === options.agentName) {
           options.quietTrigger?.(`Read helper ${member.name} failed. Read the failure report with read_inbox(team_name="${readTeamName}") and continue or report the blocker. Do not poll.`);
         }
+      } else if (suppressLeadReportInjection) {
+        // Workflow orchestrators consume full failure reports from TeamReportEvent storage.
+        // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
       } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
         options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, failureReport, false);
       } else {

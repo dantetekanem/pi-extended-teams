@@ -78,3 +78,7 @@ export function workflowAllowsSkill(member: MemberMetadataLike, skillName: strin
   if (!allowed) return false;
   return allowed.includes(skillName);
 }
+
+export function shouldSuppressLeadReportInjection(member: MemberMetadataLike): boolean {
+  return isWorkflowSpawnedMember(member);
+}

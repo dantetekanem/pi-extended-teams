@@ -21,42 +21,140 @@ export interface TeamPanelOptions {
   shutdownTeammate(teamName: string, member: Member): Promise<void>;
 }
 
+export interface TeamPanelItem {
+  name: string;
+  role: string;
+  status: string;
+  model?: string;
+  thinking?: string;
+  unreadCount: number;
+  elapsedMs: number;
+  tokensUsed: number;
+  taskSubjects: string[];
+  claimPaths: string[];
+  recentEvents: string[];
+  runtimeStatus: any;
+  tmuxPaneId?: string;
+  windowId?: string;
+  completed: boolean;
+  completedAt?: number;
+  summary?: string;
+  reportText?: string;
+  requestedBy?: string;
+}
+
+export const MAX_COMPLETED_REPORTS = 50;
+const MAX_DETAIL_TEXT_CHARS = 8_000;
+const MAX_TRANSCRIPT_MESSAGES = 20;
+const MAX_TRANSCRIPT_LINES = 80;
+const RECENT_EVENT_DISPLAY_LIMIT = 12;
+
 function inferRequestedBy(summary: string, text: string): string | undefined {
   const source = `${summary}\n${text}`;
   const match = source.match(/(?:completed|failed) for ([A-Za-z0-9_-]+)/);
   return match?.[1];
 }
 
-export async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOptions) {
-  const config = await teams.readConfig(panelTeamName);
-  const allTasks = await tasks.listTasks(panelTeamName).catch(() => []);
-  const allClaims = await claims.listClaims(panelTeamName).catch(() => []);
-  const items = [] as Array<{
-    name: string;
-    role: string;
-    status: string;
-    model?: string;
-    thinking?: string;
-    unreadCount: number;
-    elapsedMs: number;
-    tokensUsed: number;
-    taskSubjects: string[];
-    claimPaths: string[];
-    recentEvents: string[];
-    runtimeStatus: any;
-    tmuxPaneId?: string;
-    windowId?: string;
-    completed: boolean;
-    completedAt?: number;
-    summary?: string;
-    reportText?: string;
-    requestedBy?: string;
-  }>;
+function appendMapValue<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const values = map.get(key);
+  if (values) values.push(value);
+  else map.set(key, [value]);
+}
 
-  for (const member of config.members.filter((m) => m.name !== "team-lead")) {
+function buildTaskSubjectIndex(allTasks: any[]): Map<string, string[]> {
+  const subjectsByOwner = new Map<string, string[]>();
+  for (const task of allTasks) {
+    if (!task?.owner || task.status === "completed" || task.status === "deleted") continue;
+    appendMapValue(subjectsByOwner, task.owner, `#${task.id} ${task.subject}`);
+  }
+  return subjectsByOwner;
+}
+
+function buildClaimPathIndex(allClaims: Array<{ agent: string; path: string }>): Map<string, string[]> {
+  const pathsByAgent = new Map<string, string[]>();
+  for (const claim of allClaims) {
+    if (!claim?.agent || !claim?.path) continue;
+    appendMapValue(pathsByAgent, claim.agent, claim.path);
+  }
+  return pathsByAgent;
+}
+
+function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport | null {
+  const from = String(message.from || "");
+  if (!from || from === "team-lead" || from === "system" || from === "watchdog") return null;
+
+  const summary = String(message.summary || "Final report");
+  const text = String(message.text || "");
+  const metadata = message.metadata || {};
+  const role = summary.startsWith("Read helper ") || summary.startsWith("Read agent ") ? "read" : "write";
+  return {
+    name: String(message.from),
+    role,
+    status: "completed" as const,
+    report: text,
+    summary,
+    completedAt: message.timestamp ? new Date(message.timestamp).getTime() : Date.now(),
+    startedAt: typeof metadata.startedAt === "number" ? metadata.startedAt : undefined,
+    elapsedMs: typeof metadata.elapsedMs === "number" ? metadata.elapsedMs : undefined,
+    tokensUsed: typeof metadata.tokensUsed === "number" ? metadata.tokensUsed : undefined,
+    costUsd: typeof metadata.costUsd === "number" ? metadata.costUsd : undefined,
+    model: typeof metadata.model === "string" ? metadata.model : undefined,
+    thinking: typeof metadata.thinking === "string" ? metadata.thinking : undefined,
+    color: message.color,
+    requestedBy: inferRequestedBy(summary, text),
+    source: "lead-inbox" as const,
+  };
+}
+
+function collectRecentLeadInboxReports(leadInboxMessages: any[]): CompletedAgentReport[] {
+  const reports: CompletedAgentReport[] = [];
+  for (let index = leadInboxMessages.length - 1; index >= 0 && reports.length < MAX_COMPLETED_REPORTS; index--) {
+    const report = completedReportFromLeadInboxMessage(leadInboxMessages[index]);
+    if (report && report.report.trim().length > 0) reports.push(report);
+  }
+  return reports;
+}
+
+function mergeRecentCompletedReports(reports: CompletedAgentReport[]): CompletedAgentReport[] {
+  const seenCompleted = new Set<string>();
+  const merged: CompletedAgentReport[] = [];
+  const sorted = reports
+    .filter((report) => report.report.trim().length > 0)
+    .sort((a, b) => b.completedAt - a.completedAt);
+
+  for (const report of sorted) {
+    const dedupeKey = `${report.name}:${report.completedAt}:${report.summary || ""}`;
+    if (seenCompleted.has(dedupeKey)) continue;
+    seenCompleted.add(dedupeKey);
+    merged.push(report);
+    if (merged.length >= MAX_COMPLETED_REPORTS) break;
+  }
+  return merged;
+}
+
+function previewLongText(text: string, maxChars = MAX_DETAIL_TEXT_CHARS): string {
+  if (text.length <= maxChars) return text;
+  const omitted = text.length - maxChars;
+  return `${text.slice(0, maxChars).trimEnd()}\n${dimAnsi(`… truncated ${omitted} characters for /team rendering`)}`;
+}
+
+export async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOptions): Promise<TeamPanelItem[]> {
+  const [config, allTasks, allClaims] = await Promise.all([
+    teams.readConfig(panelTeamName),
+    tasks.listTasks(panelTeamName).catch(() => []),
+    claims.listClaims(panelTeamName).catch(() => []),
+  ]);
+  const taskSubjectsByOwner = buildTaskSubjectIndex(allTasks);
+  const claimPathsByAgent = buildClaimPathIndex(allClaims);
+  const now = Date.now();
+  const members = config.members.filter((m) => m.name !== "team-lead");
+
+  const activeItems = await Promise.all(members.map(async (member): Promise<TeamPanelItem> => {
     const readState = options.runningReadAgents.get(options.readAgentKey(panelTeamName, member.name));
-    const runtimeStatus = await runtime.readRuntimeStatus(panelTeamName, member.name).catch(() => null);
-    const unreadCount = (await messaging.readInbox(panelTeamName, member.name, true, false).catch(() => [])).length;
+    const [runtimeStatus, inboxMessages] = await Promise.all([
+      runtime.readRuntimeStatus(panelTeamName, member.name).catch(() => null),
+      messaging.readInbox(panelTeamName, member.name, true, false).catch(() => []),
+    ]);
     const role = member.role || "write";
     const alive = role === "read"
       ? !!readState || !!runtimeStatus?.ready
@@ -65,88 +163,52 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
     const startedAt = readState?.startedAt || runtimeStatus?.startedAt || member.joinedAt;
     const tokensUsed = readState?.tokensUsed ?? runtimeStatus?.tokensUsed ?? 0;
 
-    items.push({
+    return {
       name: member.name,
       role,
       status,
       model: member.model,
       thinking: member.thinking,
-      unreadCount,
-      elapsedMs: Date.now() - startedAt,
+      unreadCount: inboxMessages.length,
+      elapsedMs: now - startedAt,
       tokensUsed,
-      taskSubjects: allTasks
-        .filter((task: any) => task.owner === member.name && task.status !== "completed" && task.status !== "deleted")
-        .map((task: any) => `#${task.id} ${task.subject}`),
-      claimPaths: allClaims.filter((claim) => claim.agent === member.name).map((claim) => claim.path),
+      taskSubjects: taskSubjectsByOwner.get(member.name) ?? [],
+      claimPaths: claimPathsByAgent.get(member.name) ?? [],
       recentEvents: readState?.recentEvents || [],
       runtimeStatus,
       tmuxPaneId: member.tmuxPaneId,
       windowId: member.windowId,
       completed: false,
       requestedBy: member.requestedBy,
-    });
-  }
+    };
+  }));
 
   const leadInboxMessages = await messaging.readInbox(panelTeamName, "team-lead", false, false).catch(() => []);
-  const completedFromInbox: CompletedAgentReport[] = leadInboxMessages
-    .filter((message: any) => {
-      const from = String(message.from || "");
-      return from && from !== "team-lead" && from !== "system" && from !== "watchdog";
-    })
-    .map((message: any) => {
-      const summary = String(message.summary || "Final report");
-      const text = String(message.text || "");
-      const metadata = message.metadata || {};
-      const role = summary.startsWith("Read helper ") || summary.startsWith("Read agent ") ? "read" : "write";
-      return {
-        name: String(message.from),
-        role,
-        status: "completed" as const,
-        report: text,
-        summary,
-        completedAt: message.timestamp ? new Date(message.timestamp).getTime() : Date.now(),
-        startedAt: typeof metadata.startedAt === "number" ? metadata.startedAt : undefined,
-        elapsedMs: typeof metadata.elapsedMs === "number" ? metadata.elapsedMs : undefined,
-        tokensUsed: typeof metadata.tokensUsed === "number" ? metadata.tokensUsed : undefined,
-        costUsd: typeof metadata.costUsd === "number" ? metadata.costUsd : undefined,
-        model: typeof metadata.model === "string" ? metadata.model : undefined,
-        thinking: typeof metadata.thinking === "string" ? metadata.thinking : undefined,
-        color: message.color,
-        requestedBy: inferRequestedBy(summary, text),
-        source: "lead-inbox" as const,
-      };
-    });
+  const completedReports = mergeRecentCompletedReports([
+    ...(options.completedAgentReports.get(panelTeamName) ?? []),
+    ...collectRecentLeadInboxReports(leadInboxMessages),
+  ]);
+  const completedItems: TeamPanelItem[] = completedReports.map((report) => ({
+    name: report.name,
+    role: report.role,
+    status: report.status,
+    model: report.model,
+    thinking: report.thinking,
+    unreadCount: 0,
+    elapsedMs: report.elapsedMs ?? (report.startedAt ? report.completedAt - report.startedAt : 0),
+    tokensUsed: report.tokensUsed || 0,
+    taskSubjects: [],
+    claimPaths: [],
+    recentEvents: [],
+    runtimeStatus: null,
+    completed: true,
+    completedAt: report.completedAt,
+    summary: report.summary,
+    reportText: report.report,
+    requestedBy: report.requestedBy,
+  }));
 
-  const completed = [...(options.completedAgentReports.get(panelTeamName) ?? []), ...completedFromInbox]
-    .filter((report) => report.report.trim().length > 0)
-    .sort((a, b) => b.completedAt - a.completedAt);
-  const seenCompleted = new Set<string>();
-  for (const report of completed) {
-    const dedupeKey = `${report.name}:${report.completedAt}:${report.summary || ""}`;
-    if (seenCompleted.has(dedupeKey)) continue;
-    seenCompleted.add(dedupeKey);
-    items.push({
-      name: report.name,
-      role: report.role,
-      status: report.status,
-      model: report.model,
-      thinking: report.thinking,
-      unreadCount: 0,
-      elapsedMs: report.elapsedMs ?? (report.startedAt ? report.completedAt - report.startedAt : 0),
-      tokensUsed: report.tokensUsed || 0,
-      taskSubjects: [],
-      claimPaths: [],
-      recentEvents: [],
-      runtimeStatus: null,
-      completed: true,
-      completedAt: report.completedAt,
-      summary: report.summary,
-      reportText: report.report,
-      requestedBy: report.requestedBy,
-    });
-  }
-
-  return items.sort((a, b) => {
+  return [...activeItems, ...completedItems].sort((a, b) => {
     if (a.completed !== b.completed) return a.completed ? 1 : -1;
     if (a.completed && b.completed) return (b.completedAt || 0) - (a.completedAt || 0);
     return a.name.localeCompare(b.name);
@@ -205,28 +267,77 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
 
         const refresh = () => refreshItems({ showLoading: true, resetLog: true });
 
-        const buildLeftRows = (): string[] => {
-          const rows: string[] = [focusedPane === "list" ? pink("views ◂") : purple("views")];
+        const formatMainLeftRow = (): string => {
           const mainSelected = selectedIndex === 0;
-          rows.push(`${mainSelected ? pink("▸") : " "} ${mainSelected ? pink("main") : "main"}  ${dimAnsi("lead")}`);
+          return `${mainSelected ? pink("▸") : " "} ${mainSelected ? pink("main") : "main"}  ${dimAnsi("lead")}`;
+        };
+
+        const formatItemLeftRow = (entryIndex: number, item: TeamPanelItem): string => {
+          const selected = entryIndex === selectedIndex;
+          const pointer = selected ? pink("▸") : " ";
+          const role = item.completed ? dimAnsi("done") : item.role === "read" ? pink("read") : purple("write");
+          const health = item.completed ? item.status : item.status.includes("dead") ? "dead" : item.status;
+          const screen = !item.completed && item.role !== "read" && item.tmuxPaneId
+            ? ` ${dimAnsi(item.windowId ? `${item.windowId}/${item.tmuxPaneId}` : item.tmuxPaneId)}`
+            : "";
+          const requestedBy = item.requestedBy ? ` ${dimAnsi(`requested by ${item.requestedBy}`)}` : "";
+          return `${pointer} ${selected ? pink(item.name) : item.name}  ${role}${screen}  ${dimAnsi(health)}${requestedBy}`;
+        };
+
+        const renderLeftWindow = (startEntry: number, endEntry: number): string[] => {
+          const rows: string[] = [focusedPane === "list" ? pink("views ◂") : purple("views")];
+          const totalEntries = entryCount();
+          if (startEntry > 0) rows.push(dimAnsi(`… ${startEntry} more above`));
+
           let completedHeadingShown = false;
-          for (const [index, item] of items.entries()) {
-            if (item.completed && !completedHeadingShown) {
-              rows.push("");
+          for (let entryIndex = startEntry; entryIndex <= endEntry; entryIndex++) {
+            if (entryIndex === 0) {
+              rows.push(formatMainLeftRow());
+              continue;
+            }
+
+            const item = items[entryIndex - 1];
+            if (!item) continue;
+            const previousItem = entryIndex > 1 ? items[entryIndex - 2] : undefined;
+            const singleSelectedRow = startEntry === endEntry && entryIndex === selectedIndex;
+            if (!singleSelectedRow && item.completed && (!previousItem?.completed || entryIndex === startEntry) && !completedHeadingShown) {
               rows.push(purple("completed"));
               completedHeadingShown = true;
             }
-            const selected = index + 1 === selectedIndex;
-            const pointer = selected ? pink("▸") : " ";
-            const role = item.completed ? dimAnsi("done") : item.role === "read" ? pink("read") : purple("write");
-            const health = item.completed ? item.status : item.status.includes("dead") ? "dead" : item.status;
-            const screen = !item.completed && item.role !== "read" && item.tmuxPaneId
-              ? ` ${dimAnsi(item.windowId ? `${item.windowId}/${item.tmuxPaneId}` : item.tmuxPaneId)}`
-              : "";
-            const requestedBy = item.requestedBy ? ` ${dimAnsi(`requested by ${item.requestedBy}`)}` : "";
-            rows.push(`${pointer} ${selected ? pink(item.name) : item.name}  ${role}${screen}  ${dimAnsi(health)}${requestedBy}`);
+            rows.push(formatItemLeftRow(entryIndex, item));
+          }
+
+          if (endEntry < totalEntries - 1) rows.push(dimAnsi(`… ${totalEntries - 1 - endEntry} more below`));
+          return rows;
+        };
+
+        const buildLeftRows = (visibleRowLimit: number): string[] => {
+          const totalEntries = entryCount();
+          const selectableRows = Math.max(1, visibleRowLimit - 4);
+          let startEntry = Math.max(0, selectedIndex - Math.floor(selectableRows / 2));
+          let endEntry = Math.min(totalEntries - 1, startEntry + selectableRows - 1);
+          startEntry = Math.max(0, endEntry - selectableRows + 1);
+
+          let rows = renderLeftWindow(startEntry, endEntry);
+          while (rows.length > visibleRowLimit && startEntry < endEntry) {
+            if (endEntry > selectedIndex && (selectedIndex - startEntry) <= (endEntry - selectedIndex)) endEntry--;
+            else if (startEntry < selectedIndex) startEntry++;
+            else endEntry--;
+            rows = renderLeftWindow(startEntry, endEntry);
           }
           return rows;
+        };
+
+        const summarizeItems = () => {
+          let activeReaders = 0;
+          let activeWriters = 0;
+          let completed = 0;
+          for (const item of items) {
+            if (item.completed) completed++;
+            else if (item.role === "read") activeReaders++;
+            else activeWriters++;
+          }
+          return { activeReaders, activeWriters, completed };
         };
 
         const buildRightRows = (width: number): string[] => {
@@ -234,15 +345,14 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           const rows: string[] = [];
 
           if (selectedIndex === 0) {
-            const activeReaders = items.filter((item) => !item.completed && item.role === "read");
-            const activeWriters = items.filter((item) => !item.completed && item.role !== "read");
-            const completed = items.filter((item) => item.completed);
+            const { activeReaders, activeWriters, completed } = summarizeItems();
+            const completedLabel = completed >= MAX_COMPLETED_REPORTS ? `${completed} recent shown` : String(completed);
             rows.push(pink(`main · ${panelTeamName}`));
             rows.push(focusedPane === "log" ? pink("log pane focused") : dimAnsi("press → to focus log pane"));
             rows.push("");
-            rows.push(`${purple("read agents")}   ${activeReaders.length} (in-process)`);
-            rows.push(`${purple("write agents")}  ${activeWriters.length} (background tmux screens)`);
-            rows.push(`${purple("completed")}     ${completed.length}`);
+            rows.push(`${purple("read agents")}   ${activeReaders} (in-process)`);
+            rows.push(`${purple("write agents")}  ${activeWriters} (background tmux screens)`);
+            rows.push(`${purple("completed")}     ${completedLabel}`);
             rows.push(`${purple("lead inbox")}    ${options.getLeadInboxUnreadCount()} unread`);
             rows.push("");
             rows.push(dimAnsi("Select an active or completed agent on the left to inspect its live transcript or final output."));
@@ -260,7 +370,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             if (item.summary) rows.push(`${purple("summary")} ${item.summary}`);
             rows.push("");
             rows.push(purple("final output"));
-            rows.push(item.reportText || dimAnsi("(completed agent produced no output)"));
+            rows.push(previewLongText(item.reportText || dimAnsi("(completed agent produced no output)")));
             return rows.flatMap(wrap);
           }
 
@@ -276,13 +386,18 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
 
           if (item.role === "read") {
             const session = options.runningReadAgents.get(options.readAgentKey(panelTeamName, item.name))?.session;
-            const transcript = session ? formatTranscriptLines(session.messages) : [];
+            const sessionMessages = Array.isArray(session?.messages) ? session.messages : [];
+            const visibleMessages = sessionMessages.length > MAX_TRANSCRIPT_MESSAGES ? sessionMessages.slice(-MAX_TRANSCRIPT_MESSAGES) : sessionMessages;
+            const formattedTranscript = visibleMessages.length > 0 ? formatTranscriptLines(visibleMessages) : [];
+            const transcript = formattedTranscript.slice(-MAX_TRANSCRIPT_LINES);
             if (transcript.length > 0) {
               rows.push(purple("transcript"));
+              if (visibleMessages.length < sessionMessages.length) rows.push(dimAnsi(`showing last ${visibleMessages.length} of ${sessionMessages.length} transcript messages`));
+              if (transcript.length < formattedTranscript.length) rows.push(dimAnsi(`showing last ${transcript.length} of ${formattedTranscript.length} transcript lines`));
               for (const line of transcript) rows.push(line);
             } else if (item.recentEvents.length > 0) {
               rows.push(purple("recent"));
-              for (const event of item.recentEvents.slice(-12)) rows.push(`  ${event}`);
+              for (const event of item.recentEvents.slice(-RECENT_EVENT_DISPLAY_LIMIT)) rows.push(`  ${event}`);
             } else {
               rows.push(dimAnsi("Waiting for the read agent's first turn…"));
             }
@@ -292,7 +407,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             if (item.recentEvents.length > 0) {
               rows.push("");
               rows.push(purple("recent"));
-              for (const event of item.recentEvents.slice(-12)) rows.push(`  ${event}`);
+              for (const event of item.recentEvents.slice(-RECENT_EVENT_DISPLAY_LIMIT)) rows.push(`  ${event}`);
             }
           }
 
@@ -381,7 +496,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           const sep = dimAnsi(" │ ");
           const maxRows = Math.max(8, Math.floor((tui.terminal?.rows ?? 24) * 0.82));
           const bodyHeight = Math.max(3, maxRows - header.length - 3);
-          const leftRows = buildLeftRows();
+          const leftRows = buildLeftRows(bodyHeight);
           const rightRows = buildRightRows(rightWidth);
           const rightStart = logWindowStart(rightRows.length, bodyHeight, logOffsetFromBottom);
           const rightWindow = rightRows.slice(rightStart, rightStart + bodyHeight);

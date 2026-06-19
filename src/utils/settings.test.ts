@@ -4,6 +4,9 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_SETTINGS,
+  DEFAULT_READ_AGENT_MAX_CONCURRENT,
+  DEFAULT_READ_HELPER_MAX_CONCURRENT,
+  DEFAULT_WRITE_AGENT_MAX_CONCURRENT,
   globalSettingsPath,
   loadSettings,
   projectSettingsPath,
@@ -42,8 +45,12 @@ describe("loadSettings", () => {
   it("returns defaults when no files exist", () => {
     const s = loadSettings({ homeDir, projectDir });
     expect(s.watchdog.bufferSeconds).toBe(30);
-    expect(s.writeAgents.maxConcurrent).toBe(3);
+    expect(s.writeAgents.maxConcurrent).toBe(DEFAULT_WRITE_AGENT_MAX_CONCURRENT);
     expect(s.writeAgents.queueOverflow).toBe(true);
+    expect(s.readAgents.maxConcurrent).toBe(DEFAULT_READ_AGENT_MAX_CONCURRENT);
+    expect(s.readAgents.queueOverflow).toBe(true);
+    expect(s.readHelpers.maxConcurrent).toBe(DEFAULT_READ_HELPER_MAX_CONCURRENT);
+    expect(s.readHelpers.queueOverflow).toBe(true);
     expect(s.roles.read.model).toBeNull();
     expect(s.extensions.allow).toEqual([]);
     expect(s.debug.enabled).toBe(false);
@@ -59,6 +66,8 @@ describe("loadSettings", () => {
     writeGlobal({
       watchdog: { bufferSeconds: 45 },
       writeAgents: { maxConcurrent: 5, queueOverflow: false },
+      readAgents: { maxConcurrent: 7, queueOverflow: false },
+      readHelpers: { maxConcurrent: 2, queueOverflow: false },
       roles: { write: { thinking: "high" } },
       extensions: { allow: ["pi-emote", "my-ext"] },
       debug: { enabled: true },
@@ -67,6 +76,10 @@ describe("loadSettings", () => {
     expect(s.watchdog.bufferSeconds).toBe(45);
     expect(s.writeAgents.maxConcurrent).toBe(5);
     expect(s.writeAgents.queueOverflow).toBe(false);
+    expect(s.readAgents.maxConcurrent).toBe(7);
+    expect(s.readAgents.queueOverflow).toBe(false);
+    expect(s.readHelpers.maxConcurrent).toBe(2);
+    expect(s.readHelpers.queueOverflow).toBe(false);
     expect(s.roles.write.thinking).toBe("high");
     expect(s.extensions.allow).toEqual(["pi-emote", "my-ext"]);
     expect(s.debug.enabled).toBe(true);
@@ -80,11 +93,31 @@ describe("loadSettings", () => {
     expect(s.writeAgents.maxConcurrent).toBe(5); // global retained
   });
 
+  it("accepts high configured concurrency for large fanouts", () => {
+    writeProject({
+      writeAgents: { maxConcurrent: 300 },
+      readAgents: { maxConcurrent: 300 },
+      readHelpers: { maxConcurrent: 75 },
+    });
+    const s = loadSettings({ homeDir, projectDir });
+    expect(s.writeAgents.maxConcurrent).toBe(300);
+    expect(s.readAgents.maxConcurrent).toBe(300);
+    expect(s.readHelpers.maxConcurrent).toBe(75);
+  });
+
   it("ignores invalid values", () => {
-    writeGlobal({ watchdog: { bufferSeconds: -5 }, writeAgents: { maxConcurrent: 0 }, debug: "yes" });
+    writeGlobal({
+      watchdog: { bufferSeconds: -5 },
+      writeAgents: { maxConcurrent: 0 },
+      readAgents: { maxConcurrent: 0 },
+      readHelpers: { maxConcurrent: 0 },
+      debug: "yes",
+    });
     const s = loadSettings({ homeDir, projectDir });
     expect(s.watchdog.bufferSeconds).toBe(30);
-    expect(s.writeAgents.maxConcurrent).toBe(3);
+    expect(s.writeAgents.maxConcurrent).toBe(DEFAULT_WRITE_AGENT_MAX_CONCURRENT);
+    expect(s.readAgents.maxConcurrent).toBe(DEFAULT_READ_AGENT_MAX_CONCURRENT);
+    expect(s.readHelpers.maxConcurrent).toBe(DEFAULT_READ_HELPER_MAX_CONCURRENT);
     expect(s.debug.enabled).toBe(false);
   });
 

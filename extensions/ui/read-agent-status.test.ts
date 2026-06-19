@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildReadAgentIdleNudgeMessage, describeReadAgentStatus, shouldNudgeReadAgentIdle } from "./read-agent-status.js";
+import { buildReadAgentIdleNudgeMessage, describeReadAgentStatus, shouldNudgeReadAgentIdle, summarizeReadAgentStatuses } from "./read-agent-status.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 
 function makeAgent(overrides: Partial<RunningReadAgent> = {}): RunningReadAgent {
@@ -84,5 +84,24 @@ describe("read-agent status descriptions", () => {
       idleLevel: "hard",
       idleMs: 181_000,
     })).toBe("Read agent reviewer on team status-team appears hung: no response or token change for 3m01s. Ping/check it now, and consider stopping or promoting it if needed.");
+  });
+
+  it("summarizes many agents while limiting detailed status descriptions", () => {
+    const startedAt = Date.UTC(2026, 0, 1, 0, 0, 0);
+    const now = startedAt + 200_000;
+    const agents = [
+      makeAgent({ name: "thinking", status: "thinking", lastActivityAt: now - 10_000 }),
+      makeAgent({ name: "idle", status: "thinking", lastActivityAt: now - 61_000 }),
+      makeAgent({ name: "hanging", status: "working", lastActivityAt: now - 181_000 }),
+      makeAgent({ name: "working", status: "working", activeToolName: "bash", lastActivityAt: now - 5_000 }),
+    ];
+
+    const summary = summarizeReadAgentStatuses(agents, { now, maxDetailed: 2 });
+
+    expect(summary.total).toBe(4);
+    expect(summary.counts).toEqual({ thinking: 1, idle: 1, hanging: 1, working: 1 });
+    expect(summary.samples).toHaveLength(2);
+    expect(summary.samples.map(sample => sample.agent.name)).toEqual(["thinking", "idle"]);
+    expect(summary.samples.map(sample => sample.status.label)).toEqual(["thinking", "idle"]);
   });
 });

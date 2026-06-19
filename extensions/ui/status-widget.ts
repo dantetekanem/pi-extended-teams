@@ -9,17 +9,22 @@ export interface TeamActivityStatusEntry {
   detail?: string;
 }
 
+export type TeamActivityStatusCounts = Record<string, number>;
+
 export interface TeamActivityStatusSnapshot {
   activeCount: number;
   readCount: number;
   writeCount: number;
   unreadCount: number;
   entries: TeamActivityStatusEntry[];
+  statusCounts?: TeamActivityStatusCounts;
   updatedAt: number;
 }
 
 const MAX_COLLAPSED_ENTRIES = 2;
 const MAX_EXPANDED_ENTRIES = 10;
+const AGGREGATE_PREVIEW_THRESHOLD = MAX_EXPANDED_ENTRIES;
+const MAX_AGGREGATE_STATUS_PARTS = 4;
 
 function toolExpandKey(): string {
   try {
@@ -42,7 +47,38 @@ function formatEntryPreview(entry: TeamActivityStatusEntry): string {
   return `${pink(entry.name)} ${purple(entry.role)}${state ? purple(state) : ""}`;
 }
 
+function shouldUseAggregatePreview(snapshot: TeamActivityStatusSnapshot): boolean {
+  return snapshot.entries.length > AGGREGATE_PREVIEW_THRESHOLD;
+}
+
+function formatRoleSummary(snapshot: TeamActivityStatusSnapshot): string {
+  const parts: string[] = [];
+  if (snapshot.readCount > 0) parts.push(`${snapshot.readCount} read`);
+  if (snapshot.writeCount > 0) parts.push(`${snapshot.writeCount} write`);
+  return parts.length > 0 ? parts.join(" · ") : `${snapshot.activeCount} active`;
+}
+
+function formatStatusSummary(statusCounts: TeamActivityStatusCounts | undefined): string | undefined {
+  if (!statusCounts) return undefined;
+  const sorted = Object.entries(statusCounts)
+    .filter(([, count]) => count > 0)
+    .sort(([aLabel, aCount], [bLabel, bCount]) => bCount - aCount || aLabel.localeCompare(bLabel));
+  if (sorted.length === 0) return undefined;
+
+  const shown = sorted.slice(0, MAX_AGGREGATE_STATUS_PARTS).map(([label, count]) => `${count} ${label}`);
+  const remaining = sorted.length - shown.length;
+  if (remaining > 0) shown.push(`+${remaining} states`);
+  return shown.join(" · ");
+}
+
+function formatAggregatePreview(snapshot: TeamActivityStatusSnapshot): string {
+  const summary = formatStatusSummary(snapshot.statusCounts) || formatRoleSummary(snapshot);
+  return `${pink("summary")} ${purple(summary)} ${dimAnsi("/team shows agent details")}`;
+}
+
 function formatCollapsedPreview(snapshot: TeamActivityStatusSnapshot): string {
+  if (shouldUseAggregatePreview(snapshot)) return formatAggregatePreview(snapshot);
+
   const shownEntries = snapshot.entries.slice(0, MAX_COLLAPSED_ENTRIES).map(formatEntryPreview).join(dimAnsi(" · "));
   const more = snapshot.entries.length > MAX_COLLAPSED_ENTRIES
     ? dimAnsi(` +${snapshot.entries.length - MAX_COLLAPSED_ENTRIES} more`)
@@ -76,6 +112,8 @@ function expandedRows(snapshot: TeamActivityStatusSnapshot): string[] {
     formatHeader(snapshot),
     dimAnsi(`${key} collapse`),
   ];
+
+  if (shouldUseAggregatePreview(snapshot)) lines.push(formatAggregatePreview(snapshot));
 
   const entries = snapshot.entries.slice(0, MAX_EXPANDED_ENTRIES);
   for (const [index, entry] of entries.entries()) {

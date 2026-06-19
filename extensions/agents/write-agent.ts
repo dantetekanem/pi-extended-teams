@@ -119,45 +119,60 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
     if (writeQueueDraining) return;
     writeQueueDraining = true;
     try {
-      const settings = loadSettings();
-      while (await countWriteMembers(teamName, options.terminal) < settings.writeAgents.maxConcurrent) {
-        const queued = await writeQueue.dequeueWriteSpawn(teamName);
-        if (!queued) return;
+      while (true) {
+        const drainedAny = await writeQueue.withWriteQueueCapacityLock(teamName, async () => {
+          const [nextQueued] = await writeQueue.listWriteQueue(teamName);
+          if (!nextQueued) return false;
 
-        const config = await teams.readConfig(teamName);
-        if (config.members.some(member => member.name === queued.name)) {
-          await messaging.sendPlainMessage(
-            teamName,
-            "system",
-            "team-lead",
-            `Skipped queued writer ${queued.name} because a teammate with that name already exists.`,
-            `Skipped queued writer ${queued.name}`,
-            "yellow"
-          );
-          continue;
-        }
+          const settings = loadSettings({ projectDir: nextQueued.cwd });
+          const activeWriteCount = await countWriteMembers(teamName, options.terminal);
+          const availableSlots = settings.writeAgents.maxConcurrent - activeWriteCount;
+          if (availableSlots <= 0) return false;
 
-        const member = writeQueue.queuedWriteSpawnToMember(teamName, queued);
-        try {
-          const terminalId = await startWriteAgent(teamName, member, queued.prompt);
-          await messaging.sendPlainMessage(
-            teamName,
-            "system",
-            "team-lead",
-            `Queued writer ${queued.name} started in background tmux screen ${terminalId}.`,
-            `Queued writer ${queued.name} started`,
-            "green"
-          );
-        } catch (e) {
-          await messaging.sendPlainMessage(
-            teamName,
-            "system",
-            "team-lead",
-            `Queued writer ${queued.name} failed to start: ${e instanceof Error ? e.message : String(e)}`,
-            `Queued writer ${queued.name} failed`,
-            "red"
-          );
-        }
+          const queuedBatch = await writeQueue.dequeueWriteSpawns(teamName, availableSlots);
+          if (queuedBatch.length === 0) return false;
+
+          for (const queued of queuedBatch) {
+            const config = await teams.readConfig(teamName);
+            if (config.members.some(member => member.name === queued.name)) {
+              await messaging.sendPlainMessage(
+                teamName,
+                "system",
+                "team-lead",
+                `Skipped queued writer ${queued.name} because a teammate with that name already exists.`,
+                `Skipped queued writer ${queued.name}`,
+                "yellow"
+              );
+              continue;
+            }
+
+            const member = writeQueue.queuedWriteSpawnToMember(teamName, queued);
+            try {
+              const terminalId = await startWriteAgent(teamName, member, queued.prompt);
+              await messaging.sendPlainMessage(
+                teamName,
+                "system",
+                "team-lead",
+                `Queued writer ${queued.name} started in background tmux screen ${terminalId}.`,
+                `Queued writer ${queued.name} started`,
+                "green"
+              );
+            } catch (e) {
+              await messaging.sendPlainMessage(
+                teamName,
+                "system",
+                "team-lead",
+                `Queued writer ${queued.name} failed to start after being dequeued: ${e instanceof Error ? e.message : String(e)}`,
+                `Queued writer ${queued.name} failed`,
+                "red"
+              );
+            }
+          }
+
+          return true;
+        });
+
+        if (!drainedAny) return;
       }
     } finally {
       writeQueueDraining = false;

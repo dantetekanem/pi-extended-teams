@@ -4,7 +4,11 @@ import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import * as writeQueue from "../../src/utils/write-queue";
+import type { TaskFile } from "../../src/utils/models";
+import type { FileClaim } from "../../src/utils/claims";
 import type { RunningReadAgent } from "../runtime/types";
+
+type RosterTask = Pick<TaskFile, "id" | "subject" | "status">;
 
 export interface BuildRosterOptions {
   terminal: any;
@@ -62,18 +66,45 @@ export async function countWriteMembers(teamName: string, terminal?: any): Promi
   }).length;
 }
 
+function indexOpenTasksByOwner(allTasks: TaskFile[]): Map<string, RosterTask[]> {
+  const tasksByOwner = new Map<string, RosterTask[]>();
+
+  for (const task of allTasks) {
+    if (!task.owner || task.status === "completed" || task.status === "deleted") continue;
+    const memberTasks = tasksByOwner.get(task.owner) ?? [];
+    memberTasks.push({ id: task.id, subject: task.subject, status: task.status });
+    if (memberTasks.length === 1) tasksByOwner.set(task.owner, memberTasks);
+  }
+
+  return tasksByOwner;
+}
+
+function indexClaimsByAgent(allClaims: FileClaim[]): Map<string, string[]> {
+  const claimsByAgent = new Map<string, string[]>();
+
+  for (const claim of allClaims) {
+    const memberClaims = claimsByAgent.get(claim.agent) ?? [];
+    memberClaims.push(claim.path);
+    if (memberClaims.length === 1) claimsByAgent.set(claim.agent, memberClaims);
+  }
+
+  return claimsByAgent;
+}
+
 export async function buildRoster(teamName: string, options: BuildRosterOptions) {
   const config = await teams.readConfig(teamName);
   const allTasks = await tasks.listTasks(teamName).catch(() => []);
   const allClaims = await claims.listClaims(teamName).catch(() => []);
   const queue = await writeQueue.listWriteQueue(teamName).catch(() => []);
+  const tasksByOwner = indexOpenTasksByOwner(allTasks);
+  const claimsByAgent = indexClaimsByAgent(allClaims);
 
   const members = await Promise.all(config.members.map(async (member) => {
     const role = member.role ?? (member.name === "team-lead" ? "lead" : "write");
     const runtimeStatus = member.name === "team-lead" ? null : await runtime.readRuntimeStatus(teamName, member.name).catch(() => null);
     const unreadCount = member.name === "team-lead" ? 0 : (await messaging.readInbox(teamName, member.name, true, false).catch(() => [])).length;
-    const memberTasks = allTasks.filter((task: any) => task.owner === member.name && task.status !== "completed" && task.status !== "deleted");
-    const memberClaims = allClaims.filter(claim => claim.agent === member.name);
+    const memberTasks = tasksByOwner.get(member.name) ?? [];
+    const memberClaims = claimsByAgent.get(member.name) ?? [];
     const readState = options.runningReadAgents.get(options.readAgentKey(teamName, member.name));
     const alive = member.name === "team-lead"
       ? true
@@ -88,8 +119,8 @@ export async function buildRoster(teamName: string, options: BuildRosterOptions)
       model: member.model,
       cwd: member.cwd,
       unreadCount,
-      tasks: memberTasks.map((task: any) => ({ id: task.id, subject: task.subject, status: task.status })),
-      claims: memberClaims.map(claim => claim.path),
+      tasks: memberTasks,
+      claims: memberClaims,
       tmuxPaneId: member.tmuxPaneId || undefined,
       runtime: runtimeStatus,
     };

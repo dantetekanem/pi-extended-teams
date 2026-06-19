@@ -6,7 +6,9 @@ import * as paths from "../utils/paths";
 import * as teams from "../utils/teams";
 import * as messaging from "../utils/messaging";
 import * as runtime from "../utils/runtime";
-import { appendTeamReportEvent, listTeamReportEvents, observeTeam, observeTeammate, sendMessageOnce, spawnTeammateOnce } from "./index";
+import * as writeQueue from "../utils/write-queue";
+import { appendTeamReportEvent, listTeamReportEvents, observeTeam, observeTeammate, sendMessageOnce, spawnTeammateOnce, spawnTeammatesOnce } from "./index";
+import type { SpawnTeammateOnceRequest } from "./types";
 
 let root: string;
 
@@ -58,6 +60,29 @@ describe("orchestration primitives", () => {
     expect((await teams.readConfig("team")).members.some(member => member.name === "writer")).toBe(true);
   });
 
+  it("observes high-volume teams without rereading config per member", async () => {
+    const config = teams.createTeam("team", "session", "lead", "", "provider/model");
+    config.members.push(...Array.from({ length: 150 }, (_, index) => ({
+      agentId: `reader-${index}@team`,
+      name: `reader-${index}`,
+      agentType: "teammate",
+      role: "read" as const,
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "read",
+    })));
+    fs.writeFileSync(paths.configPath("team"), JSON.stringify(config, null, 2));
+    const readConfigSpy = vi.spyOn(teams, "readConfig");
+
+    const observation = await observeTeam("team");
+
+    expect(observation.members).toHaveLength(151);
+    expect(readConfigSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("reuses existing members for spawnTeammateOnce", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
@@ -99,6 +124,81 @@ describe("orchestration primitives", () => {
       modelSource: "existing",
     });
     expect(start).not.toHaveBeenCalled();
+  });
+
+  it("bulk spawn once reuses one config and queue scan for high-volume requests", async () => {
+    const config = teams.createTeam("team", "session", "lead", "", "provider/model");
+    config.members.push({
+      agentId: "existing-reader@team",
+      name: "existing-reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "read",
+      metadata: { operationId: "op-existing", workflowRunId: "run-1" },
+    });
+    fs.writeFileSync(paths.configPath("team"), JSON.stringify(config, null, 2));
+    await writeQueue.enqueueWriteSpawn("team", {
+      name: "queued-reader",
+      prompt: "queued",
+      cwd: root,
+      model: "provider/model",
+      operationId: "op-queued",
+      workflowRunId: "run-1",
+    });
+
+    const startRequests: SpawnTeammateOnceRequest[] = Array.from({ length: 120 }, (_, index) => ({
+      teamName: "team",
+      name: `reader-${index}`,
+      prompt: "read",
+      cwd: root,
+      role: "read" as const,
+      operationId: `op-start-${index}`,
+      workflowRunId: "run-1",
+    }));
+    const requests: SpawnTeammateOnceRequest[] = [
+      { teamName: "team", name: "existing-reader", prompt: "read", cwd: root, role: "read" as const },
+      { teamName: "team", name: "operation-match", prompt: "read", cwd: root, role: "read" as const, operationId: "op-existing", workflowRunId: "run-1" },
+      { teamName: "team", name: "queued-reader", prompt: "queued", cwd: root, role: "write" as const, operationId: "op-queued", workflowRunId: "run-1" },
+      ...startRequests,
+      { teamName: "team", name: "reader-0", prompt: "duplicate", cwd: root, role: "read" as const, operationId: "op-duplicate-name", workflowRunId: "run-1" },
+      { teamName: "team", name: "reader-via-op", prompt: "duplicate", cwd: root, role: "read" as const, operationId: "op-start-1", workflowRunId: "run-1" },
+    ];
+    const start = vi.fn(async (request: SpawnTeammateOnceRequest) => ({
+      member: {
+        agentId: `${request.name}@${request.teamName}`,
+        name: request.name,
+        agentType: "teammate",
+        role: request.role ?? "read",
+        model: request.model ?? "provider/model",
+        joinedAt: Date.now(),
+        tmuxPaneId: "",
+        cwd: request.cwd,
+        subscriptions: [],
+        prompt: request.prompt,
+        metadata: request.metadata,
+      },
+    }));
+    const readConfigSpy = vi.spyOn(teams, "readConfig");
+    const listQueueSpy = vi.spyOn(writeQueue, "listWriteQueue");
+
+    const results = await spawnTeammatesOnce(requests, { start });
+
+    expect(results).toHaveLength(requests.length);
+    expect(results[0]).toMatchObject({ status: "existing", member: { name: "existing-reader" } });
+    expect(results[1]).toMatchObject({ status: "existing", member: { name: "existing-reader" } });
+    expect(results[2]).toMatchObject({ status: "queued", queued: { name: "queued-reader" } });
+    expect(results[3]).toMatchObject({ status: "started", member: { name: "reader-0" } });
+    expect(results.at(-2)).toMatchObject({ status: "existing", member: { name: "reader-0" } });
+    expect(results.at(-1)).toMatchObject({ status: "existing", member: { name: "reader-1" } });
+    expect(start).toHaveBeenCalledTimes(startRequests.length);
+    expect(start.mock.calls[0][0].metadata).toMatchObject({ operationId: "op-start-0", workflowRunId: "run-1" });
+    expect(readConfigSpy).toHaveBeenCalledTimes(1);
+    expect(listQueueSpy).toHaveBeenCalledTimes(1);
   });
 
   it("synthesizes effective spawn details from start callback results", async () => {
@@ -164,6 +264,44 @@ describe("orchestration primitives", () => {
 
     const observation = await observeTeam("team");
     expect(observation.reports).toHaveLength(1);
+  });
+
+  it("records high-volume report events without lock retry backoff", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    const reportCount = 200;
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    const writes = Array.from({ length: reportCount }, (_, index) => appendTeamReportEvent("team", {
+      agentName: `reader-${index}`,
+      role: "read",
+      status: "completed",
+      report: `report-${index}`,
+      summary: `reader-${index} done`,
+      source: "read-agent",
+      operationId: `op-report-${index}`,
+      workflowRunId: "run-1",
+      createdAt: index + 1,
+    }));
+
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
+    const written = await Promise.all(writes);
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
+    expect(written).toHaveLength(reportCount);
+    expect(new Set(written.map((event) => event.id)).size).toBe(reportCount);
+
+    const replay = await listTeamReportEvents("team");
+    expect(replay).toHaveLength(reportCount);
+    expect(replay[0]).toMatchObject({ agentName: "reader-0", operationId: "op-report-0", createdAt: 1 });
+    expect(replay.at(-1)).toMatchObject({ agentName: "reader-199", operationId: "op-report-199", createdAt: 200 });
+
+    const observation = await observeTeam("team", { reportLimit: 5 });
+    expect(observation.reports.map((event) => event.operationId)).toEqual([
+      "op-report-195",
+      "op-report-196",
+      "op-report-197",
+      "op-report-198",
+      "op-report-199",
+    ]);
   });
 
   it("sends orchestration messages once", async () => {

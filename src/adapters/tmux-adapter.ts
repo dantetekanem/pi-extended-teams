@@ -6,8 +6,16 @@
 
 import { TerminalAdapter, SpawnOptions, execCommand } from "../utils/terminal-adapter";
 
+const PANE_SNAPSHOT_TTL_MS = 100;
+
+type PaneSnapshot = {
+  panes: Map<string, string | null>;
+  expiresAt: number;
+};
+
 export class TmuxAdapter implements TerminalAdapter {
   readonly name = "tmux";
+  private paneSnapshot: PaneSnapshot | null = null;
 
   detect(): boolean {
     // tmux is available if TMUX environment variable is set
@@ -20,10 +28,16 @@ export class TmuxAdapter implements TerminalAdapter {
   }
 
   getWindowIdForPane(paneId: string | null | undefined): string | null {
-    if (!paneId) return null;
+    const targetPaneId = paneId?.trim();
+    if (!targetPaneId) return null;
+
+    const snapshot = this.getPaneSnapshot();
+    if (snapshot) {
+      return snapshot.get(targetPaneId) ?? null;
+    }
 
     try {
-      const result = execCommand("tmux", ["display-message", "-p", "-t", paneId, "#{window_id}"]);
+      const result = execCommand("tmux", ["display-message", "-p", "-t", targetPaneId, "#{window_id}"]);
       if (result.status !== 0) return null;
 
       const windowId = result.stdout.trim();
@@ -34,24 +48,67 @@ export class TmuxAdapter implements TerminalAdapter {
   }
 
   private isPaneUsable(paneId: string | null | undefined): paneId is string {
-    if (!paneId) return false;
+    const targetPaneId = paneId?.trim();
+    if (!targetPaneId) return false;
+
+    const snapshot = this.getPaneSnapshot();
+    if (snapshot) {
+      return snapshot.has(targetPaneId);
+    }
 
     try {
-      const result = execCommand("tmux", ["display-message", "-p", "-t", paneId, "#{pane_id}"]);
-      return result.status === 0 && result.stdout.trim() === paneId;
+      const result = execCommand("tmux", ["display-message", "-p", "-t", targetPaneId, "#{pane_id}"]);
+      return result.status === 0 && result.stdout.trim() === targetPaneId;
     } catch {
       return false;
     }
   }
 
+  private getPaneSnapshot(): Map<string, string | null> | null {
+    const now = Date.now();
+    if (this.paneSnapshot && this.paneSnapshot.expiresAt > now) {
+      return this.paneSnapshot.panes;
+    }
+
+    try {
+      const result = execCommand("tmux", ["list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"]);
+      if (result.status !== 0) {
+        this.paneSnapshot = null;
+        return null;
+      }
+
+      const panes = new Map<string, string | null>();
+      for (const line of result.stdout.split(/\r?\n/)) {
+        const [paneId, windowId] = line.split("\t");
+        const normalizedPaneId = paneId?.trim();
+        if (!normalizedPaneId) continue;
+
+        panes.set(normalizedPaneId, windowId?.trim() || null);
+      }
+
+      this.paneSnapshot = {
+        panes,
+        expiresAt: Date.now() + PANE_SNAPSHOT_TTL_MS,
+      };
+      return panes;
+    } catch {
+      this.paneSnapshot = null;
+      return null;
+    }
+  }
+
+  private invalidatePaneSnapshot(): void {
+    this.paneSnapshot = null;
+  }
+
   private getOriginPaneId(preferredPaneId?: string | null): string | null {
     if (this.isPaneUsable(preferredPaneId)) {
-      return preferredPaneId;
+      return preferredPaneId.trim();
     }
 
     const currentPaneId = this.getCurrentPaneId();
     if (this.isPaneUsable(currentPaneId)) {
-      return currentPaneId;
+      return currentPaneId.trim();
     }
 
     return null;
@@ -89,6 +146,7 @@ export class TmuxAdapter implements TerminalAdapter {
     }
 
     const newPaneId = result.stdout.trim();
+    this.invalidatePaneSnapshot();
     if (newPaneId) {
       execCommand("tmux", ["select-pane", "-t", newPaneId, "-T", options.name]);
     }
@@ -103,6 +161,8 @@ export class TmuxAdapter implements TerminalAdapter {
       execCommand("tmux", ["kill-pane", "-t", paneId.trim()]);
     } catch {
       // Ignore errors - pane may already be dead
+    } finally {
+      this.invalidatePaneSnapshot();
     }
   }
 

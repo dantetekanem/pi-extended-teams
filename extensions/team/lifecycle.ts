@@ -5,10 +5,12 @@ import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
 import * as teams from "../../src/utils/teams";
 import { loadSettings } from "../../src/utils/settings";
-import type { Member } from "../../src/utils/models";
+import { withLock } from "../../src/utils/lock";
+import type { Member, TeamConfig } from "../../src/utils/models";
 import type { RunningReadAgent } from "../runtime/types";
 import { shutdownReadAgentSession } from "../agents/read-agent";
 import { releaseAllClaimsForAgent } from "./roster";
+import { cleanupPidFileProcess } from "../internal/session-files";
 
 export interface LifecycleRuntimeOptions {
   isTeammate: boolean;
@@ -20,6 +22,16 @@ export interface LifecycleRuntimeOptions {
   drainWriteQueue(teamName: string): Promise<void>;
   getSessionCwd(): string | undefined;
   getTeamName(): string | null | undefined;
+}
+
+interface ShutdownTeammateOptions {
+  drainQueue?: boolean;
+  removeMember?: boolean;
+}
+
+interface ReapedTeammate {
+  member: Member;
+  reason: string;
 }
 
 export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
@@ -45,15 +57,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
     }
 
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
-    if (fs.existsSync(pidFile)) {
-      try {
-        const pid = fs.readFileSync(pidFile, "utf-8").trim();
-        process.kill(parseInt(pid), "SIGKILL");
-        fs.unlinkSync(pidFile);
-      } catch {
-        // ignore
-      }
-    }
+    cleanupPidFileProcess(pidFile, { skipPid: process.pid });
 
     if (member.tmuxPaneId && options.terminal) {
       options.terminal.kill(member.tmuxPaneId);
@@ -62,67 +66,110 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
     await runtime.deleteRuntimeStatus(teamName, member.name);
   }
 
+  async function removeMembersFromTeamConfig(teamName: string, memberNames: Set<string>): Promise<void> {
+    if (memberNames.size === 0) return;
+
+    const configPath = paths.configPath(teamName);
+    if (!fs.existsSync(configPath)) return;
+
+    await withLock(configPath, async () => {
+      if (!fs.existsSync(configPath)) return;
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as TeamConfig;
+      const nextMembers = config.members.filter((member) => !memberNames.has(member.name));
+      if (nextMembers.length === config.members.length) return;
+
+      config.members = nextMembers;
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    });
+  }
+
   async function shutdownTeammate(
     teamName: string,
     member: Member,
-    shutdownOptions: { drainQueue?: boolean } = {}
+    shutdownOptions: ShutdownTeammateOptions = {}
   ): Promise<void> {
     if (member.name === "team-lead") return;
 
     const drainQueue = shutdownOptions.drainQueue ?? true;
+    const removeMember = shutdownOptions.removeMember ?? true;
     await releaseAllClaimsForAgent(teamName, member.name);
     await killTeammate(teamName, member);
-    await teams.removeMember(teamName, member.name);
+    if (removeMember) await teams.removeMember(teamName, member.name);
     if (drainQueue && (member.role ?? "write") === "write") {
       await options.drainWriteQueue(teamName);
     }
   }
 
-  function teammateRuntimeIsStale(status: runtime.AgentRuntimeStatus | null, maxAgeMs: number): boolean {
+  function teammateRuntimeIsStale(status: runtime.AgentRuntimeStatus | null, maxAgeMs: number, now = Date.now()): boolean {
     if (!status) return false;
     const lastActivity = status.lastHeartbeatAt || status.startedAt || 0;
-    return lastActivity > 0 && (Date.now() - lastActivity) > maxAgeMs;
+    return lastActivity > 0 && (now - lastActivity) > maxAgeMs;
   }
 
-  async function reapTeammate(teamName: string, member: Member, reason: string): Promise<void> {
-    await shutdownTeammate(teamName, member);
-    await messaging.sendPlainMessage(
+  async function readRuntimeStatusByMember(teamName: string, members: Member[]): Promise<Map<string, runtime.AgentRuntimeStatus | null>> {
+    const entries = await Promise.all(members.map(async (member) => {
+      const status = await runtime.readRuntimeStatus(teamName, member.name);
+      return [member.name, status] as const;
+    }));
+    return new Map(entries);
+  }
+
+  async function flushReapedTeammates(teamName: string, reaped: ReapedTeammate[]): Promise<void> {
+    if (reaped.length === 0) return;
+
+    await removeMembersFromTeamConfig(teamName, new Set(reaped.map(({ member }) => member.name)));
+
+    if (reaped.some(({ member }) => (member.role ?? "write") === "write")) {
+      await options.drainWriteQueue(teamName);
+    }
+
+    await Promise.all(reaped.map(({ member, reason }) => messaging.sendPlainMessage(
       teamName,
       "watchdog",
       "team-lead",
       `Reaped ${member.name}: ${reason}`,
       `Watchdog reaped ${member.name}`,
       "yellow"
-    );
+    )));
   }
 
   async function runWatchdogOnce(targetTeamName: string): Promise<void> {
     const settings = loadSettings({ projectDir: options.getSessionCwd() || process.cwd() });
     const staleMs = runtime.HEARTBEAT_STALE_MS + settings.watchdog.bufferSeconds * 1000;
+    const now = Date.now();
     const config = await teams.readConfig(targetTeamName);
+    const members = config.members.filter((member) => member.name !== "team-lead");
+    const runtimeStatusByMember = await readRuntimeStatusByMember(targetTeamName, members);
+    const reaped: ReapedTeammate[] = [];
 
-    for (const member of config.members) {
-      if (member.name === "team-lead") continue;
-      const role = member.role ?? "write";
-      const runtimeStatus = await runtime.readRuntimeStatus(targetTeamName, member.name);
-      const runtimeStale = teammateRuntimeIsStale(runtimeStatus, staleMs);
+    try {
+      for (const member of members) {
+        const role = member.role ?? "write";
+        const runtimeStatus = runtimeStatusByMember.get(member.name) ?? null;
+        const runtimeStale = teammateRuntimeIsStale(runtimeStatus, staleMs, now);
 
-      if (role === "read") {
-        if (runtimeStale && !options.runningReadAgents.has(options.readAgentKey(targetTeamName, member.name))) {
-          await reapTeammate(targetTeamName, member, "read-agent heartbeat is stale and no in-process session is running");
+        if (role === "read") {
+          if (runtimeStale && !options.runningReadAgents.has(options.readAgentKey(targetTeamName, member.name))) {
+            await shutdownTeammate(targetTeamName, member, { drainQueue: false, removeMember: false });
+            reaped.push({ member, reason: "read-agent heartbeat is stale and no in-process session is running" });
+          }
+          continue;
         }
-        continue;
-      }
 
-      const paneAlive = !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
-      if (!paneAlive) {
-        await reapTeammate(targetTeamName, member, "tmux screen is gone");
-        continue;
-      }
+        const paneAlive = !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
+        if (!paneAlive) {
+          await shutdownTeammate(targetTeamName, member, { drainQueue: false, removeMember: false });
+          reaped.push({ member, reason: "tmux screen is gone" });
+          continue;
+        }
 
-      if (runtimeStale) {
-        await reapTeammate(targetTeamName, member, `heartbeat is stale for more than ${Math.round(staleMs / 1000)}s`);
+        if (runtimeStale) {
+          await shutdownTeammate(targetTeamName, member, { drainQueue: false, removeMember: false });
+          reaped.push({ member, reason: `heartbeat is stale for more than ${Math.round(staleMs / 1000)}s` });
+        }
       }
+    } finally {
+      await flushReapedTeammates(targetTeamName, reaped);
     }
 
     await runtime.cleanupStaleRuntimeFiles(targetTeamName);

@@ -6,14 +6,44 @@ import * as paths from "./paths";
 import {
   cancelQueuedWriteSpawn,
   dequeueWriteSpawn,
+  dequeueWriteSpawns,
   enqueueWriteSpawn,
+  findQueuedWriteSpawn,
   listWriteQueue,
   removeQueuedWriteSpawnsByName,
   queuedWriteSpawnToMember,
 } from "./write-queue";
 
+type EnqueueWriteSpawnRequest = Parameters<typeof enqueueWriteSpawn>[1];
+
 const testDir = path.join(os.tmpdir(), "pi-extended-teams-write-queue-" + Date.now());
 const queuePath = path.join(testDir, "write-queue.json");
+const HIGH_VOLUME_WRITER_COUNT = 350;
+const HIGH_VOLUME_STAGE_BUDGET_MS = 5_000;
+const HIGH_VOLUME_TEST_TIMEOUT_MS = 15_000;
+
+function highVolumeWriterId(index: number): string {
+  return `writer-${String(index).padStart(3, "0")}`;
+}
+
+function highVolumeWriteSpawn(index: number): EnqueueWriteSpawnRequest {
+  const id = highVolumeWriterId(index);
+  return {
+    id,
+    name: id,
+    prompt: `Implement high-volume shard ${index}`,
+    cwd: "/repo",
+    category: index % 2 === 0 ? "feature" : undefined,
+    model: "provider/model",
+    thinking: index % 2 === 0 ? "xhigh" : "high",
+    planModeRequired: index % 2 === 0,
+    color: index % 2 === 0 ? "green" : "blue",
+    operationId: `scale-op-${String(index).padStart(3, "0")}`,
+    workflowRunId: "scale-run",
+    metadata: { slot: index, fanout: HIGH_VOLUME_WRITER_COUNT },
+    requestedAt: index + 1,
+  };
+}
 
 describe("write queue utilities", () => {
   beforeEach(() => {
@@ -51,6 +81,86 @@ describe("write queue utilities", () => {
     expect(await dequeueWriteSpawn("team")).toBeNull();
   });
 
+  it("handles a high configured writer capacity without dropping order or metadata", async () => {
+    const enqueueStartedAt = Date.now();
+    await Promise.all(Array.from({ length: HIGH_VOLUME_WRITER_COUNT }, (_value, index) => (
+      enqueueWriteSpawn("team", highVolumeWriteSpawn(index))
+    )));
+    const enqueueMs = Date.now() - enqueueStartedAt;
+
+    const queue = await listWriteQueue("team");
+    expect(queue).toHaveLength(HIGH_VOLUME_WRITER_COUNT);
+    expect(queue.slice(0, 3).map(item => item.id)).toEqual([
+      highVolumeWriterId(0),
+      highVolumeWriterId(1),
+      highVolumeWriterId(2),
+    ]);
+    expect(queue.at(-1)).toMatchObject({
+      id: highVolumeWriterId(HIGH_VOLUME_WRITER_COUNT - 1),
+      name: highVolumeWriterId(HIGH_VOLUME_WRITER_COUNT - 1),
+      requestedAt: HIGH_VOLUME_WRITER_COUNT,
+      metadata: { fanout: HIGH_VOLUME_WRITER_COUNT },
+    });
+
+    const middleIndex = Math.floor(HIGH_VOLUME_WRITER_COUNT / 2);
+    const middle = await findQueuedWriteSpawn("team", {
+      operationId: `scale-op-${String(middleIndex).padStart(3, "0")}`,
+      workflowRunId: "scale-run",
+    });
+    expect(middle).toMatchObject({
+      id: highVolumeWriterId(middleIndex),
+      metadata: { slot: middleIndex, fanout: HIGH_VOLUME_WRITER_COUNT },
+    });
+    expect(enqueueMs).toBeLessThan(HIGH_VOLUME_STAGE_BUDGET_MS);
+
+    const dequeueStartedAt = Date.now();
+    const drainedIds: string[] = [];
+    for (let index = 0; index < HIGH_VOLUME_WRITER_COUNT; index++) {
+      const queued = await dequeueWriteSpawn("team");
+      expect(queued).not.toBeNull();
+      drainedIds.push(queued!.id);
+    }
+    const dequeueMs = Date.now() - dequeueStartedAt;
+
+    expect(drainedIds[0]).toBe(highVolumeWriterId(0));
+    expect(drainedIds.at(-1)).toBe(highVolumeWriterId(HIGH_VOLUME_WRITER_COUNT - 1));
+    expect(await dequeueWriteSpawn("team")).toBeNull();
+    expect(dequeueMs).toBeLessThan(HIGH_VOLUME_STAGE_BUDGET_MS);
+  }, HIGH_VOLUME_TEST_TIMEOUT_MS);
+
+  it("deduplicates concurrent queued writers by name under the queue lock", async () => {
+    const results = await Promise.all(Array.from({ length: 50 }, (_value, index) => (
+      enqueueWriteSpawn("team", {
+        id: `duplicate-${index}`,
+        name: "writer-a",
+        prompt: `work ${index}`,
+        cwd: "/repo",
+        model: "provider/model",
+      })
+    )));
+
+    const queue = await listWriteQueue("team");
+    expect(queue).toHaveLength(1);
+    expect(new Set(results.map(item => item.id))).toEqual(new Set([queue[0].id]));
+  });
+
+  it("dequeues batches atomically without duplicating or dropping concurrent drains", async () => {
+    for (let index = 0; index < 10; index++) {
+      await enqueueWriteSpawn("team", highVolumeWriteSpawn(index));
+    }
+
+    const [first, second] = await Promise.all([
+      dequeueWriteSpawns("team", 7),
+      dequeueWriteSpawns("team", 7),
+    ]);
+    const drainedIds = [...first, ...second].map(item => item.id);
+
+    expect(drainedIds).toHaveLength(10);
+    expect(new Set(drainedIds).size).toBe(10);
+    expect(drainedIds.sort()).toEqual(Array.from({ length: 10 }, (_value, index) => highVolumeWriterId(index)).sort());
+    expect(await listWriteQueue("team")).toEqual([]);
+  });
+
   it("cancels a queued writer by id", async () => {
     await enqueueWriteSpawn("team", {
       id: "keep",
@@ -72,28 +182,12 @@ describe("write queue utilities", () => {
     expect(await cancelQueuedWriteSpawn("team", "missing")).toBeNull();
   });
 
-  it("removes queued writers by teammate name", async () => {
-    await enqueueWriteSpawn("team", {
-      id: "one",
-      name: "writer-a",
-      prompt: "A",
-      cwd: "/repo",
-      model: "provider/model",
-    });
-    await enqueueWriteSpawn("team", {
-      id: "two",
-      name: "writer-a",
-      prompt: "B",
-      cwd: "/repo",
-      model: "provider/model",
-    });
-    await enqueueWriteSpawn("team", {
-      id: "three",
-      name: "writer-b",
-      prompt: "C",
-      cwd: "/repo",
-      model: "provider/model",
-    });
+  it("removes all queued writers by teammate name, including legacy duplicates", async () => {
+    fs.writeFileSync(queuePath, JSON.stringify([
+      { id: "one", name: "writer-a", prompt: "A", cwd: "/repo", model: "provider/model", requestedAt: 1 },
+      { id: "two", name: "writer-a", prompt: "B", cwd: "/repo", model: "provider/model", requestedAt: 2 },
+      { id: "three", name: "writer-b", prompt: "C", cwd: "/repo", model: "provider/model", requestedAt: 3 },
+    ]));
 
     expect((await removeQueuedWriteSpawnsByName("team", "writer-a")).map(item => item.id)).toEqual(["one", "two"]);
     expect((await listWriteQueue("team")).map(item => item.id)).toEqual(["three"]);

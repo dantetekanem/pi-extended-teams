@@ -14,6 +14,30 @@ export interface ReadAgentStatusDescription {
   idleMs: number;
 }
 
+export type ReadAgentStatusCounts = Partial<Record<ReadAgentStatusLabel, number>>;
+
+export interface ReadAgentStatusSample {
+  agent: RunningReadAgent;
+  status: ReadAgentStatusDescription;
+}
+
+export interface ReadAgentStatusSummary {
+  total: number;
+  counts: ReadAgentStatusCounts;
+  samples: ReadAgentStatusSample[];
+}
+
+export interface ReadAgentStatusSummaryOptions {
+  now?: number;
+  maxDetailed?: number;
+}
+
+interface ReadAgentStatusClassification {
+  label: ReadAgentStatusLabel;
+  idleLevel: ReadAgentIdleLevel;
+  idleMs: number;
+}
+
 export function buildReadAgentIdleNudgeMessage(agent: RunningReadAgent, status: ReadAgentStatusDescription): string {
   const severity = status.idleLevel === "hard" ? "appears hung" : "has gone quiet";
   const action = status.idleLevel === "hard"
@@ -29,32 +53,70 @@ export function shouldNudgeReadAgentIdle(previousLevel: "soft" | "hard" | undefi
 }
 
 export function describeReadAgentStatus(agent: RunningReadAgent, now = Date.now()): ReadAgentStatusDescription {
+  return describeReadAgentStatusFromClassification(agent, classifyReadAgentStatus(agent, now));
+}
+
+export function summarizeReadAgentStatuses(
+  agents: Iterable<RunningReadAgent>,
+  options: ReadAgentStatusSummaryOptions = {}
+): ReadAgentStatusSummary {
+  const now = options.now ?? Date.now();
+  const maxDetailed = Math.max(0, options.maxDetailed ?? Number.POSITIVE_INFINITY);
+  const counts: ReadAgentStatusCounts = {};
+  const samples: ReadAgentStatusSample[] = [];
+  let total = 0;
+
+  for (const agent of agents) {
+    const classification = classifyReadAgentStatus(agent, now);
+    counts[classification.label] = (counts[classification.label] ?? 0) + 1;
+    if (samples.length < maxDetailed) {
+      samples.push({
+        agent,
+        status: describeReadAgentStatusFromClassification(agent, classification),
+      });
+    }
+    total++;
+  }
+
+  return { total, counts, samples };
+}
+
+function classifyReadAgentStatus(agent: RunningReadAgent, now: number): ReadAgentStatusClassification {
   const lastActivityAt = agent.lastActivityAt || agent.startedAt;
   const idleMs = Math.max(0, now - lastActivityAt);
 
   if (idleMs >= READ_AGENT_HANGING_NUDGE_MS) {
-    return {
-      label: "hanging",
-      detail: `no response/token change for ${formatElapsed(idleMs)} · ping/check now`,
-      idleLevel: "hard",
-      idleMs,
-    };
+    return { label: "hanging", idleLevel: "hard", idleMs };
   }
 
   if (idleMs >= READ_AGENT_IDLE_NUDGE_MS) {
+    return { label: "idle", idleLevel: "soft", idleMs };
+  }
+
+  return { label: agent.status, idleLevel: "none", idleMs };
+}
+
+function describeReadAgentStatusFromClassification(
+  agent: RunningReadAgent,
+  classification: ReadAgentStatusClassification
+): ReadAgentStatusDescription {
+  if (classification.idleLevel === "hard") {
     return {
-      label: "idle",
-      detail: `no response/token change for ${formatElapsed(idleMs)} · consider ping/check`,
-      idleLevel: "soft",
-      idleMs,
+      ...classification,
+      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · ping/check now`,
+    };
+  }
+
+  if (classification.idleLevel === "soft") {
+    return {
+      ...classification,
+      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · consider ping/check`,
     };
   }
 
   return {
-    label: agent.status,
+    ...classification,
     detail: describeActiveReadAgentWork(agent),
-    idleLevel: "none",
-    idleMs,
   };
 }
 

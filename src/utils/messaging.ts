@@ -22,6 +22,11 @@ export interface SendPlainMessageOnceResult {
   delivered: boolean;
 }
 
+export interface ReadInboxTailOptions {
+  unreadOnly?: boolean;
+  markAsRead?: boolean;
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }
@@ -39,10 +44,58 @@ function readInboxRaw(p: string): InboxMessage[] {
   return Array.isArray(parsed) ? parsed : [];
 }
 
-function messageOperationMatches(message: InboxMessage, operationId: string, workflowRunId?: string): boolean {
+export function messageOperationMatches(message: InboxMessage, operationId: string, workflowRunId?: string): boolean {
   const messageOperationId = message.operationId || message.metadata?.operationId;
   const messageWorkflowRunId = message.workflowRunId || message.metadata?.workflowRunId;
   return messageOperationId === operationId && (workflowRunId === undefined || messageWorkflowRunId === workflowRunId);
+}
+
+function cloneInboxMessage(message: InboxMessage): InboxMessage {
+  return {
+    ...message,
+    metadata: message.metadata ? { ...message.metadata } : undefined,
+  };
+}
+
+function cloneInboxMessages(messages: InboxMessage[]): InboxMessage[] {
+  return messages.map(cloneInboxMessage);
+}
+
+function normalizeInboxLimit(limit: number): number {
+  if (!Number.isInteger(limit) || limit < 0) {
+    throw new Error("Inbox limit must be a non-negative integer");
+  }
+  return limit;
+}
+
+function selectInboxMessages(allMsgs: InboxMessage[], unreadOnly: boolean, limit?: number): InboxMessage[] {
+  const matches = (message: InboxMessage) => !unreadOnly || !message.read;
+
+  if (limit === undefined) {
+    return unreadOnly ? allMsgs.filter(matches) : allMsgs;
+  }
+
+  const normalizedLimit = normalizeInboxLimit(limit);
+  if (normalizedLimit === 0) return [];
+
+  const result: InboxMessage[] = [];
+  for (let index = allMsgs.length - 1; index >= 0 && result.length < normalizedLimit; index--) {
+    const message = allMsgs[index];
+    if (matches(message)) result.push(message);
+  }
+
+  return result.reverse();
+}
+
+function markMessagesRead(messages: InboxMessage[]): boolean {
+  let changed = false;
+  for (const message of messages) {
+    if (!message.read) {
+      message.read = true;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 export async function appendMessage(teamName: string, agentName: string, message: InboxMessage) {
@@ -84,22 +137,50 @@ export async function readInbox(
 
   return await withLock(p, async () => {
     const allMsgs = readInboxRaw(p);
-    let result = allMsgs;
+    const result = selectInboxMessages(allMsgs, unreadOnly);
 
-    if (unreadOnly) {
-      result = allMsgs.filter(m => !m.read);
-    }
-
-    if (markAsRead && result.length > 0) {
-      for (const m of allMsgs) {
-        if (result.includes(m)) {
-          m.read = true;
-        }
-      }
+    if (markAsRead && result.length > 0 && markMessagesRead(result)) {
       fs.writeFileSync(p, JSON.stringify(allMsgs, null, 2));
     }
 
-    return result;
+    return cloneInboxMessages(result);
+  });
+}
+
+export async function readInboxTail(
+  teamName: string,
+  agentName: string,
+  limit: number,
+  options: ReadInboxTailOptions = {}
+): Promise<InboxMessage[]> {
+  const normalizedLimit = normalizeInboxLimit(limit);
+  const p = inboxPath(teamName, agentName);
+  if (!fs.existsSync(p)) return [];
+
+  return await withLock(p, async () => {
+    const allMsgs = readInboxRaw(p);
+    const result = selectInboxMessages(allMsgs, options.unreadOnly === true, normalizedLimit);
+
+    if (options.markAsRead === true && result.length > 0 && markMessagesRead(result)) {
+      fs.writeFileSync(p, JSON.stringify(allMsgs, null, 2));
+    }
+
+    return cloneInboxMessages(result);
+  });
+}
+
+export async function findInboxMessageByOperation(
+  teamName: string,
+  agentName: string,
+  operationId: string,
+  workflowRunId?: string
+): Promise<InboxMessage | undefined> {
+  const p = inboxPath(teamName, agentName);
+  if (!fs.existsSync(p)) return undefined;
+
+  return await withLock(p, async () => {
+    const message = readInboxRaw(p).find((item) => messageOperationMatches(item, operationId, workflowRunId));
+    return message ? cloneInboxMessage(message) : undefined;
   });
 }
 

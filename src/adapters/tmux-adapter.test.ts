@@ -39,28 +39,12 @@ describe("TmuxAdapter", () => {
 
   it("spawns a detached background window in the originating tmux session", () => {
     mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%16" &&
-        args[4] === "#{pane_id}"
-      ) {
-        return { stdout: "%16", stderr: "", status: 0 };
+      if (args[0] === "list-panes") {
+        return { stdout: "%16\t@7\n", stderr: "", status: 0 };
       }
 
       if (args[0] === "new-window") {
         return { stdout: "%42", stderr: "", status: 0 };
-      }
-
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%16" &&
-        args[4] === "#{window_id}"
-      ) {
-        return { stdout: "@7", stderr: "", status: 0 };
       }
 
       return { stdout: "", stderr: "", status: 0 };
@@ -99,28 +83,12 @@ describe("TmuxAdapter", () => {
 
   it("should prefer an explicit anchor pane when spawning", () => {
     mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%3" &&
-        args[4] === "#{pane_id}"
-      ) {
-        return { stdout: "%3", stderr: "", status: 0 };
+      if (args[0] === "list-panes") {
+        return { stdout: "%3\t@9\n%16\t@7\n", stderr: "", status: 0 };
       }
 
       if (args[0] === "new-window") {
         return { stdout: "%42", stderr: "", status: 0 };
-      }
-
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%3" &&
-        args[4] === "#{window_id}"
-      ) {
-        return { stdout: "@9", stderr: "", status: 0 };
       }
 
       return { stdout: "", stderr: "", status: 0 };
@@ -156,38 +124,12 @@ describe("TmuxAdapter", () => {
 
   it("should fall back to the current pane when the explicit anchor is stale", () => {
     mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%3" &&
-        args[4] === "#{pane_id}"
-      ) {
-        return { stdout: "", stderr: "no such pane", status: 1 };
-      }
-
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%16" &&
-        args[4] === "#{pane_id}"
-      ) {
-        return { stdout: "%16", stderr: "", status: 0 };
+      if (args[0] === "list-panes") {
+        return { stdout: "%16\t@7\n", stderr: "", status: 0 };
       }
 
       if (args[0] === "new-window") {
         return { stdout: "%42", stderr: "", status: 0 };
-      }
-
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%16" &&
-        args[4] === "#{window_id}"
-      ) {
-        return { stdout: "@7", stderr: "", status: 0 };
       }
 
       return { stdout: "", stderr: "", status: 0 };
@@ -217,26 +159,100 @@ describe("TmuxAdapter", () => {
     );
   });
 
-  it("focuses a pane by selecting its window and pane", () => {
+  it("checks many pane liveness calls from one list-panes snapshot", () => {
     mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%42" &&
-        args[4] === "#{pane_id}"
-      ) {
+      if (args[0] === "list-panes") {
+        return { stdout: "%1\t@7\n%2\t@7\n", stderr: "", status: 0 };
+      }
+
+      return { stdout: "", stderr: "", status: 0 };
+    });
+
+    expect(adapter.isAlive("%1")).toBe(true);
+    expect(adapter.isAlive("%2")).toBe(true);
+    expect(adapter.isAlive("%3")).toBe(false);
+
+    expect(mockExecCommand).toHaveBeenCalledTimes(1);
+    expect(mockExecCommand).toHaveBeenCalledWith(
+      "tmux",
+      ["list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"]
+    );
+  });
+
+  it("refreshes the pane snapshot after the short TTL expires", () => {
+    let now = 1000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    mockExecCommand
+      .mockReturnValueOnce({ stdout: "%1\t@7\n", stderr: "", status: 0 })
+      .mockReturnValueOnce({ stdout: "%2\t@7\n", stderr: "", status: 0 });
+
+    expect(adapter.isAlive("%1")).toBe(true);
+
+    now = 1050;
+    expect(adapter.isAlive("%2")).toBe(false);
+
+    now = 1200;
+    expect(adapter.isAlive("%2")).toBe(true);
+    expect(mockExecCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates the cached pane snapshot after spawning", () => {
+    let listPaneCalls = 0;
+    mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
+      if (args[0] === "list-panes") {
+        listPaneCalls += 1;
+        return {
+          stdout: listPaneCalls === 1 ? "%16\t@7\n" : "%16\t@7\n%42\t@8\n",
+          stderr: "",
+          status: 0,
+        };
+      }
+
+      if (args[0] === "new-window") {
         return { stdout: "%42", stderr: "", status: 0 };
       }
 
-      if (
-        args[0] === "display-message" &&
-        args[1] === "-p" &&
-        args[2] === "-t" &&
-        args[3] === "%42" &&
-        args[4] === "#{window_id}"
-      ) {
-        return { stdout: "@9", stderr: "", status: 0 };
+      return { stdout: "", stderr: "", status: 0 };
+    });
+
+    expect(adapter.isAlive("%16")).toBe(true);
+
+    const paneId = adapter.spawn({
+      name: "agent-1",
+      cwd: "/tmp/project",
+      command: "pi",
+      env: { PI_TEAM_NAME: "team-1", PI_AGENT_NAME: "agent-1" },
+    });
+
+    expect(paneId).toBe("%42");
+    expect(adapter.isAlive("%42")).toBe(true);
+    expect(listPaneCalls).toBe(2);
+  });
+
+  it("falls back to display-message when list-panes is unavailable", () => {
+    mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
+      if (args[0] === "list-panes") {
+        return { stdout: "", stderr: "tmux too old", status: 1 };
+      }
+
+      if (args[0] === "display-message") {
+        return { stdout: "%42", stderr: "", status: 0 };
+      }
+
+      return { stdout: "", stderr: "", status: 0 };
+    });
+
+    expect(adapter.isAlive("%42")).toBe(true);
+    expect(mockExecCommand).toHaveBeenCalledWith(
+      "tmux",
+      ["display-message", "-p", "-t", "%42", "#{pane_id}"]
+    );
+  });
+
+  it("focuses a pane by selecting its window and pane", () => {
+    mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
+      if (args[0] === "list-panes") {
+        return { stdout: "%42\t@9\n", stderr: "", status: 0 };
       }
 
       return { stdout: "", stderr: "", status: 0 };

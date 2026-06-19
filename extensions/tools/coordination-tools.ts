@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { Type } from "@sinclair/typebox";
 import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
@@ -11,6 +12,7 @@ import * as reportEvents from "../../src/utils/report-events";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
 import { StringEnum } from "../internal/schema";
 import { requestLeadForTeammateSpawn } from "./delegation-guard";
+import { unlinkPidFile } from "../internal/session-files";
 import { summarizeSessionUsage } from "../internal/session-usage";
 import { enqueueReadHelperRequest, listReadHelperQueue } from "../../src/utils/read-helper-queue";
 import { memberWorkflowRunId, workflowAllowsReadHelper, workflowAllowsSkill } from "../../src/utils/workflow-metadata";
@@ -181,6 +183,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         workflowRunId: member?.metadata?.workflowRunId || member?.metadata?.orchestration?.workflowRunId,
       }).catch(() => {});
       const releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);
+      unlinkPidFile(path.join(paths.teamDir(targetTeamName), `${options.agentName}.pid`));
       await runtime.deleteRuntimeStatus(targetTeamName, options.agentName);
       await teams.removeMember(targetTeamName, options.agentName);
       await options.drainWriteQueue(targetTeamName);

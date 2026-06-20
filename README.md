@@ -1,10 +1,8 @@
 # pi-extended-teams
 
-**pi-extended-teams** multiplies a single Pi session with helper agents while keeping the main agent in charge. Read agents run in-process for parallel investigation, review, and tests. Write agents are opt-in, background tmux screens for isolated edit work.
+**pi-extended-teams** multiplies a single Pi session with helper agents while keeping the main agent in charge. Agents run in-process so Pi can follow, track, and surface their reports without a separate setup ceremony.
 
-This package is intentionally narrower than the original pi-teams: tmux is the only supported write-agent screen backend, read agents do not open tmux screens, and the preferred flow is one-call team creation with automatic report delivery.
-
-> **tmux is required only for write agents.** Read agents run in-process and work without opening tmux screens.
+The preferred workflow is simple: ask for agents, or call `spawn_agent` / `spawn_swarm_agents`. The current Pi session is the implicit agent group.
 
 ## Installation
 
@@ -20,16 +18,9 @@ Install from a local checkout while developing:
 pi install /absolute/path/to/pi-extended-teams
 ```
 
-To use write agents, start Pi inside a tmux session:
+## Quick start
 
-```bash
-tmux
-pi
-```
-
-## Quick Start
-
-Usually you just describe the work and the lead does the rest. A team can be created with inline read agents, they run in parallel, and their reports come back to the main session automatically.
+Usually you just describe the work and the lead spawns agents when parallel coverage helps:
 
 ```text
 Review the current changes with a couple of agents and summarize the findings.
@@ -38,41 +29,64 @@ Review the current changes with a couple of agents and summarize the findings.
 Equivalent explicit shape:
 
 ```text
-Create a team "review" with agents:
-- git-check: inspect diffs and report risks
-- test-gaps: find missing coverage
+spawn_swarm_agents({
+  defaults: { role: "read", thinking: "high" },
+  agents: [
+    { name: "git-check", prompt: "Inspect diffs and report risks." },
+    { name: "test-gaps", prompt: "Find missing coverage and concrete test gaps." }
+  ]
+})
 ```
 
 Watch active and completed agents:
 
-```bash
-/team
+```text
+/agents
 ```
 
-Spawn a write agent only when the work is isolated and safe to run in a background tmux screen:
+`/team` remains a compatibility alias for `/agents`.
+
+Spawn an edit-allowed agent only when the work is isolated and safe to run in parallel:
 
 ```text
-Spawn a write agent to fix only the typos in docs/guide.md.
+spawn_agent({
+  name: "docs-fix",
+  role: "write",
+  prompt: "Claim docs/guide.md, fix only stale public tool names, verify, then call report_and_exit."
+})
 ```
 
-## Core Features
+## Core features
 
-- **One-call teams**: `team_create` can create a team and start inline agents immediately.
+- **Implicit current-session workflow**: no public team setup step is required.
 - **Read agents as the default multiplier**: in-process, parallel, full read/test/search tool access, directed to report without editing.
-- **Auto-delivered reports**: finished read agents report back to the main session as collapsed entries that the lead can synthesize.
-- **`/team` overlay**: inspect the lead view, active read agents, background write-agent screens, completed reports, models, thinking levels, tasks, and claims.
-- **Writer screen cycling**: write agents spawn in detached tmux windows by default; press Alt/Option+Tab to cycle main + writer screens, or press Enter/a on a writer in `/team` to attach live.
-- **Write-agent queue**: write agents are opt-in, capped, queued, and tmux-backed.
-- **Advisory file claims**: write agents coordinate file ownership with `claim_file`, `release_file`, and `list_file_claims`.
-- **Teammate messaging**: send direct messages, broadcasts, and inbox reports between team members.
-- **Shared task board**: create, assign, plan, approve, update, and list team tasks.
-- **Plan approval mode**: require a teammate to submit a plan before it starts implementation.
-- **Model and thinking selection**: use fully qualified `provider/model` strings and optional thinking levels.
-- **Watchdog cleanup**: stale teammate runtime state and dead write-agent screens are cleaned up.
+- **Optional edit agents**: in-process and followable from Pi; use them only for isolated, non-overlapping edits.
+- **Auto-delivered reports**: completed agents report back to the lead session for synthesis.
+- **`/agents` overlay**: inspect active agents, completed reports, transcripts, models, thinking levels, elapsed time, tokens, and claims.
+- **Advisory file claims**: edit agents coordinate file ownership with `claim_file`, `release_file`, and `list_file_claims`.
+- **Direct messaging**: agents and the lead can coordinate with `send_message` and `read_inbox`.
+- **Targeted health checks**: use `check_teammate` only when a specific agent appears stalled.
 
-## Supported Workflow
+## Public tool surface
 
-Use pi-extended-teams for parallel read-only investigation first, then add write agents only when the edit is isolated.
+Lead/session tools:
+
+- `spawn_agent`
+- `spawn_swarm_agents`
+- `check_teammate`
+- `send_message`
+- `read_inbox`
+
+Edit-agent coordination tools:
+
+- `claim_file`
+- `release_file`
+- `list_file_claims`
+- `report_and_exit`
+
+## Supported workflow
+
+Use pi-extended-teams for parallel read-only investigation first. Add edit agents only when the edit is isolated.
 
 Good fits:
 
@@ -80,80 +94,69 @@ Good fits:
 - Run independent test suites in parallel.
 - Validate a refactor with separate static, focused-test, full-suite, and smoke lanes.
 - Ask one agent to inspect architecture while another checks test coverage.
-- Spawn a write agent for a narrow, non-overlapping file change.
+- Spawn an edit agent for a narrow, non-overlapping file change.
 
 Avoid:
 
-- Treating write agents as the default path.
-- Spawning multiple write agents for the same files.
-- Using non-tmux backends for write agents.
+- Treating edit agents as the default implementation path.
+- Spawning multiple edit agents for the same files.
+- Having agents create more agents; they should ask the lead with `send_message`.
+- Polling for completion with sleeps or loops; the extension wakes the lead.
 
-## Common Examples
+## Common examples
 
-### List models
+### Spawn one read agent
 
 ```text
-List available models for team creation.
+spawn_agent({
+  name: "security-reviewer",
+  role: "read",
+  prompt: "Review the auth module for injection and authorization risks. Report findings with file:line evidence."
+})
 ```
 
-Models must be fully qualified, for example:
+### Spawn a swarm
 
 ```text
-openai-codex/gpt-5.5
+spawn_swarm_agents({
+  defaults: { role: "read", cwd: "/path/to/project", thinking: "high" },
+  agents: [
+    { name: "architecture", prompt: "Review module boundaries and coupling." },
+    { name: "tests", prompt: "Run focused tests and report failures or gaps." },
+    { name: "docs", prompt: "Check README accuracy against the current public tools." }
+  ]
+})
 ```
 
-### Create a team with read agents
+### Spawn an edit agent
 
 ```text
-Create a team named "repo-review" with agents:
-- architecture: review module boundaries and coupling
-- tests: run focused tests and report failures
-- docs: check README accuracy
+spawn_agent({
+  name: "typo-fix",
+  role: "write",
+  prompt: "Claim README.md, fix typos only, run the focused docs check, then call report_and_exit. Do not commit or push."
+})
 ```
 
-### Spawn a teammate
+### Send a direct message
 
 ```text
-Spawn a teammate named "security-bot" in the current folder. Tell it to scan for hardcoded API keys.
+send_message({ recipient: "security-reviewer", content: "Also check webhook signature validation.", summary: "Scope update" })
 ```
 
-### Promote a read agent into a write pane
+### Check one agent
 
 ```text
-Move teammate "docs-bot" into a background tmux screen with the same mission.
-```
-
-### Use plan approval
-
-```text
-Spawn a teammate named "refactor-bot" and require plan approval before it makes changes.
-```
-
-### Work with tasks
-
-```text
-Create a task for security-bot: "Check the .env.example file for sensitive defaults".
-```
-
-```text
-Review refactor-bot's plan for task 5. Approve it if it has enough test coverage, otherwise reject it with feedback.
-```
-
-### Send team messages
-
-```text
-Broadcast to the entire team: "The API endpoint has changed to /v2. Please update your work accordingly."
-```
-
-### Shut down
-
-```text
-Shut down team "repo-review".
+check_teammate({ agent_name: "security-reviewer" })
 ```
 
 ## Configuration
 
-Model-list ordering can be configured globally with `~/.pi/pi-extended-teams.json` or per project with `.pi/pi-extended-teams.json`.
+Model and thinking defaults come from Pi and optional pi-extended-teams settings.
+
+Project-local config lives at `.pi/pi-extended-teams.json`; global config lives at `~/.pi/pi-extended-teams.json`.
+
+Example:
 
 ```json
 {
@@ -161,29 +164,18 @@ Model-list ordering can be configured globally with `~/.pi/pi-extended-teams.jso
     "openai-codex",
     "claude-agent-sdk",
     "kimi-coding"
-  ]
+  ],
+  "readAgents": {
+    "maxConcurrent": 8,
+    "queueOverflow": true
+  },
+  "writeAgents": {
+    "maxConcurrent": 1
+  }
 }
 ```
 
-Project-local config overrides global config.
-
-Pi model settings still come from Pi settings (`defaultProvider`, `defaultModel`, and `enabledModels`). The extension combines those settings with the available model registry and reports fully qualified model names through `list_available_models`.
-
-## Terminal Requirements
-
-Write agents require tmux because they run in separate background screens. Read agents run in-process.
-
-Install tmux:
-
-- macOS: `brew install tmux`
-- Linux: `sudo apt install tmux`
-
-Run Pi inside tmux when you want write agents:
-
-```bash
-tmux
-pi
-```
+You can also pass fully qualified `provider/model` strings and thinking levels directly to `spawn_agent` or `spawn_swarm_agents`.
 
 ## Development
 
@@ -198,21 +190,21 @@ Useful checks:
 
 ```bash
 ./node_modules/.bin/tsc --noEmit
-./node_modules/.bin/vitest run extensions/internal/pi-command.test.ts extensions/ui-frame.test.ts extensions/index.test.ts
+./node_modules/.bin/vitest run extensions/index.test.ts extensions/events/register-events.test.ts extensions/tools/team-tools.read-agent.test.ts
 ./node_modules/.bin/vitest run
 rg --files -g '*.ts' -g '!node_modules' | xargs wc -l | awk '$2 != "total" && $1 > 500 {print}'
 ```
 
-The current source layout keeps TypeScript files under 500 lines. `extensions/index.ts` is a composition root; behavior lives in focused modules under `extensions/agents`, `extensions/events`, `extensions/internal`, `extensions/team`, `extensions/tools`, `extensions/ui`, and `extensions/runtime`.
+The current source layout keeps TypeScript files under 500 lines where practical. `extensions/index.ts` is a composition root; behavior lives in focused modules under `extensions/agents`, `extensions/events`, `extensions/internal`, `extensions/team`, `extensions/tools`, `extensions/ui`, and `extensions/runtime`.
 
-## Learn More
+## Learn more
 
-- [Full Usage Guide](docs/guide.md)
+- [Usage Guide](docs/guide.md)
 - [Tool Reference](docs/reference.md)
 
-## Credits & Attribution
+## Credits & attribution
 
-pi-extended-teams is based on the original [pi-teams](https://github.com/burggraf/pi-teams) project and keeps a narrower tmux-first contract for this fork.
+pi-extended-teams is based on the original [pi-teams](https://github.com/burggraf/pi-teams) project, with this fork focused on session-connected agents and a smaller public tool surface.
 
 The broader team-agent coordination lineage also includes [claude-code-teams-mcp](https://github.com/cs50victor/claude-code-teams-mcp) by [cs50victor](https://github.com/cs50victor).
 

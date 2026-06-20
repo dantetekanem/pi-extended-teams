@@ -1,416 +1,227 @@
 # pi-extended-teams Usage Guide
 
-This guide provides detailed examples, patterns, and best practices for using pi-extended-teams.
+This guide shows the current session-connected workflow for pi-extended-teams. The lead stays in the main Pi session and spawns helper agents when parallel coverage helps.
 
-## Table of Contents
+## Contents
 
-- [Getting Started](#getting-started)
-- [Common Workflows](#common-workflows)
-- [Hook System](#hook-system)
-- [Best Practices](#best-practices)
+- [Getting started](#getting-started)
+- [Common workflows](#common-workflows)
+- [Best practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
+- [Cleanup](#cleanup)
 
 ---
 
-## Getting Started
+## Getting started
 
-### Basic Team Setup
+You do not need to create a separate team. The current Pi session is the implicit agent group.
 
-First, make sure you're inside a tmux session. Write agents require background tmux screens; read agents run in-process and do not open tmux screens.
+Ask naturally:
 
-```bash
-tmux
+```text
+Use agents to review the current diff and summarize the risks.
 ```
 
-Then start pi:
+Or spawn explicitly:
 
-```bash
-pi
+```text
+spawn_swarm_agents({
+  defaults: { role: "read", thinking: "high" },
+  agents: [
+    { name: "security", prompt: "Review the diff for security risks. Report file:line findings." },
+    { name: "tests", prompt: "Find missing or weak test coverage. Report concrete gaps." }
+  ]
+})
 ```
 
-Create your first team:
+Open the panel:
 
-> **You:** "List available models for team creation, then create a team named 'my-team' using 'openai-codex/gpt-5.4'"
+```text
+/agents
+```
 
-Set a default model for all teammates:
-
-> **You:** "List available models for team creation, then create a team named 'Research' and use 'openai-codex/gpt-5.4' for everyone"
+`/team` still opens the same panel for compatibility.
 
 ---
 
-## Common Workflows
+## Common workflows
 
-### 1. Code Review Team
+### 1. Code review with read agents
 
-> **You:** "List available models for team creation"
-> **You:** "Create a team named 'code-review' using 'openai-codex/gpt-5.4'"
-> **You:** "Spawn a teammate named 'security-reviewer' to check for vulnerabilities"
-> **You:** "Spawn a teammate named 'performance-reviewer' using 'claude-agent-sdk/claude-sonnet-4-6' to check for optimization opportunities"
-> **You:** "Create a task for security-reviewer: 'Review the auth module for SQL injection risks' and set it to in_progress"
-> **You:** "Create a task for performance-reviewer: 'Analyze the database queries for N+1 issues' and set it to in_progress"
-
-### 2. Refactor with Plan Approval
-
-> **You:** "Create a team named 'refactor-squad' using 'openai-codex/gpt-5.4'"
-> **You:** "Spawn a teammate named 'refactor-bot' and require plan approval before they make any changes"
-> **You:** "Create a task for refactor-bot: 'Refactor the user service to use dependency injection' and set it to in_progress"
-
-Teammate submits a plan. Review it:
-
-> **You:** "List all tasks and show me refactor-bot's plan for task 1"
-
-Approve or reject:
-
-> **You:** "Approve refactor-bot's plan for task 1"
-
-> **You:** "Reject refactor-bot's plan for task 1 with feedback: 'Add unit tests for the new injection pattern'"
-
-### 3. Testing with Automated Hooks
-
-Create a hook script at `.pi/team-hooks/task_completed.sh`:
-
-```bash
-#!/bin/bash
-# This script runs automatically when any task is completed
-
-echo "Running post-task checks..."
-pnpm test
-if [ $? -ne 0 ]; then
-  echo "Tests failed! Please fix before marking task complete."
-  exit 1
-fi
-
-pnpm run lint
-echo "All checks passed!"
+```text
+spawn_swarm_agents({
+  defaults: { role: "read", thinking: "high" },
+  agents: [
+    { name: "security-reviewer", prompt: "Review src/auth for authn/authz bugs. Report severity, file:line, and suggested fix." },
+    { name: "performance-reviewer", prompt: "Review the diff for avoidable performance regressions. Include evidence." },
+    { name: "test-reviewer", prompt: "Inspect tests around this change. Report missing regression coverage." }
+  ]
+})
 ```
 
-> **You:** "Create a team named 'test-team' using 'openai-codex/gpt-5.4'"
-> **You:** "Spawn a teammate named 'qa-bot' to write tests"
-> **You:** "Create a task for qa-bot: 'Write unit tests for the payment module' and set it to in_progress"
+The lead keeps working or waits for automatic report delivery. Do not sleep or poll for completion.
 
-When qa-bot marks the task as completed, the hook automatically runs tests and linting.
+### 2. Focused edit agent
 
-### 4. Coordinated Migration
+Use an edit agent only when the change is narrow and isolated.
 
-> **You:** "Create a team named 'migration-team' using 'openai-codex/gpt-5.4'"
-> **You:** "Spawn a teammate named 'db-migrator' to handle database changes"
-> **You:** "Spawn a teammate named 'api-updater' using 'openai-codex/gpt-5.4' to update API endpoints"
-> **You:** "Spawn a teammate named 'test-writer' to write tests for the migration"
-> **You:** "Create a task for db-migrator: 'Add new columns to the users table' and set it to in_progress"
-
-After db-migrator completes, broadcast the schema change:
-
-> **You:** "Broadcast to the team: 'New columns added to users table: phone, email_verified. Please update your code accordingly.'"
-
-### 5. Mixed-Speed Team
-
-Use different models for cost optimization:
-
-> **You:** "List available models for team creation"
-> **You:** "Create a team named 'mixed-speed' using 'openai-codex/gpt-5.4'"
-> **You:** "Spawn a teammate named 'architect' using 'openai-codex/gpt-5.4' with 'xhigh' thinking level for design decisions"
-> **You:** "Spawn a teammate named 'implementer' using 'claude-agent-sdk/claude-sonnet-4-6' with 'low' thinking level for quick coding"
-> **You:** "Spawn a teammate named 'reviewer' using 'openai-codex/gpt-5.4' with 'medium' thinking level for code reviews"
-
-Now you have expensive reasoning for design and reviews, but fast/cheap implementation.
-
----
-
-## Hook System
-
-### Overview
-
-Hooks are shell scripts that run automatically at specific events. Currently supported:
-
-- **`task_completed.sh`** - Runs when any task's status changes to `completed`
-
-### Hook Location
-
-Hooks should be placed in `.pi/team-hooks/` in your project directory:
-
-```
-your-project/
-├── .pi/
-│   └── team-hooks/
-│       └── task_completed.sh
+```text
+spawn_agent({
+  name: "docs-fix",
+  role: "write",
+  prompt: "Claim README.md and docs/guide.md, update only stale public tool references, run the focused docs checks, then call report_and_exit. Do not commit or push."
+})
 ```
 
-### Hook Payload
+A good edit-agent prompt includes:
 
-The hook receives the task data as a JSON string as the first argument:
+- exact files or directories,
+- claim-file requirements,
+- what must not change,
+- verification commands,
+- and the expected final report.
 
-```bash
-#!/bin/bash
-TASK_DATA="$1"
-echo "Task completed: $TASK_DATA"
+### 3. Mixed model/thinking swarm
+
+```text
+spawn_swarm_agents({
+  defaults: { role: "read", cwd: "/path/to/project" },
+  agents: [
+    { name: "architect", model: "openai-codex/gpt-5.5", thinking: "xhigh", prompt: "Review architecture and coupling risks." },
+    { name: "smoke", thinking: "low", prompt: "Run lightweight smoke checks and report failures." },
+    { name: "docs", thinking: "medium", prompt: "Check README and docs for stale user instructions." }
+  ]
+})
 ```
 
-Example payload:
-```json
-{
-  "id": "task_123",
-  "subject": "Fix login bug",
-  "description": "Users can't login with special characters",
-  "status": "completed",
-  "owner": "fixer-bot"
-}
+Use fully qualified model names when overriding the current Pi model.
+
+### 4. Direct coordination
+
+Send a targeted update:
+
+```text
+send_message({
+  recipient: "docs",
+  summary: "Scope update",
+  content: "Also inspect docs/reference.md. Do not edit."
+})
 ```
 
-### Example Hooks
+Read your own inbox when the extension wakes you or you expect a reply:
 
-#### Test on Completion
-
-```bash
-#!/bin/bash
-# .pi/team-hooks/task_completed.sh
-
-TASK_DATA="$1"
-SUBJECT=$(echo "$TASK_DATA" | jq -r '.subject')
-
-echo "Running tests after task: $SUBJECT"
-pnpm test
+```text
+read_inbox({ unread_only: true })
 ```
 
-#### Notify Slack
+### 5. Liveness check
 
-```bash
-#!/bin/bash
-# .pi/team-hooks/task_completed.sh
+Use `check_teammate` only when a specific agent appears stalled:
 
-TASK_DATA="$1"
-SUBJECT=$(echo "$TASK_DATA" | jq -r '.subject')
-OWNER=$(echo "$TASK_DATA" | jq -r '.owner')
-
-curl -X POST -H 'Content-type: application/json' \
-  --data "{\"text\":\"Task '$SUBJECT' completed by $OWNER\"}" \
-  "$SLACK_WEBHOOK_URL"
-```
-
-#### Conditional Checks
-
-```bash
-#!/bin/bash
-# .pi/team-hooks/task_completed.sh
-
-TASK_DATA="$1"
-SUBJECT=$(echo "$TASK_DATA" | jq -r '.subject')
-
-# Only run full test suite for production-related tasks
-if [[ "$SUBJECT" == *"production"* ]] || [[ "$SUBJECT" == *"deploy"* ]]; then
-  pnpm run test:ci
-else
-  pnpm test
-fi
+```text
+check_teammate({ agent_name: "security-reviewer" })
 ```
 
 ---
 
-## Best Practices
+## Best practices
 
-### 1. Use Thinking Levels Wisely
+### Use read agents first
 
-- **`off`** - Simple tasks: formatting, moving code, renaming
-- **`minimal`** - Quick decisions: small refactors, straightforward bugfixes
-- **`low`** - Standard work: typical feature implementation, tests
-- **`medium`** - Complex work: architecture decisions, tricky bugs
-- **`high`** - Critical work: security reviews, major refactors, design specs
-- **`xhigh`** - Deepest available reasoning: architecture audits, thorny debugging, high-stakes review work
+Read agents are the safest multiplier. Use them for:
 
-### 2. Team Composition
+- diff review,
+- test-gap analysis,
+- architecture review,
+- security audit,
+- release-readiness checks,
+- unfamiliar-code investigation.
 
-Balanced teams typically include:
-- **1-2 high-thinking, high-model** agents for architecture and reviews
-- **Use `xhigh` sparingly** for the one teammate doing the hardest reasoning-heavy work
-- **2-3 low-thinking, fast-model** agents for implementation
-- **1 medium-thinking** agent for coordination
+### Keep edit agents rare
 
-Example:
-```bash
-# Design/Review duo (expensive but thorough)
-spawn "architect" using "openai-codex/gpt-5.4" with "xhigh" thinking
-spawn "reviewer" using "openai-codex/gpt-5.4" with "medium" thinking
+Use `role: "write"` only when:
 
-# Implementation trio (fast and cheap)
-spawn "backend-dev" using "claude-agent-sdk/claude-sonnet-4-6" with "low" thinking
-spawn "frontend-dev" using "claude-agent-sdk/claude-sonnet-4-6" with "low" thinking
-spawn "test-writer" using "claude-agent-sdk/claude-sonnet-4-6" with "off" thinking
+- files do not overlap with the lead or another edit agent,
+- the task is easy to bound,
+- verification is clear,
+- and the agent can finish with `report_and_exit`.
+
+Edit agents should claim files before writing:
+
+```text
+claim_file({ paths: ["docs/guide.md"] })
 ```
 
-### 3. Plan Approval for High-Risk Changes
+Release claims when no longer needed:
 
-Enable plan approval mode for:
-- Database schema changes
-- API contract changes
-- Security-related work
-- Performance-critical code
-
-Disable for:
-- Documentation updates
-- Test additions
-- Simple bug fixes
-
-### 4. Broadcast for Coordination
-
-Use broadcasts when:
-- API endpoints change
-- Database schemas change
-- Deployment happens
-- Team priorities shift
-
-### 5. Clear Task Descriptions
-
-Good task:
-```
-"Add password strength validation to the signup form. 
-Requirements: minimum 8 chars, at least one number and symbol.
-Use the zxcvbn library for strength calculation."
+```text
+release_file({ paths: ["docs/guide.md"] })
 ```
 
-Bad task:
+### Write clear missions
+
+Good mission:
+
+```text
+Review extensions/tools/team-tools.ts for regressions in spawn_swarm_agents. Report blockers first, with file:line evidence. Do not edit files.
 ```
-"Fix signup form"
+
+Bad mission:
+
+```text
+Check agents.
 ```
 
-### 6. Let the Extension Wake the Lead
+### Do not create an agent society
 
-For routine report completion, you do not need to ask the lead to sleep, wait, or create a separate polling loop. pi-extended-teams watches the lead inbox while the lead is idle and wakes the lead when teammate reports are ready.
+Spawned agents should not spawn more agents. If they need help, they should use `send_message` to ask the lead.
 
-Use manual checks only when you need explicit state or suspect a stall:
+### Do not poll
 
-> **You:** "List all tasks"
-> **You:** "Check my inbox for messages"
-> **You:** "How is the team doing?"
+Do not use `sleep`, `while true`, or repeated status checks to wait for completion. The extension delivers reports and wakes the lead.
 
 ---
 
 ## Troubleshooting
 
-### Teammate Not Responding
+### Agent did not report back
 
-**Problem**: A teammate is idle but not picking up messages.
+1. Check the specific agent:
+   ```text
+   check_teammate({ agent_name: "security-reviewer" })
+   ```
+2. If it has unread messages, read the relevant inbox:
+   ```text
+   read_inbox({ agent_name: "security-reviewer", unread_only: true, mark_as_read: false })
+   ```
+3. If the agent is dead or stalled, decide whether to respawn a new agent with a narrower prompt.
 
-**Solution**:
-1. Check if they're still running:
-   > **You:** "Check on teammate named 'security-bot'"
-2. Check their inbox:
-   > **You:** "Read security-bot's inbox"
-3. Force kill and respawn if needed:
-   > **You:** "Force kill security-bot and respawn them"
+### File claim conflict
 
-### tmux Screen Issues
+If `claim_file` reports a conflict, do not edit the file. Ask the lead to resolve ownership or wait for the other edit agent to release the claim.
 
-**Problem**: background tmux screens don't close when killing teammates.
-
-**Solution**: Make sure you started pi inside a tmux session. If you started pi outside tmux, it won't work properly.
-
-```bash
-# Correct way
-tmux
-pi
-
-# Incorrect way
-pi  # Then try to use tmux commands
+```text
+list_file_claims({})
 ```
 
-### Hook Not Running
+### Model errors
 
-**Problem**: Your task_completed.sh script isn't executing.
+Use fully qualified model names such as:
 
-**Checklist**:
-1. File exists at `.pi/team-hooks/task_completed.sh`
-2. File is executable: `chmod +x .pi/team-hooks/task_completed.sh`
-3. Shebang line is present: `#!/bin/bash`
-4. Test manually: `.pi/team-hooks/task_completed.sh '{"test":"data"}'`
-
-### Model Errors
-
-**Problem**: "Model not found" or similar errors.
-
-**Solution**: Use `list_available_models` first and then pass a fully qualified `provider/model` string.
-
-Examples:
-- `openai-codex/gpt-5.4`
+- `openai-codex/gpt-5.5`
 - `claude-agent-sdk/claude-sonnet-4-6`
 - `kimi-coding/kimi-for-coding`
 
-pi-extended-teams does not auto-resolve bare model names like `gpt-5` or `haiku` when creating new teams or spawning new teammates.
-If a model is not fully qualified or not available, pi-extended-teams fails fast.
+If no model is passed, pi-extended-teams uses the current Pi session model or configured defaults.
 
-If you want to control the order shown by `list_available_models`, add global or project-local pi-extended-teams config:
+### Panel is empty
 
-- Global: `~/.pi/pi-extended-teams.json`
-- Project-local: `.pi/pi-extended-teams.json`
-
-Example:
-
-```json
-{
-  "providerPriority": [
-    "openai-codex",
-    "claude-agent-sdk",
-    "kimi-coding"
-  ]
-}
-```
-
-Preferred models are still taken from pi settings (`defaultProvider`, `defaultModel`, and `enabledModels`) and are listed first.
-
-### Data Location
-
-All team data is stored in:
-- `~/.pi/teams/<team-name>/` - Team configuration, member list
-- `~/.pi/tasks/<team-name>/` - Task files
-- `~/.pi/messages/<team-name>/` - Message history
-
-You can manually inspect these JSON files to debug issues.
-
-### Write-Agent Screens Not Appearing
-
-**Problem**: write-agent background tmux screens are not appearing.
-
-**Requirements**:
-1. Start Pi from inside a tmux session.
-2. Make sure `TMUX` is present in the environment.
-3. Use read agents for investigation when you do not need a live tmux screen.
-
-pi-extended-teams is tmux-only for write-agent screens. Zellij and iTerm2 pane backends are not supported.
-
-**Debug mode**:
-Set `PI_EXTENDED_TEAMS_DEBUG=1` before starting Pi, or add this to `~/.pi/agent/pi-extended-teams/settings.json` or `<project>/.pi/pi-extended-teams.json`:
-
-```json
-{
-  "debug": { "enabled": true }
-}
-```
-
-When debug mode is enabled, write-agent spawn requests, queue decisions, launch commands, terminal window/pane IDs, and spawn failures are appended as JSON lines to `~/.pi/teams/<team-name>/debug.log`. Successful `spawn_teammate` results also include the debug log path.
-
----
-
-## Inter-Agent Communication
-
-Teammates can message each other without your intervention:
-
-```
-Frontend Bot → Backend Bot: "What's the response format for /api/users?"
-Backend Bot → Frontend Bot: "Returns {id, name, email, created_at}"
-```
-
-This enables autonomous coordination. You can see these messages by:
-> **You:** "Read backend-bot's inbox"
+Open `/agents`. If there is no active agent session yet, spawn an agent first or ask the lead to use agents for the current task.
 
 ---
 
 ## Cleanup
 
-To remove all team data, shut down the team:
+Finished read agents remove themselves from the active list after reporting. Edit agents should call `report_and_exit`, which sends the final report, releases file claims, and shuts the agent down.
 
-```bash
-> "Shut down the team named 'my-team'"
-```
-
-`team_shutdown` closes teammate screens, removes team/task state, and runs built-in stale session cleanup. Do not manually delete state unless you are recovering from a broken shutdown.
-
-Or use the delete command:
-> **You:** "Delete the team named 'my-team'"
+The lead does not need to manually shut down a separate team for the normal current-session workflow.

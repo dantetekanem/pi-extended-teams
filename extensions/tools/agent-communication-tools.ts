@@ -1,74 +1,49 @@
 import { Type } from "@sinclair/typebox";
-import { StringEnum } from "../internal/schema";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import { formatInboxMessagesForModel } from "../ui/renderers";
-import { requestLeadForTeammateSpawn, resolveLeadRequestTeamName, type TeammateDelegationOptions } from "./delegation-guard";
 
-export interface AgentCommunicationToolsOptions extends TeammateDelegationOptions {}
-
-function requireTeamName(options: AgentCommunicationToolsOptions, explicitTeamName?: string): string {
-  return resolveLeadRequestTeamName(options, explicitTeamName);
+export interface AgentCommunicationToolsOptions {
+  isTeammate: boolean;
+  agentName: string;
+  getTeamName(): string | null | undefined;
 }
 
-const teammateRequestParameters = Type.Object({
-  team_name: Type.Optional(Type.String({ description: "Team name. Defaults to the current team context." })),
-  name: Type.Optional(Type.String({ description: "Suggested teammate name." })),
-  prompt: Type.String({ description: "The mission the lead should give the teammate if approved." }),
-  role: Type.Optional(StringEnum(["read", "write"] as const, { description: "Requested role. Defaults to read unless the lead chooses otherwise." })),
-  cwd: Type.Optional(Type.String({ description: "Working directory for the requested teammate." })),
-  category: Type.Optional(Type.String({ description: "Optional category preset name." })),
-  model: Type.Optional(Type.String({ description: "Optional fully qualified provider/model." })),
-  thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const)),
-  plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
-  reason: Type.Optional(Type.String({ description: "Why another teammate is needed." })),
-});
+function requireCurrentSession(options: AgentCommunicationToolsOptions): string {
+  const teamName = options.getTeamName();
+  if (!teamName) throw new Error("No active agent session context is available.");
+  return teamName;
+}
 
 export function createAgentCommunicationTools(options: AgentCommunicationToolsOptions): any[] {
   return [
     {
       name: "send_message",
       label: "Send Message",
-      description: "Send a message to another teammate or the team lead.",
+      description: "Send a direct message in the current Pi session. Spawned agents default to messaging the lead.",
       parameters: Type.Object({
-        team_name: Type.Optional(Type.String({ description: "Team name. Defaults to the current team context." })),
-        recipient: Type.String(),
+        recipient: Type.Optional(Type.String({ description: "Recipient agent name. Defaults to team-lead for spawned agents." })),
         content: Type.String(),
-        summary: Type.String(),
+        summary: Type.Optional(Type.String()),
       }),
       async execute(_toolCallId: string, params: any) {
-        const teamName = requireTeamName(options, params.team_name);
-        await messaging.sendPlainMessage(teamName, options.agentName, params.recipient, params.content, params.summary);
-        return { content: [{ type: "text", text: `Message sent to ${params.recipient}.` }], details: { teamName, recipient: params.recipient } };
-      },
-    },
-    {
-      name: "broadcast_message",
-      label: "Broadcast Message",
-      description: "Broadcast a message to all team members except the sender.",
-      parameters: Type.Object({
-        team_name: Type.Optional(Type.String({ description: "Team name. Defaults to the current team context." })),
-        content: Type.String(),
-        summary: Type.String(),
-        color: Type.Optional(Type.String()),
-      }),
-      async execute(_toolCallId: string, params: any) {
-        const teamName = requireTeamName(options, params.team_name);
-        await messaging.broadcastMessage(teamName, options.agentName, params.content, params.summary, params.color);
-        return { content: [{ type: "text", text: "Message broadcasted to all team members." }], details: { teamName } };
+        const teamName = requireCurrentSession(options);
+        const recipient = params.recipient || (options.isTeammate ? "team-lead" : undefined);
+        if (!recipient) throw new Error("recipient is required when the lead sends a message.");
+        await messaging.sendPlainMessage(teamName, options.agentName, recipient, params.content, params.summary || "Message");
+        return { content: [{ type: "text", text: `Message sent to ${recipient}.` }], details: { session: teamName, recipient } };
       },
     },
     {
       name: "read_inbox",
       label: "Read Inbox",
-      description: "Read messages from this agent's inbox.",
+      description: "Read this agent's inbox in the current Pi session.",
       parameters: Type.Object({
-        team_name: Type.Optional(Type.String({ description: "Team name. Defaults to the current team context." })),
         unread_only: Type.Optional(Type.Boolean({ default: true })),
-        mark_as_read: Type.Optional(Type.Boolean({ default: true, description: "Set false to peek without marking messages read or updating runtime readiness." })),
+        mark_as_read: Type.Optional(Type.Boolean({ default: true, description: "Set false to peek without marking messages read." })),
       }),
       async execute(_toolCallId: string, params: any) {
-        const teamName = requireTeamName(options, params.team_name);
+        const teamName = requireCurrentSession(options);
         const markAsRead = params.mark_as_read !== false;
         const msgs = await messaging.readInbox(teamName, options.agentName, params.unread_only, markAsRead);
         if (markAsRead) {
@@ -79,20 +54,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
             lastError: undefined,
           }).catch(() => {});
         }
-        return { content: [{ type: "text", text: formatInboxMessagesForModel(msgs) }], details: { teamName, targetAgent: options.agentName, messages: msgs, markAsRead } };
-      },
-    },
-    {
-      name: "request_teammate",
-      label: "Request Teammate",
-      description: "Ask the team lead to spawn a teammate. Teammates cannot spawn, promote, or create agents directly.",
-      parameters: teammateRequestParameters,
-      async execute(_toolCallId: string, params: any) {
-        return requestLeadForTeammateSpawn(options, {
-          action: "spawn_teammate",
-          params,
-          reason: params.reason,
-        });
+        return { content: [{ type: "text", text: formatInboxMessagesForModel(msgs) }], details: { session: teamName, targetAgent: options.agentName, messages: msgs, markAsRead } };
       },
     },
   ];

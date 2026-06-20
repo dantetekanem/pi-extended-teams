@@ -3,7 +3,7 @@ import { Type } from "@sinclair/typebox";
 import { StringEnum } from "../internal/schema";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
 import { getCurrentQualifiedModel, getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
-import { cleanupStaleTeam } from "../internal/session-files";
+import { cleanupStaleTeam, getPiSessionId } from "../internal/session-files";
 import { shutdownReadAgentSession } from "../agents/read-agent";
 import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
@@ -109,12 +109,18 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   const queuedReadSpawnsByTeam = new Map<string, QueuedReadSpawn[]>();
   const readQueueDrainingTeams = new Set<string>();
 
-  function activeReadCount(teamName: string): number {
+  function activeAgentCount(teamName: string, role?: string): number {
     let count = 0;
     for (const agent of options.runningReadAgents.values()) {
-      if (agent.teamName === teamName) count += 1;
+      if (agent.teamName !== teamName) continue;
+      if (role && (agent.role || "read") !== role) continue;
+      count += 1;
     }
     return count;
+  }
+
+  function activeReadCount(teamName: string): number {
+    return activeAgentCount(teamName, "read");
   }
 
   function readQueue(teamName: string): QueuedReadSpawn[] {
@@ -199,6 +205,26 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     }
   }
 
+  function currentSessionAgentGroupName(ctx: any): string {
+    const sessionId = getPiSessionId(ctx) || "local-session";
+    return paths.sanitizeName(`session-${sessionId}`);
+  }
+
+  async function ensureCurrentSessionAgentGroup(ctx: any, explicitDefaultModel?: string): Promise<string> {
+    const sessionName = currentSessionAgentGroupName(ctx);
+    if (teams.teamExists(sessionName)) {
+      options.adoptTeamAsLead(sessionName, ctx);
+      return sessionName;
+    }
+
+    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
+    const defaultModel = requireQualifiedKnownModel(explicitDefaultModel, availableModels, "default_model")
+      || requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
+    teams.createTeam(sessionName, getPiSessionId(ctx) || "local-session", "lead-agent", "Pi session agents", defaultModel);
+    options.adoptTeamAsLead(sessionName, ctx);
+    return sessionName;
+  }
+
   async function spawnTeammate(params: any, ctx: any, spawnOptions: { once?: boolean } = {}): Promise<{ content: any[]; details: any }> {
     const safeName = paths.sanitizeName(params.name);
     const safeTeamName = paths.sanitizeName(params.team_name);
@@ -269,18 +295,6 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
 
     const chosenThinking = (resolved.thinking ?? undefined) as Member["thinking"];
     const debugLogPath = role === "write" && isTeamsDebugEnabled(settings) ? teamDebugLogPath(safeTeamName) : undefined;
-    if (role === "write" && !options.terminal) {
-      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.failure", {
-        agentName: safeName,
-        reason: "missing-terminal-adapter",
-        cwd,
-        model: chosenModel,
-        thinking: chosenThinking ?? null,
-        debugLogPath: debugLogPath ?? null,
-      }, settings);
-      const debugHint = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
-      throw new Error(`pi-extended-teams requires running inside tmux for write agents.${debugHint}`);
-    }
 
     const member: Member = {
       agentId: `${safeName}@${safeTeamName}`,
@@ -322,104 +336,50 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       };
     }
 
-    return await writeQueue.withWriteQueueCapacityLock(safeTeamName, async () => {
-      if (spawnOptions.once) {
-        const latestConfig = await teams.readConfig(safeTeamName);
-        const existingOnceMember = latestConfig.members.find(m => m.agentType === "teammate" && (m.name === safeName || memberMatchesOperation(m, params)));
-        if (existingOnceMember) {
-          return {
-            content: [{ type: "text", text: `Teammate ${safeName} already exists; reusing existing member.` }],
-            details: memberResolutionDetails(existingOnceMember, params, {
-              existing: true,
-              idempotent: true,
-              queued: false,
-              terminalId: existingOnceMember.tmuxPaneId || null,
-              modelSource: "existing",
-            }),
-          };
-        }
+    await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
+    const activeWriteCount = activeAgentCount(safeTeamName, "write");
+    await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.request", {
+      agentName: safeName,
+      cwd,
+      category: params.category ?? null,
+      requestedRole: params.role ?? "read",
+      resolvedRole: role,
+      model: chosenModel,
+      modelSource: resolved.modelSource,
+      thinking: chosenThinking ?? null,
+      activeWriteCount,
+      maxConcurrent: settings.writeAgents.maxConcurrent,
+      queueOverflow: false,
+      mode: "in-process",
+      debugLogPath: debugLogPath ?? null,
+    }, settings);
 
-        const queued = await writeQueue.findQueuedWriteSpawn(safeTeamName, {
-          name: safeName,
-          operationId: params.operation_id,
-          workflowRunId: params.workflow_run_id,
-        });
-        if (queued) {
-          const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
-          const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
-          return {
-            content: [{ type: "text", text: `Write teammate ${safeName} is already queued at position ${queuePosition}.` }],
-            details: queuedResolutionDetails(safeTeamName, queued, params, { queued: true, queueId: queued.id, queuePosition, existing: true, idempotent: true }),
-          };
-        }
-      } else {
-        await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
-      }
-
-      const activeWriteCount = await countWriteMembers(safeTeamName, options.terminal);
-      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.request", {
+    if (activeWriteCount >= settings.writeAgents.maxConcurrent) {
+      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.failure", {
         agentName: safeName,
-        cwd,
-        category: params.category ?? null,
-        requestedRole: params.role ?? "read",
-        resolvedRole: role,
-        model: chosenModel,
-        modelSource: resolved.modelSource,
-        thinking: chosenThinking ?? null,
+        reason: "capacity-reached",
         activeWriteCount,
         maxConcurrent: settings.writeAgents.maxConcurrent,
-        queueOverflow: settings.writeAgents.queueOverflow,
+        mode: "in-process",
         debugLogPath: debugLogPath ?? null,
       }, settings);
+      throw new Error(`Edit-agent capacity reached (${activeWriteCount}/${settings.writeAgents.maxConcurrent}). Wait for an active edit agent to finish before spawning another.`);
+    }
 
-      if (activeWriteCount >= settings.writeAgents.maxConcurrent) {
-        if (!settings.writeAgents.queueOverflow) {
-          await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.failure", {
-            agentName: safeName,
-            reason: "capacity-reached",
-            activeWriteCount,
-            maxConcurrent: settings.writeAgents.maxConcurrent,
-            debugLogPath: debugLogPath ?? null,
-          }, settings);
-          throw new Error(`Write-agent capacity reached (${activeWriteCount}/${settings.writeAgents.maxConcurrent}) and queueOverflow is disabled.`);
-        }
-        const queued = await writeQueue.enqueueWriteSpawn(safeTeamName, {
-          name: safeName,
-          prompt: params.prompt,
-          cwd,
-          category: params.category,
-          model: chosenModel,
-          thinking: chosenThinking,
-          planModeRequired: params.plan_mode_required,
-          color: "blue",
-          operationId: params.operation_id,
-          workflowRunId: params.workflow_run_id,
-          metadata: operationMetadataFromParams(params),
-        });
-        const queuedItems = await writeQueue.listWriteQueue(safeTeamName);
-        const queuePosition = queuedItems.findIndex(item => item.id === queued.id) + 1;
-        await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.queued", {
-          agentName: safeName,
-          queueId: queued.id,
-          queuePosition,
-          activeWriteCount,
-          maxConcurrent: settings.writeAgents.maxConcurrent,
-          debugLogPath: debugLogPath ?? null,
-        }, settings);
-        return {
-          content: [{ type: "text", text: `Write teammate ${params.name} queued at position ${queuePosition}; capacity is ${activeWriteCount}/${settings.writeAgents.maxConcurrent}.` }],
-          details: spawnResolutionDetails(member, params, resolved, { queued: true, queueId: queued.id, queuePosition, debugLogPath }),
-        };
-      }
-
-      const terminalId = await options.startWriteAgent(safeTeamName, member, params.prompt);
-      options.renderReadAgentStatus();
-      const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
-      return {
-        content: [{ type: "text", text: `Teammate ${params.name} spawned in background tmux screen ${terminalId}.${debugSuffix}` }],
-        details: spawnResolutionDetails(member, params, resolved, { terminalId, queued: false, debugLogPath }),
-      };
-    });
+    await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.success", {
+      agentName: safeName,
+      terminalId: null,
+      windowId: null,
+      mode: "in-process",
+      debugLogPath: debugLogPath ?? null,
+    }, settings);
+    await startReadAgentMember(safeTeamName, member, params.prompt, ctx);
+    options.renderReadAgentStatus();
+    const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
+    return {
+      content: [{ type: "text", text: `Edit agent ${params.name} started in-process and is followable from Pi.${debugSuffix}` }],
+      details: spawnResolutionDetails(member, params, resolved, { mode: "in-process", terminalId: null, queued: false, debugLogPath }),
+    };
   }
 
   pi.events?.on?.("pi-extended-teams:orchestration-request", async (payload: any) => {
@@ -474,6 +434,95 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       emitOrchestrationResponse(requestId, type, { ok: false, error: error instanceof Error ? error.message : String(error) });
     }
   });
+
+  const publicAgentParams = {
+    name: Type.Optional(Type.String({ description: "Stable display name. Defaults to a generated agent name." })),
+    prompt: Type.String({ description: "The agent's assignment and report shape." }),
+    role: Type.Optional(StringEnum(["read", "write"], { description: "Defaults to read. Use write only for edit-allowed assignments." })),
+    cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead session cwd." })),
+    model: Type.Optional(Type.String({ description: "Optional fully qualified provider/model. Defaults to the current Pi session model." })),
+    thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
+    metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
+  };
+
+  async function spawnPublicAgent(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
+    if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
+    if (!ctx) throw new Error("No active Pi session context is available for spawn_agent.");
+
+    const sessionName = await ensureCurrentSessionAgentGroup(ctx, params.model);
+    const name = params.name || `agent-${Date.now().toString(36)}`;
+    const result = await spawnTeammate({
+      ...params,
+      name,
+      team_name: sessionName,
+      role: params.role ?? "read",
+    }, ctx);
+
+    return {
+      content: [{ type: "text", text: `Agent ${name} started (${result.details.role}, ${result.details.mode || "in-process"}).` }],
+      details: { ...result.details, name, session: sessionName },
+    };
+  }
+
+  pi.registerTool({
+    name: "spawn_agent",
+    label: "Spawn Agent",
+    description: "Spawn one agent in the current Pi session. The session is implicit; no team setup is required. Agents run in-process so Pi can follow, track, and control them.",
+    parameters: Type.Object(publicAgentParams),
+    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      return spawnPublicAgent(params, ctx);
+    },
+  });
+
+  pi.registerTool({
+    name: "spawn_swarm_agents",
+    label: "Spawn Swarm Agents",
+    description: "Spawn a batch of agents in the current Pi session. Use per-agent model/thinking overrides or defaults for the whole swarm; scheduling and tracking are handled internally.",
+    parameters: Type.Object({
+      defaults: Type.Optional(Type.Object({
+        role: Type.Optional(StringEnum(["read", "write"])),
+        cwd: Type.Optional(Type.String()),
+        model: Type.Optional(Type.String()),
+        thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
+        metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
+      })),
+      agents: Type.Array(Type.Object(publicAgentParams), { description: "Agents to spawn as one batch." }),
+    }),
+    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
+      if (!ctx) throw new Error("No active Pi session context is available for spawn_swarm_agents.");
+      if (!Array.isArray(params.agents) || params.agents.length === 0) throw new Error("spawn_swarm_agents requires at least one agent.");
+
+      const defaultModel = params.defaults?.model || params.agents.find((agent: any) => agent.model)?.model;
+      const sessionName = await ensureCurrentSessionAgentGroup(ctx, defaultModel);
+      const spawned: any[] = [];
+      const failed: Array<{ name: string; error: string }> = [];
+
+      for (let index = 0; index < params.agents.length; index += 1) {
+        const agent = params.agents[index];
+        const merged = { ...(params.defaults || {}), ...agent };
+        const name = merged.name || `agent-${index + 1}`;
+        try {
+          const result = await spawnTeammate({
+            ...merged,
+            name,
+            team_name: sessionName,
+            role: merged.role ?? "read",
+          }, ctx);
+          spawned.push({ ...result.details, name });
+        } catch (error) {
+          failed.push({ name, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      const lines = [`Spawned ${spawned.length}/${params.agents.length} agents in the current Pi session.`];
+      for (const item of spawned) lines.push(`- ${item.name}: ${item.role}, ${item.mode || "in-process"}`);
+      for (const item of failed) lines.push(`- ${item.name}: failed — ${item.error}`);
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { session: sessionName, spawned, failed } };
+    },
+  });
+
+  return;
 
   pi.registerTool({
     name: "team_create",

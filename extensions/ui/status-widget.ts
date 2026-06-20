@@ -73,7 +73,7 @@ function formatStatusSummary(statusCounts: TeamActivityStatusCounts | undefined)
 
 function formatAggregatePreview(snapshot: TeamActivityStatusSnapshot): string {
   const summary = formatStatusSummary(snapshot.statusCounts) || formatRoleSummary(snapshot);
-  return `${pink("summary")} ${purple(summary)} ${dimAnsi("/team shows agent details")}`;
+  return `${pink("summary")} ${purple(summary)} ${dimAnsi("/agents shows agent details")}`;
 }
 
 function formatCollapsedPreview(snapshot: TeamActivityStatusSnapshot): string {
@@ -93,8 +93,8 @@ function formatExpandedEntry(entry: TeamActivityStatusEntry): string {
 }
 
 function formatHeader(snapshot: TeamActivityStatusSnapshot): string {
-  const summary = `${formatCountSummary(snapshot)} · /team · opt+tab switch agents`;
-  return `${pink("team activity")}  ${dimAnsi(summary)}`;
+  const summary = `${formatCountSummary(snapshot)} · /agents`;
+  return `${pink("agent activity")}  ${dimAnsi(summary)}`;
 }
 
 function collapsedRows(snapshot: TeamActivityStatusSnapshot): string[] {

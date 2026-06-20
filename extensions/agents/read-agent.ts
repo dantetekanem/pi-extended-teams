@@ -100,7 +100,7 @@ async function recordReadAgentReportEvent(
   const operation = operationMetadataFromMember(member);
   await reportEvents.appendTeamReportEvent(teamName, {
     agentName: member.name,
-    role: "read",
+    role: member.role || "read",
     status,
     report,
     summary,
@@ -163,10 +163,13 @@ export async function runReadAgentInProcess(
   options: RunReadAgentOptions
 ): Promise<void> {
   const key = options.readAgentKey(readTeamName, member.name);
+  const role = member.role || "read";
+  const roleLabel = role === "write" ? "edit-allowed" : "read-only";
   const state: RunningReadAgent = {
     runId: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
     name: member.name,
     teamName: readTeamName,
+    role,
     startedAt: Date.now(),
     tokensUsed: 0,
     status: "starting",
@@ -212,13 +215,17 @@ export async function runReadAgentInProcess(
       noPromptTemplates: true,
       noThemes: true,
       appendSystemPrompt: [
-        `You are read-only investigator '${member.name}' on team '${readTeamName}', running in-process in the lead session.`,
-        "You have the full toolset and may run any read-only shell command you need to investigate — git status/log/diff/show, grep/rg, ls, cat, running tests or builds, etc.",
-        "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
-        "Use send_message, broadcast_message, and read_inbox to coordinate with the lead and other teammates when needed.",
+        `You are ${roleLabel} agent '${member.name}' in Pi session '${readTeamName}', running in-process so the lead can follow and control you from Pi.`,
+        role === "write"
+          ? "You may use edit/write tools for the assigned scope only. Keep changes small, avoid unrelated cleanup, and report every file changed. Do not install or remove packages, start long-running services, commit, push, deploy, or make destructive changes unless the lead explicitly assigned that side effect."
+          : "You have the full toolset and may run any read-only shell command you need to investigate — git status/log/diff/show, grep/rg, ls, cat, running tests or builds, etc.",
+        role === "write"
+          ? "Use read/bash/edit/write as needed for the assignment. Prefer precise edits. Stop and report if you need broader product or architecture approval."
+          : "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
+        "Use send_message for direct communication and read_inbox only when you were told a reply is waiting. Do not coordinate a peer-agent society; the lead controls orchestration.",
         member.requestedBy
-          ? `You are a read helper requested by '${member.requestedBy}'. When finished, you must call send_message to send your full report to '${member.requestedBy}', then call send_message to send only a short done notification to team-lead. After both messages are sent, write a brief final answer confirming the report was sent and stop. There is no exception to this rule.`
-          : "You cannot spawn, promote, or create other agents. If another agent is needed, call request_teammate to ask the team lead to decide and spawn it.",
+          ? `You are a read helper requested by '${member.requestedBy}'. When finished, send your concise report to the lead and stop.`
+          : "You cannot spawn or create other agents. If another agent is needed, report that need to the lead; the lead decides what to spawn.",
         "NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.",
         "When finished, send or produce your final report as instructed, then stop. Do not wait for the lead to kill you — report and exit cleanly.",
       ],
@@ -290,10 +297,10 @@ export async function runReadAgentInProcess(
     const completionStats = session.getSessionStats();
     options.rememberCompletedAgentReport(readTeamName, {
       name: member.name,
-      role: "read",
+      role,
       status: "completed",
       report,
-      summary: `Read agent ${member.name} completed`,
+      summary: `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`,
       completedAt: Date.now(),
       startedAt: state.startedAt,
       elapsedMs: Date.now() - state.startedAt,
@@ -305,7 +312,7 @@ export async function runReadAgentInProcess(
       requestedBy: member.requestedBy,
       source: "read-agent",
     });
-    await recordReadAgentReportEvent(readTeamName, member, "completed", report, `Read agent ${member.name} completed`, state.startedAt, state.tokensUsed, completionStats.cost);
+    await recordReadAgentReportEvent(readTeamName, member, "completed", report, `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`, state.startedAt, state.tokensUsed, completionStats.cost);
     const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
     if (member.requestedBy) {
       await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
@@ -323,14 +330,14 @@ export async function runReadAgentInProcess(
     }
   } catch (e) {
     if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
-      const failureReport = `Read agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
+      const failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
       const failureStats = state.session?.getSessionStats();
       options.rememberCompletedAgentReport(readTeamName, {
         name: member.name,
-        role: "read",
+        role,
         status: "failed",
         report: failureReport,
-        summary: `Read agent ${member.name} failed`,
+        summary: `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`,
         completedAt: Date.now(),
         startedAt: state.startedAt,
         elapsedMs: Date.now() - state.startedAt,
@@ -342,7 +349,7 @@ export async function runReadAgentInProcess(
         requestedBy: member.requestedBy,
         source: "read-agent",
       });
-      await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, `Read agent ${member.name} failed`, state.startedAt, state.tokensUsed, failureStats?.cost, "red");
+      await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`, state.startedAt, state.tokensUsed, failureStats?.cost, "red");
       const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
       if (member.requestedBy) {
         await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, failureReport, "failed", "red");

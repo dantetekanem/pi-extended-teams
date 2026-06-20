@@ -1,16 +1,10 @@
-import * as fs from "node:fs";
 import { Type } from "@sinclair/typebox";
-import { StringEnum } from "../internal/schema";
-import { cleanupAgentSessionFolders, cleanupOrphanedTeams } from "../internal/session-files";
-import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
-import * as tasks from "../../src/utils/tasks";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
-import { observeTeam, observeTeammate } from "../../src/orchestration";
-import { formatTeammateStatusForModel, renderTeamObservation, renderTeammateStatus } from "../ui/renderers";
+import { formatTeammateStatusForModel, renderTeammateStatus } from "../ui/renderers";
 import type { RunningReadAgent } from "../runtime/types";
-import type { Member, TaskFile } from "../../src/utils/models";
+import type { Member } from "../../src/utils/models";
 
 export interface TaskRuntimeToolsOptions {
   terminal: any;
@@ -18,217 +12,50 @@ export interface TaskRuntimeToolsOptions {
   readAgentKey(teamName: string, agentName: string): string;
   shutdownTeammate(teamName: string, member: Member, options?: { drainQueue?: boolean }): Promise<void>;
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
+  getTeamName(): string | null | undefined;
 }
 
 export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptions): void {
   pi.registerTool({
-    name: "task_create",
-    label: "Create Task",
-    description: "Create a new team task.",
-    parameters: Type.Object({ team_name: Type.String(), subject: Type.String(), description: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const task = await tasks.createTask(params.team_name, params.subject, params.description);
-      return { content: [{ type: "text", text: `Task ${task.id} created.` }], details: { task } };
-    },
-  });
-
-  pi.registerTool({
-    name: "task_submit_plan",
-    label: "Submit Plan",
-    description: "Submit a plan for a task, updating its status to 'planning'.",
-    parameters: Type.Object({ team_name: Type.String(), task_id: Type.String(), plan: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const updated = await tasks.submitPlan(params.team_name, params.task_id, params.plan);
-      return { content: [{ type: "text", text: `Plan submitted for task ${params.task_id}.` }], details: { task: updated } };
-    },
-  });
-
-  pi.registerTool({
-    name: "task_evaluate_plan",
-    label: "Evaluate Plan",
-    description: "Evaluate a submitted plan for a task.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      task_id: Type.String(),
-      action: StringEnum(["approve", "reject"]),
-      feedback: Type.Optional(Type.String({ description: "Required for rejection" })),
-    }),
-    async execute(_toolCallId: string, params: any) {
-      const updated = await tasks.evaluatePlan(params.team_name, params.task_id, params.action as any, params.feedback);
-      return { content: [{ type: "text", text: `Plan for task ${params.task_id} has been ${params.action}d.` }], details: { task: updated } };
-    },
-  });
-
-  pi.registerTool({
-    name: "task_list",
-    label: "List Tasks",
-    description: "List all tasks for a team.",
-    parameters: Type.Object({ team_name: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const taskList = await tasks.listTasks(params.team_name);
-      return { content: [{ type: "text", text: JSON.stringify(taskList, null, 2) }], details: { tasks: taskList } };
-    },
-  });
-
-  pi.registerTool({
-    name: "task_update",
-    label: "Update Task",
-    description: "Update a task's status or owner.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      task_id: Type.String(),
-      status: Type.Optional(StringEnum(["pending", "planning", "in_progress", "completed", "deleted"])),
-      owner: Type.Optional(Type.String()),
-      expected_status: Type.Optional(StringEnum(["pending", "planning", "in_progress", "completed", "deleted"])),
-      expected_owner: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-      expected_version: Type.Optional(Type.Number()),
-      expected_updated_at: Type.Optional(Type.String()),
-      operation_id: Type.Optional(Type.String()),
-    }),
-    async execute(_toolCallId: string, params: any) {
-      const updates: Partial<TaskFile> = {};
-      if (Object.prototype.hasOwnProperty.call(params, "status")) updates.status = params.status as any;
-      if (Object.prototype.hasOwnProperty.call(params, "owner")) updates.owner = params.owner;
-
-      const hasGuard = params.expected_status !== undefined
-        || Object.prototype.hasOwnProperty.call(params, "expected_owner")
-        || params.expected_version !== undefined
-        || params.expected_updated_at !== undefined
-        || params.operation_id !== undefined;
-
-      if (hasGuard) {
-        const result = await tasks.updateTaskGuarded(params.team_name, params.task_id, updates, {
-          expectedStatus: params.expected_status,
-          expectedOwner: Object.prototype.hasOwnProperty.call(params, "expected_owner") ? params.expected_owner : undefined,
-          expectedVersion: params.expected_version,
-          expectedUpdatedAt: params.expected_updated_at,
-          operationId: params.operation_id,
-        });
-        return { content: [{ type: "text", text: result.idempotent ? `Task ${params.task_id} update already applied.` : `Task ${params.task_id} updated.` }], details: { task: result.task, updated: result.updated, idempotent: result.idempotent } };
-      }
-
-      const updated = await tasks.updateTask(params.team_name, params.task_id, updates);
-      return { content: [{ type: "text", text: `Task ${params.task_id} updated.` }], details: { task: updated } };
-    },
-  });
-
-  pi.registerTool({
-    name: "team_shutdown",
-    label: "Shutdown Team",
-    description: "Shutdown the entire team and close all panes/windows.",
-    parameters: Type.Object({ team_name: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const teamName = params.team_name;
-      try {
-        const config = await teams.readConfig(teamName);
-        for (const member of config.members) await options.shutdownTeammate(teamName, member, { drainQueue: false });
-        const dir = paths.teamDir(teamName);
-        const tasksDir = paths.taskDir(teamName);
-        if (fs.existsSync(tasksDir)) fs.rmSync(tasksDir, { recursive: true });
-        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
-        const cleanedSessions = cleanupAgentSessionFolders(60 * 60 * 1000);
-        const cleanedTeams = cleanupOrphanedTeams(options.terminal, { maxAgeMs: 60 * 60 * 1000 });
-        return {
-          content: [{ type: "text", text: `Team ${teamName} shut down.${cleanedSessions > 0 ? ` Cleaned up ${cleanedSessions} orphaned agent session folder(s).` : ""}${cleanedTeams > 0 ? ` Cleaned up ${cleanedTeams} orphaned team folder(s).` : ""}` }],
-          details: { cleanedSessions, cleanedTeams },
-        };
-      } catch (e) {
-        throw new Error(`Failed to shutdown team: ${e}`);
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "cleanup_agent_sessions",
-    label: "Cleanup Agent Sessions",
-    description: "Clean up orphaned agent session folders from ~/.pi/agent/teams/ that are older than a specified age.",
-    parameters: Type.Object({ max_age_hours: Type.Optional(Type.Number()) }),
-    async execute(_toolCallId: string, params: any) {
-      const maxAgeHours = params.max_age_hours ?? 24;
-      const maxAgeMs = maxAgeHours * 60 * 60 * 1000;
-      const cleaned = cleanupAgentSessionFolders(maxAgeMs);
-      const cleanedTeams = cleanupOrphanedTeams(options.terminal, { maxAgeMs });
-      return { content: [{ type: "text", text: `Cleaned up ${cleaned} orphaned agent session folder(s) and ${cleanedTeams} orphaned team folder(s) older than ${maxAgeHours} hour(s).` }], details: { cleaned, cleanedTeams, maxAgeHours } };
-    },
-  });
-
-  pi.registerTool({
-    name: "task_read",
-    label: "Read Task",
-    description: "Read details of a specific task.",
-    parameters: Type.Object({ team_name: Type.String(), task_id: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const task = await tasks.readTask(params.team_name, params.task_id);
-      return { content: [{ type: "text", text: JSON.stringify(task, null, 2) }], details: { task } };
-    },
-  });
-
-  pi.registerTool({
-    name: "observe_team",
-    label: "Observe Team",
-    description: "Purely observe a team without marking inbox messages read, releasing claims, removing members, draining queues, or shutting down teammates.",
-    parameters: Type.Object({ team_name: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const observation = await observeTeam(params.team_name, {
-        terminal: options.terminal,
-        runningReadAgents: options.runningReadAgents,
-        readAgentKey: options.readAgentKey,
-      });
-      return { content: [{ type: "text", text: JSON.stringify(observation, null, 2) }], details: observation };
-    },
-    renderResult(result: any, { expanded }: any, theme: any) {
-      return renderTeamObservation(result, expanded, theme);
-    },
-  });
-
-  pi.registerTool({
-    name: "observe_teammate",
-    label: "Observe Teammate",
-    description: "Purely observe one teammate without marking inbox messages read, releasing claims, removing members, draining queues, or shutting down the teammate.",
-    parameters: Type.Object({ team_name: Type.String(), agent_name: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const observation = await observeTeammate(params.team_name, params.agent_name, {
-        terminal: options.terminal,
-        runningReadAgents: options.runningReadAgents,
-        readAgentKey: options.readAgentKey,
-      });
-      return { content: [{ type: "text", text: formatTeammateStatusForModel(params.agent_name, observation) }], details: observation };
-    },
-    renderResult(result: any, { expanded }: any, theme: any) {
-      return renderTeammateStatus(result, expanded, theme);
-    },
-  });
-
-  pi.registerTool({
     name: "check_teammate",
-    label: "Check Teammate",
-    description: "Check a single teammate's status.",
-    parameters: Type.Object({ team_name: Type.String(), agent_name: Type.String() }),
+    label: "Check Agent",
+    description: "Check one agent's status in the current Pi session. This is the only public health/debug tool; the session is implicit.",
+    parameters: Type.Object({ agent_name: Type.String() }),
     async execute(_toolCallId: string, params: any) {
-      const config = await teams.readConfig(params.team_name);
-      const member = config.members.find(m => m.name === params.agent_name);
-      if (!member) throw new Error(`Teammate ${params.agent_name} not found`);
+      const teamName = options.getTeamName();
+      if (!teamName) throw new Error("No active agent session. Spawn an agent first.");
 
-      const unreadCount = (await messaging.readInbox(params.team_name, params.agent_name, true, false)).length;
-      const runtimeStatus = await runtime.readRuntimeStatus(params.team_name, params.agent_name);
+      const config = await teams.readConfig(teamName);
+      const member = config.members.find(m => m.name === params.agent_name);
+      if (!member) throw new Error(`Agent ${params.agent_name} not found`);
+
+      const unreadCount = (await messaging.readInbox(teamName, params.agent_name, true, false)).length;
+      const runtimeStatus = await runtime.readRuntimeStatus(teamName, params.agent_name).catch(() => null);
       const now = Date.now();
       const hasRecentHeartbeat = !!runtimeStatus?.lastHeartbeatAt && (now - runtimeStatus.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
-
-      let alive = false;
-      if (member.role === "read") {
-        alive = options.runningReadAgents.has(options.readAgentKey(params.team_name, member.name)) || (!!runtimeStatus && hasRecentHeartbeat && member.isActive !== false);
-      } else if (member.tmuxPaneId && options.terminal) {
-        alive = options.terminal.isAlive(member.tmuxPaneId);
-      }
+      const runningState = options.runningReadAgents.get(options.readAgentKey(teamName, member.name));
+      const legacyPaneAlive = !!(member.tmuxPaneId && options.terminal?.isAlive?.(member.tmuxPaneId));
+      const alive = !!runningState || (!!runtimeStatus && hasRecentHeartbeat && member.isActive !== false) || legacyPaneAlive;
       const startupStalled = alive && unreadCount > 0 && (now - member.joinedAt) > runtime.STARTUP_STALL_MS && !(runtimeStatus?.ready);
       const health = !alive ? "dead" : startupStalled ? "stalled" : runtimeStatus?.ready ? (hasRecentHeartbeat ? "healthy" : "idle") : "starting";
-      const releasedClaims = !alive ? await options.releaseAllClaimsForAgent(params.team_name, params.agent_name) : [];
-      const details = { agentName: params.agent_name, alive, unreadCount, health, agentLoopReady: !!runtimeStatus?.ready, hasRecentHeartbeat, startupStalled, runtime: runtimeStatus, releasedClaims, removedMember: false };
+      const releasedClaims = !alive ? await options.releaseAllClaimsForAgent(teamName, params.agent_name) : [];
+      const details = {
+        agentName: params.agent_name,
+        alive,
+        unreadCount,
+        health,
+        agentLoopReady: !!runtimeStatus?.ready,
+        hasRecentHeartbeat,
+        startupStalled,
+        runtime: runtimeStatus,
+        releasedClaims,
+        removedMember: false,
+      };
 
       if (!alive) {
-        await options.shutdownTeammate(params.team_name, member).catch(async () => {
-          if (runtimeStatus) await runtime.deleteRuntimeStatus(params.team_name, params.agent_name).catch(() => {});
-          await teams.removeMember(params.team_name, params.agent_name).catch(() => {});
+        await options.shutdownTeammate(teamName, member).catch(async () => {
+          if (runtimeStatus) await runtime.deleteRuntimeStatus(teamName, params.agent_name).catch(() => {});
+          await teams.removeMember(teamName, params.agent_name).catch(() => {});
         });
         details.removedMember = true;
       }
@@ -236,20 +63,6 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
     },
     renderResult(result: any, { expanded }: any, theme: any) {
       return renderTeammateStatus(result, expanded, theme);
-    },
-  });
-
-  pi.registerTool({
-    name: "process_shutdown_approved",
-    label: "Process Shutdown Approved",
-    description: "Process a teammate's shutdown.",
-    parameters: Type.Object({ team_name: Type.String(), agent_name: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const config = await teams.readConfig(params.team_name);
-      const member = config.members.find(m => m.name === params.agent_name);
-      if (!member) throw new Error(`Teammate ${params.agent_name} not found`);
-      await options.shutdownTeammate(params.team_name, member);
-      return { content: [{ type: "text", text: `Teammate ${params.agent_name} has been shut down.` }], details: {} };
     },
   });
 }

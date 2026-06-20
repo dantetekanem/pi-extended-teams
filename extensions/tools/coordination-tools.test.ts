@@ -102,7 +102,7 @@ describe("coordination tools", () => {
 
     const result = await tools.get("report_and_exit").execute(
       "report",
-      { team_name: teamName, content: "done", summary: "Done" },
+      { content: "done", summary: "Done" },
       new AbortController().signal,
       vi.fn(),
       ctx
@@ -122,7 +122,7 @@ describe("coordination tools", () => {
     expect(releaseAllClaimsForAgent).toHaveBeenCalledWith(teamName, agentName);
     expect(drainWriteQueue).toHaveBeenCalledWith(teamName);
     expect(JSON.parse(fs.readFileSync(paths.configPath(teamName), "utf-8")).members.map((item: Member) => item.name)).toEqual(["team-lead"]);
-    expect(result.content[0].text).toContain("Final report sent to team-lead");
+    expect(result.content[0].text).toContain("Final report sent.");
 
     await vi.runOnlyPendingTimersAsync();
     expect(terminal.kill).toHaveBeenCalledWith("%writer");

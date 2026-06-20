@@ -108,9 +108,7 @@ export async function buildRoster(teamName: string, options: BuildRosterOptions)
     const readState = options.runningReadAgents.get(options.readAgentKey(teamName, member.name));
     const alive = member.name === "team-lead"
       ? true
-      : role === "read"
-        ? !!readState || !!runtimeStatus?.ready
-        : isWriteMemberAlive(member, options.terminal);
+      : !!readState || !!runtimeStatus?.ready || (role === "write" && isWriteMemberAlive(member, options.terminal));
 
     return {
       name: member.name,
@@ -134,14 +132,14 @@ export async function buildRoster(teamName: string, options: BuildRosterOptions)
 }
 
 export function formatRosterForPrompt(roster: Awaited<ReturnType<typeof buildRoster>>): string {
-  const lines = [`Team roster for ${roster.teamName}:`];
+  const lines = [`Agents for session ${roster.teamName}:`];
   for (const member of roster.members) {
     const taskText = member.tasks.length > 0 ? ` tasks=${member.tasks.map(task => `#${task.id}:${task.status}`).join(",")}` : "";
     const claimText = member.claims.length > 0 ? ` claims=${member.claims.join(",")}` : "";
     lines.push(`- ${member.name}: ${member.role}, ${member.status}, unread=${member.unreadCount}${taskText}${claimText}`);
   }
   if (roster.writeQueue.length > 0) {
-    lines.push(`Queued writers: ${roster.writeQueue.map(item => `${item.position}.${item.name}`).join(", ")}`);
+    lines.push(`Queued edit agents: ${roster.writeQueue.map(item => `${item.position}.${item.name}`).join(", ")}`);
   }
   return lines.join("\n");
 }

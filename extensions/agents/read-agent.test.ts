@@ -105,14 +105,14 @@ describe("in-process read agent tool wiring", () => {
 
     expect(piMocks.createAgentSession).toHaveBeenCalledTimes(1);
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
-    const communicationToolNames = ["send_message", "broadcast_message", "read_inbox", "request_teammate"];
+    const communicationToolNames = ["send_message", "read_inbox"];
     expect(sessionOptions.tools).toEqual(expect.arrayContaining(communicationToolNames));
     expect(sessionOptions.customTools.map((tool: any) => tool.name).sort()).toEqual([...communicationToolNames].sort());
 
     expect(piMocks.loaderOptions).toHaveLength(1);
     const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
-    expect(promptText).toContain("Use send_message, broadcast_message, and read_inbox");
-    expect(promptText).toContain("call request_teammate to ask the team lead");
+    expect(promptText).toContain("Use send_message for direct communication and read_inbox only when you were told a reply is waiting");
+    expect(promptText).toContain("If another agent is needed, report that need to the lead");
 
     expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
     expect(options.emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, "final report", true);
@@ -335,8 +335,8 @@ describe("in-process read agent tool wiring", () => {
     expect(options.renderLeadInboxStatus).toHaveBeenCalled();
 
     const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
-    expect(promptText).toContain("must call send_message to send your full report to 'writer'");
-    expect(promptText).toContain("After both messages are sent");
+    expect(promptText).toContain("You are a read helper requested by 'writer'");
+    expect(promptText).toContain("send your concise report to the lead and stop");
   });
 
   it("uses a fallback delivery if a read helper exits without sending its required report", async () => {

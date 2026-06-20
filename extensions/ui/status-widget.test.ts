@@ -13,7 +13,7 @@ function makeSnapshot(overrides: Partial<TeamActivityStatusSnapshot> = {}): Team
   };
 }
 
-describe("team activity status widget", () => {
+describe("agent activity status widget", () => {
   it("renders large collapsed snapshots as an aggregate without touching per-agent fields", () => {
     const inaccessibleEntry: TeamActivityStatusEntry = Object.defineProperties({}, {
       name: { get: () => { throw new Error("name should not be rendered in aggregate mode"); } },
@@ -41,7 +41,7 @@ describe("team activity status widget", () => {
     expect(rendered).toContain("80 thinking");
     expect(rendered).toContain("10 bg");
     expect(rendered).toContain("10 working");
-    expect(rendered).toContain("/team shows agent details");
+    expect(rendered).toContain("/agents shows agent details");
   });
 
   it("keeps expanded rendering bounded while surfacing the aggregate summary", () => {

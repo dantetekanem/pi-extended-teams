@@ -11,6 +11,7 @@ export interface RunningReadAgent {
   lastActivityAt: number;
   activeToolName?: string;
   idleNudgeLevel?: "soft" | "hard";
+  role?: string;
   model?: string;
   thinking?: string;
   session?: AgentSession;

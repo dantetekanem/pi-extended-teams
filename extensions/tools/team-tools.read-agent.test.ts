@@ -22,6 +22,7 @@ function installPathSpies() {
   vi.spyOn(paths, "taskDir").mockImplementation((teamName: unknown) => path.join(tasksRoot, paths.sanitizeName(String(teamName))));
   vi.spyOn(paths, "configPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "config.json"));
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "write-queue.json"));
+  vi.spyOn(paths, "leadSessionPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lead-session.json"));
 }
 
 function writeProjectSettings(settings: unknown) {
@@ -32,6 +33,7 @@ function writeProjectSettings(settings: unknown) {
 function makeCtx() {
   return {
     cwd: root,
+    sessionManager: { getSessionId: vi.fn(() => "test-session") },
     model: { provider: "provider", id: "model" },
     modelRegistry: {
       getAvailable: vi.fn(async () => [{ provider: "provider", id: "model" }]),
@@ -40,11 +42,12 @@ function makeCtx() {
   };
 }
 
-function makeRunningReadAgent(teamName: string, member: Member): RunningReadAgent {
+function makeRunningAgent(teamName: string, member: Member): RunningReadAgent {
   return {
     runId: `${member.name}-run`,
     name: member.name,
     teamName,
+    role: member.role,
     startedAt: Date.now(),
     tokensUsed: 0,
     status: "thinking",
@@ -62,7 +65,7 @@ function registerTools() {
   const readAgentKey = (teamName: string, agentName: string) => `${teamName}:${agentName}`;
   const runReadAgentInProcess = vi.fn((teamName: string, member: Member) => {
     const key = readAgentKey(teamName, member.name);
-    runningReadAgents.set(key, makeRunningReadAgent(teamName, member));
+    runningReadAgents.set(key, makeRunningAgent(teamName, member));
     return new Promise<void>((resolve) => {
       completions.set(member.name, () => {
         runningReadAgents.delete(key);
@@ -70,8 +73,9 @@ function registerTools() {
       });
     });
   });
+  const adoptTeamAsLead = vi.fn();
 
-  registerTeamTools({ registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool) }, {
+  registerTeamTools({ registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool), events: { on: vi.fn(), emit: vi.fn() } }, {
     terminal: null,
     runningReadAgents,
     readAgentKey,
@@ -84,23 +88,19 @@ function registerTools() {
       runningReadAgents.delete(readAgentKey(teamName, member.name));
       await teams.removeMember(teamName, member.name).catch(() => {});
     }),
-    adoptTeamAsLead: vi.fn(),
+    adoptTeamAsLead,
     buildRoster: vi.fn(async () => ({})),
     isTeammate: false,
     agentName: "team-lead",
-    getTeamName: () => "team",
+    getTeamName: () => "session-test-session",
   });
 
-  return { tools, runningReadAgents, completions, runReadAgentInProcess };
+  return { tools, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead };
 }
 
-async function createTeam() {
-  teams.createTeam("team", "session", "lead", "", "provider/model");
-}
-
-describe("read-agent backpressure", () => {
+describe("public agent spawn tools", () => {
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-read-backpressure-"));
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-public-agents-"));
     teamsRoot = path.join(root, "teams");
     tasksRoot = path.join(root, "tasks");
     fs.mkdirSync(teamsRoot, { recursive: true });
@@ -113,22 +113,50 @@ describe("read-agent backpressure", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("queues read teammates at the configured cap and drains FIFO when a reader finishes", async () => {
+  it("registers only the public spawn tools from team-tools", () => {
+    const { tools } = registerTools();
+
+    expect(Array.from(tools.keys()).sort()).toEqual(["spawn_agent", "spawn_swarm_agents"]);
+  });
+
+  it("spawn_agent creates an implicit current-session group and starts an in-process read agent", async () => {
+    const { tools, runReadAgentInProcess, adoptTeamAsLead } = registerTools();
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+
+    const result = await tools.get("spawn_agent")!.execute("spawn", {
+      name: "reader",
+      role: "read",
+      prompt: "inspect one",
+      cwd: root,
+      model: "provider/model",
+      thinking: "high",
+    }, abort, undefined, ctx);
+
+    expect(result.details).toMatchObject({ name: "reader", role: "read", mode: "in-process", terminalId: null, session: "session-test-session" });
+    expect(adoptTeamAsLead).toHaveBeenCalledWith("session-test-session", ctx);
+    expect(runReadAgentInProcess).toHaveBeenCalledWith(
+      "session-test-session",
+      expect.objectContaining({ name: "reader", role: "read", model: "provider/model", thinking: "high" }),
+      "inspect one",
+      ctx,
+      expect.any(Object),
+    );
+  });
+
+  it("queues read agents at the configured cap behind spawn_agent", async () => {
     writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
-    await createTeam();
     const { tools, completions, runReadAgentInProcess } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
-    const first = await tools.get("spawn_teammate")!.execute("spawn-1", {
-      team_name: "team",
+    const first = await tools.get("spawn_agent")!.execute("spawn-1", {
       name: "reader-1",
       role: "read",
       prompt: "inspect one",
       cwd: root,
     }, abort, undefined, ctx);
-    const second = await tools.get("spawn_teammate")!.execute("spawn-2", {
-      team_name: "team",
+    const second = await tools.get("spawn_agent")!.execute("spawn-2", {
       name: "reader-2",
       role: "read",
       prompt: "inspect two",
@@ -138,75 +166,27 @@ describe("read-agent backpressure", () => {
     expect(first.details).toMatchObject({ queued: false, role: "read", mode: "in-process" });
     expect(second.details).toMatchObject({ queued: true, role: "read", queuePosition: 1 });
     expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
-    expect((await teams.readConfig("team")).members.map(member => member.name)).toEqual(["team-lead", "reader-1"]);
 
     completions.get("reader-1")!();
     await vi.waitFor(() => expect(runReadAgentInProcess).toHaveBeenCalledTimes(2));
-
     expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "reader-2", role: "read" });
-    expect((await teams.readConfig("team")).members.map(member => member.name)).toEqual(["team-lead", "reader-2"]);
   });
 
-  it("rejects read teammates at capacity when read-agent queue overflow is disabled", async () => {
-    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: false } });
-    await createTeam();
-    const { tools } = registerTools();
-    const ctx = makeCtx();
-    const abort = new AbortController().signal;
-
-    await tools.get("spawn_teammate")!.execute("spawn-1", {
-      team_name: "team",
-      name: "reader-1",
-      role: "read",
-      prompt: "inspect one",
-      cwd: root,
-    }, abort, undefined, ctx);
-
-    await expect(tools.get("spawn_teammate")!.execute("spawn-2", {
-      team_name: "team",
-      name: "reader-2",
-      role: "read",
-      prompt: "inspect two",
-      cwd: root,
-    }, abort, undefined, ctx)).rejects.toThrow("Read-agent capacity reached (1/1) and queueOverflow is disabled.");
-  });
-
-  it("keeps spawn_teammate_once idempotent for queued read teammates", async () => {
-    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
-    await createTeam();
+  it("spawn_swarm_agents applies defaults and per-agent overrides", async () => {
     const { tools, runReadAgentInProcess } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
-    await tools.get("spawn_teammate")!.execute("spawn-1", {
-      team_name: "team",
-      name: "reader-1",
-      role: "read",
-      prompt: "inspect one",
-      cwd: root,
+    const result = await tools.get("spawn_swarm_agents")!.execute("swarm", {
+      defaults: { role: "read", cwd: root, model: "provider/model", thinking: "high" },
+      agents: [
+        { name: "a", prompt: "inspect a" },
+        { name: "b", prompt: "inspect b", thinking: "xhigh" },
+      ],
     }, abort, undefined, ctx);
 
-    const queued = await tools.get("spawn_teammate_once")!.execute("spawn-once-1", {
-      team_name: "team",
-      name: "reader-2",
-      role: "read",
-      prompt: "inspect two",
-      cwd: root,
-      operation_id: "op-1",
-      workflow_run_id: "run-1",
-    }, abort, undefined, ctx);
-    const repeated = await tools.get("spawn_teammate_once")!.execute("spawn-once-2", {
-      team_name: "team",
-      name: "reader-2-renamed",
-      role: "read",
-      prompt: "inspect two again",
-      cwd: root,
-      operation_id: "op-1",
-      workflow_run_id: "run-1",
-    }, abort, undefined, ctx);
-
-    expect(queued.details).toMatchObject({ queued: true, queuePosition: 1 });
-    expect(repeated.details).toMatchObject({ queued: true, queuePosition: 1, existing: true, idempotent: true });
-    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect(result.details.spawned).toHaveLength(2);
+    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "high" });
+    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh" });
   });
 });

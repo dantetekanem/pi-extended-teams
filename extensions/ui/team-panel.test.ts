@@ -561,6 +561,48 @@ describe("team panel items", () => {
     component.dispose();
   });
 
+  it("stops auto-refreshing when only completed reports remain", async () => {
+    vi.useFakeTimers();
+    try {
+      teams.createTeam("team", "session", "lead", "", "provider/model");
+      await sendPlainMessage("team", "writer", "team-lead", "final writer report", "Writer done", "green");
+
+      let component: any;
+      const tui = { requestRender: vi.fn(), terminal: { rows: 30 } };
+      const theme = {
+        fg: (_name: string, text: string) => text,
+        bold: (text: string) => text,
+      };
+      const pi = {
+        registerCommand: vi.fn((_name: string, command: any) => {
+          pi.command = command;
+        }),
+        command: undefined as any,
+      };
+      registerTeamCommand(pi, panelOptions());
+
+      await pi.command.handler("team", {
+        ui: {
+          notify: vi.fn(),
+          custom: vi.fn(async (factory: any) => {
+            component = factory(tui, theme, {}, vi.fn());
+          }),
+        },
+      });
+
+      const rendered = component.render(120).join("\n");
+      expect(rendered).toContain("completed");
+      expect(rendered).toContain("1");
+
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(tui.requestRender).not.toHaveBeenCalled();
+      component.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("auto-refreshes an open team overlay when new read agents appear", async () => {
     vi.useFakeTimers();
     teams.createTeam("team", "session", "lead", "", "provider/model");

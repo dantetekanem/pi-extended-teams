@@ -234,6 +234,27 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
       await ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: () => void) => {
         const entryCount = () => items.length + 1;
         let autoRefreshInFlight = false;
+        let liveTimer: ReturnType<typeof setInterval> | undefined;
+
+        const itemNeedsAutoRefresh = (item: TeamPanelItem): boolean => {
+          if (item.completed) return false;
+          if (item.status === "idle/dead" || item.status.includes("dead")) return false;
+          return true;
+        };
+
+        const shouldAutoRefresh = (): boolean => {
+          // Keep an empty team panel live so agents spawned after /team opens appear
+          // automatically. Once the panel only has completed/dead entries, stop the
+          // timer: repeatedly rereading inbox history and rewrapping final reports is
+          // wasteful and can pin the TUI when every agent has finished.
+          return items.length === 0 || items.some(itemNeedsAutoRefresh);
+        };
+
+        const stopAutoRefresh = () => {
+          if (!liveTimer) return;
+          clearInterval(liveTimer);
+          liveTimer = undefined;
+        };
 
         const applyItems = (nextItems: typeof items, resetLog: boolean) => {
           const selectedName = selectedIndex > 0 ? items[selectedIndex - 1]?.name : undefined;
@@ -247,23 +268,34 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           if (resetLog) logOffsetFromBottom = 0;
         };
 
-        const refreshItems = (refreshOptions: { showLoading: boolean; resetLog: boolean }) => {
+        function updateAutoRefresh() {
+          if (!shouldAutoRefresh()) {
+            stopAutoRefresh();
+            return;
+          }
+          if (!liveTimer) {
+            liveTimer = setInterval(() => refreshItems({ showLoading: false, resetLog: false }), 1000);
+          }
+        }
+
+        function refreshItems(refreshOptions: { showLoading: boolean; resetLog: boolean }) {
           if (autoRefreshInFlight) return;
           autoRefreshInFlight = true;
           if (refreshOptions.showLoading) {
             loading = true;
             tui.requestRender();
           }
-          void buildTeamPanelItems(panelTeamName, options)
+          void buildTeamPanelItems(panelTeamName!, options)
             .then((nextItems) => applyItems(nextItems, refreshOptions.resetLog))
             .finally(() => {
               autoRefreshInFlight = false;
               loading = false;
+              updateAutoRefresh();
               tui.requestRender();
             });
-        };
+        }
 
-        const liveTimer = setInterval(() => refreshItems({ showLoading: false, resetLog: false }), 1000);
+        updateAutoRefresh();
 
         const refresh = () => refreshItems({ showLoading: true, resetLog: true });
 
@@ -519,7 +551,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           render,
           invalidate() {},
           dispose() {
-            clearInterval(liveTimer);
+            stopAutoRefresh();
           },
           handleInput(data: string) {
             if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || data === "q" || data === "Q") {

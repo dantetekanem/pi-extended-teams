@@ -1,6 +1,6 @@
 {
   "name": "pi-extended-teams",
-  "version": "1.3.9",
+  "version": "1.3.10",
   "description": "tmux-only, self-managing, role-aware agent teams for pi", 
   "repository": {
     "type": "git",

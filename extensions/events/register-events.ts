@@ -105,7 +105,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       }
 
       setTimeout(() => {
-        options.quietTrigger(`read_inbox(team_name="${teamName}") to get your instructions, then begin your work.`);
+        options.quietTrigger("read_inbox to get your instructions, then begin your work.");
       }, 1000);
 
       if (teamName) {
@@ -257,20 +257,20 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           }
           if ((member?.role ?? "write") === "write") {
             const workflowGuard = member && isWorkflowSpawnedMember(member)
-              ? "\n- Workflow mode: do not call request_read_helper or use_skill unless the workflow explicitly declared that capability in your member metadata. Ask team-lead for an explicit workflow assignment instead of creating undeclared helper fanout."
-              : "\n- For read-only help, call request_read_helper instead of spawn_teammate. The helper's full report comes back to your inbox; team-lead receives only a short done notification.";
-            roleSpecificGuidance = `\n\nWrite-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.${workflowGuard}\n- Release claims with release_file as soon as you are done editing those paths.\n- When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you.`;
+              ? "\n- Workflow mode: do not create helper fanout yourself. Ask team-lead with send_message for an explicit workflow assignment."
+              : "\n- If you need read-only help, ask team-lead with send_message. The lead decides whether to spawn another agent.";
+            roleSpecificGuidance = `\n\nEdit-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.${workflowGuard}\n- Release claims with release_file as soon as you are done editing those paths.\n- When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you.`;
           } else {
             roleSpecificGuidance = `\n\nRead-agent rules:\n- You are read-only: investigate and report. Do not edit files or make any mutating changes.\n- When finished, produce your final report and stop. Do not wait for the lead to kill you.`;
           }
-          rosterInfo = `\n\n${options.formatRosterForPrompt(await options.buildRoster(teamName))}\nUse list_teammates when you need an updated roster; do not poll check_teammate unless diagnosing liveness.`;
+          rosterInfo = `\n\n${options.formatRosterForPrompt(await options.buildRoster(teamName))}\nUse this roster as a snapshot. If you need updated roster or liveness details, ask team-lead with send_message. Do not poll.`;
         } catch {
           // Ignore roster/model enrichment errors.
         }
       }
 
       return {
-        systemPrompt: event.systemPrompt + `\n\nYou are teammate '${options.agentName}' on team '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}\n\nCore rules for every teammate:\n- NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.\n- You cannot spawn, promote, or create other agents. Write agents may use request_read_helper for direct read-only help; otherwise use request_teammate or send_message to ask team-lead to decide and spawn.\n- Use send_message, broadcast_message, and read_inbox to coordinate with the lead and other teammates when needed.\n- When your work is done, report and exit cleanly. Do not wait for the lead to shut you down.${roleSpecificGuidance}${rosterInfo}\nStart by calling read_inbox(team_name="${teamName}") to get your initial instructions.`,
+        systemPrompt: event.systemPrompt + `\n\nYou are spawned agent '${options.agentName}' in Pi session '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}\n\nCore rules for every spawned agent:\n- NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.\n- You cannot spawn, promote, or create other agents. If another agent is needed, use send_message to ask team-lead to decide and spawn.\n- Use send_message for direct communication and read_inbox when the extension wakes you or you expect a reply.\n- When your work is done, report and exit cleanly. Do not wait for the lead to shut you down.${roleSpecificGuidance}${rosterInfo}\nStart by calling read_inbox to get your initial instructions.`,
       };
     }
   });

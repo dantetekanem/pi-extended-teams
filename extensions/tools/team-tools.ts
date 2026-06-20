@@ -445,12 +445,17 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
   };
 
+  function generatedAgentName(index?: number): string {
+    const position = index === undefined ? "" : `-${index + 1}`;
+    return `agent-${Date.now().toString(36)}${position}-${crypto.randomUUID().slice(0, 8)}`;
+  }
+
   async function spawnPublicAgent(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
     if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
     if (!ctx) throw new Error("No active Pi session context is available for spawn_agent.");
 
     const sessionName = await ensureCurrentSessionAgentGroup(ctx, params.model);
-    const name = params.name || `agent-${Date.now().toString(36)}`;
+    const name = params.name || generatedAgentName();
     const result = await spawnTeammate({
       ...params,
       name,
@@ -501,7 +506,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       for (let index = 0; index < params.agents.length; index += 1) {
         const agent = params.agents[index];
         const merged = { ...(params.defaults || {}), ...agent };
-        const name = merged.name || `agent-${index + 1}`;
+        const name = merged.name || generatedAgentName(index);
         try {
           const result = await spawnTeammate({
             ...merged,

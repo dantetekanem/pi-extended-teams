@@ -74,6 +74,10 @@ function registerTools() {
     });
   });
   const adoptTeamAsLead = vi.fn();
+  const shutdownTeammate = vi.fn(async (teamName: string, member: Member) => {
+    runningReadAgents.delete(readAgentKey(teamName, member.name));
+    await teams.removeMember(teamName, member.name).catch(() => {});
+  });
 
   registerTeamTools({ registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool), events: { on: vi.fn(), emit: vi.fn() } }, {
     terminal: null,
@@ -84,10 +88,7 @@ function registerTools() {
     readAgentOptions: vi.fn(() => ({})),
     runReadAgentInProcess,
     startWriteAgent: vi.fn(async () => "%1"),
-    shutdownTeammate: vi.fn(async (teamName: string, member: Member) => {
-      runningReadAgents.delete(readAgentKey(teamName, member.name));
-      await teams.removeMember(teamName, member.name).catch(() => {});
-    }),
+    shutdownTeammate,
     adoptTeamAsLead,
     buildRoster: vi.fn(async () => ({})),
     isTeammate: false,
@@ -95,7 +96,7 @@ function registerTools() {
     getTeamName: () => "session-test-session",
   });
 
-  return { tools, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead };
+  return { tools, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate };
 }
 
 describe("public agent spawn tools", () => {
@@ -188,5 +189,25 @@ describe("public agent spawn tools", () => {
     expect(result.details.spawned).toHaveLength(2);
     expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "high" });
     expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh" });
+  });
+
+  it("spawn_swarm_agents gives unnamed agents unique names across swarms", async () => {
+    const { tools, shutdownTeammate } = registerTools();
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+
+    const first = await tools.get("spawn_swarm_agents")!.execute("swarm-1", {
+      defaults: { role: "read", cwd: root, model: "provider/model", thinking: "high" },
+      agents: [{ prompt: "inspect one" }, { prompt: "inspect two" }],
+    }, abort, undefined, ctx);
+    const second = await tools.get("spawn_swarm_agents")!.execute("swarm-2", {
+      defaults: { role: "read", cwd: root, model: "provider/model", thinking: "high" },
+      agents: [{ prompt: "inspect three" }, { prompt: "inspect four" }],
+    }, abort, undefined, ctx);
+
+    const names = [...first.details.spawned, ...second.details.spawned].map((item: any) => item.name);
+    expect(new Set(names).size).toBe(4);
+    expect(names.every((name: string) => name.startsWith("agent-"))).toBe(true);
+    expect(shutdownTeammate).not.toHaveBeenCalled();
   });
 });

@@ -49,6 +49,22 @@ function setupEvents(isIdle: () => boolean) {
   return { handlers, quietTrigger, terminal, ctx };
 }
 
+function writeTeamConfig(role: "read" | "write" = "write", metadata: Record<string, any> = {}) {
+  const configPath = paths.configPath("team");
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify({
+    name: "team",
+    description: "test team",
+    createdAt: Date.now(),
+    leadAgentId: "lead-agent",
+    leadSessionId: "session",
+    members: [
+      { agentId: "lead-agent", name: "team-lead", agentType: "lead", joinedAt: Date.now(), tmuxPaneId: "", cwd: root, subscriptions: [] },
+      { agentId: "writer@team", name: "writer", agentType: "teammate", role, joinedAt: Date.now(), tmuxPaneId: "", cwd: root, subscriptions: [], metadata },
+    ],
+  }, null, 2));
+}
+
 describe("extension teammate inbox wake", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -62,6 +78,41 @@ describe("extension teammate inbox wake", () => {
     vi.useRealTimers();
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("wakes teammates with implicit-session inbox instructions", async () => {
+    const { handlers, quietTrigger, ctx } = setupEvents(() => true);
+
+    for (const handler of handlers.get("session_start") || []) {
+      await handler({}, ctx);
+    }
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(quietTrigger).toHaveBeenCalledWith("read_inbox to get your instructions, then begin your work.");
+    expect(quietTrigger.mock.calls.flat().join("\n")).not.toContain("team_name");
+  });
+
+  it("injects teammate prompts without removed public tools or legacy parameters", async () => {
+    writeTeamConfig("write", { workflowRunId: "run-1" });
+    const { handlers } = setupEvents(() => true);
+    const [handler] = handlers.get("before_agent_start") || [];
+
+    const result = await handler({ systemPrompt: "base" });
+    const prompt = result.systemPrompt;
+
+    expect(prompt).toContain("Start by calling read_inbox to get your initial instructions.");
+    expect(prompt).toContain("use send_message to ask team-lead");
+    expect(prompt).toContain("ask team-lead with send_message");
+    for (const staleText of [
+      "request_read_helper",
+      "request_teammate",
+      "broadcast_message",
+      "list_teammates",
+      "use_skill",
+      "read_inbox(team_name",
+    ]) {
+      expect(prompt).not.toContain(staleText);
+    }
   });
 
   it("remembers inbox wakeups that arrive while writer is busy and fires on turn_end", async () => {

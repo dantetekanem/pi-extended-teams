@@ -318,7 +318,7 @@ export async function runReadAgentInProcess(
       await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
       await options.renderLeadInboxStatus?.().catch(() => {});
       if (member.requestedBy === options.agentName) {
-        options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox(team_name="${readTeamName}") and continue your task. Do not poll.`);
+        options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox and continue your task. Do not poll.`);
       }
     } else if (suppressLeadReportInjection) {
       // Workflow orchestrators consume full reports from TeamReportEvent storage.
@@ -355,7 +355,7 @@ export async function runReadAgentInProcess(
         await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, failureReport, "failed", "red");
         await options.renderLeadInboxStatus?.().catch(() => {});
         if (member.requestedBy === options.agentName) {
-          options.quietTrigger?.(`Read helper ${member.name} failed. Read the failure report with read_inbox(team_name="${readTeamName}") and continue or report the blocker. Do not poll.`);
+          options.quietTrigger?.(`Read helper ${member.name} failed. Read the failure report with read_inbox and continue or report the blocker. Do not poll.`);
         }
       } else if (suppressLeadReportInjection) {
         // Workflow orchestrators consume full failure reports from TeamReportEvent storage.

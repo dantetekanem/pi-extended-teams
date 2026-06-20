@@ -9,11 +9,9 @@ import { createWriteAgentRuntime } from "./agents/write-agent.js";
 import { registerExtensionEvents } from "./events/register-events.js";
 import { createLifecycleRuntime } from "./team/lifecycle.js";
 import { buildRoster as buildTeamRoster, formatRosterForPrompt, releaseAllClaimsForAgent, requireTeamContext as resolveTeamContext, requireWriteAgentTeam as resolveWriteAgentTeam } from "./team/roster.js";
-import { registerWriterScreenShortcut } from "./team/writer-screens.js";
+import { createWriterScreenState, registerWriterScreenShortcut, removeWriterScreenTab, upsertWriterScreenTab, type ActiveWriterTab } from "./team/writer-screens.js";
 import { registerTeamCommand } from "./ui/team-panel.js";
 import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordination-tools.js";
-import { registerModelTools } from "./tools/model-tools.js";
-import { registerPredefinedTools } from "./tools/predefined-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools } from "./tools/team-tools.js";
 import { getCurrentQualifiedModel } from "./internal/model-selection.js";
@@ -38,6 +36,8 @@ export default function (pi: ExtensionAPI) {
   let teamName = envTeamName;
 
   const terminal = getTerminalAdapter();
+  const activeWritersTabs: ActiveWriterTab[] = [];
+  const writerScreenState = createWriterScreenState(activeWritersTabs);
 
   // Track whether lead inbox/helper polling has been started (to avoid duplicates)
   let leadPollingStarted = false;
@@ -65,7 +65,11 @@ export default function (pi: ExtensionAPI) {
   // Highest unread count we've already nudged the lead about, so we wake once per
   // new batch of reports (not every poll) and re-wake when more arrive.
   let leadWakeNotifiedCount = 0;
-  const { startWriteAgent, drainWriteQueue } = createWriteAgentRuntime({ terminal });
+  const { startWriteAgent, drainWriteQueue } = createWriteAgentRuntime({
+    terminal,
+    onWriterActive: (tab) => upsertWriterScreenTab(writerScreenState, tab),
+    onWriterInactive: (targetTeamName, member) => removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId }),
+  });
   const { shutdownTeammate, startLeadWatchdog } = createLifecycleRuntime({
     isTeammate,
     terminal,
@@ -76,16 +80,37 @@ export default function (pi: ExtensionAPI) {
     drainWriteQueue,
     getSessionCwd: () => sessionCtx?.cwd,
     getTeamName: () => teamName,
+    onWriterInactive: (targetTeamName, member) => removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId }),
   });
 
   function readAgentKey(targetTeamName: string, targetAgentName: string): string {
     return `${targetTeamName}:${targetAgentName}`;
   }
 
-  function getTeamPanelName(): string | undefined {
-    if (teamName) return teamName;
+  function currentSessionAgentGroupName(ctx?: any): string | undefined {
+    const sessionId = getPiSessionId(ctx ?? sessionCtx) || "local-session";
+    return teamPaths.sanitizeName(`session-${sessionId}`);
+  }
+
+  function ensureTeamPanelName(ctx?: any): string | undefined {
+    if (teamName && teams.teamExists(teamName)) return teamName;
+
+    const sessionId = getPiSessionId(ctx ?? sessionCtx);
+    const foundTeam = findLeadTeamForSession(sessionId);
+    if (foundTeam) {
+      adoptTeamAsLead(foundTeam, ctx);
+      return foundTeam;
+    }
+
     if (activePromptBuildTeamName && teams.teamExists(activePromptBuildTeamName)) return activePromptBuildTeamName;
-    return undefined;
+
+    const sessionName = currentSessionAgentGroupName(ctx);
+    if (!sessionName) return undefined;
+    if (!teams.teamExists(sessionName)) {
+      teams.createTeam(sessionName, sessionId || "local-session", "lead-agent", "Pi session agents", getCurrentQualifiedModel(ctx ?? sessionCtx));
+    }
+    adoptTeamAsLead(sessionName, ctx);
+    return sessionName;
   }
 
   function isCurrentReadAgentRun(key: string, state: RunningReadAgent): boolean {
@@ -310,25 +335,27 @@ export default function (pi: ExtensionAPI) {
 
     const now = Date.now();
     const activityTeamName = teamName || null;
-    const readAgents = activityTeamName
+    const runningAgents = activityTeamName
       ? Array.from(runningReadAgents.values())
         .filter(agent => agent.teamName === activityTeamName)
         .sort((a, b) => a.name.localeCompare(b.name))
       : [];
+    const readAgents = runningAgents.filter(agent => (agent.role || "read") === "read");
+    const writeAgents = runningAgents.filter(agent => (agent.role || "read") === "write");
     const activeWriteMembers = activityTeamName
       ? (await teams.readConfig(activityTeamName).catch(() => null))?.members
         ?.filter(member => member.name !== "team-lead" && (member.role ?? "write") !== "read")
-        ?.filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId))) ?? []
+        ?.filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId)) && !runningReadAgents.has(readAgentKey(activityTeamName, member.name))) ?? []
       : [];
     const unreadLeadMessages = activityTeamName ? await messaging.readInbox(activityTeamName, agentName, true, false).catch(() => []) : [];
     leadInboxUnreadCount = unreadLeadMessages.length;
     clearLeadInboxWidgetOnce();
 
-    if ((readAgents.length > 0 || activeWriteMembers.length > 0) && !readAgentStatusTimer) {
+    if ((readAgents.length > 0 || writeAgents.length > 0 || activeWriteMembers.length > 0) && !readAgentStatusTimer) {
       readAgentStatusTimer = setInterval(renderReadAgentStatus, 1000);
     }
 
-    if (readAgents.length === 0 && activeWriteMembers.length === 0) {
+    if (readAgents.length === 0 && writeAgents.length === 0 && activeWriteMembers.length === 0) {
       sessionCtx.ui.setStatus?.("01-pi-extended-teams-read", undefined);
       clearTeamActivityWidget();
       sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
@@ -339,7 +366,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const activeCount = readAgents.length + activeWriteMembers.length;
+    const activeCount = readAgents.length + writeAgents.length + activeWriteMembers.length;
     const entries: TeamActivityStatusEntry[] = [];
     const statusCounts: Record<string, number> = {};
     const idleNudgeMessages: string[] = [];
@@ -348,7 +375,35 @@ export default function (pi: ExtensionAPI) {
       statusCounts[status] = (statusCounts[status] ?? 0) + 1;
     };
 
+    for (const agent of writeAgents) {
+      try {
+        const tokensUsed = agent.session?.getSessionStats().tokens.total;
+        if (typeof tokensUsed === "number" && tokensUsed !== agent.tokensUsed) {
+          agent.tokensUsed = tokensUsed;
+          agent.lastActivityAt = now;
+          agent.idleNudgeLevel = undefined;
+        }
+      } catch {
+        // Ignore stats races while the nested session is shutting down.
+      }
+      const elapsed = formatElapsed(now - agent.startedAt);
+      const status = describeReadAgentStatus(agent, now);
+      const idleNudgeMessage = getIdleReadAgentNudgeMessage(agent, status);
+      if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
+      const modelLabel = formatModelLabel(agent.model, agent.thinking);
+      const detail = [modelLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
+      countStatus(status.label);
+      entries.push({ name: agent.name, role: "write", status: status.label, detail });
+    }
+
     for (const member of activeWriteMembers.sort((a, b) => a.name.localeCompare(b.name))) {
+      upsertWriterScreenTab(writerScreenState, {
+        teamName: activityTeamName!,
+        name: member.name,
+        paneId: member.tmuxPaneId,
+        windowId: member.windowId,
+        joinedAt: member.joinedAt,
+      });
       const runtimeStatus = await runtime.readRuntimeStatus(activityTeamName!, member.name).catch(() => null);
       const elapsed = formatElapsed(now - (runtimeStatus?.startedAt || member.joinedAt));
       const modelLabel = formatModelLabel(member.model, member.thinking);
@@ -389,7 +444,7 @@ export default function (pi: ExtensionAPI) {
     updateTeamActivityWidget({
       activeCount,
       readCount: readAgents.length,
-      writeCount: activeWriteMembers.length,
+      writeCount: writeAgents.length + activeWriteMembers.length,
       unreadCount: leadInboxUnreadCount,
       entries,
       statusCounts,
@@ -623,7 +678,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerTeamCommand(pi, {
-    getTeamName: getTeamPanelName,
+    getTeamName: ensureTeamPanelName,
     getLeadInboxUnreadCount: () => leadInboxUnreadCount,
     runningReadAgents,
     completedAgentReports,
@@ -633,8 +688,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerWriterScreenShortcut(pi, {
-    getTeamName: getTeamPanelName,
+    getTeamName: () => teamName,
     terminal,
+    state: writerScreenState,
   });
 
   function readAgentOptions() {
@@ -655,7 +711,6 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  registerModelTools(pi);
   registerTeamTools(pi, {
     terminal,
     runningReadAgents,
@@ -696,13 +751,6 @@ export default function (pi: ExtensionAPI) {
     readAgentKey,
     shutdownTeammate,
     releaseAllClaimsForAgent,
-  });
-
-  registerPredefinedTools(pi, {
-    terminal,
-    adoptTeamAsLead,
-    isTeammate,
-    agentName,
     getTeamName: () => teamName,
   });
 

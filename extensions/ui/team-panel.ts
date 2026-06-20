@@ -12,7 +12,7 @@ import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import type { Member } from "../../src/utils/models";
 
 export interface TeamPanelOptions {
-  getTeamName(): string | null | undefined;
+  getTeamName(ctx?: any): string | null | undefined | Promise<string | null | undefined>;
   getLeadInboxUnreadCount(): number;
   runningReadAgents: Map<string, RunningReadAgent>;
   completedAgentReports: Map<string, CompletedAgentReport[]>;
@@ -79,9 +79,30 @@ function buildClaimPathIndex(allClaims: Array<{ agent: string; path: string }>):
   return pathsByAgent;
 }
 
+function hasFinalReportMetadata(metadata: any): boolean {
+  if (!metadata || typeof metadata !== "object") return false;
+  return typeof metadata.startedAt === "number"
+    || typeof metadata.elapsedMs === "number"
+    || typeof metadata.tokensUsed === "number"
+    || typeof metadata.costUsd === "number"
+    || typeof metadata.model === "string"
+    || typeof metadata.thinking === "string";
+}
+
+function completionStatusFromLeadInboxMessage(message: any): CompletedAgentReport["status"] | null {
+  const summary = String(message.summary || "").trim();
+  if (/^Read agent .+ completed$/i.test(summary) || /^Read helper .+ done$/i.test(summary)) return "completed";
+  if (/^Read agent .+ failed$/i.test(summary) || /^Read helper .+ failed$/i.test(summary)) return "failed";
+  if (/^Final report$/i.test(summary) || hasFinalReportMetadata(message.metadata)) return "completed";
+  return null;
+}
+
 function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport | null {
   const from = String(message.from || "");
   if (!from || from === "team-lead" || from === "system" || from === "watchdog") return null;
+
+  const status = completionStatusFromLeadInboxMessage(message);
+  if (!status) return null;
 
   const summary = String(message.summary || "Final report");
   const text = String(message.text || "");
@@ -90,7 +111,7 @@ function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport
   return {
     name: String(message.from),
     role,
-    status: "completed" as const,
+    status,
     report: text,
     summary,
     completedAt: message.timestamp ? new Date(message.timestamp).getTime() : Date.now(),
@@ -156,9 +177,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
       messaging.readInbox(panelTeamName, member.name, true, false).catch(() => []),
     ]);
     const role = member.role || "write";
-    const alive = role === "read"
-      ? !!readState || !!runtimeStatus?.ready
-      : !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
+    const alive = !!readState || !!runtimeStatus?.ready || (role === "write" && !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId)));
     const status = readState?.status || runtimeStatus?.currentAction || (alive ? "running" : "idle/dead");
     const startedAt = readState?.startedAt || runtimeStatus?.startedAt || member.joinedAt;
     const tokensUsed = readState?.tokensUsed ?? runtimeStatus?.tokensUsed ?? 0;
@@ -216,12 +235,12 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
 }
 
 export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
-  pi.registerCommand("team", {
-    description: "Switch between main + teammates (↑/↓), attach writer (enter/a), refresh (r), or stop selected teammate (x).",
+  const command = {
+    description: "Inspect main + agents (↑/↓), refresh (r), focus log (←/→), or stop selected agent (x).",
     handler: async (args: string, ctx: any) => {
-      const panelTeamName = args.trim() || options.getTeamName();
+      const panelTeamName = args.trim() || await options.getTeamName(ctx);
       if (!panelTeamName) {
-        ctx.ui.notify("No current team. Pass a team name: /team <name>", "warning");
+        ctx.ui.notify("No active agent session. Spawn an agent first.", "warning");
         return;
       }
 
@@ -307,7 +326,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
         const formatItemLeftRow = (entryIndex: number, item: TeamPanelItem): string => {
           const selected = entryIndex === selectedIndex;
           const pointer = selected ? pink("▸") : " ";
-          const role = item.completed ? dimAnsi("done") : item.role === "read" ? pink("read") : purple("write");
+          const role = item.completed ? dimAnsi("done") : item.role === "read" ? pink("read") : purple("edit");
           const health = item.completed ? item.status : item.status.includes("dead") ? "dead" : item.status;
           const screen = !item.completed && item.role !== "read" && item.tmuxPaneId
             ? ` ${dimAnsi(item.windowId ? `${item.windowId}/${item.tmuxPaneId}` : item.tmuxPaneId)}`
@@ -379,11 +398,11 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           if (selectedIndex === 0) {
             const { activeReaders, activeWriters, completed } = summarizeItems();
             const completedLabel = completed >= MAX_COMPLETED_REPORTS ? `${completed} recent shown` : String(completed);
-            rows.push(pink(`main · ${panelTeamName}`));
+            rows.push(pink("main · current session"));
             rows.push(focusedPane === "log" ? pink("log pane focused") : dimAnsi("press → to focus log pane"));
             rows.push("");
             rows.push(`${purple("read agents")}   ${activeReaders} (in-process)`);
-            rows.push(`${purple("write agents")}  ${activeWriters} (background tmux screens)`);
+            rows.push(`${purple("edit agents")}   ${activeWriters} (in-process, followable)`);
             rows.push(`${purple("completed")}     ${completedLabel}`);
             rows.push(`${purple("lead inbox")}    ${options.getLeadInboxUnreadCount()} unread`);
             rows.push("");
@@ -392,7 +411,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           }
 
           const item = items[selectedIndex - 1];
-          if (!item) return [dimAnsi("No teammates.")];
+          if (!item) return [dimAnsi("No agents.")];
 
           rows.push(pink(item.name));
           if (item.completed) {
@@ -410,85 +429,52 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           rows.push(`${purple("role")} ${item.role}${screen ? ` ${dimAnsi(screen)}` : ""}   ${purple("status")} ${item.status}   ${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
           rows.push(`${purple("model")} ${item.model || "(inherited)"}${item.thinking && item.thinking !== "off" ? `   ${purple("thinking")} ${item.thinking}` : ""}`);
           if (item.requestedBy) rows.push(`${purple("requested by")} ${item.requestedBy}`);
-          if (item.role === "read") rows.push(dimAnsi("in-process · promote_teammate moves it into a background tmux screen"));
+          if (item.role === "read") rows.push(dimAnsi("in-process · followable from Pi"));
+          if (item.role === "write") rows.push(dimAnsi("edit-allowed · in-process · followable from Pi"));
           if (item.taskSubjects.length > 0) rows.push(dimAnsi(`tasks: ${item.taskSubjects.slice(0, 4).join(" · ")}`));
           if (item.claimPaths.length > 0) rows.push(dimAnsi(`claims: ${item.claimPaths.slice(0, 4).join(" · ")}`));
           if (item.runtimeStatus?.lastError?.message) rows.push(theme.fg("warning", `error: ${item.runtimeStatus.lastError.message}`));
           rows.push("");
 
-          if (item.role === "read") {
-            const session = options.runningReadAgents.get(options.readAgentKey(panelTeamName, item.name))?.session;
-            const sessionMessages = Array.isArray(session?.messages) ? session.messages : [];
-            const visibleMessages = sessionMessages.length > MAX_TRANSCRIPT_MESSAGES ? sessionMessages.slice(-MAX_TRANSCRIPT_MESSAGES) : sessionMessages;
-            const formattedTranscript = visibleMessages.length > 0 ? formatTranscriptLines(visibleMessages) : [];
-            const transcript = formattedTranscript.slice(-MAX_TRANSCRIPT_LINES);
-            if (transcript.length > 0) {
-              rows.push(purple("transcript"));
-              if (visibleMessages.length < sessionMessages.length) rows.push(dimAnsi(`showing last ${visibleMessages.length} of ${sessionMessages.length} transcript messages`));
-              if (transcript.length < formattedTranscript.length) rows.push(dimAnsi(`showing last ${transcript.length} of ${formattedTranscript.length} transcript lines`));
-              for (const line of transcript) rows.push(line);
-            } else if (item.recentEvents.length > 0) {
-              rows.push(purple("recent"));
-              for (const event of item.recentEvents.slice(-RECENT_EVENT_DISPLAY_LIMIT)) rows.push(`  ${event}`);
-            } else {
-              rows.push(dimAnsi("Waiting for the read agent's first turn…"));
-            }
+          const session = options.runningReadAgents.get(options.readAgentKey(panelTeamName, item.name))?.session;
+          const sessionMessages = Array.isArray(session?.messages) ? session.messages : [];
+          const visibleMessages = sessionMessages.length > MAX_TRANSCRIPT_MESSAGES ? sessionMessages.slice(-MAX_TRANSCRIPT_MESSAGES) : sessionMessages;
+          const formattedTranscript = visibleMessages.length > 0 ? formatTranscriptLines(visibleMessages) : [];
+          const transcript = formattedTranscript.slice(-MAX_TRANSCRIPT_LINES);
+          if (transcript.length > 0) {
+            rows.push(purple("transcript"));
+            if (visibleMessages.length < sessionMessages.length) rows.push(dimAnsi(`showing last ${visibleMessages.length} of ${sessionMessages.length} transcript messages`));
+            if (transcript.length < formattedTranscript.length) rows.push(dimAnsi(`showing last ${transcript.length} of ${formattedTranscript.length} transcript lines`));
+            for (const line of transcript) rows.push(line);
+          } else if (item.recentEvents.length > 0) {
+            rows.push(purple("recent"));
+            for (const event of item.recentEvents.slice(-RECENT_EVENT_DISPLAY_LIMIT)) rows.push(`  ${event}`);
+          } else if (item.tmuxPaneId) {
+            rows.push(dimAnsi(`Legacy tmux-backed agent ${screen || "(unknown)"} has no in-process transcript.`));
           } else {
-            rows.push(dimAnsi(`Write agent runs in background tmux screen ${screen || "(unknown)"}${item.runtimeStatus?.pid ? ` (pid ${item.runtimeStatus.pid})` : ""}.`));
-            rows.push(dimAnsi("Press enter/a to attach, or Alt+Tab to cycle live writer screens without changing the main layout."));
-            if (item.recentEvents.length > 0) {
-              rows.push("");
-              rows.push(purple("recent"));
-              for (const event of item.recentEvents.slice(-RECENT_EVENT_DISPLAY_LIMIT)) rows.push(`  ${event}`);
-            }
+            rows.push(dimAnsi("Waiting for the agent's first turn…"));
           }
 
           return rows.flatMap(wrap);
         };
 
-        const attachSelectedWriter = () => {
+        const focusSelectedAgentLog = () => {
           if (selectedIndex === 0) {
-            ctx.ui.notify("Select a writer screen to attach.", "warning");
+            ctx.ui.notify("Select an agent to inspect.", "warning");
             return;
           }
-          const item = items[selectedIndex - 1];
-          if (!item) {
-            ctx.ui.notify("No teammate is selected.", "warning");
-            return;
-          }
-          if (item.completed) {
-            ctx.ui.notify(`${item.name} is completed; final output is available in /team.`, "info");
-            return;
-          }
-          if (item.role === "read") {
-            ctx.ui.notify(`${item.name} is an in-process read agent; promote it first to watch in tmux.`, "info");
-            return;
-          }
-          if (!item.tmuxPaneId) {
-            ctx.ui.notify(`${item.name} does not have a tmux screen yet.`, "warning");
-            return;
-          }
-          if (!options.terminal?.focusPane) {
-            ctx.ui.notify("The active terminal adapter cannot focus tmux screens.", "warning");
-            return;
-          }
-
-          const focused = options.terminal.focusPane(item.tmuxPaneId);
-          if (!focused) {
-            ctx.ui.notify(`Could not attach ${item.name} (${item.tmuxPaneId}).`, "warning");
-            return;
-          }
-          done();
+          focusedPane = "log";
+          tui.requestRender();
         };
 
         const shutdownSelected = async () => {
           if (selectedIndex === 0) {
-            ctx.ui.notify("Select a teammate (not main) to stop.", "warning");
+            ctx.ui.notify("Select an agent (not main) to stop.", "warning");
             return;
           }
           const item = items[selectedIndex - 1];
           if (!item) {
-            ctx.ui.notify("No teammate is selected.", "warning");
+            ctx.ui.notify("No agent is selected.", "warning");
             return;
           }
           if (item.completed) {
@@ -502,7 +488,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             const config = await teams.readConfig(panelTeamName);
             const member = config.members.find((member) => member.name === item.name && member.name !== "team-lead");
             if (!member) {
-              ctx.ui.notify(`Could not find member ${item.name} in team config.`, "warning");
+              ctx.ui.notify(`Could not find agent ${item.name} in session state.`, "warning");
               return;
             }
             await options.shutdownTeammate(panelTeamName, member);
@@ -520,8 +506,8 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
         const render = (width: number): string[] => {
           const innerWidth = Math.max(48, width - 4);
           const header: string[] = [];
-          header.push(pink(`▣ team ${panelTeamName}`) + (loading ? purple("  refreshing…") : ""));
-          header.push(dimAnsi("←/→ or h/l: focus list/log   list ↑/↓: select   log ↑/↓: scroll 5   enter/a: attach writer   r: refresh   x: stop selected   esc: close"));
+          header.push(pink("▣ agents") + (loading ? purple("  refreshing…") : ""));
+          header.push(dimAnsi("←/→ or h/l: focus list/log   list ↑/↓: select   log ↑/↓: scroll 5   enter/a: focus log   r: refresh   x: stop selected   esc: close"));
 
           const leftWidth = Math.min(30, Math.max(20, Math.floor(innerWidth * 0.34)));
           const rightWidth = Math.max(20, innerWidth - leftWidth - 3);
@@ -587,7 +573,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
               return;
             }
             if (matchesKey(data, Key.enter) || data === "a" || data === "A") {
-              attachSelectedWriter();
+              focusSelectedAgentLog();
               return;
             }
             if (data === "r" || data === "R") {
@@ -604,5 +590,8 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
         overlayOptions: { width: "92%", maxHeight: "84%", anchor: "center" },
       });
     },
-  });
+  };
+
+  pi.registerCommand("agents", command);
+  pi.registerCommand("team", command);
 }

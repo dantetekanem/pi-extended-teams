@@ -2,11 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Key } from "@mariozechner/pi-tui";
 
 type RegisteredTool = {
   name: string;
   execute: (toolCallId: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any>;
-  renderResult?: (result: any, options: any, theme: any) => { render(width: number): string[] };
 };
 
 const testRoot = path.join(os.tmpdir(), "pi-extended-teams-extension-" + Date.now());
@@ -14,9 +14,7 @@ const testRoot = path.join(os.tmpdir(), "pi-extended-teams-extension-" + Date.no
 function makeCtx(cwd: string, sessionId = "test-session") {
   return {
     cwd,
-    sessionManager: {
-      getSessionId: vi.fn(() => sessionId),
-    },
+    sessionManager: { getSessionId: vi.fn(() => sessionId) },
     model: { provider: "provider", id: "model" },
     modelRegistry: {
       getAvailable: vi.fn(async () => [{ provider: "provider", id: "model" }]),
@@ -28,31 +26,7 @@ function makeCtx(cwd: string, sessionId = "test-session") {
   };
 }
 
-function writeProjectSettings(root: string, settings: unknown) {
-  fs.mkdirSync(path.join(root, ".pi"), { recursive: true });
-  fs.writeFileSync(path.join(root, ".pi", "pi-extended-teams.json"), JSON.stringify(settings));
-}
-
-function addMockRunningReadAgent(readTeamName: string, member: any, options: any) {
-  const state = {
-    runId: `test-${readTeamName}-${member.name}`,
-    name: member.name,
-    teamName: readTeamName,
-    startedAt: Date.now(),
-    tokensUsed: 0,
-    status: "thinking",
-    recentEvents: [],
-    lastActivityAt: Date.now(),
-    model: member.model,
-    thinking: member.thinking,
-    session: { getSessionStats: () => ({ tokens: { total: 0 } }) },
-  };
-  options.runningReadAgents.set(options.readAgentKey(readTeamName, member.name), state);
-  options.ensureReadAgentStatusTicker();
-  return state;
-}
-
-async function setupExtension(env: Record<string, string | undefined> = {}, options: { mockReadAgent?: boolean; readAgentImplementation?: (...args: any[]) => any; modelPreflight?: any } = {}) {
+async function setupExtension(env: Record<string, string | undefined> = {}) {
   vi.resetModules();
   const originalEnv = { ...process.env };
   delete process.env.PI_TEAM_NAME;
@@ -73,37 +47,20 @@ async function setupExtension(env: Record<string, string | undefined> = {}, opti
     getWindowIdForPane: vi.fn((paneId: string) => paneId ? `@${paneId.replace("%", "")}` : null),
   };
 
-  vi.doMock("../src/adapters/terminal-registry", () => ({
-    getTerminalAdapter: () => terminal,
-  }));
+  vi.doMock("../src/adapters/terminal-registry", () => ({ getTerminalAdapter: () => terminal }));
 
   const readAgentMock = {
     runReadAgentInProcess: vi.fn(),
     shutdownReadAgentSession: vi.fn(async () => {}),
   };
-  if (options.readAgentImplementation) {
-    readAgentMock.runReadAgentInProcess.mockImplementation(options.readAgentImplementation);
-  }
-  if (options.mockReadAgent) {
-    vi.doMock("./agents/read-agent.js", () => readAgentMock);
-  }
-
-  if (options.modelPreflight) {
-    const modelPreflight = options.modelPreflight;
-    const piCommandMock = async (importOriginal: any) => {
-      const actual = await importOriginal();
-      return { ...actual, checkChildPiModelAvailability: vi.fn(() => modelPreflight) };
-    };
-    vi.doMock("./internal/pi-command.js", piCommandMock);
-    vi.doMock("./internal/pi-command", piCommandMock);
-  }
+  vi.doMock("./agents/read-agent.js", () => readAgentMock);
 
   const extensionModule = await import("./index.js") as any;
   const extension = extensionModule.default;
   const paths = await import("../src/utils/paths.js");
   const teams = await import("../src/utils/teams.js");
-  const claims = await import("../src/utils/claims.js");
 
+  fs.mkdirSync(testRoot, { recursive: true });
   const root = fs.mkdtempSync(path.join(testRoot, "case-"));
   const teamsRoot = path.join(root, "teams");
   const tasksRoot = path.join(root, "tasks");
@@ -118,1244 +75,170 @@ async function setupExtension(env: Record<string, string | undefined> = {}, opti
   vi.spyOn(paths, "claimsPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "claims.json"));
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "write-queue.json"));
   vi.spyOn(paths, "readHelperQueuePath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "read-helper-queue.json"));
-  vi.spyOn(paths, "sharedMemoryPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "shared-memory.json"));
   vi.spyOn(paths, "leadSessionPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lead-session.json"));
 
   const tools = new Map<string, RegisteredTool>();
-  const shortcuts = new Map<string, any>();
+  const commands = new Map<string, any>();
   const eventHandlers = new Map<string, Function[]>();
   const extensionEventHandlers = new Map<string, Function[]>();
   const pi = {
-    registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
-    registerCommand: vi.fn(),
-    registerShortcut: vi.fn((shortcut: string, options: any) => shortcuts.set(shortcut, options)),
-    on: vi.fn((eventName: string, handler: Function) => {
-      eventHandlers.set(eventName, [...(eventHandlers.get(eventName) || []), handler]);
+    registerTool: vi.fn((tool: RegisteredTool) => tools.set(tool.name, tool)),
+    registerCommand: vi.fn((name: string, command: any) => commands.set(name, command)),
+    registerShortcut: vi.fn(),
+    on: vi.fn((name: string, handler: Function) => {
+      eventHandlers.set(name, [...(eventHandlers.get(name) || []), handler]);
     }),
     events: {
-      on: vi.fn((eventName: string, handler: Function) => {
-        extensionEventHandlers.set(eventName, [...(extensionEventHandlers.get(eventName) || []), handler]);
+      on: vi.fn((name: string, handler: Function) => {
+        const target = name.startsWith("pi-") ? extensionEventHandlers : eventHandlers;
+        target.set(name, [...(target.get(name) || []), handler]);
       }),
       emit: vi.fn(),
     },
     sendUserMessage: vi.fn(),
-    sendMessage: vi.fn(),
   };
 
   extension(pi as any);
 
-  return { root, terminal, tools, shortcuts, pi, eventHandlers, extensionEventHandlers, paths, teams, claims, readAgentMock, restoreEnv: () => { process.env = originalEnv; } };
+  return {
+    root,
+    tools,
+    commands,
+    eventHandlers,
+    extensionEventHandlers,
+    pi,
+    terminal,
+    readAgentMock,
+    teams,
+    restoreEnv() {
+      process.env = originalEnv;
+      vi.restoreAllMocks();
+      if (fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
 }
 
 describe("extension integration", () => {
   beforeEach(() => {
-    vi.useRealTimers();
-    if (!fs.existsSync(testRoot)) fs.mkdirSync(testRoot, { recursive: true });
+    vi.useFakeTimers();
   });
 
   afterEach(() => {
-    vi.restoreAllMocks();
-    vi.doUnmock("../src/adapters/terminal-registry");
-    vi.doUnmock("./agents/read-agent.js");
-    vi.doUnmock("./internal/pi-command.js");
-    vi.doUnmock("./internal/pi-command");
-    if (fs.existsSync(testRoot)) fs.rmSync(testRoot, { recursive: true });
-  });
-
-  it("does not rediscover a lead team from another Pi session", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root, "current-session");
-    setup.teams.createTeam("foreign-team", "session", "lead", "", "provider/model");
-    fs.writeFileSync(setup.paths.leadSessionPath("foreign-team"), JSON.stringify({
-      pid: process.pid,
-      sessionId: "other-session",
-      startedAt: Date.now(),
-    }));
-
-    for (const handler of setup.eventHandlers.get("session_start") || []) {
-      await handler({}, ctx);
-    }
-    const teamCommand = setup.pi.registerCommand.mock.calls.find((call: any[]) => call[0] === "team")?.[1];
-    await teamCommand.handler("", ctx);
-
-    expect(ctx.ui.notify).toHaveBeenCalledWith("No current team. Pass a team name: /team <name>", "warning");
-    expect(ctx.ui.custom).not.toHaveBeenCalled();
-    setup.restoreEnv();
-  });
-
-  it("rediscovers a lead team only when the Pi session id matches", async () => {
-    vi.useFakeTimers();
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root, "current-session");
-    setup.teams.createTeam("current-team", "session", "lead", "", "provider/model");
-    fs.writeFileSync(setup.paths.leadSessionPath("current-team"), JSON.stringify({
-      pid: process.pid,
-      sessionId: "current-session",
-      startedAt: Date.now(),
-    }));
-
-    for (const handler of setup.eventHandlers.get("session_start") || []) {
-      await handler({}, ctx);
-    }
-    const teamCommand = setup.pi.registerCommand.mock.calls.find((call: any[]) => call[0] === "team")?.[1];
-    await teamCommand.handler("", ctx);
-
-    expect(ctx.ui.notify).not.toHaveBeenCalledWith("No current team. Pass a team name: /team <name>", "warning");
-    expect(ctx.ui.custom).toHaveBeenCalled();
-    setup.restoreEnv();
     vi.useRealTimers();
   });
 
-  it("accepts orchestration ctx for late registration after session_start", async () => {
-    vi.useFakeTimers();
+  it("registers the small public tool surface, /agents command, /team alias, and Alt+Tab shortcut", async () => {
     const setup = await setupExtension();
     try {
-      const ctx = makeCtx(setup.root, "late-session");
-      const handler = setup.extensionEventHandlers.get("pi-extended-teams:orchestration-request")?.[0];
-      expect(handler).toBeTruthy();
-
-      await handler!({
-        requestId: "req-1",
-        type: "ensure_team",
-        params: { team_name: "workflow-team", operation_id: "op-1", workflow_run_id: "run-1" },
-        ctx,
-      });
-
-      expect(setup.teams.teamExists("workflow-team")).toBe(true);
-      expect(setup.pi.events.emit).toHaveBeenCalledWith(
-        "pi-extended-teams:orchestration-response",
-        expect.objectContaining({ requestId: "req-1", type: "ensure_team", ok: true, details: expect.objectContaining({ created: true }) })
-      );
-    } finally {
-      setup.restoreEnv();
-      vi.useRealTimers();
-    }
-  });
-
-  it("returns effective resolved role/model/category for spawned teammates", async () => {
-    const setup = await setupExtension({}, { mockReadAgent: true });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-    fs.mkdirSync(path.join(setup.root, ".pi"), { recursive: true });
-    fs.writeFileSync(path.join(setup.root, ".pi", "pi-extended-teams.json"), JSON.stringify({
-      categories: { reviewer: { role: "read", model: "provider/model", thinking: "high" } },
-    }));
-
-    await setup.tools.get("team_create")!.execute("create", {
-      team_name: "team",
-      default_model: "provider/model",
-    }, abort, undefined, ctx);
-
-    const result = await setup.tools.get("spawn_teammate_once")!.execute("spawn", {
-      team_name: "team",
-      name: "reviewer",
-      prompt: "review",
-      cwd: setup.root,
-      role: "write",
-      category: "reviewer",
-      operation_id: "op-1",
-      workflow_run_id: "run-1",
-    }, abort, undefined, ctx);
-
-    expect(result.details).toMatchObject({
-      role: "read",
-      requestedRole: "write",
-      resolvedRole: "read",
-      requestedCategory: "reviewer",
-      category: "reviewer",
-      resolvedCategory: "reviewer",
-      model: "provider/model",
-      thinking: "high",
-      modelSource: "category",
-      queued: false,
-    });
-    expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledWith(
-      "team",
-      expect.objectContaining({ name: "reviewer", role: "read", category: "reviewer", model: "provider/model" }),
-      "review",
-      ctx,
-      expect.any(Object)
-    );
-    setup.restoreEnv();
-  });
-
-  it("starts prompt-build fanout without adopting it as the lead team while letting /team inspect it", async () => {
-    const setup = await setupExtension({}, { mockReadAgent: true });
-    const ctx = makeCtx(setup.root, "current-session");
-
-    for (const handler of setup.eventHandlers.get("session_start") || []) {
-      await handler({}, ctx);
-    }
-
-    for (const handler of setup.extensionEventHandlers.get("pi-prompt:prompt-build:start") || []) {
-      await handler({
-        teamName: "prompt-build-test",
-        prompts: ["build options"],
-        cwd: setup.root,
-        thinking: "high",
-      });
-    }
-
-    expect(setup.teams.teamExists("prompt-build-test")).toBe(true);
-    expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledWith(
-      "prompt-build-test",
-      expect.objectContaining({ name: "prompt-branch-1", role: "read" }),
-      "build options",
-      ctx,
-      expect.any(Object),
-    );
-
-    const teamCommand = setup.pi.registerCommand.mock.calls.find((call: any[]) => call[0] === "team")?.[1];
-    await teamCommand.handler("", ctx);
-    expect(ctx.ui.notify).not.toHaveBeenCalledWith("No current team. Pass a team name: /team <name>", "warning");
-    expect(ctx.ui.custom).toHaveBeenCalled();
-    setup.restoreEnv();
-  });
-
-  it("spawns inline agents in one team_create call", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    const result = await setup.tools.get("team_create")!.execute("1", {
-      team_name: "team",
-      default_model: "provider/model",
-      agents: [
-        { name: "w1", role: "write", prompt: "work 1", cwd: setup.root },
-        { name: "w2", role: "write", prompt: "work 2", cwd: setup.root },
-      ],
-    }, abort, undefined, ctx);
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(2);
-    expect(result.details.spawned).toHaveLength(2);
-
-    const config = await setup.teams.readConfig("team");
-    expect(config.members.map((member: any) => member.name).sort()).toEqual(["team-lead", "w1", "w2"]);
-    setup.restoreEnv();
-  });
-
-  it("Alt+Tab cycles from main through background writer screens and back", async () => {
-    const setup = await setupExtension({ TMUX_PANE: "%lead" });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    await setup.tools.get("team_create")!.execute("1", {
-      team_name: "team",
-      default_model: "provider/model",
-      agents: [
-        { name: "w1", role: "write", prompt: "work 1", cwd: setup.root },
-        { name: "w2", role: "write", prompt: "work 2", cwd: setup.root },
-      ],
-    }, abort, undefined, ctx);
-
-    const shortcut = setup.shortcuts.get("alt+tab");
-    expect(shortcut).toBeTruthy();
-
-    setup.terminal.getCurrentPaneId.mockReturnValue("%lead");
-    await shortcut.handler(ctx);
-    expect(setup.terminal.focusPane).toHaveBeenLastCalledWith("%1");
-
-    setup.terminal.getCurrentPaneId.mockReturnValue("%1");
-    await shortcut.handler(ctx);
-    expect(setup.terminal.focusPane).toHaveBeenLastCalledWith("%2");
-
-    setup.terminal.getCurrentPaneId.mockReturnValue("%2");
-    await shortcut.handler(ctx);
-    expect(setup.terminal.focusPane).toHaveBeenLastCalledWith("%lead");
-    setup.restoreEnv();
-  });
-
-  it("writes write-agent spawn debug events when debug mode is enabled", async () => {
-    const setup = await setupExtension({ PI_EXTENDED_TEAMS_DEBUG: "1" });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    try {
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
-      }, abort, undefined, ctx);
-
-      const result = await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name: "writer",
-        prompt: "work",
-        cwd: setup.root,
-        role: "write",
-      }, abort, undefined, ctx);
-
-      const debugLogPath = path.join(setup.paths.teamDir("team"), "debug.log");
-      const events = fs.readFileSync(debugLogPath, "utf-8").trim().split("\n").map(line => JSON.parse(line));
-
-      expect(result.details.debugLogPath).toBe(debugLogPath);
-      expect(events).toEqual(expect.arrayContaining([
-        expect.objectContaining({ event: "write-agent.spawn.request", agentName: "writer", activeWriteCount: 0 }),
-        expect.objectContaining({ event: "write-agent.spawn.prepare", agentName: "writer", cwd: setup.root }),
-        expect.objectContaining({ event: "write-agent.spawn.success", agentName: "writer", terminalId: "%1" }),
-      ]));
-      expect(events.find(event => event.event === "write-agent.spawn.prepare")?.command).toContain("--extension");
-      expect(events.find(event => event.event === "write-agent.spawn.prepare")?.extensionSource.replace(/\\/g, "/")).toContain("/extensions/index.");
+      expect(Array.from(setup.tools.keys()).sort()).toEqual([
+        "check_teammate",
+        "claim_file",
+        "list_file_claims",
+        "read_inbox",
+        "release_file",
+        "report_and_exit",
+        "send_message",
+        "spawn_agent",
+        "spawn_swarm_agents",
+      ]);
+      expect(setup.commands.has("agents")).toBe(true);
+      expect(setup.commands.has("team")).toBe(true);
+      expect(setup.commands.get("team")).toBe(setup.commands.get("agents"));
+      expect(setup.pi.registerShortcut).toHaveBeenCalledWith(Key.alt("tab"), expect.objectContaining({ handler: expect.any(Function) }));
+      expect(setup.tools.has("team_create")).toBe(false);
+      expect(setup.tools.has("ensure_team")).toBe(false);
+      expect(setup.tools.has("spawn_teammate")).toBe(false);
+      expect(setup.tools.has("request_read_helper")).toBe(false);
+      expect(setup.tools.has("list_available_models")).toBe(false);
     } finally {
       setup.restoreEnv();
     }
   });
 
-  it("falls back to Pi default when the child process cannot see the selected model", async () => {
-    const setup = await setupExtension({ PI_EXTENDED_TEAMS_DEBUG: "1" }, {
-      modelPreflight: {
-        status: "missing",
-        command: "pi --no-extensions --list-models",
-        stdout: "provider other-model context",
-        stderr: "",
-        exitStatus: 0,
-      },
-    });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
+  it("/agents opens an empty implicit current-session panel", async () => {
+    const setup = await setupExtension();
     try {
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
-      }, abort, undefined, ctx);
+      const ctx = makeCtx(setup.root, "empty-session");
+      await setup.commands.get("agents").handler("", ctx);
 
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name: "writer",
-        prompt: "work",
-        cwd: setup.root,
-        role: "write",
-        thinking: "high",
-      }, abort, undefined, ctx);
-
-      const spawnCommand = (setup.terminal.spawn.mock.calls as any[])[0][0].command;
-      expect(spawnCommand).not.toContain("--model");
-      expect(spawnCommand).toContain("--thinking 'high'");
-
-      const config = await setup.teams.readConfig("team");
-      const writer = config.members.find((member: any) => member.name === "writer");
-      expect(writer?.model).toBeUndefined();
-
-      const leadInbox = JSON.parse(fs.readFileSync(setup.paths.inboxPath("team", "team-lead"), "utf-8"));
-      expect(leadInbox[0].text).toContain("could not use model provider/model");
-      expect(leadInbox[0].color).toBe("yellow");
-
-      const debugLogPath = path.join(setup.paths.teamDir("team"), "debug.log");
-      const events = fs.readFileSync(debugLogPath, "utf-8").trim().split("\n").map(line => JSON.parse(line));
-      const prepare = events.find(event => event.event === "write-agent.spawn.prepare");
-      expect(prepare).toMatchObject({ model: "provider/model", launchModel: null, modelPreflight: { status: "missing" } });
-      expect(prepare.command).not.toContain("--model");
+      expect(ctx.ui.notify).not.toHaveBeenCalled();
+      expect(ctx.ui.custom).toHaveBeenCalled();
+      const config = await setup.teams.readConfig("session-empty-session");
+      expect(config.members.map((member: any) => member.name)).toEqual(["team-lead"]);
     } finally {
       setup.restoreEnv();
     }
   });
 
-  it("queues the fourth write agent and drains FIFO when a writer shuts down", async () => {
+  it("/team opens the same empty implicit current-session panel as /agents", async () => {
     const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 3 } });
-
-    await setup.tools.get("team_create")!.execute("1", {
-      team_name: "team",
-      default_model: "provider/model",
-    }, abort, undefined, ctx);
-
-    for (const name of ["w1", "w2", "w3", "w4"]) {
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name,
-        prompt: `work ${name}`,
-        cwd: setup.root,
-        role: "write",
-      }, abort, undefined, ctx);
-    }
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(3);
-    let queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
-    expect(queue.details.queue).toMatchObject([{ name: "w4" }]);
-
-    await setup.tools.get("process_shutdown_approved")!.execute("shutdown", {
-      team_name: "team",
-      agent_name: "w1",
-    }, abort, undefined, ctx);
-
-    expect(setup.terminal.kill).toHaveBeenCalledWith("%1");
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(4);
-    queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
-    expect(queue.details.queue).toEqual([]);
-
-    const config = await setup.teams.readConfig("team");
-    expect(config.members.map((member: any) => member.name).sort()).toEqual(["team-lead", "w2", "w3", "w4"]);
-    setup.restoreEnv();
-  });
-
-  it("defaults to a high write-agent cap and queues only after 100 writers", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    await setup.tools.get("team_create")!.execute("1", {
-      team_name: "team",
-      default_model: "provider/model",
-    }, abort, undefined, ctx);
-
-    for (const name of Array.from({ length: 101 }, (_, index) => `w${index + 1}`)) {
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name,
-        prompt: `work ${name}`,
-        cwd: setup.root,
-        role: "write",
-      }, abort, undefined, ctx);
-    }
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(100);
-    const queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
-    expect(queue.details.queue).toMatchObject([{ name: "w101" }]);
-    setup.restoreEnv();
-  });
-
-  it("keeps concurrent write spawns within capacity and queues overflow", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 100 } });
-
-    await setup.tools.get("team_create")!.execute("1", {
-      team_name: "team",
-      default_model: "provider/model",
-    }, abort, undefined, ctx);
-
-    const results = await Promise.all(Array.from({ length: 125 }, (_value, index) => {
-      const name = `w${index + 1}`;
-      return setup.tools.get("spawn_teammate")!.execute(`spawn-${name}`, {
-        team_name: "team",
-        name,
-        prompt: `work ${name}`,
-        cwd: setup.root,
-        role: "write",
-      }, abort, undefined, ctx);
-    }));
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(100);
-    expect(results.filter((result: any) => result.details.queued).length).toBe(25);
-    const queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
-    expect(queue.details.queue).toHaveLength(25);
-
-    const config = await setup.teams.readConfig("team");
-    const writeMembers = config.members.filter((member: any) => member.agentType === "teammate" && member.role === "write");
-    expect(writeMembers).toHaveLength(100);
-    const allWriterNames = [...writeMembers.map((member: any) => member.name), ...queue.details.queue.map((item: any) => item.name)];
-    expect(new Set(allWriterNames)).toEqual(new Set(Array.from({ length: 125 }, (_value, index) => `w${index + 1}`)));
-    setup.restoreEnv();
-  }, 15_000);
-
-  it("deduplicates concurrent idempotent write spawns that overflow into the queue", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 1 } });
-
-    await setup.tools.get("team_create")!.execute("1", {
-      team_name: "team",
-      default_model: "provider/model",
-    }, abort, undefined, ctx);
-
-    await setup.tools.get("spawn_teammate")!.execute("spawn-active", {
-      team_name: "team",
-      name: "active-writer",
-      prompt: "active work",
-      cwd: setup.root,
-      role: "write",
-    }, abort, undefined, ctx);
-
-    const results = await Promise.all(Array.from({ length: 25 }, (_value, index) => (
-      setup.tools.get("spawn_teammate_once")!.execute(`spawn-once-${index}`, {
-        team_name: "team",
-        name: "queued-writer",
-        prompt: "queued work",
-        cwd: setup.root,
-        role: "write",
-        operation_id: "op-queued",
-        workflow_run_id: "run-1",
-      }, abort, undefined, ctx)
-    )));
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(1);
-    const queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
-    expect(queue.details.queue).toMatchObject([{ name: "queued-writer" }]);
-    expect(new Set(results.map((result: any) => result.details.queueId))).toEqual(new Set([queue.details.queue[0].id]));
-    setup.restoreEnv();
-  }, 15_000);
-
-  it("drains queued writers only up to the configured project cap", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 3 } });
-
-    await setup.tools.get("team_create")!.execute("1", {
-      team_name: "team",
-      default_model: "provider/model",
-    }, abort, undefined, ctx);
-
-    for (const name of ["w1", "w2", "w3", "w4", "w5", "w6"]) {
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name,
-        prompt: `work ${name}`,
-        cwd: setup.root,
-        role: "write",
-      }, abort, undefined, ctx);
-    }
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(3);
-    let queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
-    expect(queue.details.queue.map((item: any) => item.name)).toEqual(["w4", "w5", "w6"]);
-
-    await setup.tools.get("process_shutdown_approved")!.execute("shutdown", {
-      team_name: "team",
-      agent_name: "w1",
-    }, abort, undefined, ctx);
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(4);
-    queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
-    expect(queue.details.queue.map((item: any) => item.name)).toEqual(["w5", "w6"]);
-    setup.restoreEnv();
-  });
-
-  it("does not drain queued writers while shutting down the whole team", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-    writeProjectSettings(setup.root, { writeAgents: { maxConcurrent: 3 } });
-
-    await setup.tools.get("team_create")!.execute("1", {
-      team_name: "team",
-      default_model: "provider/model",
-    }, abort, undefined, ctx);
-
-    for (const name of ["w1", "w2", "w3", "w4"]) {
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name,
-        prompt: `work ${name}`,
-        cwd: setup.root,
-        role: "write",
-      }, abort, undefined, ctx);
-    }
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(3);
-    const queue = await setup.tools.get("list_write_queue")!.execute("queue", { team_name: "team" }, abort, undefined, ctx);
-    expect(queue.details.queue).toMatchObject([{ name: "w4" }]);
-
-    await setup.tools.get("team_shutdown")!.execute("shutdown", {
-      team_name: "team",
-    }, abort, undefined, ctx);
-
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(3);
-    expect(setup.terminal.kill).toHaveBeenCalledTimes(3);
-    expect(fs.existsSync(setup.paths.teamDir("team"))).toBe(false);
-    setup.restoreEnv();
-  });
-
-  it("teammates request the lead instead of spawning another teammate directly", async () => {
-    const setup = await setupExtension({ PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer" });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    await setup.tools.get("spawn_teammate")!.execute("spawn", {
-      team_name: "team",
-      name: "helper",
-      prompt: "help with investigation",
-      cwd: setup.root,
-      role: "read",
-    }, abort, undefined, ctx);
-
-    expect(setup.terminal.spawn).not.toHaveBeenCalled();
-
-    const inboxPath = setup.paths.inboxPath("team", "team-lead");
-    const inbox = JSON.parse(fs.readFileSync(inboxPath, "utf-8"));
-    expect(inbox[0]).toMatchObject({
-      from: "writer",
-      summary: "Agent spawn request from writer for helper",
-      color: "yellow",
-      read: false,
-    });
-    expect(inbox[0].text).toContain("Teammates are not allowed to spawn or promote other agents directly.");
-    expect(inbox[0].text).toContain("Requested action: spawn_teammate");
-    expect(inbox[0].text).toContain("help with investigation");
-    setup.restoreEnv();
-  });
-
-  it("teammates request the lead instead of creating inline-agent teams", async () => {
-    const setup = await setupExtension({ PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer" });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    const result = await setup.tools.get("team_create")!.execute("create", {
-      team_name: "child-team",
-      default_model: "provider/model",
-      agents: [{ name: "helper", prompt: "help", role: "read", cwd: setup.root }],
-    }, abort, undefined, ctx);
-
-    expect(setup.terminal.spawn).not.toHaveBeenCalled();
-    expect(result.details).toMatchObject({ requested: true, requestedAction: "team_create", teamName: "team" });
-    expect(setup.teams.teamExists("child-team")).toBe(false);
-
-    const inboxPath = setup.paths.inboxPath("team", "team-lead");
-    const inbox = JSON.parse(fs.readFileSync(inboxPath, "utf-8"));
-    expect(inbox[0].text).toContain("Requested action: team_create");
-    expect(inbox[0].text).toContain("child-team");
-    setup.restoreEnv();
-  });
-
-  it("request_teammate sends a lead-owned spawn request", async () => {
-    const setup = await setupExtension({ PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer" });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    const result = await setup.tools.get("request_teammate")!.execute("request", {
-      team_name: "team",
-      name: "tester",
-      prompt: "verify the change",
-      role: "read",
-      reason: "Need independent verification",
-    }, abort, undefined, ctx);
-
-    expect(result.details).toMatchObject({ requested: true, requestedAction: "spawn_teammate", teamName: "team" });
-    const inboxPath = setup.paths.inboxPath("team", "team-lead");
-    const inbox = JSON.parse(fs.readFileSync(inboxPath, "utf-8"));
-    expect(inbox[0].text).toContain("Need independent verification");
-    expect(inbox[0].text).toContain("verify the change");
-    setup.restoreEnv();
-  });
-
-  it("teammates request the lead instead of promoting another teammate directly", async () => {
-    const setup = await setupExtension({ PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer" });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    const result = await setup.tools.get("promote_teammate")!.execute("promote", {
-      team_name: "team",
-      name: "reader",
-      prompt: "move this reader into a pane",
-    }, abort, undefined, ctx);
-
-    expect(setup.terminal.spawn).not.toHaveBeenCalled();
-    expect(setup.terminal.kill).not.toHaveBeenCalled();
-    expect(result.details).toMatchObject({ requested: true, requestedAction: "promote_teammate", teamName: "team" });
-
-    const inboxPath = setup.paths.inboxPath("team", "team-lead");
-    const inbox = JSON.parse(fs.readFileSync(inboxPath, "utf-8"));
-    expect(inbox[0].text).toContain("Requested action: promote_teammate");
-    expect(inbox[0].text).toContain("move this reader into a pane");
-    setup.restoreEnv();
-  });
-
-  it("teammates request the lead instead of creating predefined teams directly", async () => {
-    const setup = await setupExtension({ PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer" });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    const result = await setup.tools.get("create_predefined_team")!.execute("create", {
-      team_name: "child-team",
-      predefined_team: "missing-template",
-      cwd: setup.root,
-      default_model: "provider/model",
-    }, abort, undefined, ctx);
-
-    expect(setup.terminal.spawn).not.toHaveBeenCalled();
-    expect(result.details).toMatchObject({ requested: true, requestedAction: "create_predefined_team", teamName: "team" });
-    expect(setup.teams.teamExists("child-team")).toBe(false);
-
-    const inboxPath = setup.paths.inboxPath("team", "team-lead");
-    const inbox = JSON.parse(fs.readFileSync(inboxPath, "utf-8"));
-    expect(inbox[0].text).toContain("Requested action: create_predefined_team");
-    expect(inbox[0].text).toContain("missing-template");
-    setup.restoreEnv();
-  });
-
-  it("check_teammate removes dead write members instead of leaving stale entries", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    setup.terminal.isAlive.mockReturnValue(false);
-    setup.teams.createTeam("team", "session", "lead", "", "provider/model");
-    await setup.teams.addMember("team", {
-      agentId: "writer@team",
-      name: "writer",
-      agentType: "teammate",
-      role: "write",
-      model: "provider/model",
-      joinedAt: Date.now(),
-      tmuxPaneId: "%dead",
-      cwd: setup.root,
-      subscriptions: [],
-    });
-
-    const result = await setup.tools.get("check_teammate")!.execute("check", {
-      team_name: "team",
-      agent_name: "writer",
-    }, abort, undefined, ctx);
-
-    expect(result.details).toMatchObject({ alive: false, health: "dead", removedMember: true });
-    const config = await setup.teams.readConfig("team");
-    expect(config.members.map((member: any) => member.name)).toEqual(["team-lead"]);
-    setup.restoreEnv();
-  });
-
-  it("observe_team renders compact by default with expandable details", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    setup.teams.createTeam("team", "session", "lead", "", "provider/model");
-    await setup.teams.addMember("team", {
-      agentId: "writer@team",
-      name: "writer",
-      agentType: "teammate",
-      role: "write",
-      model: "provider/model",
-      joinedAt: Date.now(),
-      tmuxPaneId: "%writer",
-      cwd: setup.root,
-      subscriptions: [],
-    });
-
-    const tool = setup.tools.get("observe_team")!;
-    const result = await tool.execute("observe", { team_name: "team" }, abort, undefined, ctx);
-    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-
-    const collapsed = tool.renderResult!(result, { expanded: false }, theme).render(160).join("\n");
-    expect(collapsed).toContain("team:");
-    expect(collapsed).toContain("members");
-    expect(collapsed).toContain("details");
-    expect(collapsed).not.toContain("members:\n");
-
-    const expanded = tool.renderResult!(result, { expanded: true }, theme).render(160).join("\n");
-    expect(expanded).toContain("members:");
-    expect(expanded).toContain("writer");
-    expect(expanded).toContain("write queue: empty");
-    setup.restoreEnv();
-  });
-
-  it("dead write members do not consume write-agent capacity", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    setup.terminal.isAlive.mockReturnValue(false);
-    setup.teams.createTeam("team", "session", "lead", "", "provider/model");
-    for (const name of ["dead1", "dead2", "dead3"]) {
-      await setup.teams.addMember("team", {
-        agentId: `${name}@team`,
-        name,
-        agentType: "teammate",
-        role: "write",
-        model: "provider/model",
-        joinedAt: Date.now(),
-        tmuxPaneId: `%${name}`,
-        cwd: setup.root,
-        subscriptions: [],
-      });
-    }
-    setup.terminal.isAlive.mockReturnValueOnce(false).mockReturnValueOnce(false).mockReturnValueOnce(false).mockReturnValue(true);
-
-    const result = await setup.tools.get("spawn_teammate")!.execute("spawn", {
-      team_name: "team",
-      name: "writer",
-      prompt: "work",
-      cwd: setup.root,
-      role: "write",
-    }, abort, undefined, ctx);
-
-    expect(result.details).toMatchObject({ queued: false, role: "write" });
-    expect(setup.terminal.spawn).toHaveBeenCalledTimes(1);
-    setup.restoreEnv();
-  });
-
-  it("lead request_teammate calls do not send requests to the lead", async () => {
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    const result = await setup.tools.get("request_teammate")!.execute("request", {
-      team_name: "team",
-      name: "tester",
-      prompt: "verify the change",
-      role: "read",
-    }, abort, undefined, ctx);
-
-    expect(result.details).toEqual({ leadOnly: true });
-    expect(fs.existsSync(setup.paths.inboxPath("team", "team-lead"))).toBe(false);
-    setup.restoreEnv();
-  });
-
-  it("writer request_read_helper queues only and never starts a read agent from the writer process", async () => {
-    const setup = await setupExtension({ PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer" }, { mockReadAgent: true });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
     try {
-      setup.teams.createTeam("team", "session", "lead", "", "provider/model");
-      await setup.teams.addMember("team", {
-        agentId: "writer@team",
-        name: "writer",
-        agentType: "teammate",
+      const ctx = makeCtx(setup.root, "team-alias-session");
+      expect(setup.commands.get("team")).toBe(setup.commands.get("agents"));
+
+      await setup.commands.get("team").handler("", ctx);
+
+      expect(ctx.ui.notify).not.toHaveBeenCalled();
+      expect(ctx.ui.custom).toHaveBeenCalled();
+      const config = await setup.teams.readConfig("session-team-alias-session");
+      expect(config.members.map((member: any) => member.name)).toEqual(["team-lead"]);
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("spawn_agent creates the implicit current-session group and runs edit agents in-process", async () => {
+    const setup = await setupExtension();
+    try {
+      const ctx = makeCtx(setup.root, "edit-session");
+      const abort = new AbortController().signal;
+
+      const result = await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "editor",
         role: "write",
+        prompt: "Edit the file",
+        cwd: setup.root,
         model: "provider/model",
         thinking: "xhigh",
-        joinedAt: Date.now(),
-        tmuxPaneId: "%99",
-        cwd: setup.root,
-        subscriptions: [],
-      });
-
-      const result = await setup.tools.get("request_read_helper")!.execute("helper", {
-        team_name: "team",
-        prompt: "Research this.",
       }, abort, undefined, ctx);
 
-      expect(result.details).toMatchObject({ queued: true, helperName: "writer-reader", requester: "writer" });
-      expect(setup.terminal.spawn).not.toHaveBeenCalled();
-      expect(setup.readAgentMock.runReadAgentInProcess).not.toHaveBeenCalled();
-      const config = await setup.teams.readConfig("team");
-      expect(config.members.some((member: any) => member.name === "writer-reader")).toBe(false);
-
-      const readHelperQueue = await import("../src/utils/read-helper-queue.js");
-      const queue = await readHelperQueue.listReadHelperQueue("team");
-      expect(queue).toHaveLength(1);
-      expect(queue[0]).toMatchObject({ name: "writer-reader", requester: "writer", prompt: "Research this." });
-    } finally {
-      setup.restoreEnv();
-    }
-  });
-
-  it("team activity uses an above-editor pi-emote-style card with expandable agent details", async () => {
-    vi.useFakeTimers();
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    try {
-      for (const handler of setup.eventHandlers.get("session_start") || []) {
-        await handler({}, ctx);
-      }
-
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
-      }, abort, undefined, ctx);
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name: "writer",
-        prompt: "work",
-        cwd: setup.root,
-        role: "write",
-        thinking: "xhigh",
-      }, abort, undefined, ctx);
-      const runtime = await import("../src/utils/runtime.js");
-      await runtime.writeRuntimeStatus("team", "writer", {
-        currentAction: "working",
-        activeToolName: "bash",
-        tokensUsed: 88,
-      });
-
-      await vi.advanceTimersByTimeAsync(1000);
-      await Promise.resolve();
-
-      const widgetCall = ctx.ui.setWidget.mock.calls
-        .filter(([key, widget]: any[]) => key === "01-pi-extended-teams-readers" && typeof widget === "function")
-        .at(-1);
-      expect(widgetCall).toBeTruthy();
-      expect(widgetCall![2]).toMatchObject({ placement: "aboveEditor" });
-      const widget = widgetCall![1]({ requestRender: vi.fn() }, {});
-      const collapsed = widget.render(120);
-      expect(collapsed.length).toBeGreaterThan(1);
-      expect(collapsed[0]).toContain("─");
-      expect(collapsed.join("\n")).toContain("team activity");
-      expect(collapsed.join("\n")).toContain("opt+tab switch agents");
-      expect(collapsed.join("\n")).toContain("writer");
-      expect(collapsed.join("\n")).toContain("write");
-      expect(collapsed.join("\n")).not.toContain("working: bash");
-
-      ctx.ui.getToolsExpanded.mockReturnValue(true);
-      const rendered = widget.render(120).join("\n");
-      expect(rendered).toContain("%1");
-      expect(rendered).toContain("model · xhigh");
-      expect(rendered).not.toContain("provider/model");
-      expect(rendered).toContain("88 tok");
-      expect(rendered).toContain("working: bash");
-    } finally {
-      setup.restoreEnv();
-      vi.useRealTimers();
-    }
-  });
-
-  it("debounces read-agent status storms into one activity widget render", async () => {
-    vi.useFakeTimers();
-    const requestRender = vi.fn();
-    const setup = await setupExtension({}, {
-      mockReadAgent: true,
-      readAgentImplementation: (readTeamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
-        addMockRunningReadAgent(readTeamName, member, options);
-        for (let index = 0; index < 25; index += 1) {
-          options.renderReadAgentStatus();
-        }
-      },
-    });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-    ctx.ui.setWidget.mockImplementation((key: string, widget: any) => {
-      if (key === "01-pi-extended-teams-readers" && typeof widget === "function") {
-        widget({ requestRender }, {});
-      }
-    });
-
-    try {
-      for (const handler of setup.eventHandlers.get("session_start") || []) {
-        await handler({}, ctx);
-      }
-
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
-      }, abort, undefined, ctx);
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name: "reader",
-        prompt: "research",
-        cwd: setup.root,
-        role: "read",
-        thinking: "high",
-      }, abort, undefined, ctx);
-
-      expect(requestRender).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(75);
-      await Promise.resolve();
-
-      expect(requestRender).toHaveBeenCalledTimes(1);
-    } finally {
-      setup.restoreEnv();
-      vi.useRealTimers();
-    }
-  });
-
-  it("filters prompt-build read agents out of the normal team activity widget", async () => {
-    vi.useFakeTimers();
-    let activityWidget: { render(width: number): string[] } | undefined;
-    const setup = await setupExtension({}, {
-      mockReadAgent: true,
-      readAgentImplementation: (readTeamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
-        addMockRunningReadAgent(readTeamName, member, options);
-        options.renderReadAgentStatus();
-      },
-    });
-    const ctx = makeCtx(setup.root, "current-session");
-    const abort = new AbortController().signal;
-    ctx.ui.setWidget.mockImplementation((key: string, widget: any) => {
-      if (key === "01-pi-extended-teams-readers" && typeof widget === "function") {
-        activityWidget = widget({ requestRender: vi.fn() }, {}) as any;
-      }
-    });
-
-    try {
-      for (const handler of setup.eventHandlers.get("session_start") || []) {
-        await handler({}, ctx);
-      }
-
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
-      }, abort, undefined, ctx);
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name: "writer",
-        prompt: "work",
-        cwd: setup.root,
-        role: "write",
-        thinking: "xhigh",
-      }, abort, undefined, ctx);
-      await vi.advanceTimersByTimeAsync(75);
-
-      for (const handler of setup.extensionEventHandlers.get("pi-prompt:prompt-build:start") || []) {
-        await handler({
-          teamName: "prompt-build-test",
-          prompts: ["build options"],
-          cwd: setup.root,
-          thinking: "high",
-        });
-      }
-      await vi.advanceTimersByTimeAsync(75);
-
-      expect(activityWidget).toBeTruthy();
-      const rendered = activityWidget!.render(120).join("\n");
-      expect(rendered).toContain("1 active");
-      expect(rendered).toContain("writer");
-      expect(rendered).not.toContain("prompt-branch-1");
-    } finally {
-      setup.restoreEnv();
-      vi.useRealTimers();
-    }
-  });
-
-  it("lead inbox reports do not render a separate or confirmation status box", async () => {
-    vi.useFakeTimers();
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    try {
-      for (const handler of setup.eventHandlers.get("session_start") || []) {
-        await handler({}, ctx);
-      }
-
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
-      }, abort, undefined, ctx);
-      const messaging = await import("../src/utils/messaging.js");
-      await messaging.sendPlainMessage("team", "writer", "team-lead", "Final report", "Writer done", "green");
-
-      await vi.advanceTimersByTimeAsync(30000);
-      await Promise.resolve();
-
-      const duplicateReportWidget = ctx.ui.setWidget.mock.calls
-        .filter(([key, widget]: any[]) => key === "02-pi-extended-teams-inbox" && typeof widget === "function")
-        .at(-1);
-      expect(duplicateReportWidget).toBeUndefined();
-
-      const activityWidget = ctx.ui.setWidget.mock.calls
-        .filter(([key, widget]: any[]) => key === "01-pi-extended-teams-readers" && typeof widget === "function")
-        .at(-1);
-      expect(activityWidget).toBeUndefined();
-      expect(ctx.ui.setWidget.mock.calls.flat().join("\n")).not.toContain("done, waiting report confirmation");
-      expect(ctx.ui.setWidget.mock.calls.flat().join("\n")).not.toContain("team reports ready");
-    } finally {
-      setup.restoreEnv();
-      vi.useRealTimers();
-    }
-  });
-
-  it("does not show helper done notices or active-writer acknowledgements as dead agents", async () => {
-    vi.useFakeTimers();
-    const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    try {
-      for (const handler of setup.eventHandlers.get("session_start") || []) {
-        await handler({}, ctx);
-      }
-
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
-      }, abort, undefined, ctx);
-      await setup.tools.get("spawn_teammate")!.execute("spawn", {
-        team_name: "team",
-        name: "writer",
-        prompt: "work",
-        cwd: setup.root,
-        role: "write",
-      }, abort, undefined, ctx);
-      const messaging = await import("../src/utils/messaging.js");
-      await messaging.sendPlainMessage("team", "writer-reader", "team-lead", "Done: sent latest git log line to writer.", "Done", "cyan");
-      await messaging.sendPlainMessage("team", "writer", "team-lead", "Received helper report from writer-reader; continuing.", "writer received helper report", "green");
-
-      await vi.advanceTimersByTimeAsync(30000);
-      await Promise.resolve();
-
-      const activityWidget = ctx.ui.setWidget.mock.calls
-        .filter(([key, widget]: any[]) => key === "01-pi-extended-teams-readers" && typeof widget === "function")
-        .at(-1);
-      expect(activityWidget).toBeTruthy();
-      const rendered = activityWidget![1]({}, {}).render(120).join("\n");
-      expect(rendered).toContain("writer");
-      expect(rendered).toContain("write");
-      expect(rendered).not.toContain("writer-reader");
-      expect(rendered).not.toContain("writer done, waiting report confirmation");
-      expect(rendered).not.toContain("2 waiting confirmation");
-    } finally {
-      setup.restoreEnv();
-      vi.useRealTimers();
-    }
-  });
-
-  it("lead runtime drains queued read-helper requests and starts helpers outside the writer process", async () => {
-    vi.useFakeTimers();
-    const setup = await setupExtension({}, { mockReadAgent: true });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    try {
-      for (const handler of setup.eventHandlers.get("session_start") || []) {
-        await handler({}, ctx);
-      }
-
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
-      }, abort, undefined, ctx);
-      await setup.teams.addMember("team", {
-        agentId: "writer@team",
-        name: "writer",
-        agentType: "teammate",
-        role: "write",
-        model: "provider/model",
-        thinking: "xhigh",
-        joinedAt: Date.now(),
-        tmuxPaneId: "%99",
-        cwd: setup.root,
-        subscriptions: [],
-      });
-
-      const readHelperQueue = await import("../src/utils/read-helper-queue.js");
-      const queued = await readHelperQueue.enqueueReadHelperRequest("team", {
-        requester: "writer",
-        name: "writer-reader",
-        prompt: "Inspect the handoff contract.",
-        cwd: setup.root,
-        model: "provider/model",
-        thinking: "high",
-      });
-
-      await vi.advanceTimersByTimeAsync(5100);
-
-      expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+      expect(result.details).toMatchObject({ name: "editor", role: "write", mode: "in-process", terminalId: null, session: "session-edit-session" });
       expect(setup.terminal.spawn).not.toHaveBeenCalled();
       expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledWith(
-        "team",
-        expect.objectContaining({ name: "writer-reader", role: "read", requestedBy: "writer", helperKind: "read_helper" }),
-        expect.stringContaining("you must call send_message to send your full report to 'writer'"),
+        "session-edit-session",
+        expect.objectContaining({ name: "editor", role: "write", model: "provider/model", thinking: "xhigh" }),
+        "Edit the file",
         ctx,
-        expect.objectContaining({ isTeammate: false, agentName: "team-lead" })
+        expect.any(Object),
       );
-      expect(await readHelperQueue.listReadHelperQueue("team")).toEqual([]);
 
-      const config = await setup.teams.readConfig("team");
-      expect(config.members.find((member: any) => member.name === "writer-reader")).toMatchObject({
-        role: "read",
-        requestedBy: "writer",
-        helperKind: "read_helper",
-      });
-      expect(queued.name).toBe("writer-reader");
+      const config = await setup.teams.readConfig("session-edit-session");
+      expect(config.members.map((member: any) => member.name)).toEqual(["team-lead", "editor"]);
     } finally {
       setup.restoreEnv();
-      vi.useRealTimers();
     }
   });
 
-  it("wakes the idle lead when team reports arrive", async () => {
-    vi.useFakeTimers();
+  it("spawn_swarm_agents starts a batch with defaults and per-agent overrides", async () => {
     const setup = await setupExtension();
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
     try {
-      for (const handler of setup.eventHandlers.get("session_start") || []) {
-        await handler({}, ctx);
-      }
+      const ctx = makeCtx(setup.root, "swarm-session");
+      const abort = new AbortController().signal;
 
-      await setup.tools.get("team_create")!.execute("1", {
-        team_name: "team",
-        default_model: "provider/model",
+      const result = await setup.tools.get("spawn_swarm_agents")!.execute("swarm", {
+        defaults: { role: "read", cwd: setup.root, model: "provider/model", thinking: "high" },
+        agents: [
+          { name: "one", prompt: "Inspect one" },
+          { name: "two", prompt: "Inspect two", thinking: "xhigh" },
+        ],
       }, abort, undefined, ctx);
 
-      await setup.tools.get("send_message")!.execute("msg", {
-        team_name: "team",
-        recipient: "team-lead",
-        content: "final report",
-        summary: "review complete",
-      }, abort, undefined, ctx);
-
-      await vi.advanceTimersByTimeAsync(30000);
-
-      // Lead is woken via a hidden custom message (display:false), not a visible
-      // user turn, so coordination stays quiet in the transcript.
-      expect(setup.pi.sendUserMessage).not.toHaveBeenCalled();
-      expect(setup.pi.sendMessage).toHaveBeenCalledTimes(1);
-      expect(setup.pi.sendMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          display: false,
-          content: expect.stringContaining("1 team report ready in your inbox for team"),
-        }),
-        expect.objectContaining({ triggerTurn: true }),
-      );
-
-      await vi.advanceTimersByTimeAsync(30000);
-      expect(setup.pi.sendMessage).toHaveBeenCalledTimes(1);
+      expect(result.details.spawned).toHaveLength(2);
+      expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledTimes(2);
+      expect(setup.readAgentMock.runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "one", thinking: "high" });
+      expect(setup.readAgentMock.runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "two", thinking: "xhigh" });
     } finally {
       setup.restoreEnv();
-      vi.useRealTimers();
     }
-  });
-
-  it("report_and_exit sends the report, releases claims, removes the member, and shuts down", async () => {
-    const setup = await setupExtension({ PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer" });
-    const ctx = makeCtx(setup.root);
-    const abort = new AbortController().signal;
-
-    setup.teams.createTeam("team", "session", "lead", "", "provider/model");
-    await setup.teams.addMember("team", {
-      agentId: "writer@team",
-      name: "writer",
-      agentType: "teammate",
-      role: "write",
-      model: "provider/model",
-      joinedAt: Date.now(),
-      tmuxPaneId: "%99",
-      cwd: setup.root,
-      subscriptions: [],
-    });
-    await setup.claims.claimFiles("team", "writer", ["src/a.ts"]);
-    const runtime = await import("../src/utils/runtime.js");
-    await runtime.writeRuntimeStatus("team", "writer", { startedAt: Date.now() - 5000, tokensUsed: 7 });
-    const assistantMessage = {
-      role: "assistant",
-      provider: "provider",
-      model: "model",
-      timestamp: 123,
-      stopReason: "stop",
-      content: [],
-      usage: {
-        input: 30,
-        output: 10,
-        cacheRead: 2,
-        cacheWrite: 1,
-        cost: { total: 0.045 },
-      },
-    };
-    (ctx.sessionManager as any).getBranch = vi.fn(() => [{ type: "message", message: assistantMessage }]);
-
-    await setup.tools.get("report_and_exit")!.execute("report", {
-      team_name: "team",
-      content: "done",
-      summary: "done summary",
-    }, abort, undefined, ctx);
-
-    expect(await setup.claims.listClaims("team")).toEqual([]);
-    const config = await setup.teams.readConfig("team");
-    expect(config.members.map((member: any) => member.name)).toEqual(["team-lead"]);
-
-    const inboxPath = setup.paths.inboxPath("team", "team-lead");
-    const inbox = JSON.parse(fs.readFileSync(inboxPath, "utf-8"));
-    expect(inbox[0]).toMatchObject({
-      from: "writer",
-      text: "done",
-      summary: "done summary",
-      metadata: { tokensUsed: 43, costUsd: 0.045, model: "provider/model" },
-    });
-    const reportEvents = await import("../src/utils/report-events.js");
-    const reports = await reportEvents.listTeamReportEvents("team");
-    expect(reports[0]).toMatchObject({ agentName: "writer", tokensUsed: 43, costUsd: 0.045, model: "provider/model" });
-
-    await new Promise(resolve => setTimeout(resolve, 300));
-    expect(setup.terminal.kill).toHaveBeenCalledWith("%99");
-    expect(ctx.shutdown).toHaveBeenCalled();
-    setup.restoreEnv();
   });
 });

@@ -192,7 +192,7 @@ describe("team panel items", () => {
     });
   });
 
-  it("attaches the selected background writer screen from /team", async () => {
+  it("focuses the selected agent log from /agents without attaching tmux panes", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
       agentId: "writer@team",
@@ -229,12 +229,12 @@ describe("team panel items", () => {
 
     component.handleInput("j");
     const rendered = component.render(120).join("\n");
-    expect(rendered).toContain("background tmux screen @9/%42");
-    expect(rendered).toContain("Press enter/a to attach");
+    expect(rendered).toContain("Legacy tmux-backed agent @9/%42 has no in-process transcript.");
+    expect(rendered).toContain("enter/a: focus log");
 
     component.handleInput("\r");
-    expect(terminal.focusPane).toHaveBeenCalledWith("%42");
-    expect(done).toHaveBeenCalled();
+    expect(terminal.focusPane).not.toHaveBeenCalled();
+    expect(done).not.toHaveBeenCalled();
     component.dispose();
   });
 
@@ -252,7 +252,29 @@ describe("team panel items", () => {
     });
   });
 
-  it("keeps active reader and writer metadata visible in /team item data", async () => {
+  it("does not treat active-agent progress messages as completed reports", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "%42",
+      cwd: root,
+      subscriptions: [],
+    });
+    await sendPlainMessage("team", "writer", "team-lead", "Still investigating the issue.", "Progress update", "yellow");
+
+    const items = await buildTeamPanelItems("team", panelOptions());
+    const writerItems = items.filter(item => item.name === "writer");
+
+    expect(writerItems).toHaveLength(1);
+    expect(writerItems[0]).toMatchObject({ completed: false, status: "running" });
+  });
+
+  it("keeps active reader and writer metadata visible in /agents item data", async () => {
     const now = Date.now();
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
@@ -327,16 +349,16 @@ describe("team panel items", () => {
     });
   });
 
-  it("/team without an active team shows a safe no-team message", async () => {
+  it("/agents without an active session shows a safe message", async () => {
     const pi = { registerCommand: vi.fn() } as any;
     const options = panelOptions({ getTeamName: () => undefined });
     registerTeamCommand(pi, options);
-    const command = pi.registerCommand.mock.calls.find((call: any[]) => call[0] === "team")?.[1];
+    const command = pi.registerCommand.mock.calls.find((call: any[]) => call[0] === "agents")?.[1];
     const ctx = { ui: { notify: vi.fn(), custom: vi.fn() } };
 
     await command.handler("", ctx);
 
-    expect(ctx.ui.notify).toHaveBeenCalledWith("No current team. Pass a team name: /team <name>", "warning");
+    expect(ctx.ui.notify).toHaveBeenCalledWith("No active agent session. Spawn an agent first.", "warning");
     expect(ctx.ui.custom).not.toHaveBeenCalled();
   });
 
@@ -439,7 +461,7 @@ describe("team panel items", () => {
       const base = new Date("2026-06-19T00:00:00.000Z").getTime();
       for (let index = 0; index < MAX_COMPLETED_REPORTS + 5; index++) {
         vi.setSystemTime(new Date(base + index * 1000));
-        await sendPlainMessage("team", `writer-${index.toString().padStart(2, "0")}`, "team-lead", `report ${index}`, `Writer ${index} done`, "green");
+        await sendPlainMessage("team", `writer-${index.toString().padStart(2, "0")}`, "team-lead", `report ${index}`, "Final report", "green");
       }
 
       const items = await buildTeamPanelItems("team", panelOptions());
@@ -565,7 +587,7 @@ describe("team panel items", () => {
     vi.useFakeTimers();
     try {
       teams.createTeam("team", "session", "lead", "", "provider/model");
-      await sendPlainMessage("team", "writer", "team-lead", "final writer report", "Writer done", "green");
+      await sendPlainMessage("team", "writer", "team-lead", "final writer report", "Final report", "green");
 
       let component: any;
       const tui = { requestRender: vi.fn(), terminal: { rows: 30 } };

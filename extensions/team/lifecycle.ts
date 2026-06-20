@@ -22,6 +22,7 @@ export interface LifecycleRuntimeOptions {
   drainWriteQueue(teamName: string): Promise<void>;
   getSessionCwd(): string | undefined;
   getTeamName(): string | null | undefined;
+  onWriterInactive?(teamName: string, member: Member): void;
 }
 
 interface ShutdownTeammateOptions {
@@ -40,27 +41,27 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
   async function killTeammate(teamName: string, member: Member) {
     if (member.name === "team-lead") return;
 
-    if (member.role === "read") {
-      const key = options.readAgentKey(teamName, member.name);
-      const state = options.runningReadAgents.get(key);
-      if (state) state.stopRequested = true;
-      if (state?.session) {
-        await shutdownReadAgentSession(state.session);
-        state.session.dispose();
-      }
-      if (state && options.isCurrentReadAgentRun(key, state)) {
-        options.runningReadAgents.delete(key);
-      }
-      options.renderReadAgentStatus();
-      await runtime.deleteRuntimeStatus(teamName, member.name);
-      return;
+    const key = options.readAgentKey(teamName, member.name);
+    const state = options.runningReadAgents.get(key);
+    if (state) state.stopRequested = true;
+    if (state?.session) {
+      await shutdownReadAgentSession(state.session);
+      state.session.dispose();
     }
+    if (state && options.isCurrentReadAgentRun(key, state)) {
+      options.runningReadAgents.delete(key);
+    }
+    options.renderReadAgentStatus();
 
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
     cleanupPidFileProcess(pidFile, { skipPid: process.pid });
 
     if (member.tmuxPaneId && options.terminal) {
       options.terminal.kill(member.tmuxPaneId);
+    }
+
+    if ((member.role ?? "write") === "write") {
+      options.onWriterInactive?.(teamName, member);
     }
 
     await runtime.deleteRuntimeStatus(teamName, member.name);
@@ -148,24 +149,19 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
         const runtimeStatus = runtimeStatusByMember.get(member.name) ?? null;
         const runtimeStale = teammateRuntimeIsStale(runtimeStatus, staleMs, now);
 
-        if (role === "read") {
-          if (runtimeStale && !options.runningReadAgents.has(options.readAgentKey(targetTeamName, member.name))) {
-            await shutdownTeammate(targetTeamName, member, { drainQueue: false, removeMember: false });
-            reaped.push({ member, reason: "read-agent heartbeat is stale and no in-process session is running" });
-          }
+        const key = options.readAgentKey(targetTeamName, member.name);
+        const inProcessAlive = options.runningReadAgents.has(key);
+
+        if (runtimeStale && !inProcessAlive) {
+          await shutdownTeammate(targetTeamName, member, { drainQueue: false, removeMember: false });
+          reaped.push({ member, reason: `${role}-agent heartbeat is stale and no in-process session is running` });
           continue;
         }
 
-        const paneAlive = !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
-        if (!paneAlive) {
+        const legacyPaneAlive = !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
+        if (!inProcessAlive && member.tmuxPaneId && !legacyPaneAlive) {
           await shutdownTeammate(targetTeamName, member, { drainQueue: false, removeMember: false });
-          reaped.push({ member, reason: "tmux screen is gone" });
-          continue;
-        }
-
-        if (runtimeStale) {
-          await shutdownTeammate(targetTeamName, member, { drainQueue: false, removeMember: false });
-          reaped.push({ member, reason: `heartbeat is stale for more than ${Math.round(staleMs / 1000)}s` });
+          reaped.push({ member, reason: "legacy tmux screen is gone" });
         }
       }
     } finally {

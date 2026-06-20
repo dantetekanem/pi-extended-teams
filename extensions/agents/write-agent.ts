@@ -8,9 +8,12 @@ import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../
 import { buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
 import { countWriteMembers } from "../team/roster";
 import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
+import type { ActiveWriterTab } from "../team/writer-screens";
 
 export interface WriteAgentRuntimeOptions {
   terminal: any;
+  onWriterActive?(tab: ActiveWriterTab): void;
+  onWriterInactive?(teamName: string, member: Member): void;
 }
 
 export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
@@ -94,6 +97,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       });
       const windowId = options.terminal.getWindowIdForPane?.(terminalId) ?? undefined;
       await teams.updateMember(teamName, member.name, { tmuxPaneId: terminalId, windowId });
+      options.onWriterActive?.({ teamName, name: member.name, paneId: terminalId, windowId, joinedAt: member.joinedAt });
       await writeTeamsDebugEvent(teamName, "write-agent.spawn.success", {
         agentName: member.name,
         terminalId,
@@ -109,6 +113,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
         stack: e instanceof Error ? e.stack ?? null : null,
         debugLogPath: debugLogPath ?? null,
       }, settings);
+      options.onWriterInactive?.(teamName, member);
       await teams.removeMember(teamName, member.name);
       const debugHint = debugLogPath ? ` (debug log: ${debugLogPath})` : "";
       throw new Error(`Failed to spawn background tmux screen: ${e}${debugHint}`);

@@ -1,11 +1,19 @@
 ---
 name: teams
-description: Multiply a coding session with parallel read-only agents (and optional isolated edit agents) via pi-extended-teams. Use whenever the user asks to investigate, review, test, audit, validate, or get parallel coverage on code — or when a build/fix has isolated independent chunks worth farming out. Trigger on hot words like "agents", "spawn agents", "use agents", "send agents", or any request to parallelize investigation/review/testing. The lead stays the implementer; agents are the multiplier.
+description: Multiply a coding session with parallel read-only agents (and optional isolated edit agents) via pi-extended-teams. Use whenever the user asks to investigate, review, test, audit, validate, or get parallel coverage on code — or when a build/fix has isolated independent chunks worth farming out. Trigger on hot words like "agents", "spawn agents", "use agents", "send agents", or any request to parallelize investigation/review/testing. Never use while autoresearch mode/session is active; autoresearch must stay single-agent. The lead stays the implementer; agents are the multiplier.
 ---
 
 # pi-extended-teams
 
 Spawn helper agents inside the current Pi session. The lead stays in charge, keeps the main context, and synthesizes agent reports for the user. Agents are followable from Pi and do not require a separate team setup step.
+
+## Autoresearch conflict guard
+
+If autoresearch mode/session is active, running, or being resumed, do **not** use this skill to spawn agents, teams, subagents, or reviewer agents. This overrides hot-word triggers and all default agent delegation because autoresearch must keep experimentation, judgment, and logging in one context to avoid a conflict of interest.
+
+Treat autoresearch as running when `/autoresearch` is active, the prompt says autoresearch mode is active, the agent is following `.auto/prompt.md`, an experiment is running or pending, or the user says autoresearch is running. Do not infer running state from a `.auto/` folder alone.
+
+If agents would otherwise be useful, stop and ask the user to turn off or finish autoresearch first.
 
 ## The balance
 
@@ -61,10 +69,11 @@ spawn_agent({
 
 ## Hot-word trigger: "agents"
 
-When the user says "agents", "use agents", "spawn agents", "send agents", "agents to investigate/review/test", or any phrase meaning "delegate investigation to parallel helpers", spawn 2–3 focused read agents immediately. Do not wait for the user to explain the extension mechanics.
+When the user says "agents", "use agents", "spawn agents", "send agents", "agents to investigate/review/test", or any phrase meaning "delegate investigation to parallel helpers", spawn 2–3 focused read agents immediately. Do not wait for the user to explain the extension mechanics. Exception: if the autoresearch conflict guard is active, spawn nothing and explain that agent delegation is disabled until autoresearch is off.
 
 ## Lead rules
 
+- Never spawn agents, teams, subagents, or reviewer agents while autoresearch mode/session is active, running, or being resumed.
 - Prefer read agents for parallel coverage.
 - Keep implementation in the lead unless a write task is genuinely isolated.
 - Never sleep, busy-wait, or poll. The extension wakes the lead when reports arrive.

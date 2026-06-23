@@ -4,6 +4,16 @@ This guide explains how `pi-extended-teams` transforms your single Pi agent into
 
 ---
 
+## 🛑 Autoresearch Conflict Guard
+
+If autoresearch mode/session is active, running, or being resumed, do **not** create teams, spawn agents, use subagents, or run reviewer agents. Autoresearch must stay single-agent while active because delegating research/review during the optimization loop is a conflict of interest. This guard overrides every pi-extended-teams trigger, including hot-word requests like "agents" or "spawn agents".
+
+Treat autoresearch as running when `/autoresearch` is active, the prompt says autoresearch mode is active, the agent is following `.auto/prompt.md`, an experiment is running or pending, or the user says autoresearch is running. Do not infer running state from a `.auto/` folder alone.
+
+If team help is needed, stop and ask the user to turn off or finish autoresearch first.
+
+---
+
 ## 🎭 The Two Roles
 
 In a `pi-extended-teams` environment, there are two distinct types of agents:
@@ -82,7 +92,7 @@ Use automated hooks to ensure standards.
 - **Code Review**: Having one agent write code and another (specialized) agent review it.
 
 ## 🎯 Hot-word trigger: "agents"
-When the user says "agents", "use agents", "spawn agents", "send agents", or any phrase meaning "delegate to parallel helpers", create a team and spawn read agents immediately — do not wait for a more specific instruction. Default: team_create with 2-3 focused read agents.
+When the user says "agents", "use agents", "spawn agents", "send agents", or any phrase meaning "delegate to parallel helpers", create a team and spawn read agents immediately — do not wait for a more specific instruction. Default: team_create with 2-3 focused read agents. Exception: if the Autoresearch Conflict Guard is active, do not spawn anything; explain that agents are disabled until autoresearch is off.
 
 ## ⚠️ Best Practices
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.

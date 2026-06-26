@@ -14,34 +14,28 @@ function makeSnapshot(overrides: Partial<TeamActivityStatusSnapshot> = {}): Team
 }
 
 describe("agent activity status widget", () => {
-  it("renders large collapsed snapshots as an aggregate without touching per-agent fields", () => {
-    const inaccessibleEntry: TeamActivityStatusEntry = Object.defineProperties({}, {
-      name: { get: () => { throw new Error("name should not be rendered in aggregate mode"); } },
-      role: { get: () => { throw new Error("role should not be rendered in aggregate mode"); } },
-      status: { get: () => { throw new Error("status should not be rendered in aggregate mode"); } },
-      detail: { get: () => { throw new Error("detail should not be rendered in aggregate mode"); } },
-    }) as TeamActivityStatusEntry;
-    const entries = Array.from({ length: 100 }, () => inaccessibleEntry);
+  it("renders open snapshots without a collapse hint", () => {
+    const entries: TeamActivityStatusEntry[] = [{
+      name: "reader",
+      role: "read",
+      status: "thinking",
+      detail: "provider/model · 12 tok · waiting for model response",
+    }];
     const snapshot = makeSnapshot({
-      activeCount: 100,
-      readCount: 90,
-      writeCount: 10,
-      unreadCount: 3,
+      activeCount: 1,
+      readCount: 1,
       entries,
-      statusCounts: { thinking: 80, working: 10, bg: 10 },
+      statusCounts: { thinking: 1 },
     });
 
     const rendered = teamActivityStatusWidget(() => snapshot, () => false).render(120).join("\n");
 
-    expect(rendered).toContain("100 active");
-    expect(rendered).toContain("90 read");
-    expect(rendered).toContain("10 write");
-    expect(rendered).toContain("3 inbox");
-    expect(rendered).toContain("summary");
-    expect(rendered).toContain("80 thinking");
-    expect(rendered).toContain("10 bg");
-    expect(rendered).toContain("10 working");
-    expect(rendered).toContain("/agents shows agent details");
+    expect(rendered).toContain("1 active");
+    expect(rendered).toContain("1 read");
+    expect(rendered).toContain("reader");
+    expect(rendered).toContain("thinking");
+    expect(rendered).not.toContain("collapse");
+    expect(rendered).not.toContain("ctrl+o");
   });
 
   it("keeps expanded rendering bounded while surfacing the aggregate summary", () => {

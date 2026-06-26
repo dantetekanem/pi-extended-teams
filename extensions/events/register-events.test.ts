@@ -80,6 +80,38 @@ describe("extension teammate inbox wake", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("renders agent report messages open even when tool expansion is collapsed", () => {
+    const registerMessageRenderer = vi.fn();
+    registerExtensionEvents({
+      registerMessageRenderer,
+      on: vi.fn(),
+    }, {
+      isTeammate: false,
+      agentName: "team-lead",
+      getTeamName: () => "team",
+      setSessionCtx: vi.fn(),
+      terminal: {},
+      quietTrigger: vi.fn(),
+      startLeadInboxPolling: vi.fn(),
+      startLeadWatchdog: vi.fn(),
+      buildRoster: vi.fn(async () => ({ teamName: "team", members: [] })),
+      formatRosterForPrompt: vi.fn(() => "Roster: empty"),
+    });
+
+    const renderer = registerMessageRenderer.mock.calls.find((call) => call[0] === "pi-extended-teams-report")?.[1];
+    const output = renderer({
+      content: "full report body",
+      details: { name: "reader", tokens: 42, elapsedMs: 1000, ok: true },
+    }, { expanded: false }, {
+      fg: (_name: string, text: string) => text,
+      bold: (text: string) => text,
+    }).render(120).join("\n");
+
+    expect(output).toContain("reader reported");
+    expect(output).toContain("full report body");
+    expect(output).not.toContain("ctrl+o");
+  });
+
   it("wakes teammates with implicit-session inbox instructions", async () => {
     const { handlers, quietTrigger, ctx } = setupEvents(() => true);
 

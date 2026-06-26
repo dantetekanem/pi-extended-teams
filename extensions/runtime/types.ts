@@ -33,5 +33,6 @@ export interface CompletedAgentReport {
   thinking?: string;
   color?: string;
   requestedBy?: string;
-  source: "read-agent" | "lead-inbox";
+  initialPrompt?: string;
+  source: "read-agent" | "lead-inbox" | "report-event";
 }

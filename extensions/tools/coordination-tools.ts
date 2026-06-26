@@ -120,6 +120,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         costUsd,
         model: member?.model,
         thinking: member?.thinking,
+        initialPrompt: member?.prompt,
       };
 
       await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", params.content, params.summary || "Final report", undefined, { metadata: reportMetadata });
@@ -137,6 +138,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         model: member?.model,
         thinking: member?.thinking,
         color: member?.color,
+        metadata: member?.prompt ? { initialPrompt: member.prompt } : undefined,
       }).catch(() => {});
 
       const releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);

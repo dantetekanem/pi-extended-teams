@@ -578,7 +578,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
         }
       }
       if (spawned.length > 0) {
-        lines.push("", "Agents are running. Their reports will arrive here automatically (collapsed; ctrl+o to expand) and you will synthesize them — no polling needed.");
+        lines.push("", "Agents are running. Their reports will arrive here automatically as open report entries and you will synthesize them — no polling needed.");
       }
 
       return { content: [{ type: "text", text: lines.join("\n") }], details: { config, spawned } };

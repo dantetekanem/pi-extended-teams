@@ -1,8 +1,8 @@
 import type { RunningReadAgent } from "../runtime/types";
 import { formatElapsed } from "./renderers.js";
 
-export const READ_AGENT_IDLE_NUDGE_MS = 60_000;
-export const READ_AGENT_HANGING_NUDGE_MS = 180_000;
+export const READ_AGENT_IDLE_NUDGE_MS = 5 * 60_000;
+export const READ_AGENT_HANGING_NUDGE_MS = 15 * 60_000;
 
 export type ReadAgentStatusLabel = RunningReadAgent["status"] | "idle" | "hanging";
 export type ReadAgentIdleLevel = "none" | "soft" | "hard";
@@ -40,16 +40,11 @@ interface ReadAgentStatusClassification {
 
 export function buildReadAgentIdleNudgeMessage(agent: RunningReadAgent, status: ReadAgentStatusDescription): string {
   const severity = status.idleLevel === "hard" ? "appears hung" : "has gone quiet";
-  const action = status.idleLevel === "hard"
-    ? "Ping/check it now, and consider stopping or promoting it if needed."
-    : "Ping it or check /team before assuming it is healthy.";
-  return `Read agent ${agent.name} on team ${agent.teamName} ${severity}: no response or token change for ${formatElapsed(status.idleMs)}. ${action}`;
+  return `Read agent ${agent.name} on team ${agent.teamName} ${severity}: no response or token change for ${formatElapsed(status.idleMs)}. Status is visible in /agents; do not ping/check repeatedly.`;
 }
 
-export function shouldNudgeReadAgentIdle(previousLevel: "soft" | "hard" | undefined, currentLevel: ReadAgentIdleLevel): boolean {
-  if (currentLevel === "none") return false;
-  if (currentLevel === "hard") return previousLevel !== "hard";
-  return previousLevel === undefined;
+export function shouldNudgeReadAgentIdle(_previousLevel: "soft" | "hard" | undefined, _currentLevel: ReadAgentIdleLevel): boolean {
+  return false;
 }
 
 export function describeReadAgentStatus(agent: RunningReadAgent, now = Date.now()): ReadAgentStatusDescription {
@@ -103,14 +98,14 @@ function describeReadAgentStatusFromClassification(
   if (classification.idleLevel === "hard") {
     return {
       ...classification,
-      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · ping/check now`,
+      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · visible in /agents`,
     };
   }
 
   if (classification.idleLevel === "soft") {
     return {
       ...classification,
-      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · consider ping/check`,
+      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · visible in /agents`,
     };
   }
 

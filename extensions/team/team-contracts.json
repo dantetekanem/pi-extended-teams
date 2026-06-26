@@ -5,7 +5,7 @@
   "contracts": [
     {
       "id": "ui.team-activity-card",
-      "description": "Live team activity renders as an above-editor pi-emote-style card with a compact collapsed view and Ctrl+O-expanded details. It must not use a below-editor/bottom-bar text strip. Completed reports arrive as messages/collapsed reports and do not create report-ready or waiting-confirmation status rows."
+      "description": "Live team activity renders as an above-editor pi-emote-style card with always-open bounded details. It must not use a below-editor/bottom-bar text strip. Completed reports arrive as open messages/reports and do not create report-ready or waiting-confirmation status rows."
     },
     {
       "id": "ui.active-reader-writer-info",

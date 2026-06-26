@@ -77,7 +77,10 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 - Prefer read agents for parallel coverage.
 - Keep implementation in the lead unless a write task is genuinely isolated.
 - Never sleep, busy-wait, or poll. The extension wakes the lead when reports arrive.
-- Use `check_teammate` only when a specific agent appears stalled or unhealthy.
+- Trust quiet agents. Do not ping, message, or check an agent just because it has been quiet for less than several minutes; idle/hanging status is visible in `/agents`.
+- Do not wake the lead just to ping idle agents.
+- Use `check_teammate` only when a specific agent appears stalled or unhealthy after several minutes, not immediately after sending a message.
+- Use `stop_teammate` only when the user explicitly asks to cancel/stop an agent or an agent is no longer needed.
 - Ask before applying fixes during an investigation.
 - Never commit, push, deploy, install packages, or start services unless the user authorizes that side effect.
 
@@ -85,7 +88,7 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 
 - Use `/agents` to inspect active agents, completed reports, transcripts, model/thinking levels, elapsed time, and token usage.
 - `/team` remains a compatibility alias for `/agents`.
-- Completed reports also arrive in the lead session as collapsed report entries.
+- Completed reports also arrive in the lead session as open report entries.
 - Use `check_teammate({ agent_name: "name" })` only for targeted liveness diagnostics.
 
 ## Public tools
@@ -94,6 +97,7 @@ Default lead tools:
 
 - `spawn_agent` — start one read or edit-allowed agent in the current Pi session.
 - `spawn_swarm_agents` — start a batch of agents with optional shared defaults.
+- `stop_teammate` — explicitly stop one active agent when cancellation is requested.
 - `check_teammate` — inspect one agent's health when needed.
 - `send_message` — send a direct message in the current session.
 - `read_inbox` — read the current session inbox.

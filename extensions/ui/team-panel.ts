@@ -1,15 +1,19 @@
+import fs from "node:fs";
+import path from "node:path";
 import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import * as teamPaths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
 import * as tasks from "../../src/utils/tasks";
 import * as claims from "../../src/utils/claims";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
+import * as reportEvents from "../../src/utils/report-events";
 import { dimAnsi, pink, purple } from "./ansi";
 import { framePanel, logWindowStart } from "./frame";
 import { isDownInput, isLeftInput, isRightInput, isUpInput } from "./input";
 import { formatElapsed, formatTokenCount, formatTranscriptLines, sanitizeTuiLine } from "./renderers";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
-import type { Member } from "../../src/utils/models";
+import type { InboxMessage, Member, TeamConfig, TeamReportEvent } from "../../src/utils/models";
 
 export interface TeamPanelOptions {
   getTeamName(ctx?: any): string | null | undefined | Promise<string | null | undefined>;
@@ -19,6 +23,15 @@ export interface TeamPanelOptions {
   readAgentKey(teamName: string, agentName: string): string;
   terminal: any;
   shutdownTeammate(teamName: string, member: Member): Promise<void>;
+}
+
+export interface TeamPanelMessage {
+  from: string;
+  to: string;
+  text: string;
+  summary?: string;
+  timestamp: string;
+  read: boolean;
 }
 
 export interface TeamPanelItem {
@@ -41,10 +54,16 @@ export interface TeamPanelItem {
   summary?: string;
   reportText?: string;
   requestedBy?: string;
+  initialPrompt?: string;
+  communications: TeamPanelMessage[];
+  helperNames: string[];
 }
 
 export const MAX_COMPLETED_REPORTS = 50;
 const MAX_DETAIL_TEXT_CHARS = 8_000;
+const MAX_INITIAL_PROMPT_CHARS = 8_000;
+const MAX_COMMUNICATION_MESSAGES = 20;
+const MAX_COMMUNICATION_TEXT_CHARS = 1_500;
 const MAX_TRANSCRIPT_MESSAGES = 20;
 const MAX_TRANSCRIPT_LINES = 80;
 const RECENT_EVENT_DISPLAY_LIMIT = 12;
@@ -59,6 +78,15 @@ function appendMapValue<K, V>(map: Map<K, V[]>, key: K, value: V): void {
   const values = map.get(key);
   if (values) values.push(value);
   else map.set(key, [value]);
+}
+
+function appendUniqueMapValue<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const values = map.get(key);
+  if (values) {
+    if (!values.includes(value)) values.push(value);
+  } else {
+    map.set(key, [value]);
+  }
 }
 
 function buildTaskSubjectIndex(allTasks: any[]): Map<string, string[]> {
@@ -97,6 +125,13 @@ function completionStatusFromLeadInboxMessage(message: any): CompletedAgentRepor
   return null;
 }
 
+function initialPromptFromMetadata(metadata: any): string | undefined {
+  if (!metadata || typeof metadata !== "object") return undefined;
+  if (typeof metadata.initialPrompt === "string") return metadata.initialPrompt;
+  if (typeof metadata.prompt === "string") return metadata.prompt;
+  return undefined;
+}
+
 function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport | null {
   const from = String(message.from || "");
   if (!from || from === "team-lead" || from === "system" || from === "watchdog") return null;
@@ -123,7 +158,32 @@ function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport
     thinking: typeof metadata.thinking === "string" ? metadata.thinking : undefined,
     color: message.color,
     requestedBy: inferRequestedBy(summary, text),
+    initialPrompt: initialPromptFromMetadata(metadata),
     source: "lead-inbox" as const,
+  };
+}
+
+function completedReportFromReportEvent(event: TeamReportEvent): CompletedAgentReport | null {
+  const report = String(event.report || "");
+  if (!event.agentName || report.trim().length === 0) return null;
+
+  return {
+    name: event.agentName,
+    role: event.role || "read",
+    status: event.status,
+    report,
+    summary: event.summary,
+    completedAt: event.createdAt,
+    startedAt: event.startedAt,
+    elapsedMs: event.elapsedMs,
+    tokensUsed: event.tokensUsed,
+    costUsd: event.costUsd,
+    model: event.model,
+    thinking: event.thinking,
+    color: event.color,
+    requestedBy: event.requestedBy,
+    initialPrompt: initialPromptFromMetadata(event.metadata),
+    source: "report-event" as const,
   };
 }
 
@@ -136,6 +196,24 @@ function collectRecentLeadInboxReports(leadInboxMessages: any[]): CompletedAgent
   return reports;
 }
 
+function collectReportEventReports(events: TeamReportEvent[]): CompletedAgentReport[] {
+  return events
+    .map(completedReportFromReportEvent)
+    .filter((report): report is CompletedAgentReport => !!report);
+}
+
+function isHelperDoneNotice(report: CompletedAgentReport): boolean {
+  return /^Read helper .+ done$/i.test(String(report.summary || ""));
+}
+
+function filterInboxCompletionNoticesWithPersistedReports(
+  inboxReports: CompletedAgentReport[],
+  persistedReports: CompletedAgentReport[]
+): CompletedAgentReport[] {
+  const persistedAgents = new Set(persistedReports.map((report) => report.name));
+  return inboxReports.filter((report) => !(persistedAgents.has(report.name) && isHelperDoneNotice(report)));
+}
+
 function mergeRecentCompletedReports(reports: CompletedAgentReport[]): CompletedAgentReport[] {
   const seenCompleted = new Set<string>();
   const merged: CompletedAgentReport[] = [];
@@ -144,7 +222,7 @@ function mergeRecentCompletedReports(reports: CompletedAgentReport[]): Completed
     .sort((a, b) => b.completedAt - a.completedAt);
 
   for (const report of sorted) {
-    const dedupeKey = `${report.name}:${report.completedAt}:${report.summary || ""}`;
+    const dedupeKey = `${report.name}:${report.summary || ""}:${report.report}`;
     if (seenCompleted.has(dedupeKey)) continue;
     seenCompleted.add(dedupeKey);
     merged.push(report);
@@ -159,16 +237,92 @@ function previewLongText(text: string, maxChars = MAX_DETAIL_TEXT_CHARS): string
   return `${text.slice(0, maxChars).trimEnd()}\n${dimAnsi(`… truncated ${omitted} characters for /team rendering`)}`;
 }
 
+function communicationTimestampMs(message: TeamPanelMessage): number {
+  const timestamp = message.timestamp ? new Date(message.timestamp).getTime() : 0;
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function isSafeInboxRecipientName(name: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(name);
+}
+
+function teamPanelMessageFromInbox(to: string, message: InboxMessage): TeamPanelMessage {
+  return {
+    from: String(message.from || ""),
+    to,
+    text: String(message.text || ""),
+    summary: message.summary,
+    timestamp: message.timestamp,
+    read: !!message.read,
+  };
+}
+
+async function collectTeamCommunications(teamName: string, config: TeamConfig): Promise<TeamPanelMessage[]> {
+  const recipients = new Set<string>(["team-lead", ...config.members.map((member) => member.name)]);
+  const inboxDir = path.join(teamPaths.teamDir(teamName), "inboxes");
+
+  if (fs.existsSync(inboxDir)) {
+    for (const fileName of fs.readdirSync(inboxDir)) {
+      if (!fileName.endsWith(".json")) continue;
+      const recipient = path.basename(fileName, ".json");
+      if (isSafeInboxRecipientName(recipient)) recipients.add(recipient);
+    }
+  }
+
+  const batches = await Promise.all([...recipients].map(async (recipient) => {
+    const messages = await messaging.readInbox(teamName, recipient, false, false).catch(() => []);
+    return messages.map((message) => teamPanelMessageFromInbox(recipient, message));
+  }));
+
+  return batches.flat().sort((a, b) => communicationTimestampMs(a) - communicationTimestampMs(b));
+}
+
+function communicationsForAgent(messages: TeamPanelMessage[], agentName: string): TeamPanelMessage[] {
+  return messages
+    .filter((message) => message.from === agentName || message.to === agentName)
+    .slice(-MAX_COMMUNICATION_MESSAGES);
+}
+
+function formatCommunicationTimestamp(message: TeamPanelMessage): string {
+  const timestampMs = communicationTimestampMs(message);
+  if (!timestampMs) return "unknown time";
+  return new Date(timestampMs).toLocaleString();
+}
+
+function appendHelperRelationships(helperNamesByRequester: Map<string, string[]>, reports: CompletedAgentReport[], members: Member[]): void {
+  for (const member of members) {
+    if (member.requestedBy) appendUniqueMapValue(helperNamesByRequester, member.requestedBy, member.name);
+  }
+  for (const report of reports) {
+    if (report.requestedBy) appendUniqueMapValue(helperNamesByRequester, report.requestedBy, report.name);
+  }
+}
+
 export async function buildTeamPanelItems(panelTeamName: string, options: TeamPanelOptions): Promise<TeamPanelItem[]> {
-  const [config, allTasks, allClaims] = await Promise.all([
-    teams.readConfig(panelTeamName),
+  const config = await teams.readConfig(panelTeamName);
+  const [allTasks, allClaims, teamCommunications, persistedReportEvents] = await Promise.all([
     tasks.listTasks(panelTeamName).catch(() => []),
     claims.listClaims(panelTeamName).catch(() => []),
+    collectTeamCommunications(panelTeamName, config).catch(() => []),
+    reportEvents.listTeamReportEvents(panelTeamName).catch(() => []),
   ]);
   const taskSubjectsByOwner = buildTaskSubjectIndex(allTasks);
   const claimPathsByAgent = buildClaimPathIndex(allClaims);
   const now = Date.now();
   const members = config.members.filter((m) => m.name !== "team-lead");
+  const leadInboxMessages = await messaging.readInbox(panelTeamName, "team-lead", false, false).catch(() => []);
+  const persistedReports = collectReportEventReports(persistedReportEvents);
+  const leadInboxReports = filterInboxCompletionNoticesWithPersistedReports(
+    collectRecentLeadInboxReports(leadInboxMessages),
+    persistedReports
+  );
+  const completedReports = mergeRecentCompletedReports([
+    ...(options.completedAgentReports.get(panelTeamName) ?? []),
+    ...persistedReports,
+    ...leadInboxReports,
+  ]);
+  const helperNamesByRequester = new Map<string, string[]>();
+  appendHelperRelationships(helperNamesByRequester, completedReports, members);
 
   const activeItems = await Promise.all(members.map(async (member): Promise<TeamPanelItem> => {
     const readState = options.runningReadAgents.get(options.readAgentKey(panelTeamName, member.name));
@@ -199,14 +353,12 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
       windowId: member.windowId,
       completed: false,
       requestedBy: member.requestedBy,
+      initialPrompt: member.prompt,
+      communications: communicationsForAgent(teamCommunications, member.name),
+      helperNames: helperNamesByRequester.get(member.name) ?? [],
     };
   }));
 
-  const leadInboxMessages = await messaging.readInbox(panelTeamName, "team-lead", false, false).catch(() => []);
-  const completedReports = mergeRecentCompletedReports([
-    ...(options.completedAgentReports.get(panelTeamName) ?? []),
-    ...collectRecentLeadInboxReports(leadInboxMessages),
-  ]);
   const completedItems: TeamPanelItem[] = completedReports.map((report) => ({
     name: report.name,
     role: report.role,
@@ -225,6 +377,9 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
     summary: report.summary,
     reportText: report.report,
     requestedBy: report.requestedBy,
+    initialPrompt: report.initialPrompt,
+    communications: communicationsForAgent(teamCommunications, report.name),
+    helperNames: helperNamesByRequester.get(report.name) ?? [],
   }));
 
   return [...activeItems, ...completedItems].sort((a, b) => {
@@ -236,7 +391,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
 
 export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
   const command = {
-    description: "Inspect main + agents (↑/↓), refresh (r), focus log (←/→), or stop selected agent (x).",
+    description: "Inspect main + agents, prompts, messages, transcripts, and reports; scroll with ↑/↓ or PgUp/PgDn.",
     handler: async (args: string, ctx: any) => {
       const panelTeamName = args.trim() || await options.getTeamName(ctx);
       if (!panelTeamName) {
@@ -249,9 +404,19 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
       let loading = false;
       let focusedPane: "list" | "log" = "list";
       let logOffsetFromBottom = 0;
+      let lastBodyHeight = 10;
+      let lastMaxLogOffset = 0;
 
       await ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: () => void) => {
         const entryCount = () => items.length + 1;
+        const pageSize = () => Math.max(1, lastBodyHeight - 1);
+        const moveSelection = (delta: number) => {
+          selectedIndex = Math.max(0, Math.min(entryCount() - 1, selectedIndex + delta));
+          logOffsetFromBottom = 0;
+        };
+        const scrollLog = (deltaFromBottom: number) => {
+          logOffsetFromBottom = Math.max(0, Math.min(lastMaxLogOffset, logOffsetFromBottom + deltaFromBottom));
+        };
         let autoRefreshInFlight = false;
         let liveTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -394,6 +559,24 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
         const buildRightRows = (width: number): string[] => {
           const wrap = (text: string) => wrapTextWithAnsi(text, Math.max(10, width));
           const rows: string[] = [];
+          const appendAgentContext = (item: TeamPanelItem) => {
+            if (item.helperNames.length > 0) rows.push(`${purple("requested helpers")} ${item.helperNames.join(" · ")}`);
+            if (item.initialPrompt?.trim()) {
+              rows.push(purple("initial prompt"));
+              rows.push(previewLongText(item.initialPrompt, MAX_INITIAL_PROMPT_CHARS));
+              rows.push("");
+            }
+            if (item.communications.length > 0) {
+              rows.push(purple("messages"));
+              for (const message of item.communications) {
+                const summary = message.summary ? dimAnsi(` · ${message.summary}`) : "";
+                const unread = message.read ? "" : dimAnsi(" · unread");
+                rows.push(`${dimAnsi(formatCommunicationTimestamp(message))} ${message.from} ${purple("→")} ${message.to}${summary}${unread}`);
+                if (message.text.trim().length > 0) rows.push(`  ${previewLongText(message.text, MAX_COMMUNICATION_TEXT_CHARS)}`);
+              }
+              rows.push("");
+            }
+          };
 
           if (selectedIndex === 0) {
             const { activeReaders, activeWriters, completed } = summarizeItems();
@@ -419,7 +602,8 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             if (item.elapsedMs > 0 || item.tokensUsed > 0) rows.push(`${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
             if (item.requestedBy) rows.push(`${purple("requested by")} ${item.requestedBy}`);
             if (item.summary) rows.push(`${purple("summary")} ${item.summary}`);
-            rows.push("");
+            appendAgentContext(item);
+            if (rows[rows.length - 1] !== "") rows.push("");
             rows.push(purple("final output"));
             rows.push(previewLongText(item.reportText || dimAnsi("(completed agent produced no output)")));
             return rows.flatMap(wrap);
@@ -435,6 +619,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           if (item.claimPaths.length > 0) rows.push(dimAnsi(`claims: ${item.claimPaths.slice(0, 4).join(" · ")}`));
           if (item.runtimeStatus?.lastError?.message) rows.push(theme.fg("warning", `error: ${item.runtimeStatus.lastError.message}`));
           rows.push("");
+          appendAgentContext(item);
 
           const session = options.runningReadAgents.get(options.readAgentKey(panelTeamName, item.name))?.session;
           const sessionMessages = Array.isArray(session?.messages) ? session.messages : [];
@@ -505,19 +690,25 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
 
         const render = (width: number): string[] => {
           const innerWidth = Math.max(48, width - 4);
-          const header: string[] = [];
-          header.push(pink("▣ agents") + (loading ? purple("  refreshing…") : ""));
-          header.push(dimAnsi("←/→ or h/l: focus list/log   list ↑/↓: select   log ↑/↓: scroll 5   enter/a: focus log   r: refresh   x: stop selected   esc: close"));
-
           const leftWidth = Math.min(30, Math.max(20, Math.floor(innerWidth * 0.34)));
           const rightWidth = Math.max(20, innerWidth - leftWidth - 3);
           const sep = dimAnsi(" │ ");
           const maxRows = Math.max(8, Math.floor((tui.terminal?.rows ?? 24) * 0.82));
-          const bodyHeight = Math.max(3, maxRows - header.length - 3);
+          const headerHeight = 2;
+          const bodyHeight = Math.max(3, maxRows - headerHeight - 3);
+          lastBodyHeight = bodyHeight;
           const leftRows = buildLeftRows(bodyHeight);
           const rightRows = buildRightRows(rightWidth);
+          lastMaxLogOffset = Math.max(0, rightRows.length - bodyHeight);
+          logOffsetFromBottom = Math.min(logOffsetFromBottom, lastMaxLogOffset);
           const rightStart = logWindowStart(rightRows.length, bodyHeight, logOffsetFromBottom);
-          const rightWindow = rightRows.slice(rightStart, rightStart + bodyHeight);
+          const rightEnd = Math.min(rightRows.length, rightStart + bodyHeight);
+          const rightWindow = rightRows.slice(rightStart, rightEnd);
+          const scrollInfo = lastMaxLogOffset > 0 ? `   ${rightStart + 1}-${rightEnd}/${rightRows.length}` : "";
+          const header: string[] = [
+            pink("▣ agents") + (loading ? purple("  refreshing…") : ""),
+            dimAnsi(`←/→ or h/l: focus list/log   list ↑/↓/pg: select   log ↑/↓/pg/home/end: scroll   enter/a: focus log   r: refresh   x: stop selected   esc: close${scrollInfo}`),
+          ];
 
           const content: string[] = [...header, purple("─".repeat(innerWidth))];
           for (let i = 0; i < bodyHeight; i++) {
@@ -554,21 +745,39 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
               tui.requestRender();
               return;
             }
+            if (matchesKey(data, Key.pageDown)) {
+              if (focusedPane === "log") scrollLog(-pageSize());
+              else moveSelection(pageSize());
+              tui.requestRender();
+              return;
+            }
+            if (matchesKey(data, Key.pageUp)) {
+              if (focusedPane === "log") scrollLog(pageSize());
+              else moveSelection(-pageSize());
+              tui.requestRender();
+              return;
+            }
+            if (matchesKey(data, Key.home)) {
+              if (focusedPane === "log") logOffsetFromBottom = lastMaxLogOffset;
+              else moveSelection(-entryCount());
+              tui.requestRender();
+              return;
+            }
+            if (matchesKey(data, Key.end)) {
+              if (focusedPane === "log") logOffsetFromBottom = 0;
+              else moveSelection(entryCount());
+              tui.requestRender();
+              return;
+            }
             if (isDownInput(data)) {
-              if (focusedPane === "log") logOffsetFromBottom = Math.max(0, logOffsetFromBottom - 5);
-              else {
-                selectedIndex = Math.min(entryCount() - 1, selectedIndex + 1);
-                logOffsetFromBottom = 0;
-              }
+              if (focusedPane === "log") scrollLog(-5);
+              else moveSelection(1);
               tui.requestRender();
               return;
             }
             if (isUpInput(data)) {
-              if (focusedPane === "log") logOffsetFromBottom += 5;
-              else {
-                selectedIndex = Math.max(0, selectedIndex - 1);
-                logOffsetFromBottom = 0;
-              }
+              if (focusedPane === "log") scrollLog(5);
+              else moveSelection(-1);
               tui.requestRender();
               return;
             }

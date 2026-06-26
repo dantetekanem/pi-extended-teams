@@ -50,7 +50,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     };
   };
 
-  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, renderOptions: any, theme: any) => {
+  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, _renderOptions: any, theme: any) => {
     const d = message.details || {};
     const meta = [
       d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
@@ -58,9 +58,6 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     ].filter(Boolean).join(" · ");
     const mark = d.ok === false ? theme.fg("warning", "✗") : theme.fg("success", "✓");
     const headline = `${mark} ${d.name || "agent"} reported${meta ? ` · ${meta}` : ""}`;
-    if (!renderOptions.expanded) {
-      return new Text(`${headline}  ${theme.fg("dim", "(ctrl+o to expand)")}`, 0, 0);
-    }
     const body = typeof message.content === "string" ? message.content : "";
     return new Text(`${theme.bold(headline)}\n\n${body}`, 0, 0);
   });

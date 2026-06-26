@@ -1,4 +1,3 @@
-import { keyText } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth } from "@mariozechner/pi-tui";
 import { dimAnsi, pink, purple } from "./ansi";
 
@@ -21,18 +20,9 @@ export interface TeamActivityStatusSnapshot {
   updatedAt: number;
 }
 
-const MAX_COLLAPSED_ENTRIES = 2;
 const MAX_EXPANDED_ENTRIES = 10;
 const AGGREGATE_PREVIEW_THRESHOLD = MAX_EXPANDED_ENTRIES;
 const MAX_AGGREGATE_STATUS_PARTS = 4;
-
-function toolExpandKey(): string {
-  try {
-    return keyText("app.tools.expand") || "ctrl+o";
-  } catch {
-    return "ctrl+o";
-  }
-}
 
 function formatCountSummary(snapshot: TeamActivityStatusSnapshot): string {
   const parts = [`${snapshot.activeCount} active`];
@@ -40,11 +30,6 @@ function formatCountSummary(snapshot: TeamActivityStatusSnapshot): string {
   if (snapshot.writeCount > 0) parts.push(`${snapshot.writeCount} write`);
   if (snapshot.unreadCount > 0) parts.push(`${snapshot.unreadCount} inbox`);
   return parts.join(" · ");
-}
-
-function formatEntryPreview(entry: TeamActivityStatusEntry): string {
-  const state = entry.status ? ` ${entry.status}` : "";
-  return `${pink(entry.name)} ${purple(entry.role)}${state ? purple(state) : ""}`;
 }
 
 function shouldUseAggregatePreview(snapshot: TeamActivityStatusSnapshot): boolean {
@@ -76,16 +61,6 @@ function formatAggregatePreview(snapshot: TeamActivityStatusSnapshot): string {
   return `${pink("summary")} ${purple(summary)} ${dimAnsi("/agents shows agent details")}`;
 }
 
-function formatCollapsedPreview(snapshot: TeamActivityStatusSnapshot): string {
-  if (shouldUseAggregatePreview(snapshot)) return formatAggregatePreview(snapshot);
-
-  const shownEntries = snapshot.entries.slice(0, MAX_COLLAPSED_ENTRIES).map(formatEntryPreview).join(dimAnsi(" · "));
-  const more = snapshot.entries.length > MAX_COLLAPSED_ENTRIES
-    ? dimAnsi(` +${snapshot.entries.length - MAX_COLLAPSED_ENTRIES} more`)
-    : "";
-  return shownEntries ? `${shownEntries}${more}` : dimAnsi("no active agents");
-}
-
 function formatExpandedEntry(entry: TeamActivityStatusEntry): string {
   const status = entry.status ? ` ${purple(entry.status)}` : "";
   const detail = entry.detail ? ` ${dimAnsi(entry.detail)}` : "";
@@ -97,21 +72,8 @@ function formatHeader(snapshot: TeamActivityStatusSnapshot): string {
   return `${pink("agent activity")}  ${dimAnsi(summary)}`;
 }
 
-function collapsedRows(snapshot: TeamActivityStatusSnapshot): string[] {
-  const key = toolExpandKey();
-  return [
-    formatHeader(snapshot),
-    formatCollapsedPreview(snapshot),
-    dimAnsi(`reports land collapsed in chat · ${key} details`),
-  ];
-}
-
 function expandedRows(snapshot: TeamActivityStatusSnapshot): string[] {
-  const key = toolExpandKey();
-  const lines = [
-    formatHeader(snapshot),
-    dimAnsi(`${key} collapse`),
-  ];
+  const lines = [formatHeader(snapshot)];
 
   if (shouldUseAggregatePreview(snapshot)) lines.push(formatAggregatePreview(snapshot));
 
@@ -128,7 +90,7 @@ function expandedRows(snapshot: TeamActivityStatusSnapshot): string[] {
 
 export function teamActivityStatusWidget(
   getSnapshot: () => TeamActivityStatusSnapshot | null | undefined,
-  getExpanded: () => boolean
+  _getExpanded: () => boolean
 ) {
   return {
     render(width: number): string[] {
@@ -136,7 +98,7 @@ export function teamActivityStatusWidget(
       if (!snapshot || width <= 0) return [];
 
       const border = purple("─".repeat(Math.max(0, width)));
-      const bodyRows = getExpanded() ? expandedRows(snapshot) : collapsedRows(snapshot);
+      const bodyRows = expandedRows(snapshot);
       return [border, ...bodyRows.map((body) => truncateToWidth(body, width, "…", true))];
     },
     invalidate() {},

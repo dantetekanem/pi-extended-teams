@@ -140,6 +140,7 @@ describe("extension integration", () => {
         "send_message",
         "spawn_agent",
         "spawn_swarm_agents",
+        "stop_teammate",
       ]);
       expect(setup.commands.has("agents")).toBe(true);
       expect(setup.commands.has("team")).toBe(true);

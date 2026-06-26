@@ -9,6 +9,7 @@ import * as paths from "../../src/utils/paths.js";
 import * as teams from "../../src/utils/teams.js";
 import * as runtime from "../../src/utils/runtime.js";
 import { sendPlainMessage } from "../../src/utils/messaging.js";
+import { appendTeamReportEvent } from "../../src/utils/report-events.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 
 let root: string;
@@ -92,28 +93,21 @@ describe("team panel items", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("keeps the team activity widget compact for 300 active agents", () => {
+  it("keeps the team activity widget open and bounded for 300 active agents", () => {
     const snapshot = makeActivitySnapshot(300);
-    const collapsed = teamActivityStatusWidget(() => snapshot, () => false).render(80);
-    const collapsedText = collapsed.join("\n");
+    const rendered = teamActivityStatusWidget(() => snapshot, () => false).render(80);
+    const text = rendered.join("\n");
 
-    expect(collapsed).toHaveLength(4);
-    expect(collapsedText).toContain("300 active");
-    expect(collapsedText).toContain("summary");
-    expect(collapsedText).toContain("300 thinking");
-    expect(collapsedText).not.toContain("reader-000");
-    expect(collapsed.every((line) => visibleWidth(line) <= 80)).toBe(true);
-
-    const expanded = teamActivityStatusWidget(() => snapshot, () => true).render(80);
-    const expandedText = expanded.join("\n");
-
-    expect(expanded).toHaveLength(15);
-    expect(expandedText).toContain("300 thinking");
-    expect(expandedText).toContain("reader-000");
-    expect(expandedText).toContain("reader-009");
-    expect(expandedText).not.toContain("reader-010");
-    expect(expandedText).toContain("290 more active agents");
-    expect(expanded.every((line) => visibleWidth(line) <= 80)).toBe(true);
+    expect(rendered).toHaveLength(14);
+    expect(text).toContain("300 active");
+    expect(text).toContain("summary");
+    expect(text).toContain("300 thinking");
+    expect(text).toContain("reader-000");
+    expect(text).toContain("reader-009");
+    expect(text).not.toContain("reader-010");
+    expect(text).toContain("290 more active agents");
+    expect(text).not.toContain("collapse");
+    expect(rendered.every((line) => visibleWidth(line) <= 80)).toBe(true);
   });
 
   it("renders the /team overlay compactly for 300 active read agents", async () => {
@@ -252,6 +246,26 @@ describe("team panel items", () => {
     });
   });
 
+  it("does not duplicate read-helper done notices when a persisted full report exists", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await appendTeamReportEvent("team", {
+      agentName: "writer-reader",
+      role: "read",
+      status: "completed",
+      report: "full helper report",
+      summary: "Read agent writer-reader completed",
+      source: "read-agent",
+      requestedBy: "writer",
+    });
+    await sendPlainMessage("team", "writer-reader", "team-lead", "Read helper writer-reader completed for writer. Report sent to writer.", "Read helper writer-reader done", "cyan");
+
+    const items = await buildTeamPanelItems("team", panelOptions());
+    const completed = items.filter(item => item.name === "writer-reader" && item.completed);
+
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({ reportText: "full helper report", requestedBy: "writer" });
+  });
+
   it("does not treat active-agent progress messages as completed reports", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
@@ -347,6 +361,70 @@ describe("team panel items", () => {
       requestedBy: "writer",
       completed: false,
     });
+  });
+
+  it("shows initial prompts, helper relationships, and team messages in /agents", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "%42",
+      cwd: root,
+      subscriptions: [],
+      prompt: "Fix the brittle agent reporting path.",
+    });
+    await teams.addMember("team", {
+      agentId: "writer-reader@team",
+      name: "writer-reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "Inspect report delivery only.",
+      requestedBy: "writer",
+      helperKind: "read_helper",
+    });
+    await sendPlainMessage("team", "writer", "writer-reader", "Please inspect the report handoff.", "Helper request", "blue");
+
+    let component: any;
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => {
+        pi.command = command;
+      }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, panelOptions());
+
+    await pi.command.handler("team", {
+      ui: {
+        notify: vi.fn(),
+        custom: vi.fn(async (factory: any) => {
+          component = factory({ requestRender: vi.fn(), terminal: { rows: 40 } }, { fg: (_name: string, text: string) => text }, {}, vi.fn());
+        }),
+      },
+    });
+
+    component.handleInput("j");
+    const output = component.render(160).join("\n");
+
+    expect(output).toContain("requested helpers");
+    expect(output).toContain("writer-reader");
+    expect(output).toContain("initial prompt");
+    expect(output).toContain("Fix the brittle agent reporting path.");
+    expect(output).toContain("messages");
+    expect(output).toContain("writer");
+    expect(output).toContain("writer-reader");
+    expect(output).toContain("Helper request");
+    expect(output).toContain("Please inspect the report handoff.");
+
+    component.dispose();
   });
 
   it("/agents without an active session shows a safe message", async () => {

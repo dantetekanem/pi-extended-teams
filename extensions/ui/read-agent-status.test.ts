@@ -38,61 +38,71 @@ describe("read-agent status descriptions", () => {
     });
   });
 
-  it("nudges softly after 60 seconds without response or token movement", () => {
+  it("trusts quiet agents for the first few minutes", () => {
     const agent = makeAgent({ status: "thinking" });
 
     expect(describeReadAgentStatus(agent, agent.startedAt + 61_000)).toMatchObject({
-      label: "idle",
-      detail: "no response/token change for 1m01s · consider ping/check",
-      idleLevel: "soft",
-      idleMs: 61_000,
+      label: "thinking",
+      detail: "waiting for model response",
+      idleLevel: "none",
     });
   });
 
-  it("nudges hard after 3 minutes without response or token movement", () => {
+  it("marks idle agents without instructing the lead to ping", () => {
+    const agent = makeAgent({ status: "thinking" });
+
+    expect(describeReadAgentStatus(agent, agent.startedAt + 301_000)).toMatchObject({
+      label: "idle",
+      detail: "no response/token change for 5m01s · visible in /agents",
+      idleLevel: "soft",
+      idleMs: 301_000,
+    });
+  });
+
+  it("marks hanging agents without instructing the lead to ping", () => {
     const agent = makeAgent({ status: "working", activeToolName: "read" });
 
-    expect(describeReadAgentStatus(agent, agent.startedAt + 181_000)).toMatchObject({
+    expect(describeReadAgentStatus(agent, agent.startedAt + 901_000)).toMatchObject({
       label: "hanging",
-      detail: "no response/token change for 3m01s · ping/check now",
+      detail: "no response/token change for 15m01s · visible in /agents",
       idleLevel: "hard",
-      idleMs: 181_000,
+      idleMs: 901_000,
     });
   });
 
-  it("sends each idle nudge once, while still escalating from soft to hard", () => {
+  it("does not wake the lead for idle/hanging read agents", () => {
     expect(shouldNudgeReadAgentIdle(undefined, "none")).toBe(false);
-    expect(shouldNudgeReadAgentIdle(undefined, "soft")).toBe(true);
+    expect(shouldNudgeReadAgentIdle(undefined, "soft")).toBe(false);
     expect(shouldNudgeReadAgentIdle("soft", "soft")).toBe(false);
-    expect(shouldNudgeReadAgentIdle("soft", "hard")).toBe(true);
+    expect(shouldNudgeReadAgentIdle("soft", "hard")).toBe(false);
     expect(shouldNudgeReadAgentIdle("hard", "hard")).toBe(false);
   });
 
-  it("builds the soft and hard lead nudge messages", () => {
+  it("builds passive idle status messages", () => {
     const agent = makeAgent({ name: "reviewer", teamName: "status-team" });
 
     expect(buildReadAgentIdleNudgeMessage(agent, {
       label: "idle",
       detail: "",
       idleLevel: "soft",
-      idleMs: 61_000,
-    })).toBe("Read agent reviewer on team status-team has gone quiet: no response or token change for 1m01s. Ping it or check /team before assuming it is healthy.");
+      idleMs: 301_000,
+    })).toBe("Read agent reviewer on team status-team has gone quiet: no response or token change for 5m01s. Status is visible in /agents; do not ping/check repeatedly.");
 
     expect(buildReadAgentIdleNudgeMessage(agent, {
       label: "hanging",
       detail: "",
       idleLevel: "hard",
-      idleMs: 181_000,
-    })).toBe("Read agent reviewer on team status-team appears hung: no response or token change for 3m01s. Ping/check it now, and consider stopping or promoting it if needed.");
+      idleMs: 901_000,
+    })).toBe("Read agent reviewer on team status-team appears hung: no response or token change for 15m01s. Status is visible in /agents; do not ping/check repeatedly.");
   });
 
   it("summarizes many agents while limiting detailed status descriptions", () => {
     const startedAt = Date.UTC(2026, 0, 1, 0, 0, 0);
-    const now = startedAt + 200_000;
+    const now = startedAt + 1_000_000;
     const agents = [
       makeAgent({ name: "thinking", status: "thinking", lastActivityAt: now - 10_000 }),
-      makeAgent({ name: "idle", status: "thinking", lastActivityAt: now - 61_000 }),
-      makeAgent({ name: "hanging", status: "working", lastActivityAt: now - 181_000 }),
+      makeAgent({ name: "idle", status: "thinking", lastActivityAt: now - 301_000 }),
+      makeAgent({ name: "hanging", status: "working", lastActivityAt: now - 901_000 }),
       makeAgent({ name: "working", status: "working", activeToolName: "bash", lastActivityAt: now - 5_000 }),
     ];
 

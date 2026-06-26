@@ -115,7 +115,31 @@ async function recordReadAgentReportEvent(
     source: "read-agent",
     operationId: operation.operationId,
     workflowRunId: operation.workflowRunId,
+    metadata: member.prompt ? { initialPrompt: member.prompt } : undefined,
   }).catch(() => {});
+}
+
+async function ensureLeadCompletionMessage(
+  teamName: string,
+  member: Member,
+  startedAt: number,
+  report: string,
+  summary: string,
+  color: string | undefined,
+  metadata: Record<string, any>
+): Promise<void> {
+  const leadHasReport = await hasRecentMessageFrom(teamName, member.name, "team-lead", startedAt);
+  if (leadHasReport) return;
+
+  await messaging.sendPlainMessage(
+    teamName,
+    member.name,
+    "team-lead",
+    report,
+    summary,
+    color,
+    { metadata }
+  );
 }
 
 async function ensureReadHelperCompletionMessages(
@@ -310,9 +334,20 @@ export async function runReadAgentInProcess(
       thinking: member.thinking,
       color: member.color,
       requestedBy: member.requestedBy,
+      initialPrompt: member.prompt || prompt,
       source: "read-agent",
     });
-    await recordReadAgentReportEvent(readTeamName, member, "completed", report, `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`, state.startedAt, state.tokensUsed, completionStats.cost);
+    const completionSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
+    const completionMetadata = {
+      startedAt: state.startedAt,
+      elapsedMs: Date.now() - state.startedAt,
+      tokensUsed: state.tokensUsed,
+      costUsd: completionStats.cost,
+      model: member.model,
+      thinking: member.thinking,
+      initialPrompt: member.prompt || prompt,
+    };
+    await recordReadAgentReportEvent(readTeamName, member, "completed", report, completionSummary, state.startedAt, state.tokensUsed, completionStats.cost);
     const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
     if (member.requestedBy) {
       await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
@@ -324,9 +359,12 @@ export async function runReadAgentInProcess(
       // Workflow orchestrators consume full reports from TeamReportEvent storage.
       // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
     } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
+      if (!readTeamName.startsWith("prompt-build-")) {
+        await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, report, completionSummary, member.color, completionMetadata);
+      }
       options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
     } else {
-      await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", report, `Read agent ${member.name} completed`, member.color);
+      await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, report, completionSummary, member.color, completionMetadata);
     }
   } catch (e) {
     if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
@@ -347,9 +385,20 @@ export async function runReadAgentInProcess(
         thinking: member.thinking,
         color: "red",
         requestedBy: member.requestedBy,
+        initialPrompt: member.prompt || prompt,
         source: "read-agent",
       });
-      await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`, state.startedAt, state.tokensUsed, failureStats?.cost, "red");
+      const failureSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`;
+      const failureMetadata = {
+        startedAt: state.startedAt,
+        elapsedMs: Date.now() - state.startedAt,
+        tokensUsed: state.tokensUsed,
+        costUsd: failureStats?.cost,
+        model: member.model,
+        thinking: member.thinking,
+        initialPrompt: member.prompt || prompt,
+      };
+      await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, failureSummary, state.startedAt, state.tokensUsed, failureStats?.cost, "red");
       const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
       if (member.requestedBy) {
         await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, failureReport, "failed", "red");
@@ -361,9 +410,12 @@ export async function runReadAgentInProcess(
         // Workflow orchestrators consume full failure reports from TeamReportEvent storage.
         // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
       } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
+        if (!readTeamName.startsWith("prompt-build-")) {
+          await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, failureReport, failureSummary, "red", failureMetadata);
+        }
         options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, failureReport, false);
       } else {
-        await messaging.sendPlainMessage(readTeamName, member.name, "team-lead", failureReport, `Read agent ${member.name} failed`, "red");
+        await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, failureReport, failureSummary, "red", failureMetadata);
       }
       try {
         await runtime.writeRuntimeStatus(readTeamName, member.name, {

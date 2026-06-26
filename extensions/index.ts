@@ -746,6 +746,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   registerTaskRuntimeTools(pi, {
+    isTeammate,
     terminal,
     runningReadAgents,
     readAgentKey,

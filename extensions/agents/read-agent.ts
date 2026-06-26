@@ -359,9 +359,6 @@ export async function runReadAgentInProcess(
       // Workflow orchestrators consume full reports from TeamReportEvent storage.
       // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
     } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
-      if (!readTeamName.startsWith("prompt-build-")) {
-        await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, report, completionSummary, member.color, completionMetadata);
-      }
       options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
     } else {
       await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, report, completionSummary, member.color, completionMetadata);
@@ -410,9 +407,6 @@ export async function runReadAgentInProcess(
         // Workflow orchestrators consume full failure reports from TeamReportEvent storage.
         // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
       } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
-        if (!readTeamName.startsWith("prompt-build-")) {
-          await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, failureReport, failureSummary, "red", failureMetadata);
-        }
         options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, failureReport, false);
       } else {
         await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, failureReport, failureSummary, "red", failureMetadata);

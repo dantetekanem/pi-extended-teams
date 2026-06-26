@@ -116,14 +116,8 @@ describe("in-process read agent tool wiring", () => {
 
     expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
     expect(options.emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, "final report", true);
-    const leadInbox = await readInbox("team", "team-lead", false, false);
-    expect(leadInbox).toHaveLength(1);
-    expect(leadInbox[0]).toMatchObject({
-      from: "reader",
-      text: "final report",
-      summary: "Read agent reader completed",
-      metadata: { initialPrompt: "investigate", tokensUsed: 42 },
-    });
+    expect(await readInbox("team", "team-lead", true, false)).toEqual([]);
+    expect(await readInbox("team", "team-lead", false, false)).toEqual([]);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader");
     expect(runningReadAgents.size).toBe(0);
   });

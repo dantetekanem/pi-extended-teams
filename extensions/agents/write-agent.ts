@@ -2,7 +2,7 @@ import * as process from "node:process";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as writeQueue from "../../src/utils/write-queue";
-import { loadSettings, resolveAllowedExtensions } from "../../src/utils/settings";
+import { loadSettings, requireFavoriteModelLevel, resolveAllowedExtensions } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
 import { buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
@@ -16,10 +16,22 @@ export interface WriteAgentRuntimeOptions {
   onWriterInactive?(teamName: string, member: Member): void;
 }
 
+function assertWriterUsesConfiguredLevel(member: Member): void {
+  const settings = loadSettings({ projectDir: member.cwd });
+  const level = requireFavoriteModelLevel(settings, member.modelSlot);
+  if (level.role !== "write" || member.role !== "write") {
+    throw new Error(`Write agent ${member.name} must use a writing-* level. Spawn agents by level only.`);
+  }
+  if (member.model !== level.model || member.thinking !== level.thinking) {
+    throw new Error(`Write agent ${member.name} must use configured level ${level.slot}; direct model/thinking overrides are not allowed.`);
+  }
+}
+
 export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
   let writeQueueDraining = false;
 
   async function startWriteAgent(teamName: string, member: Member, prompt: string): Promise<string> {
+    assertWriterUsesConfiguredLevel(member);
     if (!options.terminal) {
       throw new Error("pi-extended-teams requires running inside tmux for write agents.");
     }

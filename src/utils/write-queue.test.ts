@@ -32,10 +32,9 @@ function highVolumeWriteSpawn(index: number): EnqueueWriteSpawnRequest {
     id,
     name: id,
     prompt: `Implement high-volume shard ${index}`,
-    cwd: "/repo",
+    cwd: testDir,
     category: index % 2 === 0 ? "feature" : undefined,
-    model: "provider/model",
-    thinking: index % 2 === 0 ? "xhigh" : "high",
+    modelSlot: "writing-hard",
     planModeRequired: index % 2 === 0,
     color: index % 2 === 0 ? "green" : "blue",
     operationId: `scale-op-${String(index).padStart(3, "0")}`,
@@ -45,11 +44,24 @@ function highVolumeWriteSpawn(index: number): EnqueueWriteSpawnRequest {
   };
 }
 
+function writeFavoriteLevels() {
+  const settingsPath = path.join(testDir, ".pi", "agent", "pi-extended-teams", "settings.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    favoriteModels: {
+      "writing-basic": { model: "provider/model", thinking: "high" },
+      "writing-hard": { model: "provider/model", thinking: "xhigh" },
+    },
+  }));
+}
+
 describe("write queue utilities", () => {
   beforeEach(() => {
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
     fs.mkdirSync(testDir, { recursive: true });
     vi.spyOn(paths, "writeQueuePath").mockReturnValue(queuePath);
+    vi.spyOn(os, "homedir").mockReturnValue(testDir);
+    writeFavoriteLevels();
   });
 
   afterEach(() => {
@@ -62,16 +74,16 @@ describe("write queue utilities", () => {
       id: "first",
       name: "writer-a",
       prompt: "A",
-      cwd: "/repo",
-      model: "provider/model",
+      cwd: testDir,
+      modelSlot: "writing-basic",
       requestedAt: 1,
     });
     const second = await enqueueWriteSpawn("team", {
       id: "second",
       name: "writer-b",
       prompt: "B",
-      cwd: "/repo",
-      model: "provider/model",
+      cwd: testDir,
+      modelSlot: "writing-hard",
       requestedAt: 2,
     });
 
@@ -134,8 +146,8 @@ describe("write queue utilities", () => {
         id: `duplicate-${index}`,
         name: "writer-a",
         prompt: `work ${index}`,
-        cwd: "/repo",
-        model: "provider/model",
+        cwd: testDir,
+        modelSlot: "writing-basic",
       })
     )));
 
@@ -166,15 +178,15 @@ describe("write queue utilities", () => {
       id: "keep",
       name: "writer-a",
       prompt: "A",
-      cwd: "/repo",
-      model: "provider/model",
+      cwd: testDir,
+      modelSlot: "writing-basic",
     });
     const canceled = await enqueueWriteSpawn("team", {
       id: "cancel-me",
       name: "writer-b",
       prompt: "B",
-      cwd: "/repo",
-      model: "provider/model",
+      cwd: testDir,
+      modelSlot: "writing-hard",
     });
 
     expect(await cancelQueuedWriteSpawn("team", canceled.id)).toEqual(canceled);
@@ -184,9 +196,9 @@ describe("write queue utilities", () => {
 
   it("removes all queued writers by teammate name, including legacy duplicates", async () => {
     fs.writeFileSync(queuePath, JSON.stringify([
-      { id: "one", name: "writer-a", prompt: "A", cwd: "/repo", model: "provider/model", requestedAt: 1 },
-      { id: "two", name: "writer-a", prompt: "B", cwd: "/repo", model: "provider/model", requestedAt: 2 },
-      { id: "three", name: "writer-b", prompt: "C", cwd: "/repo", model: "provider/model", requestedAt: 3 },
+      { id: "one", name: "writer-a", prompt: "A", cwd: testDir, modelSlot: "writing-basic", requestedAt: 1 },
+      { id: "two", name: "writer-a", prompt: "B", cwd: testDir, modelSlot: "writing-hard", requestedAt: 2 },
+      { id: "three", name: "writer-b", prompt: "C", cwd: testDir, modelSlot: "writing-basic", requestedAt: 3 },
     ]));
 
     expect((await removeQueuedWriteSpawnsByName("team", "writer-a")).map(item => item.id)).toEqual(["one", "two"]);
@@ -198,10 +210,9 @@ describe("write queue utilities", () => {
       id: "queued",
       name: "writer-a",
       prompt: "Implement it",
-      cwd: "/repo",
+      cwd: testDir,
       category: "feature",
-      model: "provider/model",
-      thinking: "xhigh",
+      modelSlot: "writing-hard",
       planModeRequired: true,
       requestedAt: 1,
     });
@@ -213,7 +224,8 @@ describe("write queue utilities", () => {
       role: "write",
       category: "feature",
       model: "provider/model",
-      cwd: "/repo",
+      modelSlot: "writing-hard",
+      cwd: testDir,
       prompt: "Implement it",
       color: "blue",
       thinking: "xhigh",

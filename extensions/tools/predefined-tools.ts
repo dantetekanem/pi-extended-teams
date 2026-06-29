@@ -1,12 +1,12 @@
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "../internal/schema";
 import { buildPiCommand, getPiLaunchCommand } from "../internal/pi-command";
-import { getCurrentQualifiedModel, getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
+import { getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
 import * as predefined from "../../src/utils/predefined-teams";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as paths from "../../src/utils/paths";
-import { loadSettings, resolveAllowedExtensions } from "../../src/utils/settings";
+import { loadSettings, requireFavoriteModelLevel, resolveAllowedExtensions } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import { requestLeadForTeammateSpawn } from "./delegation-guard";
 
@@ -55,12 +55,12 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
   pi.registerTool({
     name: "create_predefined_team",
     label: "Create Predefined Team",
-    description: "Create a team from a predefined team configuration. Any default_model you pass must be a fully qualified provider/model string from list_available_models. If omitted, the current active model is used. Agent definitions with models must also already be fully qualified.",
+    description: "Create a team from a predefined team configuration by configured level only. model_slot selects write-agent behavior, model, and thinking; direct model/thinking/default_model overrides are not allowed.",
     parameters: Type.Object({
       team_name: Type.String({ description: "Name for the new team instance" }),
       predefined_team: Type.String({ description: "Name of the predefined team template from teams.yaml" }),
       cwd: Type.String({ description: "Working directory for spawned agents" }),
-      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model) for agents without a specified model. Use list_available_models first. If omitted, the current active model is used." })),
+      model_slot: Type.Optional(Type.String({ description: "Favorite writing level from /agents-favorite-models. Defaults to writing-hard." })),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       if (options.isTeammate) {
@@ -79,11 +79,16 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
       }
       if (!options.terminal) throw new Error("pi-extended-teams requires running inside tmux.");
 
-      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
-      const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
-      const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
-      const defaultModel = explicitDefaultModel || currentModel;
-      const allowedExtensions = resolveAllowedExtensions(loadSettings({ projectDir: ctx.cwd }));
+      if (params.default_model || params.model || params.thinking || params.role) {
+        throw new Error("create_predefined_team must use model_slot only; direct model, thinking, role, or default_model is not allowed.");
+      }
+      const settings = loadSettings({ projectDir: ctx.cwd });
+      const level = requireFavoriteModelLevel(settings, params.model_slot || "writing-hard");
+      if (level.role !== "write") throw new Error(`create_predefined_team requires a writing-* level, got ${level.slot}.`);
+      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [level.model]);
+      const defaultModel = requireQualifiedKnownModel(level.model, availableModels, "model_slot");
+      if (!defaultModel) throw new Error(`Favorite level ${level.slot} resolved to unavailable model ${level.model}.`);
+      const allowedExtensions = resolveAllowedExtensions(settings);
 
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
       options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
@@ -100,11 +105,11 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
         try {
           const safeName = paths.sanitizeName(agentName);
           const safeTeamName = paths.sanitizeName(params.team_name);
-          const agentModel = requireQualifiedKnownModel(agentDef.model, availableModels, `model for predefined agent \"${agentName}\"`);
-          const chosenModel = agentModel || defaultModel || config.defaultModel;
-          if (!chosenModel) {
-            throw new Error(`No model specified for predefined agent \"${agentName}\". Add a fully qualified model to the agent definition or pass a fully qualified default_model.`);
+          if (agentDef.model || agentDef.thinking) {
+            throw new Error(`Predefined agent \"${agentName}\" must not declare direct model or thinking; choose model_slot when creating the team.`);
           }
+          const chosenModel = defaultModel || config.defaultModel;
+          if (!chosenModel) throw new Error(`No configured model found for favorite level ${level.slot}.`);
 
           const member: Member = {
             agentId: `${safeName}@${safeTeamName}`,
@@ -118,7 +123,8 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
             subscriptions: [],
             prompt: agentDef.prompt,
             color: "blue",
-            thinking: agentDef.thinking,
+            thinking: level.thinking,
+            modelSlot: level.slot,
           };
 
           await teams.addMember(safeTeamName, member);

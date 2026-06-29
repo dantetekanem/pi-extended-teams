@@ -43,6 +43,16 @@ function installPathSpies() {
   });
 }
 
+function writeFavoriteLevels() {
+  const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    favoriteModels: {
+      "reading-default": { model: "provider/model", thinking: "high" },
+    },
+  }));
+}
+
 function makeSession() {
   return {
     messages: [{ role: "assistant", content: "final report" }],
@@ -60,7 +70,9 @@ describe("in-process read agent tool wiring", () => {
     piMocks.loaderOptions.length = 0;
     piMocks.createAgentSession.mockReset();
     piMocks.sessionManagerInMemory.mockClear();
+    vi.spyOn(os, "homedir").mockReturnValue(root);
     installPathSpies();
+    writeFavoriteLevels();
   });
 
   afterEach(() => {
@@ -92,6 +104,7 @@ describe("in-process read agent tool wiring", () => {
       role: "read",
       model: "provider/model",
       thinking: "high",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,
@@ -155,6 +168,7 @@ describe("in-process read agent tool wiring", () => {
       role: "read",
       model: "provider/model",
       thinking: "high",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,
@@ -191,6 +205,7 @@ describe("in-process read agent tool wiring", () => {
       role: "read",
       model: "provider/model",
       thinking: "high",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,
@@ -231,6 +246,7 @@ describe("in-process read agent tool wiring", () => {
       role: "read",
       model: "provider/model",
       thinking: "high",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,
@@ -284,6 +300,7 @@ describe("in-process read agent tool wiring", () => {
       role: "read",
       model: "provider/model",
       thinking: "high",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,
@@ -343,6 +360,7 @@ describe("in-process read agent tool wiring", () => {
       role: "read",
       model: "provider/model",
       thinking: "high",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,
@@ -413,6 +431,7 @@ describe("in-process read agent tool wiring", () => {
       role: "read",
       model: "provider/model",
       thinking: "high",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,

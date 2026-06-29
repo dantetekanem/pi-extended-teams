@@ -162,6 +162,13 @@ export function roleForFavoriteModelSlot(slot: FavoriteModelSlot): AgentRole {
   return slot.startsWith("writing-") ? "write" : "read";
 }
 
+export interface ResolvedFavoriteModelLevel {
+  slot: FavoriteModelSlot;
+  role: AgentRole;
+  model: string;
+  thinking: ThinkingLevelName;
+}
+
 function normalizeThinking(value: unknown): string | null {
   const s = toStringOrNull(value);
   return s && THINKING_LEVELS.has(s) ? s : null;
@@ -362,6 +369,24 @@ export function requireConfiguredFavoriteModel(
     );
   }
   return { slot, config };
+}
+
+export function requireFavoriteModelLevel(
+  settings: PiExtendedTeamsSettings,
+  slot: unknown
+): ResolvedFavoriteModelLevel {
+  const favorite = requireConfiguredFavoriteModel(settings, slot);
+  if (!favorite?.config.model || !favorite.config.thinking) {
+    throw new Error(
+      `Favorite model slot "${String(slot ?? "")}" is not configured. Run /agents-favorite-models to define levels before spawning agents.`
+    );
+  }
+  return {
+    slot: favorite.slot,
+    role: roleForFavoriteModelSlot(favorite.slot),
+    model: favorite.config.model,
+    thinking: favorite.config.thinking as ThinkingLevelName,
+  };
 }
 
 export interface ResolveModelInput {

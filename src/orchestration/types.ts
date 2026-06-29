@@ -2,8 +2,9 @@ import type { AgentRuntimeStatus } from "../utils/runtime";
 import type { QueuedWriteSpawn } from "../utils/write-queue";
 import type { FileClaim } from "../utils/claims";
 import type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel } from "../utils/models";
+import type { FavoriteModelSlot } from "../utils/settings";
 
-export type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel };
+export type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel, FavoriteModelSlot };
 
 export interface OrchestrationOperationMetadata {
   operationId?: string;
@@ -48,7 +49,8 @@ export interface ObserveRuntimeOptions {
 export interface EnsureTeamRequest extends OrchestrationOperationMetadata {
   teamName: string;
   description?: string;
-  defaultModel?: string;
+  /** Favorite level used for the team's internal default model. Defaults to reading-default. */
+  defaultModelSlot?: FavoriteModelSlot;
   sessionId?: string;
   leadAgentId?: string;
   separateWindows?: boolean;
@@ -64,24 +66,21 @@ export interface SpawnTeammateOnceRequest extends OrchestrationOperationMetadata
   name: string;
   prompt: string;
   cwd: string;
-  role?: "read" | "write";
-  category?: string;
-  model?: string;
-  thinking?: ThinkingLevel;
+  /** Required favorite level; selects read/write behavior, model, and thinking. */
+  modelSlot: FavoriteModelSlot;
   planModeRequired?: boolean;
   color?: string;
 }
 
 export type SpawnTeammateOnceStatus = "existing" | "queued" | "started" | "not_started";
-export type TeammateModelSource = "explicit" | "category" | "role" | "team" | "current" | "none" | "existing" | "queued";
+export type TeammateModelSource = "favorite-slot" | "existing" | "queued";
 
 export interface TeammateResolutionDetails {
   requestedRole?: "read" | "write";
   role?: "read" | "write" | string;
   resolvedRole?: "read" | "write" | string;
-  requestedCategory?: string | null;
-  category?: string | null;
-  resolvedCategory?: string | null;
+  requestedModelSlot?: FavoriteModelSlot | string | null;
+  modelSlot?: FavoriteModelSlot | string | null;
   model?: string | null;
   thinking?: ThinkingLevel | string | null;
   modelSource?: TeammateModelSource | string;

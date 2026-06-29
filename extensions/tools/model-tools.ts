@@ -5,13 +5,13 @@ export function registerModelTools(pi: any): void {
   pi.registerTool({
     name: "list_available_models",
     label: "List Available Models",
-    description: "List available fully qualified models for team creation and teammate spawning. Use this before creating a new team or spawning teammates. Models must be specified as provider/model.",
+    description: "Legacy/debug helper for listing scoped models. Agent spawning must use configured /agents-favorite-models levels, not direct provider/model values.",
     parameters: Type.Object({}),
     async execute(_toolCallId: string, _params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       const state = await getModelSelectionState(ctx, ctx.cwd);
       const lines = [
-        "Choose a fully qualified provider/model string from this list when creating teams or spawning teammates.",
-        "Unqualified model names like \"gpt-5\" or \"haiku\" are not accepted.",
+        "Agent spawning must use configured model_slot levels from /agents-favorite-models.",
+        "This debug list exists only to explain which provider/model values can be assigned inside favorite levels.",
       ];
 
       if (state.preferredQualifiedModels.length > 0) {

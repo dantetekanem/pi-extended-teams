@@ -16,6 +16,7 @@ import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordi
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools } from "./tools/team-tools.js";
 import { getCurrentQualifiedModel } from "./internal/model-selection.js";
+import { loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
 import { formatElapsed, formatModelLabel, formatTokenCount } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
@@ -523,9 +524,11 @@ export default function (pi: ExtensionAPI) {
           if (config.members.some(member => member.name === queued.name)) {
             throw new Error(`Teammate ${queued.name} already exists in team ${queued.teamName}.`);
           }
-          const [provider, modelId] = String(queued.model).split("/", 2);
+          const level = requireFavoriteModelLevel(loadSettings({ projectDir: queued.cwd }), queued.modelSlot);
+          if (level.role !== "read") throw new Error(`Read helper ${queued.name} requires a reading-* level, got ${level.slot}.`);
+          const [provider, modelId] = level.model.split("/", 2);
           const model = provider && modelId ? sessionCtx.modelRegistry?.find?.(provider, modelId) : undefined;
-          if (!model) throw new Error(`Read helper model \"${queued.model}\" is not available in the lead session.`);
+          if (!model) throw new Error(`Read helper model \"${level.model}\" from level ${level.slot} is not available in the lead session.`);
 
           const helperPrompt = buildReadHelperPrompt(queued.teamName, queued.requester, queued.prompt);
           const member: Member = {
@@ -533,14 +536,15 @@ export default function (pi: ExtensionAPI) {
             name: queued.name,
             agentType: "teammate",
             role: "read",
-            model: queued.model,
+            model: level.model,
             joinedAt: Date.now(),
             tmuxPaneId: "",
             cwd: queued.cwd,
             subscriptions: [],
             prompt: helperPrompt,
             color: "cyan",
-            thinking: queued.thinking,
+            thinking: level.thinking,
+            modelSlot: level.slot,
             requestedBy: queued.requester,
             helperKind: "read_helper",
           };
@@ -646,14 +650,15 @@ export default function (pi: ExtensionAPI) {
       activePromptBuildTeamName = requestedTeamName;
       const cwd = payload?.cwd || sessionCtx.cwd;
       const agentNamePrefix = teamPaths.sanitizeName(payload?.agentNamePrefix || "prompt-branch");
-      const model = getCurrentQualifiedModel(sessionCtx);
-      if (!model) {
-        pi.events?.emit?.("pi-prompt:prompt-build:error", { teamName: requestedTeamName, error: "No current model available for read agents." });
-        return;
+      if (payload?.model || payload?.thinking || payload?.role) {
+        throw new Error("Prompt-build agents must use model_slot only; direct model, thinking, or role is not allowed.");
       }
+      const slot = payload?.model_slot || "reading-default";
+      const level = requireFavoriteModelLevel(loadSettings({ projectDir: cwd }), slot);
+      if (level.role !== "read") throw new Error(`Prompt-build requires a reading-* level, got ${level.slot}.`);
 
       if (!teams.teamExists(requestedTeamName)) {
-        teams.createTeam(requestedTeamName, getPiSessionId(sessionCtx) || "local-session", "lead-agent", payload?.description || "pi-prompt prompt-build", model);
+        teams.createTeam(requestedTeamName, getPiSessionId(sessionCtx) || "local-session", "lead-agent", payload?.description || "pi-prompt prompt-build", level.model);
       }
       // Prompt-build teams are private fanout jobs owned by pi-prompt. Do not
       // adopt them as the lead's current team, or normal /team context and
@@ -668,14 +673,15 @@ export default function (pi: ExtensionAPI) {
           name,
           agentType: "teammate",
           role: "read",
-          model,
+          model: level.model,
           joinedAt: Date.now(),
           tmuxPaneId: "",
           cwd,
           subscriptions: [],
           prompt,
           color: "cyan",
-          thinking: payload?.thinking || "high",
+          thinking: level.thinking,
+          modelSlot: level.slot,
         };
         await teams.addMember(requestedTeamName, member);
         void runReadAgentInProcess(requestedTeamName, member, prompt, sessionCtx, readAgentOptions());

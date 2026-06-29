@@ -14,6 +14,7 @@ import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, getLastAssistantText, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools } from "../tools/agent-communication-tools";
 import { shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
+import { loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
 
 export interface RunReadAgentOptions {
   isTeammate: boolean;
@@ -197,6 +198,18 @@ async function ensureReadHelperCompletionMessages(
   }
 }
 
+function assertMemberUsesConfiguredLevel(member: Member): void {
+  const settings = loadSettings({ projectDir: member.cwd });
+  const level = requireFavoriteModelLevel(settings, member.modelSlot);
+  const role = member.role || "read";
+  if (role !== level.role) {
+    throw new Error(`Agent ${member.name} level ${level.slot} resolves to role ${level.role}, not ${role}. Spawn agents by level only.`);
+  }
+  if (member.model !== level.model || member.thinking !== level.thinking) {
+    throw new Error(`Agent ${member.name} must use configured level ${level.slot}; direct model/thinking overrides are not allowed.`);
+  }
+}
+
 export async function runReadAgentInProcess(
   readTeamName: string,
   member: Member,
@@ -204,6 +217,7 @@ export async function runReadAgentInProcess(
   ctx: any,
   options: RunReadAgentOptions
 ): Promise<void> {
+  assertMemberUsesConfiguredLevel(member);
   const key = options.readAgentKey(readTeamName, member.name);
   const role = member.role || "read";
   const roleLabel = role === "write" ? "edit-allowed" : "read-only";

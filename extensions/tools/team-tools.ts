@@ -2,18 +2,17 @@ import crypto from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "../internal/schema";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
-import { getCurrentQualifiedModel, getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
-import { cleanupStaleTeam, getPiSessionId } from "../internal/session-files";
-import { shutdownReadAgentSession } from "../agents/read-agent";
+import { getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
+import { getPiSessionId } from "../internal/session-files";
 import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as writeQueue from "../../src/utils/write-queue";
-import { FAVORITE_MODEL_SLOTS, isFavoriteModelSlot, loadSettings, requireConfiguredFavoriteModel, resolveModel, roleForFavoriteModelSlot, type AgentRole, type FavoriteModelSlot } from "../../src/utils/settings";
+import { FAVORITE_MODEL_SLOTS, isFavoriteModelSlot, loadSettings, requireFavoriteModelLevel, resolveModel, roleForFavoriteModelSlot, type AgentRole, type FavoriteModelSlot } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
-import { countWriteMembers, formatRosterForPrompt } from "../team/roster";
+
 import type { RunningReadAgent } from "../runtime/types";
-import { requestLeadForTeammateSpawn } from "./delegation-guard";
+
 
 export interface TeamToolsOptions {
   terminal: any;
@@ -83,8 +82,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   function configuredFavoriteModelForSpawn(params: any, ctx: any, context = "spawn_agent"): string {
     const slot = requireSpawnLevel(params, context);
     const settings = loadSettings({ projectDir: params.cwd || ctx.cwd });
-    const favorite = requireConfiguredFavoriteModel(settings, slot);
-    return favorite?.config.model ?? "";
+    return requireFavoriteModelLevel(settings, slot).model;
   }
 
   function mergeSwarmAgentParams(defaults: any = {}, agent: any = {}): any {
@@ -120,18 +118,19 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
 
   function queuedResolutionDetails(safeTeamName: string, queued: writeQueue.QueuedWriteSpawn, params: any, extras: Record<string, any> = {}): Record<string, any> {
     const category = queued.category ?? null;
+    const level = requireFavoriteModelLevel(loadSettings({ projectDir: queued.cwd }), queued.modelSlot);
     return {
       agentId: `${queued.name}@${safeTeamName}`,
       role: "write",
-      requestedRole: isFavoriteModelSlot(params.model_slot) ? roleForFavoriteModelSlot(params.model_slot) : "write",
+      requestedRole: isFavoriteModelSlot(params.model_slot) ? roleForFavoriteModelSlot(params.model_slot) : level.role,
       resolvedRole: "write",
       requestedCategory: params.category ?? null,
       category,
       resolvedCategory: category,
       requestedModelSlot: params.model_slot ?? null,
-      modelSlot: null,
-      model: queued.model,
-      thinking: queued.thinking ?? null,
+      modelSlot: level.slot,
+      model: level.model,
+      thinking: level.thinking,
       modelSource: "queued",
       ...extras,
     };
@@ -248,16 +247,16 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     return paths.sanitizeName(`session-${sessionId}`);
   }
 
-  async function ensureCurrentSessionAgentGroup(ctx: any, explicitDefaultModel?: string): Promise<string> {
+  async function ensureCurrentSessionAgentGroup(ctx: any, explicitDefaultModel: string): Promise<string> {
     const sessionName = currentSessionAgentGroupName(ctx);
     if (teams.teamExists(sessionName)) {
       options.adoptTeamAsLead(sessionName, ctx);
       return sessionName;
     }
 
-    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
-    const defaultModel = requireQualifiedKnownModel(explicitDefaultModel, availableModels, "default_model")
-      || requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
+    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [explicitDefaultModel]);
+    const defaultModel = requireQualifiedKnownModel(explicitDefaultModel, availableModels, "model_slot");
+    if (!defaultModel) throw new Error("Agent sessions require a configured model_slot level before spawning.");
     teams.createTeam(sessionName, getPiSessionId(ctx) || "local-session", "lead-agent", "Pi session agents", defaultModel);
     options.adoptTeamAsLead(sessionName, ctx);
     return sessionName;
@@ -314,26 +313,26 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     const settings = loadSettings({ projectDir: cwd });
     const modelSlot = requireSpawnLevel(params, `Agent ${safeName}`);
     const role: AgentRole = roleForFavoriteModelSlot(modelSlot);
-    const currentModelHint = getCurrentQualifiedModel(ctx);
-    const requestedFavoriteModel = requireConfiguredFavoriteModel(settings, modelSlot)?.config.model;
-    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint, requestedFavoriteModel].filter(Boolean) as string[]);
+    const requestedLevel = requireFavoriteModelLevel(settings, modelSlot);
+    const requestedFavoriteModel = requestedLevel.model;
+    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, requestedFavoriteModel].filter(Boolean) as string[]);
     const resolved = resolveModel(settings, {
       role,
       modelSlot,
       explicitModel: null,
       explicitThinking: null,
       teamDefaultModel: teamConfig.defaultModel,
-      currentModel: currentModelHint,
+      currentModel: null,
     });
 
     const chosenModel = requireQualifiedKnownModel(resolved.model ?? undefined, availableModels, "resolved model");
     if (!chosenModel) {
       throw new Error(
-        "No model could be resolved. Pass a fully qualified model, configure a category/role default in settings.json, create the team with a default_model, or ensure the current session has an active model."
+        "No model could be resolved from the configured model_slot level. Define levels with /agents-favorite-models before spawning agents."
       );
     }
 
-    const chosenThinking = (resolved.thinking ?? undefined) as Member["thinking"];
+    const chosenThinking = requestedLevel.thinking as Member["thinking"];
     const debugLogPath = role === "write" && isTeamsDebugEnabled(settings) ? teamDebugLogPath(safeTeamName) : undefined;
 
     const member: Member = {
@@ -444,10 +443,13 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
           return;
         }
 
-        const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
-        const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
-        const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
-        const defaultModel = explicitDefaultModel || currentModel;
+        if (params.default_model || params.model || params.thinking || params.role) {
+          throw new Error("ensure_team must use default_model_slot only; direct model, thinking, or role is not allowed.");
+        }
+        const level = requireFavoriteModelLevel(loadSettings({ projectDir: ctx.cwd }), params.default_model_slot || "reading-default");
+        const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [level.model]);
+        const defaultModel = requireQualifiedKnownModel(level.model, availableModels, "default_model_slot");
+        if (!defaultModel) throw new Error(`Favorite level ${level.slot} resolved to unavailable model ${level.model}.`);
         const result = await teams.ensureTeam({
           name: safeTeamName,
           sessionId: "local-session",
@@ -574,274 +576,4 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     },
   });
 
-  return;
-
-  pi.registerTool({
-    name: "team_create",
-    label: "Create Team",
-    description: "Create a team and (optionally) spawn its agents in one call. Pass `agents` to spawn them immediately — they start running and report back on their own; you do not need to create tasks, poll, or read an inbox. Agents default to read-only (investigation/review/testing); use role 'write' only for isolated independent edit work. If default_model is given it must be a fully qualified provider/model from list_available_models; otherwise the current model is used.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      description: Type.Optional(Type.String()),
-      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). Use list_available_models first. If omitted, the current active model is used." })),
-      agents: Type.Optional(Type.Array(Type.Object({
-        name: Type.String(),
-        prompt: Type.String({ description: "The agent's mission and the report shape you want back." }),
-        role: Type.Optional(StringEnum(["read", "write"], { description: "Defaults to 'read'. Use 'write' only for isolated independent edit work." })),
-        cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead's cwd." })),
-        category: Type.Optional(Type.String()),
-        model: Type.Optional(Type.String({ description: "Fully qualified provider/model." })),
-        thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
-      }, { description: "An agent to spawn immediately." }), { description: "Agents to define and spawn as soon as the team is created." })),
-    }),
-    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
-      if (options.isTeammate) {
-        return requestLeadForTeammateSpawn(options, {
-          action: "team_create",
-          params,
-          reason: "Teammate attempted to create a team or spawn inline agents.",
-        });
-      }
-
-      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
-      const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
-      const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
-      const defaultModel = explicitDefaultModel || currentModel;
-
-      if (teams.teamExists(params.team_name)) cleanupStaleTeam(params.team_name, options.terminal);
-
-      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, defaultModel);
-      options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
-
-      const lines = [`Team ${params.team_name} created.`];
-      const spawned: any[] = [];
-      for (const agent of (params.agents ?? [])) {
-        try {
-          const result = await spawnTeammate({ ...agent, team_name: params.team_name }, ctx);
-          spawned.push(result.details);
-          lines.push(`- ${result.content?.[0]?.text ?? agent.name}`);
-        } catch (e) {
-          lines.push(`- ${agent.name}: failed to spawn — ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      if (spawned.length > 0) {
-        lines.push("", "Agents are running. Their reports will arrive here automatically as open report entries and you will synthesize them — no polling needed.");
-      }
-
-      return { content: [{ type: "text", text: lines.join("\n") }], details: { config, spawned } };
-    },
-  });
-
-  pi.registerTool({
-    name: "ensure_team",
-    label: "Ensure Team",
-    description: "Idempotently create a team if it does not exist; returns the existing team without cleanup or overwrite when it already exists.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      description: Type.Optional(Type.String()),
-      default_model: Type.Optional(Type.String({ description: "Fully qualified default model (provider/model). If omitted, the current active model is used for new teams." })),
-      operation_id: Type.Optional(Type.String()),
-      workflow_run_id: Type.Optional(Type.String()),
-      metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
-    }),
-    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
-      if (options.isTeammate) {
-        return requestLeadForTeammateSpawn(options, {
-          action: "team_create",
-          params,
-          reason: "Teammate attempted to ensure/create a team.",
-        });
-      }
-
-      const safeTeamName = paths.sanitizeName(params.team_name);
-      if (teams.teamExists(safeTeamName)) {
-        const config = await teams.readConfig(safeTeamName);
-        options.adoptTeamAsLead(safeTeamName, ctx);
-        return { content: [{ type: "text", text: `Team ${safeTeamName} already exists.` }], details: { config, created: false, idempotent: true } };
-      }
-
-      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd);
-      const explicitDefaultModel = requireQualifiedKnownModel(params.default_model, availableModels, "default_model");
-      const currentModel = requireQualifiedKnownModel(getCurrentQualifiedModel(ctx), availableModels, "current model");
-      const defaultModel = explicitDefaultModel || currentModel;
-      const result = await teams.ensureTeam({
-        name: safeTeamName,
-        sessionId: "local-session",
-        leadAgentId: "lead-agent",
-        description: params.description,
-        defaultModel,
-        metadata: operationMetadataFromParams(params),
-      });
-      options.adoptTeamAsLead(safeTeamName, ctx);
-      return { content: [{ type: "text", text: `Team ${safeTeamName} created.` }], details: { config: result.config, created: result.created, idempotent: true } };
-    },
-  });
-
-  pi.registerTool({
-    name: "spawn_teammate_once",
-    label: "Spawn Teammate Once",
-    description: "Idempotently spawn a teammate using name and optional operation_id/workflow_run_id metadata. Existing or queued same-key teammates are returned instead of replaced.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      name: Type.String(),
-      prompt: Type.String(),
-      cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead's cwd." })),
-      role: Type.Optional(StringEnum(["read", "write"], { description: "Agent role. Defaults to read." })),
-      category: Type.Optional(Type.String({ description: "Optional category preset name from settings.json." })),
-      model: Type.Optional(Type.String({ description: "Fully qualified model." })),
-      thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
-      plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
-      operation_id: Type.Optional(Type.String()),
-      workflow_run_id: Type.Optional(Type.String()),
-      metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
-    }),
-    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
-      if (options.isTeammate) {
-        return requestLeadForTeammateSpawn(options, {
-          action: "spawn_teammate",
-          params,
-          reason: "Teammate attempted to spawn another agent directly.",
-        });
-      }
-
-      const safeTeamName = paths.sanitizeName(params.team_name);
-      if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
-      options.adoptTeamAsLead(safeTeamName, ctx);
-      return spawnTeammate(params, ctx, { once: true });
-    },
-  });
-
-  pi.registerTool({
-    name: "spawn_teammate",
-    label: "Spawn Teammate",
-    description: "Spawn one teammate. Default role is 'read' (read-only, in-process, unlimited, parallel — for investigation/review/testing). Use role 'write' only for isolated, independent edit work that should run in a background tmux screen; the lead normally writes itself. Model resolves from explicit arg -> category -> role default -> team default -> current model. Any explicit model must be a fully qualified provider/model from list_available_models.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      name: Type.String(),
-      prompt: Type.String(),
-      cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead's cwd." })),
-      role: Type.Optional(StringEnum(["read", "write"], { description: "Agent role. 'read' (default) is read-only and in-process. 'write' spawns in tmux and can edit files — use only for isolated independent work." })),
-      category: Type.Optional(Type.String({ description: "Optional category preset name from settings.json (bundles role + model + thinking)." })),
-      model: Type.Optional(Type.String({ description: "Fully qualified model (provider/model). Use list_available_models first. If omitted, the category/role/team default or current model is used." })),
-      thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
-      plan_mode_required: Type.Optional(Type.Boolean({ default: false })),
-      metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
-    }),
-    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
-      if (options.isTeammate) {
-        return requestLeadForTeammateSpawn(options, {
-          action: "spawn_teammate",
-          params,
-          reason: "Teammate attempted to spawn another agent directly.",
-        });
-      }
-
-      const safeTeamName = paths.sanitizeName(params.team_name);
-      if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
-      options.adoptTeamAsLead(safeTeamName, ctx);
-      return spawnTeammate(params, ctx);
-    },
-  });
-
-  pi.registerTool({
-    name: "promote_teammate",
-    label: "Move Teammate to background tmux screen",
-    description: "Move a running in-process read agent into its own background tmux screen so you can watch and interact with it there. Stops the in-process session and re-spawns the same mission as a tmux teammate. Requires running inside tmux.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      name: Type.String(),
-      prompt: Type.Optional(Type.String({ description: "Optional updated mission. Defaults to the agent's original mission." })),
-    }),
-    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
-      if (options.isTeammate) {
-        return requestLeadForTeammateSpawn(options, {
-          action: "promote_teammate",
-          params,
-          reason: "Teammate attempted to move/spawn another agent into a pane.",
-        });
-      }
-
-      const safeTeamName = paths.sanitizeName(params.team_name);
-      const safeName = paths.sanitizeName(params.name);
-      if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
-      options.adoptTeamAsLead(safeTeamName, ctx);
-      if (!options.terminal) throw new Error("pi-extended-teams requires running inside tmux to move an agent into a pane.");
-
-      const config = await teams.readConfig(safeTeamName);
-      const member = config.members.find(m => m.name === safeName);
-      const key = options.readAgentKey(safeTeamName, safeName);
-      const state = options.runningReadAgents.get(key);
-      const prompt = params.prompt || member?.prompt;
-      if (!prompt) throw new Error(`No mission found for ${params.name}; pass prompt to set one.`);
-
-      if (state) state.stopRequested = true;
-      if (state?.session) {
-        await shutdownReadAgentSession(state.session);
-        state.session.dispose();
-      }
-      if (state && options.isCurrentReadAgentRun(key, state)) options.runningReadAgents.delete(key);
-      options.renderReadAgentStatus();
-      await runtime.deleteRuntimeStatus(safeTeamName, safeName).catch(() => {});
-      if (member) await teams.removeMember(safeTeamName, safeName).catch(() => {});
-
-      const result = await spawnTeammate({
-        team_name: safeTeamName,
-        name: safeName,
-        prompt,
-        role: "write",
-        model: member?.model,
-        thinking: member?.thinking,
-        cwd: member?.cwd,
-      }, ctx);
-
-      return {
-        content: [{ type: "text", text: `Moved ${params.name} into a background tmux screen. ${result.content?.[0]?.text ?? ""}`.trim() }],
-        details: { ...result.details, promoted: true },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "list_teammates",
-    label: "List Teammates",
-    description: "List live team roster with roles, status, current tasks, held claims, unread inbox counts, and queued writers.",
-    parameters: Type.Object({ team_name: Type.String() }),
-    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
-      if (teams.teamExists(paths.sanitizeName(params.team_name))) options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
-      const roster = await options.buildRoster(params.team_name);
-      return { content: [{ type: "text", text: formatRosterForPrompt(roster) }], details: roster };
-    },
-  });
-
-  pi.registerTool({
-    name: "list_write_queue",
-    label: "List Write Queue",
-    description: "List queued write-agent spawns for a team.",
-    parameters: Type.Object({ team_name: Type.String() }),
-    async execute(_toolCallId: string, params: any) {
-      const queue = await writeQueue.listWriteQueue(params.team_name);
-      const text = queue.length > 0
-        ? [`Queued write agents for ${params.team_name}:`, ...queue.map((item, index) => `${index + 1}. ${item.name} (${item.id}) requested ${new Date(item.requestedAt).toISOString()}`)].join("\n")
-        : `No queued write agents for ${params.team_name}.`;
-      return { content: [{ type: "text", text }], details: { teamName: params.team_name, queue } };
-    },
-  });
-
-  pi.registerTool({
-    name: "cancel_write_queue",
-    label: "Cancel Write Queue Item",
-    description: "Cancel one pending write-agent spawn by queue id.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      id: Type.String({ description: "Queue item id returned by list_write_queue or a queued spawn." }),
-    }),
-    async execute(_toolCallId: string, params: any) {
-      const removed = await writeQueue.cancelQueuedWriteSpawn(params.team_name, params.id);
-      if (!removed) throw new Error(`Queued write-agent spawn ${params.id} not found for team ${params.team_name}.`);
-      return {
-        content: [{ type: "text", text: `Canceled queued writer ${removed.name} (${removed.id}).` }],
-        details: { teamName: params.team_name, canceled: removed },
-      };
-    },
-  });
 }

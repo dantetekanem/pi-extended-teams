@@ -6,6 +6,7 @@ import * as runtime from "../utils/runtime";
 import * as writeQueue from "../utils/write-queue";
 import * as reports from "../utils/report-events";
 import type { Member } from "../utils/models";
+import { loadSettings, requireFavoriteModelLevel, roleForFavoriteModelSlot } from "../utils/settings";
 import type {
   BroadcastMessageOnceRequest,
   EnsureTeamRequest,
@@ -58,15 +59,13 @@ function metadataForOperation(request: { operationId?: string; workflowRunId?: s
 
 function memberResolutionDetails(member: Member, request: Partial<SpawnTeammateOnceRequest>, extras: Record<string, any> = {}): TeammateResolutionDetails & Record<string, any> {
   const role = member.role ?? "write";
-  const category = member.category ?? null;
   return {
     agentId: member.agentId,
     role,
-    requestedRole: request.role ?? "read",
+    requestedRole: request.modelSlot ? roleForFavoriteModelSlot(request.modelSlot) : role,
     resolvedRole: role,
-    requestedCategory: request.category ?? null,
-    category,
-    resolvedCategory: category,
+    requestedModelSlot: request.modelSlot ?? null,
+    modelSlot: member.modelSlot ?? null,
     model: member.model ?? null,
     thinking: member.thinking ?? null,
     ...extras,
@@ -74,17 +73,16 @@ function memberResolutionDetails(member: Member, request: Partial<SpawnTeammateO
 }
 
 function queuedResolutionDetails(teamName: string, queued: writeQueue.QueuedWriteSpawn, request: Partial<SpawnTeammateOnceRequest>, extras: Record<string, any> = {}): TeammateResolutionDetails & Record<string, any> {
-  const category = queued.category ?? null;
+  const level = requireFavoriteModelLevel(loadSettings({ projectDir: queued.cwd }), queued.modelSlot);
   return {
     agentId: `${queued.name}@${teamName}`,
     role: "write",
-    requestedRole: request.role ?? "read",
+    requestedRole: request.modelSlot ? roleForFavoriteModelSlot(request.modelSlot) : level.role,
     resolvedRole: "write",
-    requestedCategory: request.category ?? null,
-    category,
-    resolvedCategory: category,
-    model: queued.model,
-    thinking: queued.thinking ?? null,
+    requestedModelSlot: request.modelSlot ?? null,
+    modelSlot: level.slot,
+    model: level.model,
+    thinking: level.thinking,
     modelSource: "queued",
     ...extras,
   };
@@ -189,14 +187,16 @@ async function loadSpawnOnceTeamState(teamName: string): Promise<SpawnOnceTeamSt
 }
 
 function notStartedSpawnResponse(request: SpawnTeammateOnceRequest): SpawnTeammateOnceResponse {
+  const level = requireFavoriteModelLevel(loadSettings({ projectDir: request.cwd }), request.modelSlot);
   return {
     status: "not_started",
     details: {
       reason: "No spawn start callback supplied",
-      requestedRole: request.role ?? "read",
-      requestedCategory: request.category ?? null,
-      model: request.model ?? null,
-      thinking: request.thinking ?? null,
+      requestedRole: level.role,
+      requestedModelSlot: level.slot,
+      modelSlot: level.slot,
+      model: level.model,
+      thinking: level.thinking,
     },
   };
 }
@@ -314,12 +314,13 @@ export async function observeTeam(
 }
 
 export async function ensureTeam(request: EnsureTeamRequest): Promise<EnsureTeamResponse> {
+  const level = requireFavoriteModelLevel(loadSettings(), request.defaultModelSlot || "reading-default");
   const result = await teams.ensureTeam({
     name: request.teamName,
     sessionId: request.sessionId,
     leadAgentId: request.leadAgentId,
     description: request.description,
-    defaultModel: request.defaultModel,
+    defaultModel: level.model,
     separateWindows: request.separateWindows,
     metadata: metadataForOperation(request),
   });

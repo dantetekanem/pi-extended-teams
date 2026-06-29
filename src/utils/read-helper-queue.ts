@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { withLock } from "./lock";
 import { readHelperQueuePath } from "./paths";
-import type { Member } from "./models";
+import type { FavoriteModelSlot } from "./settings";
 
 export interface QueuedReadHelperRequest {
   id: string;
@@ -12,8 +12,7 @@ export interface QueuedReadHelperRequest {
   name: string;
   prompt: string;
   cwd: string;
-  model: string;
-  thinking?: Member["thinking"];
+  modelSlot: FavoriteModelSlot;
   requestedAt: number;
 }
 
@@ -56,8 +55,7 @@ export async function enqueueReadHelperRequest(
       name: request.name,
       prompt: request.prompt,
       cwd: request.cwd,
-      model: request.model,
-      thinking: request.thinking,
+      modelSlot: request.modelSlot,
       requestedAt: request.requestedAt || Date.now(),
     };
     queue.push(queued);

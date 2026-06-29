@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.17] - 2026-06-28
+
+### Changed
+- Closed remaining runtime/exported bypasses so prompt-build agents, read-helper queues, write queues, predefined-team spawning, and orchestration requests resolve through configured favorite levels instead of direct model/thinking values.
+- Low-level read/write agent launchers now validate that members match their configured `model_slot` before running.
+
 ## [1.3.16] - 2026-06-28
 
 ### Added

@@ -4,6 +4,7 @@ import path from "node:path";
 import { Member } from "./models";
 import { withLock } from "./lock";
 import { writeQueuePath } from "./paths";
+import { loadSettings, requireFavoriteModelLevel, type FavoriteModelSlot } from "./settings";
 
 export interface QueuedWriteSpawn {
   id: string;
@@ -11,8 +12,7 @@ export interface QueuedWriteSpawn {
   prompt: string;
   cwd: string;
   category?: string;
-  model: string;
-  thinking?: Member["thinking"];
+  modelSlot: FavoriteModelSlot;
   planModeRequired?: boolean;
   color?: string;
   operationId?: string;
@@ -99,8 +99,7 @@ export async function enqueueWriteSpawn(
       prompt: request.prompt,
       cwd: request.cwd,
       category: request.category,
-      model: request.model,
-      thinking: request.thinking,
+      modelSlot: request.modelSlot,
       planModeRequired: request.planModeRequired,
       color: request.color,
       operationId: request.operationId,
@@ -174,20 +173,25 @@ export async function findQueuedWriteSpawn(
 }
 
 export function queuedWriteSpawnToMember(teamName: string, queued: QueuedWriteSpawn): Member {
+  const level = requireFavoriteModelLevel(loadSettings({ projectDir: queued.cwd }), queued.modelSlot);
+  if (level.role !== "write") {
+    throw new Error(`Queued writer ${queued.name} requires a writing-* level, got ${level.slot}.`);
+  }
   return {
     agentId: `${queued.name}@${teamName}`,
     name: queued.name,
     agentType: "teammate",
     role: "write",
     category: queued.category,
-    model: queued.model,
+    model: level.model,
     joinedAt: Date.now(),
     tmuxPaneId: "",
     cwd: queued.cwd,
     subscriptions: [],
     prompt: queued.prompt,
     color: queued.color || "blue",
-    thinking: queued.thinking,
+    thinking: level.thinking,
+    modelSlot: level.slot,
     planModeRequired: queued.planModeRequired,
     metadata: {
       ...(queued.metadata || {}),

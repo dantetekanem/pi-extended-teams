@@ -8,6 +8,7 @@ import * as messaging from "../utils/messaging";
 import * as runtime from "../utils/runtime";
 import * as writeQueue from "../utils/write-queue";
 import { appendTeamReportEvent, listTeamReportEvents, observeTeam, observeTeammate, sendMessageOnce, spawnTeammateOnce, spawnTeammatesOnce } from "./index";
+import { roleForFavoriteModelSlot } from "../utils/settings";
 import type { SpawnTeammateOnceRequest } from "./types";
 
 let root: string;
@@ -22,10 +23,23 @@ function installPathSpies() {
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "write-queue.json"));
 }
 
+function writeFavoriteLevels() {
+  const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    favoriteModels: {
+      "reading-default": { model: "provider/model", thinking: "high" },
+      "writing-hard": { model: "provider/model", thinking: "xhigh" },
+    },
+  }));
+}
+
 describe("orchestration primitives", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-orchestration-"));
+    vi.spyOn(os, "homedir").mockReturnValue(root);
     installPathSpies();
+    writeFavoriteLevels();
   });
 
   afterEach(() => {
@@ -91,6 +105,7 @@ describe("orchestration primitives", () => {
       agentType: "teammate",
       role: "read",
       model: "provider/model",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,
@@ -105,7 +120,7 @@ describe("orchestration primitives", () => {
       name: "reader",
       prompt: "read again",
       cwd: root,
-      role: "read",
+      modelSlot: "reading-default",
       operationId: "op-1",
       workflowRunId: "run-1",
     }, { start });
@@ -119,7 +134,8 @@ describe("orchestration primitives", () => {
       role: "read",
       requestedRole: "read",
       resolvedRole: "read",
-      category: null,
+      requestedModelSlot: "reading-default",
+      modelSlot: "reading-default",
       model: "provider/model",
       modelSource: "existing",
     });
@@ -134,6 +150,7 @@ describe("orchestration primitives", () => {
       agentType: "teammate",
       role: "read",
       model: "provider/model",
+      modelSlot: "reading-default",
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd: root,
@@ -146,7 +163,7 @@ describe("orchestration primitives", () => {
       name: "queued-reader",
       prompt: "queued",
       cwd: root,
-      model: "provider/model",
+      modelSlot: "writing-hard",
       operationId: "op-queued",
       workflowRunId: "run-1",
     });
@@ -156,25 +173,26 @@ describe("orchestration primitives", () => {
       name: `reader-${index}`,
       prompt: "read",
       cwd: root,
-      role: "read" as const,
+      modelSlot: "reading-default",
       operationId: `op-start-${index}`,
       workflowRunId: "run-1",
     }));
     const requests: SpawnTeammateOnceRequest[] = [
-      { teamName: "team", name: "existing-reader", prompt: "read", cwd: root, role: "read" as const },
-      { teamName: "team", name: "operation-match", prompt: "read", cwd: root, role: "read" as const, operationId: "op-existing", workflowRunId: "run-1" },
-      { teamName: "team", name: "queued-reader", prompt: "queued", cwd: root, role: "write" as const, operationId: "op-queued", workflowRunId: "run-1" },
+      { teamName: "team", name: "existing-reader", prompt: "read", cwd: root, modelSlot: "reading-default" },
+      { teamName: "team", name: "operation-match", prompt: "read", cwd: root, modelSlot: "reading-default", operationId: "op-existing", workflowRunId: "run-1" },
+      { teamName: "team", name: "queued-reader", prompt: "queued", cwd: root, modelSlot: "writing-hard", operationId: "op-queued", workflowRunId: "run-1" },
       ...startRequests,
-      { teamName: "team", name: "reader-0", prompt: "duplicate", cwd: root, role: "read" as const, operationId: "op-duplicate-name", workflowRunId: "run-1" },
-      { teamName: "team", name: "reader-via-op", prompt: "duplicate", cwd: root, role: "read" as const, operationId: "op-start-1", workflowRunId: "run-1" },
+      { teamName: "team", name: "reader-0", prompt: "duplicate", cwd: root, modelSlot: "reading-default", operationId: "op-duplicate-name", workflowRunId: "run-1" },
+      { teamName: "team", name: "reader-via-op", prompt: "duplicate", cwd: root, modelSlot: "reading-default", operationId: "op-start-1", workflowRunId: "run-1" },
     ];
     const start = vi.fn(async (request: SpawnTeammateOnceRequest) => ({
       member: {
         agentId: `${request.name}@${request.teamName}`,
         name: request.name,
         agentType: "teammate",
-        role: request.role ?? "read",
-        model: request.model ?? "provider/model",
+        role: roleForFavoriteModelSlot(request.modelSlot),
+        model: "provider/model",
+        modelSlot: request.modelSlot,
         joinedAt: Date.now(),
         tmuxPaneId: "",
         cwd: request.cwd,
@@ -208,9 +226,9 @@ describe("orchestration primitives", () => {
       name: "writer",
       agentType: "teammate",
       role: "write" as const,
-      category: "impl",
       model: "provider/model",
       thinking: "xhigh" as const,
+      modelSlot: "writing-hard",
       joinedAt: Date.now(),
       tmuxPaneId: "%1",
       cwd: root,
@@ -222,25 +240,23 @@ describe("orchestration primitives", () => {
       name: "writer",
       prompt: "write",
       cwd: root,
-      role: "read",
-      category: "impl",
+      modelSlot: "writing-hard",
       operationId: "op-2",
       workflowRunId: "run-1",
     }, {
-      start: vi.fn(async () => ({ member: startedMember, details: { queued: false, terminalId: "%1", modelSource: "category" } })),
+      start: vi.fn(async () => ({ member: startedMember, details: { queued: false, terminalId: "%1", modelSource: "favorite-slot" } })),
     });
 
     expect(result.status).toBe("started");
     expect(result.details).toMatchObject({
       role: "write",
-      requestedRole: "read",
+      requestedRole: "write",
       resolvedRole: "write",
-      requestedCategory: "impl",
-      category: "impl",
-      resolvedCategory: "impl",
+      requestedModelSlot: "writing-hard",
+      modelSlot: "writing-hard",
       model: "provider/model",
       thinking: "xhigh",
-      modelSource: "category",
+      modelSource: "favorite-slot",
       queued: false,
       terminalId: "%1",
     });

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.15] - 2026-06-28
+
+### Fixed
+- Bottom agent activity now omits assistant progress snippets; live thinking/progress remains available inside `/agents` only.
+- `/team` now labels each agent's level (`model_slot`), model, and thinking setting explicitly.
+
 ## [1.3.14] - 2026-06-28
 
 ### Added

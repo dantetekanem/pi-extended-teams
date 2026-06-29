@@ -407,8 +407,7 @@ export default function (pi: ExtensionAPI) {
       if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
       const slotLabel = agent.modelSlot ? `slot:${agent.modelSlot}` : "";
-      const progress = agent.latestAssistantSnippet ? `says: ${agent.latestAssistantSnippet}` : "";
-      const detail = [modelLabel, slotLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, progress, status.detail].filter(Boolean).join(" · ");
+      const detail = [modelLabel, slotLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "write", status: status.label, detail });
     }
@@ -465,8 +464,7 @@ export default function (pi: ExtensionAPI) {
       if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
       const slotLabel = agent.modelSlot ? `slot:${agent.modelSlot}` : "";
-      const progress = agent.latestAssistantSnippet ? `says: ${agent.latestAssistantSnippet}` : "";
-      const detail = [modelLabel, slotLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, progress, status.detail].filter(Boolean).join(" · ");
+      const detail = [modelLabel, slotLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "read", status: status.label, detail });
     }

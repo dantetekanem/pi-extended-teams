@@ -221,6 +221,54 @@ describe("extension integration", () => {
     }
   });
 
+  it("status widget omits assistant progress snippets for running agents", async () => {
+    const setup = await setupExtension();
+    try {
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), {
+          runId: "reader-run",
+          name: member.name,
+          teamName,
+          startedAt: Date.now() - 1000,
+          tokensUsed: 12,
+          status: "thinking",
+          recentEvents: ["assistant: secret agent thought"],
+          lastActivityAt: Date.now(),
+          role: member.role,
+          model: member.model,
+          thinking: member.thinking,
+          modelSlot: member.modelSlot,
+          latestAssistantSnippet: "secret agent thought",
+        });
+      });
+      const ctx = makeCtx(setup.root, "status-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      const abort = new AbortController().signal;
+
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader",
+        role: "read",
+        prompt: "Think about this",
+        cwd: setup.root,
+        model: "provider/model",
+        thinking: "high",
+      }, abort, undefined, ctx);
+      await vi.advanceTimersByTimeAsync(100);
+
+      const widgetCall = ctx.ui.setWidget.mock.calls.find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      expect(widgetCall).toBeTruthy();
+      const widget = widgetCall![1]({ requestRender: vi.fn() });
+      const rendered = widget.render(160).join("\n");
+
+      expect(rendered).toContain("reader");
+      expect(rendered).toContain("12 tok");
+      expect(rendered).not.toContain("says:");
+      expect(rendered).not.toContain("secret agent thought");
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("spawn_swarm_agents starts a batch with defaults and per-agent overrides", async () => {
     const setup = await setupExtension();
     try {

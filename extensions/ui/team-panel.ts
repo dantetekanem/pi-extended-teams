@@ -514,7 +514,12 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             ? ` ${dimAnsi(item.windowId ? `${item.windowId}/${item.tmuxPaneId}` : item.tmuxPaneId)}`
             : "";
           const requestedBy = item.requestedBy ? ` ${dimAnsi(`requested by ${item.requestedBy}`)}` : "";
-          return `${pointer} ${selected ? pink(item.name) : item.name}  ${role}${screen}  ${dimAnsi(health)}${requestedBy}`;
+          const modelSummary = [
+            item.modelSlot ? `level ${item.modelSlot}` : "level none",
+            item.model ? `model ${item.model}` : "model inherited",
+            item.thinking ? `thinking ${item.thinking}` : "thinking inherited",
+          ].join(" · ");
+          return `${pointer} ${selected ? pink(item.name) : item.name}  ${role}${screen}  ${dimAnsi(health)}${requestedBy}  ${dimAnsi(modelSummary)}`;
         };
 
         const renderLeftWindow = (startEntry: number, endEntry: number): string[] => {
@@ -613,7 +618,11 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           const item = items[selectedIndex - 1];
           if (!item) return [dimAnsi("No agents.")];
 
-          const modelInfo = `${purple("model")} ${item.model || "(inherited)"}${item.thinking && item.thinking !== "off" ? `   ${purple("thinking")} ${item.thinking}` : ""}${item.modelSlot ? `   ${purple("slot")} ${item.modelSlot}` : ""}`;
+          const modelInfo = [
+            `${purple("level")} ${item.modelSlot || "(none)"}`,
+            `${purple("model")} ${item.model || "(inherited)"}`,
+            `${purple("thinking")} ${item.thinking || "(inherited)"}`,
+          ].join("   ");
 
           rows.push(pink(item.name));
           if (item.completed) {

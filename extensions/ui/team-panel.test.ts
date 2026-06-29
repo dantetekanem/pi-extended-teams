@@ -524,6 +524,53 @@ describe("team panel items", () => {
     component.dispose();
   });
 
+  it("renders level, model, and thinking for active agents", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", {
+      agentId: "reader@team",
+      name: "reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "high",
+      modelSlot: "reading-fast",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    });
+
+    let component: any;
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => {
+        pi.command = command;
+      }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, panelOptions());
+
+    await pi.command.handler("team", {
+      ui: {
+        notify: vi.fn(),
+        custom: vi.fn(async (factory: any) => {
+          component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, { fg: (_name: string, text: string) => text }, {}, vi.fn());
+        }),
+      },
+    });
+
+    component.handleInput("j");
+    const output = component.render(160).join("\n");
+
+    expect(output).toContain("level");
+    expect(output).toContain("reading-fast");
+    expect(output).toContain("model");
+    expect(output).toContain("provider/model");
+    expect(output).toContain("thinking");
+    expect(output).toContain("high");
+
+    component.dispose();
+  });
+
   it("renders model, thinking, and selected slot for completed reports", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await sendPlainMessage("team", "writer", "team-lead", "final writer report", "Final report", "green", {

@@ -144,6 +144,7 @@ describe("extension integration", () => {
       ]);
       expect(setup.commands.has("agents")).toBe(true);
       expect(setup.commands.has("team")).toBe(true);
+      expect(setup.commands.has("agents-favorite-models")).toBe(true);
       expect(setup.commands.get("team")).toBe(setup.commands.get("agents"));
       expect(setup.pi.registerShortcut).toHaveBeenCalledWith(Key.alt("tab"), expect.objectContaining({ handler: expect.any(Function) }));
       expect(setup.tools.has("team_create")).toBe(false);

@@ -11,6 +11,7 @@ import { createLifecycleRuntime } from "./team/lifecycle.js";
 import { buildRoster as buildTeamRoster, formatRosterForPrompt, releaseAllClaimsForAgent, requireTeamContext as resolveTeamContext, requireWriteAgentTeam as resolveWriteAgentTeam } from "./team/roster.js";
 import { createWriterScreenState, registerWriterScreenShortcut, removeWriterScreenTab, upsertWriterScreenTab, type ActiveWriterTab } from "./team/writer-screens.js";
 import { registerTeamCommand } from "./ui/team-panel.js";
+import { registerFavoriteModelsCommand } from "./ui/favorite-models-command.js";
 import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordination-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools } from "./tools/team-tools.js";
@@ -342,20 +343,34 @@ export default function (pi: ExtensionAPI) {
       : [];
     const readAgents = runningAgents.filter(agent => (agent.role || "read") === "read");
     const writeAgents = runningAgents.filter(agent => (agent.role || "read") === "write");
+    const activityConfig = activityTeamName ? await teams.readConfig(activityTeamName).catch(() => null) : null;
+    const runtimeOnlyReadMembers = activityTeamName
+      ? (await Promise.all((activityConfig?.members ?? [])
+        .filter(member => member.name !== "team-lead" && (member.role ?? "read") === "read")
+        .filter(member => !runningReadAgents.has(readAgentKey(activityTeamName, member.name)))
+        .map(async (member) => ({
+          member,
+          runtimeStatus: await runtime.readRuntimeStatus(activityTeamName, member.name).catch(() => null),
+        }))))
+        .filter(({ member, runtimeStatus }) => {
+          const hasRecentHeartbeat = !!runtimeStatus?.lastHeartbeatAt && (now - runtimeStatus.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
+          return member.isActive !== false && !!runtimeStatus && hasRecentHeartbeat;
+        })
+      : [];
     const activeWriteMembers = activityTeamName
-      ? (await teams.readConfig(activityTeamName).catch(() => null))?.members
-        ?.filter(member => member.name !== "team-lead" && (member.role ?? "write") !== "read")
-        ?.filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId)) && !runningReadAgents.has(readAgentKey(activityTeamName, member.name))) ?? []
+      ? (activityConfig?.members ?? [])
+        .filter(member => member.name !== "team-lead" && (member.role ?? "write") !== "read")
+        .filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId)) && !runningReadAgents.has(readAgentKey(activityTeamName, member.name))) ?? []
       : [];
     const unreadLeadMessages = activityTeamName ? await messaging.readInbox(activityTeamName, agentName, true, false).catch(() => []) : [];
     leadInboxUnreadCount = unreadLeadMessages.length;
     clearLeadInboxWidgetOnce();
 
-    if ((readAgents.length > 0 || writeAgents.length > 0 || activeWriteMembers.length > 0) && !readAgentStatusTimer) {
+    if ((readAgents.length > 0 || writeAgents.length > 0 || runtimeOnlyReadMembers.length > 0 || activeWriteMembers.length > 0) && !readAgentStatusTimer) {
       readAgentStatusTimer = setInterval(renderReadAgentStatus, 1000);
     }
 
-    if (readAgents.length === 0 && writeAgents.length === 0 && activeWriteMembers.length === 0) {
+    if (readAgents.length === 0 && writeAgents.length === 0 && runtimeOnlyReadMembers.length === 0 && activeWriteMembers.length === 0) {
       sessionCtx.ui.setStatus?.("01-pi-extended-teams-read", undefined);
       clearTeamActivityWidget();
       sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
@@ -366,7 +381,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const activeCount = readAgents.length + writeAgents.length + activeWriteMembers.length;
+    const activeCount = readAgents.length + writeAgents.length + runtimeOnlyReadMembers.length + activeWriteMembers.length;
     const entries: TeamActivityStatusEntry[] = [];
     const statusCounts: Record<string, number> = {};
     const idleNudgeMessages: string[] = [];
@@ -391,7 +406,9 @@ export default function (pi: ExtensionAPI) {
       const idleNudgeMessage = getIdleReadAgentNudgeMessage(agent, status);
       if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
-      const detail = [modelLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
+      const slotLabel = agent.modelSlot ? `slot:${agent.modelSlot}` : "";
+      const progress = agent.latestAssistantSnippet ? `says: ${agent.latestAssistantSnippet}` : "";
+      const detail = [modelLabel, slotLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, progress, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "write", status: status.label, detail });
     }
@@ -417,6 +434,20 @@ export default function (pi: ExtensionAPI) {
       entries.push({ name: member.name, role: "write", status: "bg", detail });
     }
 
+    for (const { member, runtimeStatus } of runtimeOnlyReadMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
+      const elapsed = formatElapsed(now - (runtimeStatus?.startedAt || member.joinedAt));
+      const modelLabel = formatModelLabel(member.model, member.thinking);
+      const slotLabel = member.modelSlot ? `slot:${member.modelSlot}` : "";
+      const tokens = typeof runtimeStatus?.tokensUsed === "number" ? `${formatTokenCount(runtimeStatus.tokensUsed)} tok` : "0 tok";
+      const action = runtimeStatus?.activeToolName
+        ? `${runtimeStatus.currentAction || "working"}: ${runtimeStatus.activeToolName}`
+        : runtimeStatus?.currentAction || (runtimeStatus?.ready ? "ready" : "running");
+      const detail = [modelLabel, slotLabel, elapsed, tokens, action].filter(Boolean).join(" · ");
+      const status = runtimeStatus?.ready ? "ready" : "running";
+      countStatus(status);
+      entries.push({ name: member.name, role: "read", status, detail });
+    }
+
     for (const agent of readAgents) {
       try {
         const tokensUsed = agent.session?.getSessionStats().tokens.total;
@@ -433,7 +464,9 @@ export default function (pi: ExtensionAPI) {
       const idleNudgeMessage = getIdleReadAgentNudgeMessage(agent, status);
       if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
-      const detail = [modelLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
+      const slotLabel = agent.modelSlot ? `slot:${agent.modelSlot}` : "";
+      const progress = agent.latestAssistantSnippet ? `says: ${agent.latestAssistantSnippet}` : "";
+      const detail = [modelLabel, slotLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, progress, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "read", status: status.label, detail });
     }
@@ -443,7 +476,7 @@ export default function (pi: ExtensionAPI) {
     sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
     updateTeamActivityWidget({
       activeCount,
-      readCount: readAgents.length,
+      readCount: readAgents.length + runtimeOnlyReadMembers.length,
       writeCount: writeAgents.length + activeWriteMembers.length,
       unreadCount: leadInboxUnreadCount,
       entries,
@@ -686,6 +719,7 @@ export default function (pi: ExtensionAPI) {
     terminal,
     shutdownTeammate,
   });
+  registerFavoriteModelsCommand(pi);
 
   registerWriterScreenShortcut(pi, {
     getTeamName: () => teamName,

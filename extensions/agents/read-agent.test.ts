@@ -122,6 +122,51 @@ describe("in-process read agent tool wiring", () => {
     expect(runningReadAgents.size).toBe(0);
   });
 
+  it("does not reset tool-working status for non-assistant message updates", async () => {
+    let subscriber: ((event: any) => void) | undefined;
+    const session = makeSession();
+    session.subscribe.mockImplementation((callback: (event: any) => void) => {
+      subscriber = callback;
+    });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    session.prompt.mockImplementation(async () => {
+      subscriber?.({ type: "tool_execution_start", toolName: "bash" });
+      subscriber?.({ type: "message_update", message: { role: "toolResult", content: "not assistant text" } });
+      expect(runningReadAgents.get("team:reader")).toMatchObject({ status: "working", activeToolName: "bash" });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    };
+
+    await runReadAgentInProcess("team", {
+      agentId: "reader@team",
+      name: "reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "high",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "investigate",
+    }, "investigate", {
+      modelRegistry: {
+        find: vi.fn(() => ({ provider: "provider", id: "model" })),
+      },
+    }, options);
+  });
+
   it("emits prompt-build reports even when prompt-build is not the adopted lead team", async () => {
     const session = makeSession();
     piMocks.createAgentSession.mockResolvedValue({ session });

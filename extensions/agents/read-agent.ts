@@ -11,7 +11,7 @@ import * as teams from "../../src/utils/teams";
 import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
-import { getLastAssistantText } from "../ui/renderers";
+import { extractTextParts, getLastAssistantText, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools } from "../tools/agent-communication-tools";
 import { shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 
@@ -56,6 +56,23 @@ function refreshReadAgentStats(agent: RunningReadAgent, session: AgentSession): 
     agent.idleNudgeLevel = undefined;
   }
   agent.tokensUsed = tokensUsed;
+}
+
+function assistantProgressSnippet(message: any): string | undefined {
+  if (message?.role !== "assistant") return undefined;
+  const text = sanitizeTuiLine(extractTextParts(message.content)).trim();
+  if (!text) return undefined;
+  return text.length > 180 ? `…${text.slice(-179)}` : text;
+}
+
+function updateAssistantProgress(agent: RunningReadAgent, message: any, recordEvent: boolean): boolean {
+  const snippet = assistantProgressSnippet(message);
+  if (!snippet || snippet === agent.latestAssistantSnippet) return false;
+  agent.latestAssistantSnippet = snippet;
+  agent.lastActivityAt = Date.now();
+  agent.idleNudgeLevel = undefined;
+  if (recordEvent) pushReadAgentEvent(agent, `assistant: ${snippet}`);
+  return true;
 }
 
 export async function shutdownReadAgentSession(session: AgentSession | undefined): Promise<void> {
@@ -110,12 +127,13 @@ async function recordReadAgentReportEvent(
     costUsd,
     model: member.model,
     thinking: member.thinking,
+    modelSlot: member.modelSlot,
     color: color || member.color,
     requestedBy: member.requestedBy,
     source: "read-agent",
     operationId: operation.operationId,
     workflowRunId: operation.workflowRunId,
-    metadata: member.prompt ? { initialPrompt: member.prompt } : undefined,
+    metadata: { ...(member.prompt ? { initialPrompt: member.prompt } : {}), ...(member.modelSlot ? { modelSlot: member.modelSlot } : {}) },
   }).catch(() => {});
 }
 
@@ -201,6 +219,7 @@ export async function runReadAgentInProcess(
     lastActivityAt: Date.now(),
     model: member.model,
     thinking: member.thinking,
+    modelSlot: member.modelSlot,
   };
   options.runningReadAgents.set(key, state);
   options.ensureReadAgentStatusTicker();
@@ -285,8 +304,12 @@ export async function runReadAgentInProcess(
       if (event.type === "message_start" && event.message?.role === "assistant") {
         markReadAgentActivity(state, "thinking", "thinking");
       }
-      if (event.type === "message_update") {
-        markReadAgentActivity(state, "thinking", "thinking");
+      if (event.type === "message_update" && updateAssistantProgress(state, event.message, false)) {
+        state.status = "thinking";
+        state.activeToolName = undefined;
+      }
+      if (event.type === "message_end" && event.message?.role === "assistant") {
+        updateAssistantProgress(state, event.message, true);
       }
       if (event.type === "tool_execution_start") {
         markReadAgentActivity(state, `working: ${event.toolName}`, "working", event.toolName);
@@ -332,6 +355,7 @@ export async function runReadAgentInProcess(
       costUsd: completionStats.cost,
       model: member.model,
       thinking: member.thinking,
+      modelSlot: member.modelSlot,
       color: member.color,
       requestedBy: member.requestedBy,
       initialPrompt: member.prompt || prompt,
@@ -339,12 +363,14 @@ export async function runReadAgentInProcess(
     });
     const completionSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
     const completionMetadata = {
+      finalReport: true,
       startedAt: state.startedAt,
       elapsedMs: Date.now() - state.startedAt,
       tokensUsed: state.tokensUsed,
       costUsd: completionStats.cost,
       model: member.model,
       thinking: member.thinking,
+      modelSlot: member.modelSlot,
       initialPrompt: member.prompt || prompt,
     };
     await recordReadAgentReportEvent(readTeamName, member, "completed", report, completionSummary, state.startedAt, state.tokensUsed, completionStats.cost);
@@ -380,6 +406,7 @@ export async function runReadAgentInProcess(
         costUsd: failureStats?.cost,
         model: member.model,
         thinking: member.thinking,
+        modelSlot: member.modelSlot,
         color: "red",
         requestedBy: member.requestedBy,
         initialPrompt: member.prompt || prompt,
@@ -387,12 +414,14 @@ export async function runReadAgentInProcess(
       });
       const failureSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`;
       const failureMetadata = {
+        finalReport: true,
         startedAt: state.startedAt,
         elapsedMs: Date.now() - state.startedAt,
         tokensUsed: state.tokensUsed,
         costUsd: failureStats?.cost,
         model: member.model,
         thinking: member.thinking,
+        modelSlot: member.modelSlot,
         initialPrompt: member.prompt || prompt,
       };
       await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, failureSummary, state.startedAt, state.tokensUsed, failureStats?.cost, "red");

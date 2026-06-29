@@ -440,6 +440,17 @@ describe("team panel items", () => {
     expect(ctx.ui.custom).not.toHaveBeenCalled();
   });
 
+  it("does not treat generic metadata-bearing inbox messages as completed reports", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await sendPlainMessage("team", "agent", "team-lead", "progress update", "Progress", "cyan", {
+      metadata: { model: "provider/model", thinking: "high", tokensUsed: 123 },
+    });
+
+    const items = await buildTeamPanelItems("team", panelOptions());
+
+    expect(items.filter(item => item.completed)).toEqual([]);
+  });
+
   it("keeps completed writer history even when a writer with the same name is active again", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
@@ -454,7 +465,7 @@ describe("team panel items", () => {
       subscriptions: [],
     });
     await sendPlainMessage("team", "writer", "team-lead", "previous writer report", "Previous writer done", "green", {
-      metadata: { tokensUsed: 321, elapsedMs: 4567, model: "provider/model", thinking: "xhigh" },
+      metadata: { finalReport: true, tokensUsed: 321, elapsedMs: 4567, model: "provider/model", thinking: "xhigh", modelSlot: "writing-hard" },
     });
 
     const items = await buildTeamPanelItems("team", panelOptions());
@@ -463,7 +474,88 @@ describe("team panel items", () => {
 
     expect(writerItems).toHaveLength(2);
     expect(writerItems.some(item => !item.completed && item.status === "running")).toBe(true);
-    expect(completedWriter).toMatchObject({ tokensUsed: 321, elapsedMs: 4567, model: "provider/model", thinking: "xhigh" });
+    expect(completedWriter).toMatchObject({ tokensUsed: 321, elapsedMs: 4567, model: "provider/model", thinking: "xhigh", modelSlot: "writing-hard" });
+  });
+
+  it("preserves same-name completed selection across refresh", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "%42",
+      cwd: root,
+      subscriptions: [],
+    });
+    await sendPlainMessage("team", "writer", "team-lead", "previous writer report", "Final report", "green", {
+      metadata: { finalReport: true, model: "provider/model", thinking: "xhigh" },
+    });
+
+    let component: any;
+    const tui = { requestRender: vi.fn(), terminal: { rows: 30 } };
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => {
+        pi.command = command;
+      }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, panelOptions());
+
+    await pi.command.handler("team", {
+      ui: {
+        notify: vi.fn(),
+        custom: vi.fn(async (factory: any) => {
+          component = factory(tui, { fg: (_name: string, text: string) => text }, {}, vi.fn());
+        }),
+      },
+    });
+
+    component.handleInput("j");
+    component.handleInput("j");
+    expect(component.render(140).join("\n")).toContain("previous writer report");
+
+    component.handleInput("r");
+    await vi.waitFor(() => expect(tui.requestRender).toHaveBeenCalled());
+
+    expect(component.render(140).join("\n")).toContain("previous writer report");
+    component.dispose();
+  });
+
+  it("renders model, thinking, and selected slot for completed reports", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await sendPlainMessage("team", "writer", "team-lead", "final writer report", "Final report", "green", {
+      metadata: { model: "provider/model", thinking: "xhigh", modelSlot: "writing-hard" },
+    });
+
+    let component: any;
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => {
+        pi.command = command;
+      }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, panelOptions());
+
+    await pi.command.handler("team", {
+      ui: {
+        notify: vi.fn(),
+        custom: vi.fn(async (factory: any) => {
+          component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, { fg: (_name: string, text: string) => text }, {}, vi.fn());
+        }),
+      },
+    });
+
+    component.handleInput("j");
+    const output = component.render(140).join("\n");
+
+    expect(output).toContain("provider/model");
+    expect(output).toContain("xhigh");
+    expect(output).toContain("writing-hard");
+
+    component.dispose();
   });
 
   it("sanitizes unsafe transcript control sequences before overlay rendering", async () => {

@@ -5,6 +5,7 @@ This guide shows the current session-connected workflow for pi-extended-teams. T
 ## Contents
 
 - [Getting started](#getting-started)
+- [Choosing favorite model slots](#choosing-favorite-model-slots)
 - [Common workflows](#common-workflows)
 - [Best practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
@@ -26,9 +27,9 @@ Or spawn explicitly:
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", thinking: "high" },
+  defaults: { role: "read", model_slot: "reading-default" },
   agents: [
-    { name: "security", prompt: "Review the diff for security risks. Report file:line findings." },
+    { name: "security", model_slot: "reading-hard", prompt: "Review the diff for security risks. Report file:line findings." },
     { name: "tests", prompt: "Find missing or weak test coverage. Report concrete gaps." }
   ]
 })
@@ -44,15 +45,42 @@ Open the panel:
 
 ---
 
+## Choosing favorite model slots
+
+Use `/agents-favorite-models` to save five named model/thinking favorites from one screen. The picker lists the scoped models available to the current Pi session, lets you move across slots, models, and thinking levels, then saves the global settings file when you press Enter. After that, spawn agents by declaring the workload slot instead of repeating model names:
+
+```text
+spawn_agent({
+  name: "auth-security",
+  role: "read",
+  model_slot: "reading-hard",
+  prompt: "Review src/auth for authorization bugs. Report file:line evidence."
+})
+```
+
+Slot guidance:
+
+| Slot | Best for | Avoid for |
+| --- | --- | --- |
+| `reading-fast` | Fast read-only collection over small independent datasets: many issue files, route files, logs, docs pages, simple conventions, or shallow yes/no checks. | Ambiguous design calls, security-sensitive conclusions, or tasks where one agent must hold the whole system in context. |
+| `reading-default` | Normal read-only work: focused diff review, test-gap analysis, README/reference checks, local convention discovery. | Expensive architecture/security/root-cause analysis. |
+| `reading-hard` | Deep read-only reasoning: architecture boundaries, security review, production-risk review, migration/data correctness, unclear root cause. | Simple inventory work that can be split across fast readers. |
+| `writing-basic` | Small isolated edits with obvious verification: docs, typos, one-file config, narrow test fixture fixes. | Broad refactors, multi-file logic, risky behavior changes. |
+| `writing-hard` | Non-trivial write work: multi-file implementation, refactors, production bug fixes, difficult test repairs. | Parallel writes to overlapping files; keep writer concurrency low. |
+
+For collection-style work, prefer breadth: five `reading-fast` agents each reading one slice often beats one `reading-hard` agent reading every file. Ask each fast reader for concise evidence, then synthesize in the lead session.
+
+---
+
 ## Common workflows
 
 ### 1. Code review with read agents
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", thinking: "high" },
+  defaults: { role: "read", model_slot: "reading-default" },
   agents: [
-    { name: "security-reviewer", prompt: "Review src/auth for authn/authz bugs. Report severity, file:line, and suggested fix." },
+    { name: "security-reviewer", model_slot: "reading-hard", prompt: "Review src/auth for authn/authz bugs. Report severity, file:line, and suggested fix." },
     { name: "performance-reviewer", prompt: "Review the diff for avoidable performance regressions. Include evidence." },
     { name: "test-reviewer", prompt: "Inspect tests around this change. Report missing regression coverage." }
   ]
@@ -69,6 +97,7 @@ Use an edit agent only when the change is narrow and isolated.
 spawn_agent({
   name: "docs-fix",
   role: "write",
+  model_slot: "writing-basic",
   prompt: "Claim README.md and docs/guide.md, update only stale public tool references, run the focused docs checks, then call report_and_exit. Do not commit or push."
 })
 ```
@@ -81,20 +110,20 @@ A good edit-agent prompt includes:
 - verification commands,
 - and the expected final report.
 
-### 3. Mixed model/thinking swarm
+### 3. Favorite-slot swarm
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", cwd: "/path/to/project" },
+  defaults: { role: "read", cwd: "/path/to/project", model_slot: "reading-fast" },
   agents: [
-    { name: "architect", model: "openai-codex/gpt-5.5", thinking: "xhigh", prompt: "Review architecture and coupling risks." },
-    { name: "smoke", thinking: "low", prompt: "Run lightweight smoke checks and report failures." },
-    { name: "docs", thinking: "medium", prompt: "Check README and docs for stale user instructions." }
+    { name: "routes", prompt: "Collect route patterns and public endpoints from config/routes*. Report concise evidence." },
+    { name: "jobs", prompt: "Collect queue/retry conventions from background jobs. Report concise evidence." },
+    { name: "architect", model_slot: "reading-hard", prompt: "Use the collected facts plus direct inspection to review architecture and coupling risks." }
   ]
 })
 ```
 
-Use fully qualified model names when overriding the current Pi model.
+Use favorite slots for normal orchestration. Use fully qualified model names only when intentionally overriding the configured favorites.
 
 ### 4. Direct coordination
 
@@ -136,6 +165,8 @@ Read agents are the safest multiplier. Use them for:
 - security audit,
 - release-readiness checks,
 - unfamiliar-code investigation.
+
+Match slot strength to the job. Use `reading-fast` for splitable collection and `reading-hard` only when depth is needed.
 
 ### Keep edit agents rare
 
@@ -206,13 +237,11 @@ list_file_claims({})
 
 ### Model errors
 
-Use fully qualified model names such as:
+If a `model_slot` fails, check `/agents-favorite-models` and confirm the slot has a fully qualified `provider/model` plus a valid thinking level.
 
-- `openai-codex/gpt-5.5`
-- `claude-agent-sdk/claude-sonnet-4-6`
-- `kimi-coding/kimi-for-coding`
+When bypassing slots, use fully qualified model names such as `provider/model`.
 
-If no model is passed, pi-extended-teams uses the current Pi session model or configured defaults.
+If no `model_slot` or model is passed, pi-extended-teams uses the current Pi session model or configured defaults.
 
 ### Panel is empty
 

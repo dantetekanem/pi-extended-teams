@@ -24,6 +24,8 @@ export interface Member {
   role?: "read" | "write";
   /** Optional category preset name from settings.json. */
   category?: string;
+  /** Optional favorite model slot selected at spawn time. */
+  modelSlot?: string;
   /** Agent that requested this read helper; final reports are delivered there. */
   requestedBy?: string;
   /** Marks extension-managed helper agents with special delivery/cleanup semantics. */
@@ -89,6 +91,7 @@ export interface TeamReportEvent {
   costUsd?: number;
   model?: string;
   thinking?: string;
+  modelSlot?: string;
   color?: string;
   requestedBy?: string;
   source: "read-agent" | "write-agent" | "lead-inbox" | "tool" | "workflow";

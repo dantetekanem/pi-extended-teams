@@ -18,10 +18,28 @@ export type AgentRole = "read" | "write";
 
 export const AGENT_ROLES: AgentRole[] = ["read", "write"];
 
-const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+export const THINKING_LEVEL_NAMES = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ThinkingLevelName = (typeof THINKING_LEVEL_NAMES)[number];
+const THINKING_LEVELS = new Set<string>(THINKING_LEVEL_NAMES);
+
+export const FAVORITE_MODEL_SLOTS = [
+  "reading-fast",
+  "reading-default",
+  "reading-hard",
+  "writing-basic",
+  "writing-hard",
+] as const;
+export type FavoriteModelSlot = (typeof FAVORITE_MODEL_SLOTS)[number];
+const FAVORITE_MODEL_SLOT_SET = new Set<string>(FAVORITE_MODEL_SLOTS);
 
 /** Per-role default model/thinking. `null`/omitted means "inherit". */
 export interface RoleModelConfig {
+  model: string | null;
+  thinking: string | null;
+}
+
+/** A favorite model slot selected by spawn-time workload intent. */
+export interface FavoriteModelConfig {
   model: string | null;
   thinking: string | null;
 }
@@ -77,6 +95,7 @@ export interface PiExtendedTeamsSettings {
   readAgents: ReadAgentsConfig;
   readHelpers: ReadHelpersConfig;
   roles: Record<AgentRole, RoleModelConfig>;
+  favoriteModels: Partial<Record<FavoriteModelSlot, FavoriteModelConfig>>;
   categories: Record<string, CategoryConfig>;
   extensions: ExtensionsConfig;
   debug: DebugConfig;
@@ -95,6 +114,7 @@ export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
     read: { model: null, thinking: null },
     write: { model: null, thinking: null },
   },
+  favoriteModels: {},
   categories: {},
   extensions: { allow: [], block: [] },
   debug: { enabled: false },
@@ -134,6 +154,10 @@ function normalizeRole(value: unknown): AgentRole | undefined {
   return value === "read" || value === "write" ? value : undefined;
 }
 
+export function isFavoriteModelSlot(value: unknown): value is FavoriteModelSlot {
+  return typeof value === "string" && FAVORITE_MODEL_SLOT_SET.has(value);
+}
+
 function normalizeThinking(value: unknown): string | null {
   const s = toStringOrNull(value);
   return s && THINKING_LEVELS.has(s) ? s : null;
@@ -150,8 +174,9 @@ function mergeRoleConfig(base: RoleModelConfig, raw: any): RoleModelConfig {
 /**
  * Apply one raw settings object on top of an accumulator, in place.
  */
-function applyLayer(acc: PiExtendedTeamsSettings, raw: any): void {
+function applyLayer(acc: PiExtendedTeamsSettings, raw: any, options: { favoriteModels?: boolean } = {}): void {
   if (!raw || typeof raw !== "object") return;
+  const includeFavoriteModels = options.favoriteModels !== false;
 
   if (raw.watchdog && typeof raw.watchdog === "object") {
     const b = Number(raw.watchdog.bufferSeconds);
@@ -185,6 +210,16 @@ function applyLayer(acc: PiExtendedTeamsSettings, raw: any): void {
   if (raw.roles && typeof raw.roles === "object") {
     acc.roles.read = mergeRoleConfig(acc.roles.read, raw.roles.read);
     acc.roles.write = mergeRoleConfig(acc.roles.write, raw.roles.write);
+  }
+
+  if (includeFavoriteModels && raw.favoriteModels && typeof raw.favoriteModels === "object") {
+    for (const [slot, value] of Object.entries<any>(raw.favoriteModels)) {
+      if (!isFavoriteModelSlot(slot) || !value || typeof value !== "object") continue;
+      acc.favoriteModels[slot] = {
+        model: toStringOrNull(value.model),
+        thinking: normalizeThinking(value.thinking),
+      };
+    }
   }
 
   if (raw.categories && typeof raw.categories === "object") {
@@ -224,16 +259,113 @@ export function loadSettings(options?: {
 
   applyLayer(acc, readJson(globalSettingsPath(homeDir)));
   if (options?.projectDir) {
-    applyLayer(acc, readJson(projectSettingsPath(options.projectDir)));
+    // Favorite model slots are intentionally global-only: /agents-favorite-models
+    // writes ~/.pi/agent/pi-extended-teams/settings.json, so spawn resolution must
+    // not be shadowed by project-local slot values the picker cannot update.
+    applyLayer(acc, readJson(projectSettingsPath(options.projectDir)), { favoriteModels: false });
   }
 
   return acc;
+}
+
+function readRawSettingsObject(filePath: string): Record<string, any> {
+  const raw = readJson(filePath);
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+}
+
+function writeRawSettingsObject(filePath: string, raw: Record<string, any>): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(raw, null, 2)}\n`);
+}
+
+export function setGlobalFavoriteModel(
+  slot: FavoriteModelSlot,
+  config: FavoriteModelConfig,
+  options?: { homeDir?: string }
+): void {
+  if (!isFavoriteModelSlot(slot)) throw new Error(`Unknown favorite model slot "${slot}".`);
+  const model = toStringOrNull(config.model);
+  const thinking = normalizeThinking(config.thinking);
+  if (!model) throw new Error(`Favorite model slot "${slot}" requires a fully qualified provider/model.`);
+  if (!thinking) throw new Error(`Favorite model slot "${slot}" requires a valid thinking level.`);
+
+  const filePath = globalSettingsPath(options?.homeDir ?? os.homedir());
+  const raw = readRawSettingsObject(filePath);
+  const favoriteModels = raw.favoriteModels && typeof raw.favoriteModels === "object" && !Array.isArray(raw.favoriteModels)
+    ? { ...raw.favoriteModels }
+    : {};
+  favoriteModels[slot] = { model, thinking };
+  raw.favoriteModels = favoriteModels;
+  writeRawSettingsObject(filePath, raw);
+}
+
+export function clearGlobalFavoriteModels(options?: {
+  homeDir?: string;
+  slot?: FavoriteModelSlot;
+}): void {
+  if (options?.slot && !isFavoriteModelSlot(options.slot)) {
+    throw new Error(`Unknown favorite model slot "${options.slot}".`);
+  }
+
+  const filePath = globalSettingsPath(options?.homeDir ?? os.homedir());
+  const raw = readRawSettingsObject(filePath);
+  const favoriteModels = raw.favoriteModels && typeof raw.favoriteModels === "object" && !Array.isArray(raw.favoriteModels)
+    ? { ...raw.favoriteModels }
+    : {};
+
+  if (options?.slot) delete favoriteModels[options.slot];
+  else for (const slot of FAVORITE_MODEL_SLOTS) delete favoriteModels[slot];
+
+  raw.favoriteModels = favoriteModels;
+  writeRawSettingsObject(filePath, raw);
+}
+
+export function replaceGlobalFavoriteModels(
+  favoriteModels: Partial<Record<FavoriteModelSlot, FavoriteModelConfig>>,
+  options?: { homeDir?: string }
+): void {
+  const next: Partial<Record<FavoriteModelSlot, FavoriteModelConfig>> = {};
+  for (const slot of FAVORITE_MODEL_SLOTS) {
+    const config = favoriteModels[slot];
+    if (!config) continue;
+    const model = toStringOrNull(config.model);
+    const thinking = normalizeThinking(config.thinking);
+    if (!model || !thinking) continue;
+    next[slot] = { model, thinking };
+  }
+
+  const filePath = globalSettingsPath(options?.homeDir ?? os.homedir());
+  const raw = readRawSettingsObject(filePath);
+  raw.favoriteModels = next;
+  writeRawSettingsObject(filePath, raw);
+}
+
+export function requireConfiguredFavoriteModel(
+  settings: PiExtendedTeamsSettings,
+  slot: unknown
+): { slot: FavoriteModelSlot; config: FavoriteModelConfig } | null {
+  if (slot === undefined || slot === null || slot === "") return null;
+  if (!isFavoriteModelSlot(slot)) {
+    throw new Error(
+      `Unknown favorite model slot "${String(slot)}". Use one of: ${FAVORITE_MODEL_SLOTS.join(", ")}.`
+    );
+  }
+
+  const config = settings.favoriteModels[slot];
+  if (!config?.model || !config.thinking) {
+    throw new Error(
+      `Favorite model slot "${slot}" is not configured. Run /agents-favorite-models set ${slot} <provider/model> <thinking>.`
+    );
+  }
+  return { slot, config };
 }
 
 export interface ResolveModelInput {
   role: AgentRole;
   /** Optional category name referencing settings.categories. */
   category?: string;
+  /** Favorite model slot selected at spawn time. */
+  modelSlot?: string | null;
   /** Explicit fully-qualified model passed at spawn time. */
   explicitModel?: string | null;
   /** Explicit thinking level passed at spawn time. */
@@ -248,14 +380,14 @@ export interface ResolvedModel {
   model: string | null;
   thinking: string | null;
   /** Where the model came from, for diagnostics. */
-  modelSource: "explicit" | "category" | "role" | "team" | "current" | "none";
+  modelSource: "explicit" | "favorite-slot" | "category" | "role" | "team" | "current" | "none";
 }
 
 /**
  * Resolve a member's effective model/thinking.
  *
- * Model precedence:   explicit -> category -> role default -> team default -> current
- * Thinking precedence: explicit -> category -> role default (else none)
+ * Model precedence:   explicit -> favorite slot -> category -> role default -> team default -> current
+ * Thinking precedence: explicit -> favorite slot -> category -> role default (else none)
  *
  * Today read and write typically resolve to the same model (role defaults are
  * null = inherit). The precedence chain lets that diverge purely via settings,
@@ -275,6 +407,14 @@ export function resolveModel(
   const roleDefaults = settings.roles[input.role];
 
   const explicitModel = toStringOrNull(input.explicitModel ?? null);
+  const explicitThinkingInput = toStringOrNull(input.explicitThinking ?? null);
+  const favorite = requireConfiguredFavoriteModel(settings, input.modelSlot);
+  if (favorite && (explicitModel || explicitThinkingInput)) {
+    throw new Error(
+      `model_slot cannot be combined with explicit model or thinking. Slot "${favorite.slot}" already defines both.`
+    );
+  }
+
   const teamDefault = toStringOrNull(input.teamDefaultModel ?? null);
   const current = toStringOrNull(input.currentModel ?? null);
 
@@ -283,6 +423,9 @@ export function resolveModel(
   if (explicitModel) {
     model = explicitModel;
     modelSource = "explicit";
+  } else if (favorite?.config.model) {
+    model = favorite.config.model;
+    modelSource = "favorite-slot";
   } else if (category?.model) {
     model = category.model;
     modelSource = "category";
@@ -303,6 +446,7 @@ export function resolveModel(
   const explicitThinking = normalizeThinking(input.explicitThinking);
   const thinking =
     explicitThinking ??
+    favorite?.config.thinking ??
     category?.thinking ??
     roleDefaults.thinking ??
     null;

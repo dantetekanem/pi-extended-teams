@@ -26,7 +26,8 @@ Spawn one agent in the current Pi session.
 - `prompt` (required): Assignment and expected report shape.
 - `role` (optional): `read` or `write`. Defaults to `read`.
 - `cwd` (optional): Working directory. Defaults to the lead session cwd.
-- `model` (optional): Fully qualified `provider/model` string. Defaults to the current Pi session model or configured defaults.
+- `model_slot` (optional): One of `reading-fast`, `reading-default`, `reading-hard`, `writing-basic`, or `writing-hard`. Uses the configured favorite model and thinking for that workload.
+- `model` (optional): Fully qualified `provider/model` string. Defaults to the current Pi session model or configured defaults. Prefer `model_slot` for normal orchestration once favorites are configured.
 - `thinking` (optional): `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
 - `metadata` (optional): Extra structured metadata for runtime/orchestration use.
 
@@ -36,8 +37,8 @@ Spawn one agent in the current Pi session.
 spawn_agent({
   name: "security-reviewer",
   role: "read",
-  prompt: "Review src/auth for authorization bugs. Report findings with file:line evidence.",
-  thinking: "high"
+  model_slot: "reading-hard",
+  prompt: "Review src/auth for authorization bugs. Report findings with file:line evidence."
 })
 ```
 
@@ -47,6 +48,7 @@ Use `role: "write"` only for isolated edit work. Edit agents should claim files 
 spawn_agent({
   name: "docs-fix",
   role: "write",
+  model_slot: "writing-basic",
   prompt: "Claim docs/guide.md, fix stale public tool references only, verify, then call report_and_exit."
 })
 ```
@@ -57,18 +59,18 @@ Spawn a batch of agents in the current Pi session. Use `defaults` for shared set
 
 **Parameters**
 
-- `defaults` (optional): Shared `role`, `cwd`, `model`, `thinking`, and `metadata` values.
-- `agents` (required): Array of agent specs. Each agent accepts the same fields as `spawn_agent`.
+- `defaults` (optional): Shared `role`, `cwd`, `model_slot`, `model`, `thinking`, and `metadata` values.
+- `agents` (required): Array of agent specs. Each agent accepts the same fields as `spawn_agent`. Per-agent `model_slot` can override a default slot.
 
 **Example**
 
 ```javascript
 spawn_swarm_agents({
-  defaults: { role: "read", thinking: "high" },
+  defaults: { role: "read", model_slot: "reading-default" },
   agents: [
-    { name: "architecture", prompt: "Review module boundaries and coupling." },
+    { name: "architecture", model_slot: "reading-hard", prompt: "Review module boundaries and coupling." },
     { name: "tests", prompt: "Run focused tests and report failures or gaps." },
-    { name: "docs", prompt: "Check docs for stale tool references." }
+    { name: "docs", model_slot: "reading-fast", prompt: "Check docs for stale tool references." }
   ]
 })
 ```
@@ -222,20 +224,42 @@ Open the agent panel for the current Pi session. It shows active agents, complet
 
 Compatibility alias for `/agents`.
 
+### `/agents-favorite-models`
+
+Configure the five favorite model slots used by `model_slot`:
+
+- `reading-fast`
+- `reading-default`
+- `reading-hard`
+- `writing-basic`
+- `writing-hard`
+
+By default, all slots start empty. Run the command without arguments to open a single-screen picker for all five slots; the model column is populated from the scoped models available to the current Pi session. Pick a model and thinking level, then press Enter to save. Updates are saved to `~/.pi/agent/pi-extended-teams/settings.json`.
+
+Use the slots to communicate intent when spawning agents. For example, use `reading-fast` for many small read-only collection agents, `reading-hard` for one deep architecture/security reviewer, `writing-basic` for a narrow docs edit, and `writing-hard` for a difficult implementation agent.
+
 ---
 
 ## Configuration
 
-pi-extended-teams reads optional settings from:
+pi-extended-teams reads optional runtime settings from:
 
-- Project: `.pi/pi-extended-teams.json`
-- Global: `~/.pi/pi-extended-teams.json`
+- Global: `~/.pi/agent/pi-extended-teams/settings.json`
+- Project override for non-favorite settings: `.pi/pi-extended-teams.json`
 
-Common settings:
+Favorite model slots are global-only so `/agents-favorite-models` and spawn resolution use the same values.
+
+Common runtime settings:
 
 ```json
 {
-  "providerPriority": ["openai-codex", "claude-agent-sdk"],
+  "favoriteModels": {
+    "reading-fast": { "model": "provider/model", "thinking": "low" },
+    "reading-default": { "model": "provider/model", "thinking": "high" },
+    "reading-hard": { "model": "provider/model", "thinking": "xhigh" },
+    "writing-basic": { "model": "provider/model", "thinking": "high" },
+    "writing-hard": { "model": "provider/model", "thinking": "xhigh" }
+  },
   "readAgents": {
     "maxConcurrent": 8,
     "queueOverflow": true
@@ -249,7 +273,9 @@ Common settings:
 }
 ```
 
-Model settings still come from Pi's active model configuration unless you pass a fully qualified `provider/model` string in a spawn call.
+Provider-priority sorting for model selection also supports `providerPriority` in `~/.pi/pi-extended-teams.json` or `.pi/pi-extended-teams.json`.
+
+Model settings still come from Pi's active model configuration unless you use `model_slot` or pass a fully qualified `provider/model` string in a spawn call. In `spawn_swarm_agents`, per-agent `model`, `thinking`, or `model_slot` fields override conflicting defaults instead of being combined.
 
 ---
 
@@ -258,6 +284,7 @@ Model settings still come from Pi's active model configuration unless you pass a
 - The lead controls orchestration. Spawned agents should not create other agents.
 - Agents run in-process and are followable from Pi.
 - Read agents should not edit files or make mutating changes.
+- Prefer multiple `reading-fast` agents for splitable collection work; use `reading-hard` for deep synthesis, risky analysis, or ambiguous root cause.
 - Edit agents should keep diffs small, claim files before editing, and use `report_and_exit` when finished.
 - Do not use sleep loops or polling to wait for reports; pi-extended-teams wakes the lead when agent reports arrive.
 - Internal source files still use `team` terminology in places for persisted state and backward compatibility. That terminology is not part of the current public workflow.

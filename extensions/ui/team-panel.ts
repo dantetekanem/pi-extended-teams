@@ -8,6 +8,7 @@ import * as claims from "../../src/utils/claims";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as reportEvents from "../../src/utils/report-events";
+import { FAVORITE_MODEL_SLOTS } from "../../src/utils/settings";
 import { dimAnsi, pink, purple } from "./ansi";
 import { framePanel, logWindowStart } from "./frame";
 import { isDownInput, isLeftInput, isRightInput, isUpInput } from "./input";
@@ -40,6 +41,7 @@ export interface TeamPanelItem {
   status: string;
   model?: string;
   thinking?: string;
+  modelSlot?: string;
   unreadCount: number;
   elapsedMs: number;
   tokensUsed: number;
@@ -108,13 +110,7 @@ function buildClaimPathIndex(allClaims: Array<{ agent: string; path: string }>):
 }
 
 function hasFinalReportMetadata(metadata: any): boolean {
-  if (!metadata || typeof metadata !== "object") return false;
-  return typeof metadata.startedAt === "number"
-    || typeof metadata.elapsedMs === "number"
-    || typeof metadata.tokensUsed === "number"
-    || typeof metadata.costUsd === "number"
-    || typeof metadata.model === "string"
-    || typeof metadata.thinking === "string";
+  return !!metadata && typeof metadata === "object" && metadata.finalReport === true;
 }
 
 function completionStatusFromLeadInboxMessage(message: any): CompletedAgentReport["status"] | null {
@@ -132,6 +128,15 @@ function initialPromptFromMetadata(metadata: any): string | undefined {
   return undefined;
 }
 
+function inferModelSlotFromText(...values: Array<string | undefined>): string | undefined {
+  const source = values.filter(Boolean).join("\n");
+  for (const slot of FAVORITE_MODEL_SLOTS) {
+    const escaped = slot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(^|[^A-Za-z0-9_-])${escaped}([^A-Za-z0-9_-]|$)`).test(source)) return slot;
+  }
+  return undefined;
+}
+
 function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport | null {
   const from = String(message.from || "");
   if (!from || from === "team-lead" || from === "system" || from === "watchdog") return null;
@@ -142,6 +147,7 @@ function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport
   const summary = String(message.summary || "Final report");
   const text = String(message.text || "");
   const metadata = message.metadata || {};
+  const initialPrompt = initialPromptFromMetadata(metadata);
   const role = summary.startsWith("Read helper ") || summary.startsWith("Read agent ") ? "read" : "write";
   return {
     name: String(message.from),
@@ -156,9 +162,10 @@ function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport
     costUsd: typeof metadata.costUsd === "number" ? metadata.costUsd : undefined,
     model: typeof metadata.model === "string" ? metadata.model : undefined,
     thinking: typeof metadata.thinking === "string" ? metadata.thinking : undefined,
+    modelSlot: typeof metadata.modelSlot === "string" ? metadata.modelSlot : inferModelSlotFromText(summary, text, initialPrompt),
     color: message.color,
     requestedBy: inferRequestedBy(summary, text),
-    initialPrompt: initialPromptFromMetadata(metadata),
+    initialPrompt,
     source: "lead-inbox" as const,
   };
 }
@@ -167,6 +174,7 @@ function completedReportFromReportEvent(event: TeamReportEvent): CompletedAgentR
   const report = String(event.report || "");
   if (!event.agentName || report.trim().length === 0) return null;
 
+  const initialPrompt = initialPromptFromMetadata(event.metadata);
   return {
     name: event.agentName,
     role: event.role || "read",
@@ -180,9 +188,10 @@ function completedReportFromReportEvent(event: TeamReportEvent): CompletedAgentR
     costUsd: event.costUsd,
     model: event.model,
     thinking: event.thinking,
+    modelSlot: event.modelSlot || (typeof event.metadata?.modelSlot === "string" ? event.metadata.modelSlot : inferModelSlotFromText(event.summary, report, initialPrompt)),
     color: event.color,
     requestedBy: event.requestedBy,
-    initialPrompt: initialPromptFromMetadata(event.metadata),
+    initialPrompt,
     source: "report-event" as const,
   };
 }
@@ -342,6 +351,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
       status,
       model: member.model,
       thinking: member.thinking,
+      modelSlot: member.modelSlot,
       unreadCount: inboxMessages.length,
       elapsedMs: now - startedAt,
       tokensUsed,
@@ -365,6 +375,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
     status: report.status,
     model: report.model,
     thinking: report.thinking,
+    modelSlot: report.modelSlot,
     unreadCount: 0,
     elapsedMs: report.elapsedMs ?? (report.startedAt ? report.completedAt - report.startedAt : 0),
     tokensUsed: report.tokensUsed || 0,
@@ -440,11 +451,17 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           liveTimer = undefined;
         };
 
+        const itemIdentity = (item: TeamPanelItem): string => {
+          return item.completed
+            ? `completed:${item.name}:${item.completedAt || 0}:${item.summary || ""}`
+            : `active:${item.name}`;
+        };
+
         const applyItems = (nextItems: typeof items, resetLog: boolean) => {
-          const selectedName = selectedIndex > 0 ? items[selectedIndex - 1]?.name : undefined;
+          const selectedKey = selectedIndex > 0 && items[selectedIndex - 1] ? itemIdentity(items[selectedIndex - 1]) : undefined;
           items = nextItems;
-          if (selectedName) {
-            const nextIndex = items.findIndex((item) => item.name === selectedName);
+          if (selectedKey) {
+            const nextIndex = items.findIndex((item) => itemIdentity(item) === selectedKey);
             selectedIndex = nextIndex >= 0 ? nextIndex + 1 : Math.min(selectedIndex, Math.max(0, entryCount() - 1));
           } else {
             selectedIndex = Math.min(selectedIndex, Math.max(0, entryCount() - 1));
@@ -596,9 +613,12 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           const item = items[selectedIndex - 1];
           if (!item) return [dimAnsi("No agents.")];
 
+          const modelInfo = `${purple("model")} ${item.model || "(inherited)"}${item.thinking && item.thinking !== "off" ? `   ${purple("thinking")} ${item.thinking}` : ""}${item.modelSlot ? `   ${purple("slot")} ${item.modelSlot}` : ""}`;
+
           rows.push(pink(item.name));
           if (item.completed) {
             rows.push(`${purple("status")} ${item.status}   ${purple("completed")} ${item.completedAt ? new Date(item.completedAt).toLocaleString() : "unknown"}`);
+            rows.push(modelInfo);
             if (item.elapsedMs > 0 || item.tokensUsed > 0) rows.push(`${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
             if (item.requestedBy) rows.push(`${purple("requested by")} ${item.requestedBy}`);
             if (item.summary) rows.push(`${purple("summary")} ${item.summary}`);
@@ -611,7 +631,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
 
           const screen = item.windowId ? `${item.windowId}/${item.tmuxPaneId}` : item.tmuxPaneId;
           rows.push(`${purple("role")} ${item.role}${screen ? ` ${dimAnsi(screen)}` : ""}   ${purple("status")} ${item.status}   ${purple("elapsed")} ${formatElapsed(item.elapsedMs)}   ${purple("tokens")} ${formatTokenCount(item.tokensUsed)}`);
-          rows.push(`${purple("model")} ${item.model || "(inherited)"}${item.thinking && item.thinking !== "off" ? `   ${purple("thinking")} ${item.thinking}` : ""}`);
+          rows.push(modelInfo);
           if (item.requestedBy) rows.push(`${purple("requested by")} ${item.requestedBy}`);
           if (item.role === "read") rows.push(dimAnsi("in-process · followable from Pi"));
           if (item.role === "write") rows.push(dimAnsi("edit-allowed · in-process · followable from Pi"));

@@ -9,7 +9,7 @@ import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as writeQueue from "../../src/utils/write-queue";
-import { loadSettings, resolveModel, resolveRole, type AgentRole } from "../../src/utils/settings";
+import { FAVORITE_MODEL_SLOTS, loadSettings, requireConfiguredFavoriteModel, resolveModel, resolveRole, type AgentRole } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import { countWriteMembers, formatRosterForPrompt } from "../team/roster";
 import type { RunningReadAgent } from "../runtime/types";
@@ -58,6 +58,41 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     return Object.keys(metadata).length > 0 ? metadata : undefined;
   }
 
+  function configuredFavoriteModelForSpawn(params: any, ctx: any): string | undefined {
+    if (!params.model_slot) return undefined;
+    const settings = loadSettings({ projectDir: params.cwd || ctx.cwd });
+    const favorite = requireConfiguredFavoriteModel(settings, params.model_slot);
+    if (params.model || params.thinking) {
+      throw new Error(
+        `model_slot cannot be combined with explicit model or thinking. Slot "${favorite?.slot}" already defines both.`
+      );
+    }
+    return favorite?.config.model ?? undefined;
+  }
+
+  function hasOwnParam(params: any, key: string): boolean {
+    return !!params && Object.prototype.hasOwnProperty.call(params, key);
+  }
+
+  function mergeSwarmAgentParams(defaults: any = {}, agent: any = {}): any {
+    const merged = { ...defaults, ...agent };
+    const defaultHasSlot = hasOwnParam(defaults, "model_slot");
+    const defaultHasModel = hasOwnParam(defaults, "model");
+    const defaultHasThinking = hasOwnParam(defaults, "thinking");
+    const agentHasSlot = hasOwnParam(agent, "model_slot");
+    const agentHasModel = hasOwnParam(agent, "model");
+    const agentHasThinking = hasOwnParam(agent, "thinking");
+
+    if (agentHasSlot) {
+      if (defaultHasModel && !agentHasModel) delete merged.model;
+      if (defaultHasThinking && !agentHasThinking) delete merged.thinking;
+    } else if (defaultHasSlot && (agentHasModel || agentHasThinking)) {
+      delete merged.model_slot;
+    }
+
+    return merged;
+  }
+
   function memberMatchesOperation(member: Member, params: any): boolean {
     if (!params.operation_id) return false;
     const operationId = member.metadata?.operationId || member.metadata?.orchestration?.operationId;
@@ -76,6 +111,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       requestedCategory: params.category ?? null,
       category,
       resolvedCategory: category,
+      requestedModelSlot: params.model_slot ?? null,
+      modelSlot: member.modelSlot ?? null,
       model: member.model ?? null,
       thinking: member.thinking ?? null,
       ...extras,
@@ -92,6 +129,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       requestedCategory: params.category ?? null,
       category,
       resolvedCategory: category,
+      requestedModelSlot: params.model_slot ?? null,
+      modelSlot: null,
       model: queued.model,
       thinking: queued.thinking ?? null,
       modelSource: "queued",
@@ -276,10 +315,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     const settings = loadSettings({ projectDir: cwd });
     const role: AgentRole = resolveRole(settings, params.role ?? "read", params.category);
     const currentModelHint = getCurrentQualifiedModel(ctx);
-    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint].filter(Boolean) as string[]);
+    const requestedFavoriteModel = params.model_slot ? requireConfiguredFavoriteModel(settings, params.model_slot)?.config.model : undefined;
+    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint, requestedFavoriteModel].filter(Boolean) as string[]);
     const resolved = resolveModel(settings, {
       role,
       category: params.category,
+      modelSlot: params.model_slot,
       explicitModel: params.model,
       explicitThinking: params.thinking,
       teamDefaultModel: teamConfig.defaultModel,
@@ -302,6 +343,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       agentType: "teammate",
       role,
       category: params.category,
+      modelSlot: params.model_slot,
       model: chosenModel,
       joinedAt: Date.now(),
       tmuxPaneId: "",
@@ -440,6 +482,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     prompt: Type.String({ description: "The agent's assignment and report shape." }),
     role: Type.Optional(StringEnum(["read", "write"], { description: "Defaults to read. Use write only for edit-allowed assignments." })),
     cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead session cwd." })),
+    model_slot: Type.Optional(StringEnum(FAVORITE_MODEL_SLOTS, { description: "Favorite model slot to use: reading-fast, reading-default, reading-hard, writing-basic, or writing-hard." })),
     model: Type.Optional(Type.String({ description: "Optional fully qualified provider/model. Defaults to the current Pi session model." })),
     thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
     metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
@@ -454,7 +497,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
     if (!ctx) throw new Error("No active Pi session context is available for spawn_agent.");
 
-    const sessionName = await ensureCurrentSessionAgentGroup(ctx, params.model);
+    const sessionDefaultModel = params.model || configuredFavoriteModelForSpawn(params, ctx);
+    const sessionName = await ensureCurrentSessionAgentGroup(ctx, sessionDefaultModel);
     const name = params.name || generatedAgentName();
     const result = await spawnTeammate({
       ...params,
@@ -487,6 +531,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       defaults: Type.Optional(Type.Object({
         role: Type.Optional(StringEnum(["read", "write"])),
         cwd: Type.Optional(Type.String()),
+        model_slot: Type.Optional(StringEnum(FAVORITE_MODEL_SLOTS)),
         model: Type.Optional(Type.String()),
         thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
         metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
@@ -498,14 +543,16 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       if (!ctx) throw new Error("No active Pi session context is available for spawn_swarm_agents.");
       if (!Array.isArray(params.agents) || params.agents.length === 0) throw new Error("spawn_swarm_agents requires at least one agent.");
 
-      const defaultModel = params.defaults?.model || params.agents.find((agent: any) => agent.model)?.model;
+      const mergedAgents = params.agents.map((agent: any) => mergeSwarmAgentParams(params.defaults || {}, agent));
+      const firstModelAgent = mergedAgents.find((agent: any) => agent.model);
+      const firstSlotAgent = mergedAgents.find((agent: any) => agent.model_slot);
+      const defaultModel = firstModelAgent?.model || (firstSlotAgent ? configuredFavoriteModelForSpawn(firstSlotAgent, ctx) : undefined);
       const sessionName = await ensureCurrentSessionAgentGroup(ctx, defaultModel);
       const spawned: any[] = [];
       const failed: Array<{ name: string; error: string }> = [];
 
-      for (let index = 0; index < params.agents.length; index += 1) {
-        const agent = params.agents[index];
-        const merged = { ...(params.defaults || {}), ...agent };
+      for (let index = 0; index < mergedAgents.length; index += 1) {
+        const merged = mergedAgents[index];
         const name = merged.name || generatedAgentName(index);
         try {
           const result = await spawnTeammate({

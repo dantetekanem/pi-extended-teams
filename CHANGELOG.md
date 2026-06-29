@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.14] - 2026-06-28
+
+### Added
+- `/agents-favorite-models` single-screen picker for the five global favorite model slots, populated from the scoped models available to the current Pi session.
+- `model_slot` support for `spawn_agent` and `spawn_swarm_agents`, including persisted model/thinking/slot metadata in `/agents` completed reports.
+- Live agent activity details now include model, thinking, selected slot, and visible assistant progress snippets when available.
+
+### Changed
+- Favorite model slots are global-only (`~/.pi/agent/pi-extended-teams/settings.json`) so the picker and spawn resolution cannot disagree because of project overrides.
+- `spawn_swarm_agents` now treats per-agent model, thinking, or model slot fields as overrides for conflicting defaults instead of combining them.
+- The bottom agent activity widget remains visible for runtime-backed active agents with fresh heartbeats, including after reload or in-memory state loss.
+
+### Fixed
+- `/agents` no longer jumps between active and completed rows that share the same agent name during refresh.
+- Lead-inbox progress messages with model/thinking metadata are no longer mistaken for completed reports unless they are explicit final reports.
+- The favorite-model picker no longer displays or saves thinking-only empty slots.
+- Read-agent progress updates no longer mask tool-working state when a non-assistant message update arrives.
+
 ## [1.1.0] - 2026-06-15
 
 Seamless, rebalanced multi-agent flow: the lead stays the implementer, read

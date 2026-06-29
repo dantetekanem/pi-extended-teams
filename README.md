@@ -30,7 +30,7 @@ Equivalent explicit shape:
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", thinking: "high" },
+  defaults: { role: "read", model_slot: "reading-default" },
   agents: [
     { name: "git-check", prompt: "Inspect diffs and report risks." },
     { name: "test-gaps", prompt: "Find missing coverage and concrete test gaps." }
@@ -52,6 +52,7 @@ Spawn an edit-allowed agent only when the work is isolated and safe to run in pa
 spawn_agent({
   name: "docs-fix",
   role: "write",
+  model_slot: "writing-basic",
   prompt: "Claim docs/guide.md, fix only stale public tool names, verify, then call report_and_exit."
 })
 ```
@@ -103,6 +104,22 @@ Avoid:
 - Having agents create more agents; they should ask the lead with `send_message`.
 - Polling for completion with sleeps or loops; the extension wakes the lead.
 
+## Favorite model slots
+
+Configure favorite slots with `/agents-favorite-models`. It opens a single-screen picker for all five slots, populated from the scoped models the current Pi session can actually access. Each slot supplies both the model and thinking level, so the lead does not have to remember model names in every prompt.
+
+Use these slots by intent:
+
+| Slot | Use when | Typical shape |
+| --- | --- | --- |
+| `reading-fast` | The task is read-only, bounded, and benefits from breadth more than deep refinement. | Many cheap agents splitting small directories, issue files, logs, routes, docs, or other collection-style datasets. |
+| `reading-default` | The task is normal read-only review or investigation. | Diff review, test-gap checks, docs validation, focused code archaeology. |
+| `reading-hard` | The task needs deep reasoning across ambiguous or risky context. | Architecture review, security analysis, root-cause work, migration risk, cross-system behavior. |
+| `writing-basic` | The edit is narrow, isolated, and easy to verify. | Typos, docs updates, config tweaks, small one-file fixes. |
+| `writing-hard` | The edit is non-trivial and needs stronger reasoning. | Refactors, production bug fixes, multi-file implementation, difficult test repair. |
+
+For small independent collection work, several `reading-fast` agents are usually more powerful than one expensive hard-thinking agent reading everything. Split the dataset, ask each fast reader for evidence, and let the lead synthesize.
+
 ## Common examples
 
 ### Spawn one read agent
@@ -111,6 +128,7 @@ Avoid:
 spawn_agent({
   name: "security-reviewer",
   role: "read",
+  model_slot: "reading-hard",
   prompt: "Review the auth module for injection and authorization risks. Report findings with file:line evidence."
 })
 ```
@@ -119,10 +137,10 @@ spawn_agent({
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", cwd: "/path/to/project", thinking: "high" },
+  defaults: { role: "read", cwd: "/path/to/project", model_slot: "reading-fast" },
   agents: [
-    { name: "architecture", prompt: "Review module boundaries and coupling." },
-    { name: "tests", prompt: "Run focused tests and report failures or gaps." },
+    { name: "routes", prompt: "Inspect config/routes files and report public endpoint patterns." },
+    { name: "jobs", prompt: "Inspect background jobs and report retry/queue conventions." },
     { name: "docs", prompt: "Check README accuracy against the current public tools." }
   ]
 })
@@ -134,6 +152,7 @@ spawn_swarm_agents({
 spawn_agent({
   name: "typo-fix",
   role: "write",
+  model_slot: "writing-basic",
   prompt: "Claim README.md, fix typos only, run the focused docs check, then call report_and_exit. Do not commit or push."
 })
 ```
@@ -154,17 +173,19 @@ check_teammate({ agent_name: "security-reviewer" })
 
 Model and thinking defaults come from Pi and optional pi-extended-teams settings.
 
-Project-local config lives at `.pi/pi-extended-teams.json`; global config lives at `~/.pi/pi-extended-teams.json`.
+Runtime settings live globally at `~/.pi/agent/pi-extended-teams/settings.json`; project-local overrides live at `.pi/pi-extended-teams.json`. Favorite model slots are global-only so `/agents-favorite-models` and spawn resolution use the same values; project files still override other runtime settings. `/agents-favorite-models` writes the global runtime settings file after you save the single-screen picker.
 
 Example:
 
 ```json
 {
-  "providerPriority": [
-    "openai-codex",
-    "claude-agent-sdk",
-    "kimi-coding"
-  ],
+  "favoriteModels": {
+    "reading-fast": { "model": "provider/model", "thinking": "low" },
+    "reading-default": { "model": "provider/model", "thinking": "high" },
+    "reading-hard": { "model": "provider/model", "thinking": "xhigh" },
+    "writing-basic": { "model": "provider/model", "thinking": "high" },
+    "writing-hard": { "model": "provider/model", "thinking": "xhigh" }
+  },
   "readAgents": {
     "maxConcurrent": 8,
     "queueOverflow": true
@@ -175,7 +196,9 @@ Example:
 }
 ```
 
-You can also pass fully qualified `provider/model` strings and thinking levels directly to `spawn_agent` or `spawn_swarm_agents`.
+Provider-priority sorting for model selection also supports `providerPriority` in `~/.pi/pi-extended-teams.json` or `.pi/pi-extended-teams.json`.
+
+You can still pass fully qualified `provider/model` strings and thinking levels directly to `spawn_agent` or `spawn_swarm_agents` when you intentionally bypass favorite slots.
 
 ## Development
 

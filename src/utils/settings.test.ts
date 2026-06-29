@@ -7,12 +7,14 @@ import {
   DEFAULT_READ_AGENT_MAX_CONCURRENT,
   DEFAULT_READ_HELPER_MAX_CONCURRENT,
   DEFAULT_WRITE_AGENT_MAX_CONCURRENT,
+  clearGlobalFavoriteModels,
   globalSettingsPath,
   loadSettings,
   projectSettingsPath,
   resolveAllowedExtensions,
   resolveModel,
   resolveRole,
+  setGlobalFavoriteModel,
   type PiExtendedTeamsSettings,
 } from "./settings";
 
@@ -52,6 +54,7 @@ describe("loadSettings", () => {
     expect(s.readHelpers.maxConcurrent).toBe(DEFAULT_READ_HELPER_MAX_CONCURRENT);
     expect(s.readHelpers.queueOverflow).toBe(true);
     expect(s.roles.read.model).toBeNull();
+    expect(s.favoriteModels).toEqual({});
     expect(s.extensions.allow).toEqual([]);
     expect(s.debug.enabled).toBe(false);
   });
@@ -143,6 +146,58 @@ describe("loadSettings", () => {
     expect(s.categories.bad.role).toBeUndefined();
     expect(s.categories.bad.thinking).toBeNull();
   });
+
+  it("loads configured favorite model slots and ignores unknown slots", () => {
+    writeGlobal({
+      favoriteModels: {
+        "reading-fast": { model: "provider/fast", thinking: "low" },
+        unknown: { model: "provider/ignored", thinking: "high" },
+        "reading-hard": { model: "provider/hard", thinking: "ultra" },
+      },
+    });
+    const s = loadSettings({ homeDir, projectDir });
+    expect(s.favoriteModels["reading-fast"]).toEqual({ model: "provider/fast", thinking: "low" });
+    expect(s.favoriteModels["reading-hard"]).toEqual({ model: "provider/hard", thinking: null });
+    expect(s.favoriteModels).not.toHaveProperty("unknown");
+  });
+
+  it("keeps favorite model slots global-only even when project settings exist", () => {
+    writeGlobal({ favoriteModels: { "reading-default": { model: "global/model", thinking: "high" } } });
+    writeProject({ favoriteModels: { "reading-default": { model: "project/model", thinking: "xhigh" } } });
+    const s = loadSettings({ homeDir, projectDir });
+    expect(s.favoriteModels["reading-default"]).toEqual({ model: "global/model", thinking: "high" });
+  });
+});
+
+describe("favorite model persistence", () => {
+  it("writes favorite slots to the global settings path while preserving other keys", () => {
+    writeGlobal({ readAgents: { maxConcurrent: 3 }, unknownKey: true });
+
+    setGlobalFavoriteModel("writing-hard", { model: "provider/writer", thinking: "xhigh" }, { homeDir });
+
+    const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.readAgents).toEqual({ maxConcurrent: 3 });
+    expect(raw.unknownKey).toBe(true);
+    expect(raw.favoriteModels["writing-hard"]).toEqual({ model: "provider/writer", thinking: "xhigh" });
+  });
+
+  it("clears one or all favorite slots", () => {
+    writeGlobal({
+      favoriteModels: {
+        "reading-fast": { model: "provider/fast", thinking: "low" },
+        "reading-hard": { model: "provider/hard", thinking: "xhigh" },
+      },
+    });
+
+    clearGlobalFavoriteModels({ homeDir, slot: "reading-fast" });
+    let raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.favoriteModels).not.toHaveProperty("reading-fast");
+    expect(raw.favoriteModels).toHaveProperty("reading-hard");
+
+    clearGlobalFavoriteModels({ homeDir });
+    raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.favoriteModels).toEqual({});
+  });
 });
 
 function withCategories(categories: PiExtendedTeamsSettings["categories"]): PiExtendedTeamsSettings {
@@ -159,10 +214,11 @@ describe("resolveModel", () => {
     expect(r.modelSource).toBe("current");
   });
 
-  it("honors precedence: explicit > category > role > team > current", () => {
+  it("honors precedence: explicit > favorite slot > category > role > team > current", () => {
     const settings = withCategories({
       impl: { role: "write", model: "cat/model", thinking: null },
     });
+    settings.favoriteModels["writing-hard"] = { model: "favorite/model", thinking: "xhigh" };
     settings.roles.write = { model: "role/model", thinking: "medium" };
 
     expect(
@@ -174,6 +230,17 @@ describe("resolveModel", () => {
         currentModel: "current/model",
       }).model
     ).toBe("explicit/model");
+
+    const favorite = resolveModel(settings, {
+      role: "write",
+      category: "impl",
+      modelSlot: "writing-hard",
+      teamDefaultModel: "team/model",
+      currentModel: "current/model",
+    });
+    expect(favorite.model).toBe("favorite/model");
+    expect(favorite.modelSource).toBe("favorite-slot");
+    expect(favorite.thinking).toBe("xhigh");
 
     expect(
       resolveModel(settings, {
@@ -221,6 +288,18 @@ describe("resolveModel", () => {
     expect(() =>
       resolveModel(structuredClone(DEFAULT_SETTINGS), { role: "read", category: "nope" })
     ).toThrow(/Unknown category/);
+  });
+
+  it("throws when a requested favorite slot is unset or combined with explicit overrides", () => {
+    expect(() =>
+      resolveModel(structuredClone(DEFAULT_SETTINGS), { role: "read", modelSlot: "reading-fast" })
+    ).toThrow(/not configured/);
+
+    const settings = structuredClone(DEFAULT_SETTINGS);
+    settings.favoriteModels["reading-fast"] = { model: "provider/fast", thinking: "low" };
+    expect(() =>
+      resolveModel(settings, { role: "read", modelSlot: "reading-fast", explicitThinking: "high" })
+    ).toThrow(/cannot be combined/);
   });
 });
 

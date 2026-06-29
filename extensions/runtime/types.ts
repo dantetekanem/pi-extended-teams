@@ -14,6 +14,8 @@ export interface RunningReadAgent {
   role?: string;
   model?: string;
   thinking?: string;
+  modelSlot?: string;
+  latestAssistantSnippet?: string;
   session?: AgentSession;
   stopRequested?: boolean;
 }
@@ -31,6 +33,7 @@ export interface CompletedAgentReport {
   costUsd?: number;
   model?: string;
   thinking?: string;
+  modelSlot?: string;
   color?: string;
   requestedBy?: string;
   initialPrompt?: string;

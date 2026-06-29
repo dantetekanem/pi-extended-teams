@@ -36,6 +36,18 @@ function writeGlobalSettings(settings: unknown) {
   fs.writeFileSync(settingsPath, JSON.stringify(settings));
 }
 
+function writeFavoriteLevels() {
+  writeGlobalSettings({
+    favoriteModels: {
+      "reading-fast": { model: "provider/model", thinking: "low" },
+      "reading-default": { model: "provider/model", thinking: "high" },
+      "reading-hard": { model: "provider/model", thinking: "xhigh" },
+      "writing-basic": { model: "provider/model", thinking: "high" },
+      "writing-hard": { model: "provider/model", thinking: "xhigh" },
+    },
+  });
+}
+
 function makeCtx() {
   return {
     cwd: root,
@@ -127,25 +139,24 @@ describe("public agent spawn tools", () => {
     expect(Array.from(tools.keys()).sort()).toEqual(["spawn_agent", "spawn_swarm_agents"]);
   });
 
-  it("spawn_agent creates an implicit current-session group and starts an in-process read agent", async () => {
+  it("spawn_agent creates an implicit current-session group and starts an in-process read agent by level", async () => {
+    writeFavoriteLevels();
     const { tools, runReadAgentInProcess, adoptTeamAsLead } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
     const result = await tools.get("spawn_agent")!.execute("spawn", {
       name: "reader",
-      role: "read",
       prompt: "inspect one",
       cwd: root,
-      model: "provider/model",
-      thinking: "high",
+      model_slot: "reading-default",
     }, abort, undefined, ctx);
 
-    expect(result.details).toMatchObject({ name: "reader", role: "read", mode: "in-process", terminalId: null, session: "session-test-session" });
+    expect(result.details).toMatchObject({ name: "reader", role: "read", mode: "in-process", terminalId: null, session: "session-test-session", modelSlot: "reading-default" });
     expect(adoptTeamAsLead).toHaveBeenCalledWith("session-test-session", ctx);
     expect(runReadAgentInProcess).toHaveBeenCalledWith(
       "session-test-session",
-      expect.objectContaining({ name: "reader", role: "read", model: "provider/model", thinking: "high" }),
+      expect.objectContaining({ name: "reader", role: "read", model: "provider/model", thinking: "high", modelSlot: "reading-default" }),
       "inspect one",
       ctx,
       expect.any(Object),
@@ -164,7 +175,6 @@ describe("public agent spawn tools", () => {
 
     const result = await tools.get("spawn_agent")!.execute("spawn", {
       name: "fast-reader",
-      role: "read",
       prompt: "inspect quickly",
       cwd: root,
       model_slot: "reading-fast",
@@ -180,27 +190,50 @@ describe("public agent spawn tools", () => {
     );
   });
 
-  it("rejects model_slot combined with explicit model or thinking", async () => {
-    writeGlobalSettings({
-      favoriteModels: {
-        "reading-fast": { model: "provider/model", thinking: "low" },
-      },
-    });
+  it("requires a configured model_slot level", async () => {
+    const { tools } = registerTools();
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+
+    await expect(tools.get("spawn_agent")!.execute("spawn", {
+      name: "missing-level",
+      prompt: "inspect quickly",
+      cwd: root,
+    }, abort, undefined, ctx)).rejects.toThrow(/requires a configured model_slot level/);
+
+    await expect(tools.get("spawn_agent")!.execute("spawn", {
+      name: "unset-level",
+      prompt: "inspect quickly",
+      cwd: root,
+      model_slot: "reading-fast",
+    }, abort, undefined, ctx)).rejects.toThrow(/Favorite model slot "reading-fast" is not configured/);
+  });
+
+  it("rejects direct model, thinking, or role selection", async () => {
+    writeFavoriteLevels();
     const { tools } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
     await expect(tools.get("spawn_agent")!.execute("spawn", {
       name: "conflict-reader",
-      role: "read",
       prompt: "inspect quickly",
       cwd: root,
       model_slot: "reading-fast",
       thinking: "high",
-    }, abort, undefined, ctx)).rejects.toThrow(/model_slot cannot be combined/);
+    }, abort, undefined, ctx)).rejects.toThrow(/must use model_slot only.*thinking/);
+
+    await expect(tools.get("spawn_agent")!.execute("spawn", {
+      name: "role-reader",
+      role: "read",
+      prompt: "inspect quickly",
+      cwd: root,
+      model_slot: "reading-fast",
+    }, abort, undefined, ctx)).rejects.toThrow(/must use model_slot only.*role/);
   });
 
   it("queues read agents at the configured cap behind spawn_agent", async () => {
+    writeFavoriteLevels();
     writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
     const { tools, completions, runReadAgentInProcess } = registerTools();
     const ctx = makeCtx();
@@ -208,15 +241,15 @@ describe("public agent spawn tools", () => {
 
     const first = await tools.get("spawn_agent")!.execute("spawn-1", {
       name: "reader-1",
-      role: "read",
       prompt: "inspect one",
       cwd: root,
+      model_slot: "reading-fast",
     }, abort, undefined, ctx);
     const second = await tools.get("spawn_agent")!.execute("spawn-2", {
       name: "reader-2",
-      role: "read",
       prompt: "inspect two",
       cwd: root,
+      model_slot: "reading-fast",
     }, abort, undefined, ctx);
 
     expect(first.details).toMatchObject({ queued: false, role: "read", mode: "in-process" });
@@ -228,22 +261,39 @@ describe("public agent spawn tools", () => {
     expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "reader-2", role: "read" });
   });
 
-  it("spawn_swarm_agents applies defaults and per-agent overrides", async () => {
+  it("spawn_swarm_agents requires every agent to have a configured level", async () => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess } = registerTools();
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+
+    await expect(tools.get("spawn_swarm_agents")!.execute("swarm", {
+      defaults: { cwd: root },
+      agents: [
+        { name: "a", prompt: "inspect a" },
+      ],
+    }, abort, undefined, ctx)).rejects.toThrow(/requires a configured model_slot level/);
+
+    expect(runReadAgentInProcess).not.toHaveBeenCalled();
+  });
+
+  it("spawn_swarm_agents applies default and per-agent levels", async () => {
+    writeFavoriteLevels();
     const { tools, runReadAgentInProcess } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
     const result = await tools.get("spawn_swarm_agents")!.execute("swarm", {
-      defaults: { role: "read", cwd: root, model: "provider/model", thinking: "high" },
+      defaults: { cwd: root, model_slot: "reading-default" },
       agents: [
         { name: "a", prompt: "inspect a" },
-        { name: "b", prompt: "inspect b", thinking: "xhigh" },
+        { name: "b", prompt: "inspect b", model_slot: "reading-hard" },
       ],
     }, abort, undefined, ctx);
 
     expect(result.details.spawned).toHaveLength(2);
-    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "high" });
-    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh" });
+    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "high", modelSlot: "reading-default" });
+    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh", modelSlot: "reading-hard" });
   });
 
   it("spawn_swarm_agents applies default and per-agent favorite model slots", async () => {
@@ -258,7 +308,7 @@ describe("public agent spawn tools", () => {
     const abort = new AbortController().signal;
 
     const result = await tools.get("spawn_swarm_agents")!.execute("swarm", {
-      defaults: { role: "read", cwd: root, model_slot: "reading-fast" },
+      defaults: { cwd: root, model_slot: "reading-fast" },
       agents: [
         { name: "a", prompt: "inspect a" },
         { name: "b", prompt: "inspect b", model_slot: "reading-hard" },
@@ -270,64 +320,51 @@ describe("public agent spawn tools", () => {
     expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh", modelSlot: "reading-hard" });
   });
 
-  it("spawn_swarm_agents lets per-agent explicit model/thinking override a default model_slot", async () => {
-    writeGlobalSettings({
-      favoriteModels: {
-        "reading-fast": { model: "provider/model", thinking: "low" },
-      },
-    });
+  it("spawn_swarm_agents rejects per-agent direct model/thinking even with a default level", async () => {
+    writeFavoriteLevels();
     const { tools, runReadAgentInProcess } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
-    const result = await tools.get("spawn_swarm_agents")!.execute("swarm", {
-      defaults: { role: "read", cwd: root, model_slot: "reading-fast" },
+    await expect(tools.get("spawn_swarm_agents")!.execute("swarm", {
+      defaults: { cwd: root, model_slot: "reading-fast" },
       agents: [
         { name: "a", prompt: "inspect a" },
         { name: "b", prompt: "inspect b", model: "provider/model", thinking: "xhigh" },
       ],
-    }, abort, undefined, ctx);
+    }, abort, undefined, ctx)).rejects.toThrow(/must use model_slot only.*model.*thinking/);
 
-    expect(result.details.failed).toEqual([]);
-    expect(result.details.spawned).toHaveLength(2);
-    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "low", modelSlot: "reading-fast" });
-    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh" });
-    expect(runReadAgentInProcess.mock.calls[1][1].modelSlot).toBeUndefined();
+    expect(runReadAgentInProcess).not.toHaveBeenCalled();
   });
 
-  it("spawn_swarm_agents lets per-agent model_slot override default model/thinking", async () => {
-    writeGlobalSettings({
-      favoriteModels: {
-        "reading-hard": { model: "provider/model", thinking: "xhigh" },
-      },
-    });
+  it("spawn_swarm_agents rejects direct defaults even when an agent supplies a level", async () => {
+    writeFavoriteLevels();
     const { tools, runReadAgentInProcess } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
-    const result = await tools.get("spawn_swarm_agents")!.execute("swarm", {
-      defaults: { role: "read", cwd: root, model: "provider/model", thinking: "low" },
+    await expect(tools.get("spawn_swarm_agents")!.execute("swarm", {
+      defaults: { cwd: root, model: "provider/model", thinking: "low" },
       agents: [
         { name: "a", prompt: "inspect a", model_slot: "reading-hard" },
       ],
-    }, abort, undefined, ctx);
+    }, abort, undefined, ctx)).rejects.toThrow(/must use model_slot only.*model.*thinking/);
 
-    expect(result.details.failed).toEqual([]);
-    expect(result.details.spawned).toHaveLength(1);
-    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "xhigh", modelSlot: "reading-hard" });
+    expect(runReadAgentInProcess).not.toHaveBeenCalled();
   });
 
   it("spawn_swarm_agents gives unnamed agents unique names across swarms", async () => {
+    writeFavoriteLevels();
     const { tools, shutdownTeammate } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
     const first = await tools.get("spawn_swarm_agents")!.execute("swarm-1", {
-      defaults: { role: "read", cwd: root, model: "provider/model", thinking: "high" },
+      defaults: { cwd: root, model_slot: "reading-default" },
       agents: [{ prompt: "inspect one" }, { prompt: "inspect two" }],
     }, abort, undefined, ctx);
     const second = await tools.get("spawn_swarm_agents")!.execute("swarm-2", {
-      defaults: { role: "read", cwd: root, model: "provider/model", thinking: "high" },
+      defaults: { cwd: root, model_slot: "reading-default" },
       agents: [{ prompt: "inspect three" }, { prompt: "inspect four" }],
     }, abort, undefined, ctx);
 

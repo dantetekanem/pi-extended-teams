@@ -158,6 +158,10 @@ export function isFavoriteModelSlot(value: unknown): value is FavoriteModelSlot 
   return typeof value === "string" && FAVORITE_MODEL_SLOT_SET.has(value);
 }
 
+export function roleForFavoriteModelSlot(slot: FavoriteModelSlot): AgentRole {
+  return slot.startsWith("writing-") ? "write" : "read";
+}
+
 function normalizeThinking(value: unknown): string | null {
   const s = toStringOrNull(value);
   return s && THINKING_LEVELS.has(s) ? s : null;

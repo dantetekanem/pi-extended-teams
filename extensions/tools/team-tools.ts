@@ -9,7 +9,7 @@ import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as writeQueue from "../../src/utils/write-queue";
-import { FAVORITE_MODEL_SLOTS, loadSettings, requireConfiguredFavoriteModel, resolveModel, resolveRole, type AgentRole } from "../../src/utils/settings";
+import { FAVORITE_MODEL_SLOTS, isFavoriteModelSlot, loadSettings, requireConfiguredFavoriteModel, resolveModel, roleForFavoriteModelSlot, type AgentRole, type FavoriteModelSlot } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import { countWriteMembers, formatRosterForPrompt } from "../team/roster";
 import type { RunningReadAgent } from "../runtime/types";
@@ -58,39 +58,37 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     return Object.keys(metadata).length > 0 ? metadata : undefined;
   }
 
-  function configuredFavoriteModelForSpawn(params: any, ctx: any): string | undefined {
-    if (!params.model_slot) return undefined;
-    const settings = loadSettings({ projectDir: params.cwd || ctx.cwd });
-    const favorite = requireConfiguredFavoriteModel(settings, params.model_slot);
-    if (params.model || params.thinking) {
-      throw new Error(
-        `model_slot cannot be combined with explicit model or thinking. Slot "${favorite?.slot}" already defines both.`
-      );
-    }
-    return favorite?.config.model ?? undefined;
-  }
-
   function hasOwnParam(params: any, key: string): boolean {
     return !!params && Object.prototype.hasOwnProperty.call(params, key);
   }
 
-  function mergeSwarmAgentParams(defaults: any = {}, agent: any = {}): any {
-    const merged = { ...defaults, ...agent };
-    const defaultHasSlot = hasOwnParam(defaults, "model_slot");
-    const defaultHasModel = hasOwnParam(defaults, "model");
-    const defaultHasThinking = hasOwnParam(defaults, "thinking");
-    const agentHasSlot = hasOwnParam(agent, "model_slot");
-    const agentHasModel = hasOwnParam(agent, "model");
-    const agentHasThinking = hasOwnParam(agent, "thinking");
+  function rejectDirectModelSelection(params: any, context: string): void {
+    const forbidden = ["model", "thinking", "role"].filter((key) => hasOwnParam(params, key));
+    if (forbidden.length === 0) return;
+    throw new Error(
+      `${context} must use model_slot only. Do not pass ${forbidden.join(", ")}; choose a configured level from /agents-favorite-models. See TIPS.md for level examples.`
+    );
+  }
 
-    if (agentHasSlot) {
-      if (defaultHasModel && !agentHasModel) delete merged.model;
-      if (defaultHasThinking && !agentHasThinking) delete merged.thinking;
-    } else if (defaultHasSlot && (agentHasModel || agentHasThinking)) {
-      delete merged.model_slot;
+  function requireSpawnLevel(params: any, context: string): FavoriteModelSlot {
+    rejectDirectModelSelection(params, context);
+    if (!isFavoriteModelSlot(params?.model_slot)) {
+      throw new Error(
+        `${context} requires a configured model_slot level: ${FAVORITE_MODEL_SLOTS.join(", ")}. Define levels with /agents-favorite-models and see TIPS.md for examples.`
+      );
     }
+    return params.model_slot;
+  }
 
-    return merged;
+  function configuredFavoriteModelForSpawn(params: any, ctx: any, context = "spawn_agent"): string {
+    const slot = requireSpawnLevel(params, context);
+    const settings = loadSettings({ projectDir: params.cwd || ctx.cwd });
+    const favorite = requireConfiguredFavoriteModel(settings, slot);
+    return favorite?.config.model ?? "";
+  }
+
+  function mergeSwarmAgentParams(defaults: any = {}, agent: any = {}): any {
+    return { ...defaults, ...agent };
   }
 
   function memberMatchesOperation(member: Member, params: any): boolean {
@@ -102,11 +100,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
 
   function memberResolutionDetails(member: Member, params: any, extras: Record<string, any> = {}): Record<string, any> {
     const role = member.role ?? "write";
+    const requestedRole = isFavoriteModelSlot(params.model_slot) ? roleForFavoriteModelSlot(params.model_slot) : role;
     const category = member.category ?? null;
     return {
       agentId: member.agentId,
       role,
-      requestedRole: params.role ?? "read",
+      requestedRole,
       resolvedRole: role,
       requestedCategory: params.category ?? null,
       category,
@@ -124,7 +123,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     return {
       agentId: `${queued.name}@${safeTeamName}`,
       role: "write",
-      requestedRole: params.role ?? "read",
+      requestedRole: isFavoriteModelSlot(params.model_slot) ? roleForFavoriteModelSlot(params.model_slot) : "write",
       resolvedRole: "write",
       requestedCategory: params.category ?? null,
       category,
@@ -313,16 +312,16 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     if (existingMember) await options.shutdownTeammate(safeTeamName, existingMember);
 
     const settings = loadSettings({ projectDir: cwd });
-    const role: AgentRole = resolveRole(settings, params.role ?? "read", params.category);
+    const modelSlot = requireSpawnLevel(params, `Agent ${safeName}`);
+    const role: AgentRole = roleForFavoriteModelSlot(modelSlot);
     const currentModelHint = getCurrentQualifiedModel(ctx);
-    const requestedFavoriteModel = params.model_slot ? requireConfiguredFavoriteModel(settings, params.model_slot)?.config.model : undefined;
+    const requestedFavoriteModel = requireConfiguredFavoriteModel(settings, modelSlot)?.config.model;
     const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, currentModelHint, requestedFavoriteModel].filter(Boolean) as string[]);
     const resolved = resolveModel(settings, {
       role,
-      category: params.category,
-      modelSlot: params.model_slot,
-      explicitModel: params.model,
-      explicitThinking: params.thinking,
+      modelSlot,
+      explicitModel: null,
+      explicitThinking: null,
       teamDefaultModel: teamConfig.defaultModel,
       currentModel: currentModelHint,
     });
@@ -343,7 +342,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       agentType: "teammate",
       role,
       category: params.category,
-      modelSlot: params.model_slot,
+      modelSlot,
       model: chosenModel,
       joinedAt: Date.now(),
       tmuxPaneId: "",
@@ -384,7 +383,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       agentName: safeName,
       cwd,
       category: params.category ?? null,
-      requestedRole: params.role ?? "read",
+      requestedRole: role,
       resolvedRole: role,
       model: chosenModel,
       modelSource: resolved.modelSource,
@@ -477,15 +476,20 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     }
   });
 
-  const publicAgentParams = {
+  const levelDescription = "Required agent level from /agents-favorite-models. Use only these configured levels: reading-fast, reading-default, reading-hard, writing-basic, or writing-hard. The level selects read/write behavior, model, and thinking. Do not pass role, model, or thinking directly; see TIPS.md for examples.";
+  const publicAgentBaseParams = {
     name: Type.Optional(Type.String({ description: "Stable display name. Defaults to a generated agent name." })),
     prompt: Type.String({ description: "The agent's assignment and report shape." }),
-    role: Type.Optional(StringEnum(["read", "write"], { description: "Defaults to read. Use write only for edit-allowed assignments." })),
     cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead session cwd." })),
-    model_slot: Type.Optional(StringEnum(FAVORITE_MODEL_SLOTS, { description: "Favorite model slot to use: reading-fast, reading-default, reading-hard, writing-basic, or writing-hard." })),
-    model: Type.Optional(Type.String({ description: "Optional fully qualified provider/model. Defaults to the current Pi session model." })),
-    thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
     metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
+  };
+  const publicAgentParams = {
+    ...publicAgentBaseParams,
+    model_slot: StringEnum(FAVORITE_MODEL_SLOTS, { description: levelDescription }),
+  };
+  const publicSwarmAgentParams = {
+    ...publicAgentBaseParams,
+    model_slot: Type.Optional(StringEnum(FAVORITE_MODEL_SLOTS, { description: levelDescription })),
   };
 
   function generatedAgentName(index?: number): string {
@@ -497,14 +501,13 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
     if (!ctx) throw new Error("No active Pi session context is available for spawn_agent.");
 
-    const sessionDefaultModel = params.model || configuredFavoriteModelForSpawn(params, ctx);
+    const sessionDefaultModel = configuredFavoriteModelForSpawn(params, ctx);
     const sessionName = await ensureCurrentSessionAgentGroup(ctx, sessionDefaultModel);
     const name = params.name || generatedAgentName();
     const result = await spawnTeammate({
       ...params,
       name,
       team_name: sessionName,
-      role: params.role ?? "read",
     }, ctx);
 
     return {
@@ -516,7 +519,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   pi.registerTool({
     name: "spawn_agent",
     label: "Spawn Agent",
-    description: "Spawn one agent in the current Pi session. The session is implicit; no team setup is required. Agents run in-process so Pi can follow, track, and control them.",
+    description: "Spawn one agent in the current Pi session by configured level only. model_slot is required and is the only way to choose read/write behavior, model, and thinking. Do not pass role, model, or thinking directly; see TIPS.md for level guidance. Agents run in-process so Pi can follow, track, and control them.",
     parameters: Type.Object(publicAgentParams),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       return spawnPublicAgent(params, ctx);
@@ -526,17 +529,14 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   pi.registerTool({
     name: "spawn_swarm_agents",
     label: "Spawn Swarm Agents",
-    description: "Spawn a batch of agents in the current Pi session. Use per-agent model/thinking overrides or defaults for the whole swarm; scheduling and tracking are handled internally.",
+    description: "Spawn a batch of agents in the current Pi session by configured levels only. Each agent must get a model_slot directly or from defaults; the level selects read/write behavior, model, and thinking. Do not pass role, model, or thinking directly; see TIPS.md for level guidance. Scheduling and tracking are handled internally.",
     parameters: Type.Object({
       defaults: Type.Optional(Type.Object({
-        role: Type.Optional(StringEnum(["read", "write"])),
         cwd: Type.Optional(Type.String()),
-        model_slot: Type.Optional(StringEnum(FAVORITE_MODEL_SLOTS)),
-        model: Type.Optional(Type.String()),
-        thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
+        model_slot: Type.Optional(StringEnum(FAVORITE_MODEL_SLOTS, { description: levelDescription })),
         metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
       })),
-      agents: Type.Array(Type.Object(publicAgentParams), { description: "Agents to spawn as one batch." }),
+      agents: Type.Array(Type.Object(publicSwarmAgentParams), { description: "Agents to spawn as one batch. Each one must have model_slot directly or inherit it from defaults." }),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
@@ -544,9 +544,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       if (!Array.isArray(params.agents) || params.agents.length === 0) throw new Error("spawn_swarm_agents requires at least one agent.");
 
       const mergedAgents = params.agents.map((agent: any) => mergeSwarmAgentParams(params.defaults || {}, agent));
-      const firstModelAgent = mergedAgents.find((agent: any) => agent.model);
-      const firstSlotAgent = mergedAgents.find((agent: any) => agent.model_slot);
-      const defaultModel = firstModelAgent?.model || (firstSlotAgent ? configuredFavoriteModelForSpawn(firstSlotAgent, ctx) : undefined);
+      const defaultModel = configuredFavoriteModelForSpawn(mergedAgents[0], ctx, "spawn_swarm_agents");
+      for (let index = 0; index < mergedAgents.length; index += 1) {
+        configuredFavoriteModelForSpawn(mergedAgents[index], ctx, `spawn_swarm_agents agent ${mergedAgents[index].name || index + 1}`);
+      }
       const sessionName = await ensureCurrentSessionAgentGroup(ctx, defaultModel);
       const spawned: any[] = [];
       const failed: Array<{ name: string; error: string }> = [];
@@ -559,7 +560,6 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
             ...merged,
             name,
             team_name: sessionName,
-            role: merged.role ?? "read",
           }, ctx);
           spawned.push({ ...result.details, name });
         } catch (error) {

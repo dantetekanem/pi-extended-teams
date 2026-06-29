@@ -19,15 +19,15 @@ If agents would otherwise be useful, stop and ask the user to turn off or finish
 
 - **The lead is the implementer.** Plan, coordinate, and do central edits in the main session.
 - **Read agents are the default multiplier.** Use them freely for investigation, review, testing, audits, and second opinions. They run in-process and report back automatically.
-- **Edit agents are optional and rare.** Use `role: "write"` only for isolated, non-overlapping edits. Edit agents must claim files before writing and report every changed path.
+- **Edit agents are optional and rare.** Use a `writing-*` level only for isolated, non-overlapping edits. Edit agents must claim files before writing and report every changed path.
 
 ## Default flow
 
-Use `spawn_agent` for one helper or `spawn_swarm_agents` for a batch. The current Pi session is the implicit container; do not create or manage a separate team.
+Use `spawn_agent` for one helper or `spawn_swarm_agents` for a batch. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by `model_slot` level only; never pass `role`, raw `model`, or `thinking` directly. The level selects read/write behavior, model, and effort. See `TIPS.md` for level-selection examples.
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", thinking: "high" },
+  defaults: { model_slot: "reading-default" },
   agents: [
     {
       name: "git-check",
@@ -52,7 +52,7 @@ Spawn one more focused helper when needed:
 ```text
 spawn_agent({
   name: "docs-review",
-  role: "read",
+  model_slot: "reading-default",
   prompt: "Review README.md and docs/guide.md for stale agent-tool references. Report exact lines and replacements."
 })
 ```
@@ -62,7 +62,7 @@ Spawn an edit agent only for isolated work:
 ```text
 spawn_agent({
   name: "docs-fix",
-  role: "write",
+  model_slot: "writing-basic",
   prompt: "Fix only stale tool names in docs/guide.md. Claim the file first, keep the diff small, then call report_and_exit."
 })
 ```
@@ -95,8 +95,8 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 
 Default lead tools:
 
-- `spawn_agent` — start one read or edit-allowed agent in the current Pi session.
-- `spawn_swarm_agents` — start a batch of agents with optional shared defaults.
+- `spawn_agent` — start one read or edit-allowed agent in the current Pi session using required `model_slot` level.
+- `spawn_swarm_agents` — start a batch of agents with optional shared `model_slot` defaults.
 - `stop_teammate` — explicitly stop one active agent when cancellation is requested.
 - `check_teammate` — inspect one agent's health when needed.
 - `send_message` — send a direct message in the current session.
@@ -115,7 +115,7 @@ Give every agent:
 
 - a bounded mission,
 - relevant files or directories,
-- whether it may edit,
+- the right `model_slot` level (`reading-*` for read-only, `writing-*` for edit-allowed),
 - the report shape you want,
 - and verification expectations.
 

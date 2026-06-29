@@ -18,36 +18,33 @@ This reference documents the current public surface for pi-extended-teams. The e
 
 ### `spawn_agent`
 
-Spawn one agent in the current Pi session.
+Spawn one agent in the current Pi session by configured level only.
 
 **Parameters**
 
 - `name` (optional): Stable display name. If omitted, pi-extended-teams generates a unique name.
 - `prompt` (required): Assignment and expected report shape.
-- `role` (optional): `read` or `write`. Defaults to `read`.
 - `cwd` (optional): Working directory. Defaults to the lead session cwd.
-- `model_slot` (optional): One of `reading-fast`, `reading-default`, `reading-hard`, `writing-basic`, or `writing-hard`. Uses the configured favorite model and thinking for that workload.
-- `model` (optional): Fully qualified `provider/model` string. Defaults to the current Pi session model or configured defaults. Prefer `model_slot` for normal orchestration once favorites are configured.
-- `thinking` (optional): `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
+- `model_slot` (required): One of `reading-fast`, `reading-default`, `reading-hard`, `writing-basic`, or `writing-hard`. This level selects read/write behavior, model, and thinking from `/agents-favorite-models`.
 - `metadata` (optional): Extra structured metadata for runtime/orchestration use.
+
+Do not pass `role`, `model`, or `thinking` directly. Spawn calls reject them; see `TIPS.md` for examples.
 
 **Example**
 
 ```javascript
 spawn_agent({
   name: "security-reviewer",
-  role: "read",
   model_slot: "reading-hard",
   prompt: "Review src/auth for authorization bugs. Report findings with file:line evidence."
 })
 ```
 
-Use `role: "write"` only for isolated edit work. Edit agents should claim files before writing and finish with `report_and_exit`.
+Use a `writing-*` level only for isolated edit work. Edit agents should claim files before writing and finish with `report_and_exit`.
 
 ```javascript
 spawn_agent({
   name: "docs-fix",
-  role: "write",
   model_slot: "writing-basic",
   prompt: "Claim docs/guide.md, fix stale public tool references only, verify, then call report_and_exit."
 })
@@ -55,18 +52,18 @@ spawn_agent({
 
 ### `spawn_swarm_agents`
 
-Spawn a batch of agents in the current Pi session. Use `defaults` for shared settings and per-agent fields for overrides.
+Spawn a batch of agents in the current Pi session. Use `defaults` for shared level/cwd/metadata and per-agent fields for overrides.
 
 **Parameters**
 
-- `defaults` (optional): Shared `role`, `cwd`, `model_slot`, `model`, `thinking`, and `metadata` values.
-- `agents` (required): Array of agent specs. Each agent accepts the same fields as `spawn_agent`. Per-agent `model_slot` can override a default slot.
+- `defaults` (optional): Shared `cwd`, `model_slot`, and `metadata` values.
+- `agents` (required): Array of agent specs. Each agent accepts the same fields as `spawn_agent`, except `model_slot` may be inherited from `defaults`.
 
 **Example**
 
 ```javascript
 spawn_swarm_agents({
-  defaults: { role: "read", model_slot: "reading-default" },
+  defaults: { model_slot: "reading-default" },
   agents: [
     { name: "architecture", model_slot: "reading-hard", prompt: "Review module boundaries and coupling." },
     { name: "tests", prompt: "Run focused tests and report failures or gaps." },
@@ -273,9 +270,9 @@ Common runtime settings:
 }
 ```
 
-Provider-priority sorting for model selection also supports `providerPriority` in `~/.pi/pi-extended-teams.json` or `.pi/pi-extended-teams.json`.
+Provider-priority sorting for the `/agents-favorite-models` picker also supports `providerPriority` in `~/.pi/pi-extended-teams.json` or `.pi/pi-extended-teams.json`.
 
-Model settings still come from Pi's active model configuration unless you use `model_slot` or pass a fully qualified `provider/model` string in a spawn call. In `spawn_swarm_agents`, per-agent `model`, `thinking`, or `model_slot` fields override conflicting defaults instead of being combined.
+Spawn calls use `model_slot` only. They reject raw `model`, direct `thinking`, and direct `role` fields. In `spawn_swarm_agents`, each agent must receive a configured level directly or inherit one from `defaults`.
 
 ---
 
@@ -284,7 +281,7 @@ Model settings still come from Pi's active model configuration unless you use `m
 - The lead controls orchestration. Spawned agents should not create other agents.
 - Agents run in-process and are followable from Pi.
 - Read agents should not edit files or make mutating changes.
-- Prefer multiple `reading-fast` agents for splitable collection work; use `reading-hard` for deep synthesis, risky analysis, or ambiguous root cause.
+- Prefer multiple `reading-fast` agents for splitable collection work; use `reading-hard` for deep synthesis, risky analysis, or ambiguous root cause. See `TIPS.md` for level-selection examples.
 - Edit agents should keep diffs small, claim files before editing, and use `report_and_exit` when finished.
 - Do not use sleep loops or polling to wait for reports; pi-extended-teams wakes the lead when agent reports arrive.
 - Internal source files still use `team` terminology in places for persisted state and backward compatibility. That terminology is not part of the current public workflow.

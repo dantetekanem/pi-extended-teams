@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.3.16] - 2026-06-28
+
+### Added
+- `TIPS.md` documents which agent level to use and shows correct/incorrect spawn examples.
+- Lead sessions now warn at boot when no favorite agent levels are configured.
+
+### Changed
+- Public agent spawning is level-only: `model_slot` is required, selects read/write behavior, model, and thinking, and direct `role`, `model`, or `thinking` spawn fields are rejected.
+
 ## [1.3.15] - 2026-06-28
 
 ### Fixed

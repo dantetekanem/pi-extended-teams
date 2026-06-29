@@ -27,7 +27,7 @@ Or spawn explicitly:
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", model_slot: "reading-default" },
+  defaults: { model_slot: "reading-default" },
   agents: [
     { name: "security", model_slot: "reading-hard", prompt: "Review the diff for security risks. Report file:line findings." },
     { name: "tests", prompt: "Find missing or weak test coverage. Report concrete gaps." }
@@ -47,12 +47,11 @@ Open the panel:
 
 ## Choosing favorite model slots
 
-Use `/agents-favorite-models` to save five named model/thinking favorites from one screen. The picker lists the scoped models available to the current Pi session, lets you move across slots, models, and thinking levels, then saves the global settings file when you press Enter. After that, spawn agents by declaring the workload slot instead of repeating model names:
+Use `/agents-favorite-models` to save five named model/thinking favorites from one screen. The picker lists the scoped models available to the current Pi session, lets you move across slots, models, and thinking levels, then saves the global settings file when you press Enter. After that, spawn agents by declaring the workload slot only. The slot is the level: it selects read/write behavior, model, and thinking. Do not pass `role`, raw model names, or `thinking` in spawn calls; see `TIPS.md` for examples.
 
 ```text
 spawn_agent({
   name: "auth-security",
-  role: "read",
   model_slot: "reading-hard",
   prompt: "Review src/auth for authorization bugs. Report file:line evidence."
 })
@@ -78,7 +77,7 @@ For collection-style work, prefer breadth: five `reading-fast` agents each readi
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", model_slot: "reading-default" },
+  defaults: { model_slot: "reading-default" },
   agents: [
     { name: "security-reviewer", model_slot: "reading-hard", prompt: "Review src/auth for authn/authz bugs. Report severity, file:line, and suggested fix." },
     { name: "performance-reviewer", prompt: "Review the diff for avoidable performance regressions. Include evidence." },
@@ -96,7 +95,6 @@ Use an edit agent only when the change is narrow and isolated.
 ```text
 spawn_agent({
   name: "docs-fix",
-  role: "write",
   model_slot: "writing-basic",
   prompt: "Claim README.md and docs/guide.md, update only stale public tool references, run the focused docs checks, then call report_and_exit. Do not commit or push."
 })
@@ -114,7 +112,7 @@ A good edit-agent prompt includes:
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", cwd: "/path/to/project", model_slot: "reading-fast" },
+  defaults: { cwd: "/path/to/project", model_slot: "reading-fast" },
   agents: [
     { name: "routes", prompt: "Collect route patterns and public endpoints from config/routes*. Report concise evidence." },
     { name: "jobs", prompt: "Collect queue/retry conventions from background jobs. Report concise evidence." },
@@ -123,7 +121,7 @@ spawn_swarm_agents({
 })
 ```
 
-Use favorite slots for normal orchestration. Use fully qualified model names only when intentionally overriding the configured favorites.
+Use favorite slots for all orchestration. Spawn calls reject raw model names, direct thinking levels, and direct role selection.
 
 ### 4. Direct coordination
 
@@ -170,7 +168,7 @@ Match slot strength to the job. Use `reading-fast` for splitable collection and 
 
 ### Keep edit agents rare
 
-Use `role: "write"` only when:
+Use a `writing-*` level only when:
 
 - files do not overlap with the lead or another edit agent,
 - the task is easy to bound,
@@ -239,9 +237,7 @@ list_file_claims({})
 
 If a `model_slot` fails, check `/agents-favorite-models` and confirm the slot has a fully qualified `provider/model` plus a valid thinking level.
 
-When bypassing slots, use fully qualified model names such as `provider/model`.
-
-If no `model_slot` or model is passed, pi-extended-teams uses the current Pi session model or configured defaults.
+If no `model_slot` is passed, pi-extended-teams rejects the spawn. Define levels with `/agents-favorite-models` first, then choose the level that matches the job.
 
 ### Panel is empty
 

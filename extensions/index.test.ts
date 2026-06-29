@@ -66,6 +66,7 @@ async function setupExtension(env: Record<string, string | undefined> = {}) {
   const tasksRoot = path.join(root, "tasks");
   fs.mkdirSync(teamsRoot, { recursive: true });
   fs.mkdirSync(tasksRoot, { recursive: true });
+  vi.spyOn(os, "homedir").mockReturnValue(root);
 
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName))));
   vi.spyOn(paths, "taskDir").mockImplementation((teamName: unknown) => path.join(tasksRoot, paths.sanitizeName(String(teamName))));
@@ -118,6 +119,20 @@ async function setupExtension(env: Record<string, string | undefined> = {}) {
   };
 }
 
+function writeFavoriteLevels(root: string) {
+  const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify({
+    favoriteModels: {
+      "reading-fast": { model: "provider/model", thinking: "low" },
+      "reading-default": { model: "provider/model", thinking: "high" },
+      "reading-hard": { model: "provider/model", thinking: "xhigh" },
+      "writing-basic": { model: "provider/model", thinking: "high" },
+      "writing-hard": { model: "provider/model", thinking: "xhigh" },
+    },
+  }));
+}
+
 describe("extension integration", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -157,6 +172,21 @@ describe("extension integration", () => {
     }
   });
 
+  it("warns lead sessions at boot when no favorite levels are configured", async () => {
+    const setup = await setupExtension();
+    try {
+      const ctx = makeCtx(setup.root, "boot-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        "No agent levels are configured. Define them with /agents-favorite-models before spawning agents. See TIPS.md for level examples.",
+        "warning"
+      );
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("/agents opens an empty implicit current-session panel", async () => {
     const setup = await setupExtension();
     try {
@@ -189,26 +219,25 @@ describe("extension integration", () => {
     }
   });
 
-  it("spawn_agent creates the implicit current-session group and runs edit agents in-process", async () => {
+  it("spawn_agent creates the implicit current-session group and runs edit agents in-process by level", async () => {
     const setup = await setupExtension();
     try {
+      writeFavoriteLevels(setup.root);
       const ctx = makeCtx(setup.root, "edit-session");
       const abort = new AbortController().signal;
 
       const result = await setup.tools.get("spawn_agent")!.execute("spawn", {
         name: "editor",
-        role: "write",
         prompt: "Edit the file",
         cwd: setup.root,
-        model: "provider/model",
-        thinking: "xhigh",
+        model_slot: "writing-hard",
       }, abort, undefined, ctx);
 
-      expect(result.details).toMatchObject({ name: "editor", role: "write", mode: "in-process", terminalId: null, session: "session-edit-session" });
+      expect(result.details).toMatchObject({ name: "editor", role: "write", mode: "in-process", terminalId: null, session: "session-edit-session", modelSlot: "writing-hard" });
       expect(setup.terminal.spawn).not.toHaveBeenCalled();
       expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledWith(
         "session-edit-session",
-        expect.objectContaining({ name: "editor", role: "write", model: "provider/model", thinking: "xhigh" }),
+        expect.objectContaining({ name: "editor", role: "write", model: "provider/model", thinking: "xhigh", modelSlot: "writing-hard" }),
         "Edit the file",
         ctx,
         expect.any(Object),
@@ -245,13 +274,12 @@ describe("extension integration", () => {
       for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
       const abort = new AbortController().signal;
 
+      writeFavoriteLevels(setup.root);
       await setup.tools.get("spawn_agent")!.execute("spawn", {
         name: "reader",
-        role: "read",
         prompt: "Think about this",
         cwd: setup.root,
-        model: "provider/model",
-        thinking: "high",
+        model_slot: "reading-default",
       }, abort, undefined, ctx);
       await vi.advanceTimersByTimeAsync(100);
 
@@ -269,24 +297,25 @@ describe("extension integration", () => {
     }
   });
 
-  it("spawn_swarm_agents starts a batch with defaults and per-agent overrides", async () => {
+  it("spawn_swarm_agents starts a batch with default and per-agent levels", async () => {
     const setup = await setupExtension();
     try {
+      writeFavoriteLevels(setup.root);
       const ctx = makeCtx(setup.root, "swarm-session");
       const abort = new AbortController().signal;
 
       const result = await setup.tools.get("spawn_swarm_agents")!.execute("swarm", {
-        defaults: { role: "read", cwd: setup.root, model: "provider/model", thinking: "high" },
+        defaults: { cwd: setup.root, model_slot: "reading-default" },
         agents: [
           { name: "one", prompt: "Inspect one" },
-          { name: "two", prompt: "Inspect two", thinking: "xhigh" },
+          { name: "two", prompt: "Inspect two", model_slot: "reading-hard" },
         ],
       }, abort, undefined, ctx);
 
       expect(result.details.spawned).toHaveLength(2);
       expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledTimes(2);
-      expect(setup.readAgentMock.runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "one", thinking: "high" });
-      expect(setup.readAgentMock.runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "two", thinking: "xhigh" });
+      expect(setup.readAgentMock.runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "one", thinking: "high", modelSlot: "reading-default" });
+      expect(setup.readAgentMock.runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "two", thinking: "xhigh", modelSlot: "reading-hard" });
     } finally {
       setup.restoreEnv();
     }

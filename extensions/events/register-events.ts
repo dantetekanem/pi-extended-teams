@@ -9,6 +9,7 @@ import { cleanupAgentSessionFolders, cleanupOrphanedTeams } from "../internal/se
 import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
 import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
+import { FAVORITE_MODEL_SLOTS, loadSettings } from "../../src/utils/settings";
 
 export interface RegisterEventsOptions {
   isTeammate: boolean;
@@ -71,6 +72,20 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     cleanupAgentSessionFolders(24 * 60 * 60 * 1000);
     options.setSessionCtx(ctx);
     const teamName = options.getTeamName();
+
+    if (!options.isTeammate) {
+      const settings = loadSettings({ projectDir: ctx.cwd });
+      const configuredLevels = FAVORITE_MODEL_SLOTS.filter((slot) => {
+        const config = settings.favoriteModels[slot];
+        return !!config?.model && !!config.thinking;
+      });
+      if (configuredLevels.length === 0) {
+        ctx.ui?.notify?.(
+          "No agent levels are configured. Define them with /agents-favorite-models before spawning agents. See TIPS.md for level examples.",
+          "warning"
+        );
+      }
+    }
 
     if (options.isTeammate) {
       if (teamName) {

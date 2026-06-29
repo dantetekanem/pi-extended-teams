@@ -14,6 +14,7 @@ import {
   resolveAllowedExtensions,
   resolveModel,
   resolveRole,
+  roleForFavoriteModelSlot,
   setGlobalFavoriteModel,
   type PiExtendedTeamsSettings,
 } from "./settings";
@@ -330,6 +331,16 @@ describe("resolveAllowedExtensions", () => {
     s.extensions.block = ["shopify-proxy"];
 
     expect(resolveAllowedExtensions(s, { homeDir })).toEqual(["custom-ext"]);
+  });
+});
+
+describe("roleForFavoriteModelSlot", () => {
+  it("derives agent role from the selected level", () => {
+    expect(roleForFavoriteModelSlot("reading-fast")).toBe("read");
+    expect(roleForFavoriteModelSlot("reading-default")).toBe("read");
+    expect(roleForFavoriteModelSlot("reading-hard")).toBe("read");
+    expect(roleForFavoriteModelSlot("writing-basic")).toBe("write");
+    expect(roleForFavoriteModelSlot("writing-hard")).toBe("write");
   });
 });
 

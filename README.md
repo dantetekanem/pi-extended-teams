@@ -30,7 +30,7 @@ Equivalent explicit shape:
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", model_slot: "reading-default" },
+  defaults: { model_slot: "reading-default" },
   agents: [
     { name: "git-check", prompt: "Inspect diffs and report risks." },
     { name: "test-gaps", prompt: "Find missing coverage and concrete test gaps." }
@@ -106,7 +106,7 @@ Avoid:
 
 ## Favorite model slots
 
-Configure favorite slots with `/agents-favorite-models`. It opens a single-screen picker for all five slots, populated from the scoped models the current Pi session can actually access. Each slot supplies both the model and thinking level, so the lead does not have to remember model names in every prompt.
+Configure favorite slots with `/agents-favorite-models`. It opens a single-screen picker for all five slots, populated from the scoped models the current Pi session can actually access. Each slot supplies the agent kind, model, and thinking level, so spawning agents uses `model_slot` only. Do not pass raw model names, `thinking`, or `role` in spawn calls. See `TIPS.md` for level-selection examples.
 
 Use these slots by intent:
 
@@ -127,7 +127,6 @@ For small independent collection work, several `reading-fast` agents are usually
 ```text
 spawn_agent({
   name: "security-reviewer",
-  role: "read",
   model_slot: "reading-hard",
   prompt: "Review the auth module for injection and authorization risks. Report findings with file:line evidence."
 })
@@ -137,7 +136,7 @@ spawn_agent({
 
 ```text
 spawn_swarm_agents({
-  defaults: { role: "read", cwd: "/path/to/project", model_slot: "reading-fast" },
+  defaults: { cwd: "/path/to/project", model_slot: "reading-fast" },
   agents: [
     { name: "routes", prompt: "Inspect config/routes files and report public endpoint patterns." },
     { name: "jobs", prompt: "Inspect background jobs and report retry/queue conventions." },
@@ -151,7 +150,6 @@ spawn_swarm_agents({
 ```text
 spawn_agent({
   name: "typo-fix",
-  role: "write",
   model_slot: "writing-basic",
   prompt: "Claim README.md, fix typos only, run the focused docs check, then call report_and_exit. Do not commit or push."
 })
@@ -171,7 +169,7 @@ check_teammate({ agent_name: "security-reviewer" })
 
 ## Configuration
 
-Model and thinking defaults come from Pi and optional pi-extended-teams settings.
+Agent model and thinking choices come from configured favorite levels only.
 
 Runtime settings live globally at `~/.pi/agent/pi-extended-teams/settings.json`; project-local overrides live at `.pi/pi-extended-teams.json`. Favorite model slots are global-only so `/agents-favorite-models` and spawn resolution use the same values; project files still override other runtime settings. `/agents-favorite-models` writes the global runtime settings file after you save the single-screen picker.
 
@@ -196,9 +194,9 @@ Example:
 }
 ```
 
-Provider-priority sorting for model selection also supports `providerPriority` in `~/.pi/pi-extended-teams.json` or `.pi/pi-extended-teams.json`.
+Provider-priority sorting for the `/agents-favorite-models` picker also supports `providerPriority` in `~/.pi/pi-extended-teams.json` or `.pi/pi-extended-teams.json`.
 
-You can still pass fully qualified `provider/model` strings and thinking levels directly to `spawn_agent` or `spawn_swarm_agents` when you intentionally bypass favorite slots.
+If no favorite levels are configured, pi-extended-teams warns at session start and spawn calls fail until you define at least the levels you want to use.
 
 ## Development
 

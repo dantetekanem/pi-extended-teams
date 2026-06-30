@@ -297,6 +297,51 @@ describe("extension integration", () => {
     }
   });
 
+  it("keeps runtime-only running agents visible in the status widget after a stale heartbeat", async () => {
+    const setup = await setupExtension();
+    try {
+      const runtime = await import("../src/utils/runtime.js");
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation(() => {});
+      const ctx = makeCtx(setup.root, "runtime-only-status-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      const abort = new AbortController().signal;
+
+      writeFavoriteLevels(setup.root);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader",
+        prompt: "Think about this",
+        cwd: setup.root,
+        model_slot: "reading-default",
+      }, abort, undefined, ctx);
+
+      const now = Date.now();
+      await runtime.writeRuntimeStatus("session-runtime-only-status-session", "reader", {
+        pid: process.pid,
+        startedAt: now - 120_000,
+        lastHeartbeatAt: now - runtime.HEARTBEAT_STALE_MS - 1_000,
+        ready: true,
+        currentAction: "thinking",
+        tokensUsed: 7,
+      });
+      await vi.advanceTimersByTimeAsync(1_200);
+
+      const widgetCall = [...ctx.ui.setWidget.mock.calls]
+        .reverse()
+        .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      expect(widgetCall).toBeTruthy();
+      const widget = widgetCall![1]({ requestRender: vi.fn() });
+      const rendered = widget.render(160).join("\n");
+
+      expect(rendered).toContain("1 active");
+      expect(rendered).toContain("reader");
+      expect(rendered).toContain("stale");
+      expect(rendered).toContain("heartbeat stale");
+      expect(rendered).toContain("thinking");
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("spawn_swarm_agents starts a batch with default and per-agent levels", async () => {
     const setup = await setupExtension();
     try {

@@ -89,6 +89,37 @@ export default function (pi: ExtensionAPI) {
     return `${targetTeamName}:${targetAgentName}`;
   }
 
+  function memberActivityRole(member: Member): "read" | "write" {
+    if (member.role === "read" || member.role === "write") return member.role;
+    return member.modelSlot?.startsWith("reading-") ? "read" : "write";
+  }
+
+  function runtimeHeartbeatIsRecent(status: runtime.AgentRuntimeStatus, now: number): boolean {
+    return !!status.lastHeartbeatAt && (now - status.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
+  }
+
+  function isVisibleRuntimeOnlyMember(
+    member: Member,
+    runtimeStatus: runtime.AgentRuntimeStatus | null
+  ): runtimeStatus is runtime.AgentRuntimeStatus {
+    return member.isActive !== false && runtimeStatus?.ready === true;
+  }
+
+  function runtimeOnlyStatusLabel(status: runtime.AgentRuntimeStatus, now: number): string {
+    if (!runtimeHeartbeatIsRecent(status, now)) return "stale";
+    if (status.currentAction && status.currentAction !== "done") return status.currentAction;
+    return status.ready ? "ready" : "running";
+  }
+
+  function runtimeOnlyActionLabel(status: runtime.AgentRuntimeStatus): string {
+    if (status.activeToolName) return `${status.currentAction || "working"}: ${status.activeToolName}`;
+    return status.currentAction || (status.ready ? "ready" : "running");
+  }
+
+  function runtimeOnlyHeartbeatDetail(status: runtime.AgentRuntimeStatus, now: number): string {
+    return runtimeHeartbeatIsRecent(status, now) ? "" : "heartbeat stale";
+  }
+
   function currentSessionAgentGroupName(ctx?: any): string | undefined {
     const sessionId = getPiSessionId(ctx ?? sessionCtx) || "local-session";
     return teamPaths.sanitizeName(`session-${sessionId}`);
@@ -345,33 +376,34 @@ export default function (pi: ExtensionAPI) {
     const readAgents = runningAgents.filter(agent => (agent.role || "read") === "read");
     const writeAgents = runningAgents.filter(agent => (agent.role || "read") === "write");
     const activityConfig = activityTeamName ? await teams.readConfig(activityTeamName).catch(() => null) : null;
-    const runtimeOnlyReadMembers = activityTeamName
-      ? (await Promise.all((activityConfig?.members ?? [])
-        .filter(member => member.name !== "team-lead" && (member.role ?? "read") === "read")
+    const activityMembers = activityConfig?.members ?? [];
+    const runtimeOnlyMembers = activityTeamName
+      ? (await Promise.all(activityMembers
+        .filter(member => member.name !== "team-lead")
         .filter(member => !runningReadAgents.has(readAgentKey(activityTeamName, member.name)))
         .map(async (member) => ({
           member,
           runtimeStatus: await runtime.readRuntimeStatus(activityTeamName, member.name).catch(() => null),
         }))))
-        .filter(({ member, runtimeStatus }) => {
-          const hasRecentHeartbeat = !!runtimeStatus?.lastHeartbeatAt && (now - runtimeStatus.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
-          return member.isActive !== false && !!runtimeStatus && hasRecentHeartbeat;
-        })
+        .filter((entry): entry is { member: Member; runtimeStatus: runtime.AgentRuntimeStatus } => isVisibleRuntimeOnlyMember(entry.member, entry.runtimeStatus))
       : [];
+    const runtimeOnlyMemberNames = new Set(runtimeOnlyMembers.map(({ member }) => member.name));
+    const runtimeOnlyReadMembers = runtimeOnlyMembers.filter(({ member }) => memberActivityRole(member) === "read");
+    const runtimeOnlyWriteMembers = runtimeOnlyMembers.filter(({ member }) => memberActivityRole(member) === "write");
     const activeWriteMembers = activityTeamName
-      ? (activityConfig?.members ?? [])
-        .filter(member => member.name !== "team-lead" && (member.role ?? "write") !== "read")
-        .filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId)) && !runningReadAgents.has(readAgentKey(activityTeamName, member.name))) ?? []
+      ? activityMembers
+        .filter(member => member.name !== "team-lead" && memberActivityRole(member) === "write")
+        .filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId)) && !runningReadAgents.has(readAgentKey(activityTeamName, member.name)) && !runtimeOnlyMemberNames.has(member.name)) ?? []
       : [];
     const unreadLeadMessages = activityTeamName ? await messaging.readInbox(activityTeamName, agentName, true, false).catch(() => []) : [];
     leadInboxUnreadCount = unreadLeadMessages.length;
     clearLeadInboxWidgetOnce();
 
-    if ((readAgents.length > 0 || writeAgents.length > 0 || runtimeOnlyReadMembers.length > 0 || activeWriteMembers.length > 0) && !readAgentStatusTimer) {
+    if ((readAgents.length > 0 || writeAgents.length > 0 || runtimeOnlyReadMembers.length > 0 || runtimeOnlyWriteMembers.length > 0 || activeWriteMembers.length > 0) && !readAgentStatusTimer) {
       readAgentStatusTimer = setInterval(renderReadAgentStatus, 1000);
     }
 
-    if (readAgents.length === 0 && writeAgents.length === 0 && runtimeOnlyReadMembers.length === 0 && activeWriteMembers.length === 0) {
+    if (readAgents.length === 0 && writeAgents.length === 0 && runtimeOnlyReadMembers.length === 0 && runtimeOnlyWriteMembers.length === 0 && activeWriteMembers.length === 0) {
       sessionCtx.ui.setStatus?.("01-pi-extended-teams-read", undefined);
       clearTeamActivityWidget();
       sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
@@ -382,7 +414,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const activeCount = readAgents.length + writeAgents.length + runtimeOnlyReadMembers.length + activeWriteMembers.length;
+    const activeCount = readAgents.length + writeAgents.length + runtimeOnlyReadMembers.length + runtimeOnlyWriteMembers.length + activeWriteMembers.length;
     const entries: TeamActivityStatusEntry[] = [];
     const statusCounts: Record<string, number> = {};
     const idleNudgeMessages: string[] = [];
@@ -413,6 +445,20 @@ export default function (pi: ExtensionAPI) {
       entries.push({ name: agent.name, role: "write", status: status.label, detail });
     }
 
+    for (const { member, runtimeStatus } of runtimeOnlyWriteMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
+      const elapsed = formatElapsed(now - (runtimeStatus.startedAt || member.joinedAt));
+      const modelLabel = formatModelLabel(member.model, member.thinking);
+      const slotLabel = member.modelSlot ? `slot:${member.modelSlot}` : "";
+      const tokens = typeof runtimeStatus.tokensUsed === "number" ? `${formatTokenCount(runtimeStatus.tokensUsed)} tok` : "0 tok";
+      const screen = member.tmuxPaneId ? (member.windowId ? `${member.windowId}/${member.tmuxPaneId}` : member.tmuxPaneId) : "";
+      const action = runtimeOnlyActionLabel(runtimeStatus);
+      const heartbeat = runtimeOnlyHeartbeatDetail(runtimeStatus, now);
+      const detail = [screen, modelLabel, slotLabel, elapsed, tokens, heartbeat, action].filter(Boolean).join(" · ");
+      const status = runtimeOnlyStatusLabel(runtimeStatus, now);
+      countStatus(status);
+      entries.push({ name: member.name, role: "write", status, detail });
+    }
+
     for (const member of activeWriteMembers.sort((a, b) => a.name.localeCompare(b.name))) {
       upsertWriterScreenTab(writerScreenState, {
         teamName: activityTeamName!,
@@ -435,15 +481,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyReadMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
-      const elapsed = formatElapsed(now - (runtimeStatus?.startedAt || member.joinedAt));
+      const elapsed = formatElapsed(now - (runtimeStatus.startedAt || member.joinedAt));
       const modelLabel = formatModelLabel(member.model, member.thinking);
       const slotLabel = member.modelSlot ? `slot:${member.modelSlot}` : "";
-      const tokens = typeof runtimeStatus?.tokensUsed === "number" ? `${formatTokenCount(runtimeStatus.tokensUsed)} tok` : "0 tok";
-      const action = runtimeStatus?.activeToolName
-        ? `${runtimeStatus.currentAction || "working"}: ${runtimeStatus.activeToolName}`
-        : runtimeStatus?.currentAction || (runtimeStatus?.ready ? "ready" : "running");
-      const detail = [modelLabel, slotLabel, elapsed, tokens, action].filter(Boolean).join(" · ");
-      const status = runtimeStatus?.ready ? "ready" : "running";
+      const tokens = typeof runtimeStatus.tokensUsed === "number" ? `${formatTokenCount(runtimeStatus.tokensUsed)} tok` : "0 tok";
+      const action = runtimeOnlyActionLabel(runtimeStatus);
+      const heartbeat = runtimeOnlyHeartbeatDetail(runtimeStatus, now);
+      const detail = [modelLabel, slotLabel, elapsed, tokens, heartbeat, action].filter(Boolean).join(" · ");
+      const status = runtimeOnlyStatusLabel(runtimeStatus, now);
       countStatus(status);
       entries.push({ name: member.name, role: "read", status, detail });
     }
@@ -476,7 +521,7 @@ export default function (pi: ExtensionAPI) {
     updateTeamActivityWidget({
       activeCount,
       readCount: readAgents.length + runtimeOnlyReadMembers.length,
-      writeCount: writeAgents.length + activeWriteMembers.length,
+      writeCount: writeAgents.length + runtimeOnlyWriteMembers.length + activeWriteMembers.length,
       unreadCount: leadInboxUnreadCount,
       entries,
       statusCounts,

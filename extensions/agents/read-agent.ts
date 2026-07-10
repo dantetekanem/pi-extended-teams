@@ -12,7 +12,8 @@ import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, getLastAssistantText, sanitizeTuiLine } from "../ui/renderers";
-import { createAgentCommunicationTools } from "../tools/agent-communication-tools";
+import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
+import { requireWriteAgentTeam } from "../team/roster";
 import { shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 import { loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
 
@@ -239,6 +240,60 @@ export async function runReadAgentInProcess(
   options.ensureReadAgentStatusTicker();
 
   let heartbeatTimer: NodeJS.Timeout | null = null;
+  let submittedFinalReport: SubmittedAgentReport | undefined;
+
+  const deliverCompletion = async (report: string, completionSummary: string): Promise<void> => {
+    const session = state.session;
+    if (!session) throw new Error(`Agent ${member.name} completed without a nested session.`);
+    const completionStats = session.getSessionStats();
+    options.rememberCompletedAgentReport(readTeamName, {
+      name: member.name,
+      role,
+      status: "completed",
+      report,
+      summary: completionSummary,
+      completedAt: Date.now(),
+      startedAt: state.startedAt,
+      elapsedMs: Date.now() - state.startedAt,
+      tokensUsed: state.tokensUsed,
+      costUsd: completionStats.cost,
+      model: member.model,
+      thinking: member.thinking,
+      modelSlot: member.modelSlot,
+      color: member.color,
+      requestedBy: member.requestedBy,
+      initialPrompt: member.prompt || prompt,
+      source: "read-agent",
+    });
+    const completionMetadata = {
+      finalReport: true,
+      startedAt: state.startedAt,
+      elapsedMs: Date.now() - state.startedAt,
+      tokensUsed: state.tokensUsed,
+      costUsd: completionStats.cost,
+      model: member.model,
+      thinking: member.thinking,
+      modelSlot: member.modelSlot,
+      initialPrompt: member.prompt || prompt,
+    };
+    await recordReadAgentReportEvent(readTeamName, member, "completed", report, completionSummary, state.startedAt, state.tokensUsed, completionStats.cost);
+    const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
+    if (member.requestedBy) {
+      await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
+      await options.renderLeadInboxStatus?.().catch(() => {});
+      if (member.requestedBy === options.agentName) {
+        options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox and continue your task. Do not poll.`);
+      }
+    } else if (suppressLeadReportInjection) {
+      // Workflow orchestrators consume full reports from TeamReportEvent storage.
+      // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
+    } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
+      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
+    } else {
+      await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, report, completionSummary, member.color, completionMetadata);
+    }
+  };
+
   try {
     const [provider, modelId] = (member.model || "").split("/", 2);
     const model = provider && modelId ? ctx.modelRegistry.find(provider, modelId) : undefined;
@@ -292,7 +347,16 @@ export async function runReadAgentInProcess(
     const communicationTools = createAgentCommunicationTools({
       isTeammate: true,
       agentName: member.name,
+      role,
       getTeamName: () => readTeamName,
+      authorizeWriteMember: async (teamName, agentName) => {
+        await requireWriteAgentTeam(teamName, true, agentName);
+      },
+      onReportAndExit: async report => {
+        if (submittedFinalReport) return { accepted: false };
+        submittedFinalReport = report;
+        return { accepted: true };
+      },
     });
     const communicationToolNames = communicationTools.map(tool => tool.name);
 
@@ -354,55 +418,11 @@ export async function runReadAgentInProcess(
 
     if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) return;
 
-    const report = getLastAssistantText(session.messages) || "Read agent completed, but produced no assistant text.";
-    const completionStats = session.getSessionStats();
-    options.rememberCompletedAgentReport(readTeamName, {
-      name: member.name,
-      role,
-      status: "completed",
-      report,
-      summary: `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`,
-      completedAt: Date.now(),
-      startedAt: state.startedAt,
-      elapsedMs: Date.now() - state.startedAt,
-      tokensUsed: state.tokensUsed,
-      costUsd: completionStats.cost,
-      model: member.model,
-      thinking: member.thinking,
-      modelSlot: member.modelSlot,
-      color: member.color,
-      requestedBy: member.requestedBy,
-      initialPrompt: member.prompt || prompt,
-      source: "read-agent",
-    });
-    const completionSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
-    const completionMetadata = {
-      finalReport: true,
-      startedAt: state.startedAt,
-      elapsedMs: Date.now() - state.startedAt,
-      tokensUsed: state.tokensUsed,
-      costUsd: completionStats.cost,
-      model: member.model,
-      thinking: member.thinking,
-      modelSlot: member.modelSlot,
-      initialPrompt: member.prompt || prompt,
-    };
-    await recordReadAgentReportEvent(readTeamName, member, "completed", report, completionSummary, state.startedAt, state.tokensUsed, completionStats.cost);
-    const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
-    if (member.requestedBy) {
-      await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
-      await options.renderLeadInboxStatus?.().catch(() => {});
-      if (member.requestedBy === options.agentName) {
-        options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox and continue your task. Do not poll.`);
-      }
-    } else if (suppressLeadReportInjection) {
-      // Workflow orchestrators consume full reports from TeamReportEvent storage.
-      // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
-    } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
-      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
-    } else {
-      await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, report, completionSummary, member.color, completionMetadata);
-    }
+    const report = submittedFinalReport?.content
+      ?? (getLastAssistantText(session.messages) || "Read agent completed, but produced no assistant text.");
+    const completionSummary = submittedFinalReport?.summary
+      ?? `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
+    await deliverCompletion(report, completionSummary);
   } catch (e) {
     if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
       const failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;

@@ -24,12 +24,15 @@ function installPathSpies() {
   });
 }
 
-function makeTools(teamName: string | null = "session", agentName = "reader") {
+function makeTools(teamName: string | null = "session", agentName = "reader", role: "read" | "write" = "read") {
   return new Map<string, Tool>(createAgentCommunicationTools({
     isTeammate: true,
     agentName,
+    role,
     getTeamName: () => teamName ?? undefined,
-  }).map((tool: Tool) => [tool.name, tool]));
+    authorizeWriteMember: vi.fn(async () => {}),
+    onReportAndExit: vi.fn(async () => ({ accepted: true })),
+  } as any).map((tool: Tool) => [tool.name, tool]));
 }
 
 describe("read-agent communication tools", () => {
@@ -43,10 +46,23 @@ describe("read-agent communication tools", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("exposes only simple direct communication tools", () => {
-    const tools = Array.from(makeTools().keys()).sort();
+  it("exposes only simple direct communication tools to read agents", () => {
+    const tools = Array.from(makeTools("session", "reader", "read").keys()).sort();
 
     expect(tools).toEqual(["read_inbox", "send_message"]);
+  });
+
+  it("exposes the complete coordination surface to write agents", () => {
+    const tools = Array.from(makeTools("session", "writer", "write").keys()).sort();
+
+    expect(tools).toEqual([
+      "claim_file",
+      "list_file_claims",
+      "read_inbox",
+      "release_file",
+      "report_and_exit",
+      "send_message",
+    ]);
   });
 
   it("send_message uses the current session and defaults spawned agents to the lead", async () => {

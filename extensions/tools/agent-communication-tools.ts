@@ -1,12 +1,26 @@
 import { Type } from "@sinclair/typebox";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
+import * as claims from "../../src/utils/claims";
 import { formatInboxMessagesForModel } from "../ui/renderers";
+import { createFileClaimTools } from "./file-claim-tools";
+
+export interface SubmittedAgentReport {
+  content: string;
+  summary?: string;
+}
+
+export interface AgentReportSubmissionResult {
+  accepted: boolean;
+}
 
 export interface AgentCommunicationToolsOptions {
   isTeammate: boolean;
   agentName: string;
+  role: "read" | "write";
   getTeamName(): string | null | undefined;
+  authorizeWriteMember(teamName: string, agentName: string): Promise<void>;
+  onReportAndExit(report: SubmittedAgentReport): Promise<AgentReportSubmissionResult>;
 }
 
 function requireCurrentSession(options: AgentCommunicationToolsOptions): string {
@@ -16,7 +30,7 @@ function requireCurrentSession(options: AgentCommunicationToolsOptions): string 
 }
 
 export function createAgentCommunicationTools(options: AgentCommunicationToolsOptions): any[] {
-  return [
+  const communicationTools = [
     {
       name: "send_message",
       label: "Send Message",
@@ -58,4 +72,37 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
       },
     },
   ];
+
+  if (options.role !== "write") return communicationTools;
+
+  const fileClaimTools = createFileClaimTools({
+    agentName: options.agentName,
+    getAuthorizedWriteTeam: async () => {
+      const teamName = requireCurrentSession(options);
+      await options.authorizeWriteMember(teamName, options.agentName);
+      return teamName;
+    },
+    getCurrentTeam: () => requireCurrentSession(options),
+    claims,
+  });
+
+  const reportAndExitTool = {
+    name: "report_and_exit",
+    label: "Report and Exit",
+    description: "Submit a final report to the lead and finish this nested edit-agent run.",
+    parameters: Type.Object({
+      content: Type.String({ description: "Final report to send to the lead." }),
+      summary: Type.Optional(Type.String({ description: "Short report summary." })),
+    }),
+    async execute(_toolCallId: string, params: SubmittedAgentReport) {
+      const teamName = requireCurrentSession(options);
+      const result = await options.onReportAndExit({ content: params.content, summary: params.summary });
+      const text = result.accepted
+        ? "Final report accepted. Finish immediately; the outer runner will release claims and stop this nested session."
+        : "A final report was already accepted for this run. This duplicate was ignored; finish immediately.";
+      return { content: [{ type: "text", text }], details: { session: teamName, accepted: result.accepted } };
+    },
+  };
+
+  return [...communicationTools, ...fileClaimTools, reportAndExitTool];
 }

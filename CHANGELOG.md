@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-10
+
+### Changed
+- Advanced the extension to the requested `2.0.0` major release while keeping public spawning model-slot-only.
+- Nested writer coordination is bound to the spawned member identity instead of shared process environment.
+
+### Fixed
+- Restored `claim_file`, `release_file`, `list_file_claims`, and `report_and_exit` for in-process `writing-basic` and `writing-hard` agents.
+- Writer final reports and cleanup are now idempotent and owned by the outer runner, so a nested writer exits without shutting down the lead session; read agents remain limited to messaging coordination tools.
+
 ## [1.3.17] - 2026-06-28
 
 ### Changed

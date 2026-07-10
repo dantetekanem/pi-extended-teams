@@ -38,7 +38,10 @@ export async function requireWriteAgentTeam(
 
   const teamConfig = await teams.readConfig(teamName);
   const member = teamConfig.members.find(m => m.name === agentName);
-  const role = member?.role ?? "write";
+  if (!member) {
+    throw new Error(`Agent ${agentName} is not a member of session ${teamName}.`);
+  }
+  const role = member.role ?? "write";
   if (role !== "write") {
     throw new Error("File claim tools are only available to write agents.");
   }

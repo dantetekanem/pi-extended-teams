@@ -6,6 +6,7 @@ import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import * as reportEvents from "../../src/utils/report-events";
+import { createFileClaimTools } from "./file-claim-tools";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
 import { unlinkPidFile } from "../internal/session-files";
 import { summarizeSessionUsage } from "../internal/session-usage";
@@ -42,56 +43,14 @@ function requireCurrentSession(options: CoordinationToolsOptions): string {
 }
 
 export function registerCoordinationTools(pi: any, options: CoordinationToolsOptions): void {
-  pi.registerTool({
-    name: "claim_file",
-    label: "Claim File",
-    description: "Claim file paths before an edit agent changes them. Claims are scoped to the current Pi session.",
-    parameters: Type.Object({ paths: Type.Array(Type.String({ description: "Repository-relative file path." })) }),
-    async execute(_toolCallId: string, params: any) {
-      const targetTeamName = await options.requireWriteAgentTeam();
-      const result = await claims.claimFiles(targetTeamName, options.agentName, params.paths);
-      const text = result.conflicts.length > 0
-        ? [
-            `File claim request blocked for ${options.agentName}.`,
-            "Conflicts:",
-            ...result.conflicts.map(conflict => `- ${conflict.path} held by ${conflict.heldBy}`),
-          ].join("\n")
-        : result.granted.length > 0
-          ? [`Claimed ${result.granted.length} file(s) for ${options.agentName}:`, ...result.granted.map(item => `- ${item}`)].join("\n")
-          : `No file paths claimed for ${options.agentName}.`;
-      return { content: [{ type: "text", text }], details: { agent: options.agentName, session: targetTeamName, ...result } };
-    },
-  });
-
-  pi.registerTool({
-    name: "release_file",
-    label: "Release File",
-    description: "Release file claims held by the current edit agent.",
-    parameters: Type.Object({ paths: Type.Array(Type.String({ description: "Repository-relative file path." })) }),
-    async execute(_toolCallId: string, params: any) {
-      const targetTeamName = await options.requireWriteAgentTeam();
-      const released = await claims.releaseFiles(targetTeamName, options.agentName, params.paths);
-      const text = released.length > 0
-        ? `Released ${released.length} file claim(s) for ${options.agentName}:\n${released.map(item => `- ${item}`).join("\n")}`
-        : `No matching file claims held by ${options.agentName} were released.`;
-      return { content: [{ type: "text", text }], details: { agent: options.agentName, session: targetTeamName, released } };
-    },
-  });
-
-  pi.registerTool({
-    name: "list_file_claims",
-    label: "List File Claims",
-    description: "List file claims in the current Pi session.",
-    parameters: Type.Object({}),
-    async execute() {
-      const targetTeamName = requireCurrentSession(options);
-      const currentClaims = (await claims.listClaims(targetTeamName)).sort((a, b) => a.path.localeCompare(b.path));
-      const text = currentClaims.length > 0
-        ? [`Current file claims:`, ...currentClaims.map(claim => `- ${claim.path} held by ${claim.agent} since ${new Date(claim.since).toISOString()}`)].join("\n")
-        : "No current file claims.";
-      return { content: [{ type: "text", text }], details: { session: targetTeamName, claims: currentClaims } };
-    },
-  });
+  for (const tool of createFileClaimTools({
+    agentName: options.agentName,
+    getAuthorizedWriteTeam: options.requireWriteAgentTeam,
+    getCurrentTeam: () => requireCurrentSession(options),
+    claims,
+  })) {
+    pi.registerTool(tool);
+  }
 
   pi.registerTool({
     name: "report_and_exit",

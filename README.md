@@ -51,7 +51,6 @@ Spawn an edit-allowed agent only when the work is isolated and safe to run in pa
 ```text
 spawn_agent({
   name: "docs-fix",
-  role: "write",
   model_slot: "writing-basic",
   prompt: "Claim docs/guide.md, fix only stale public tool names, verify, then call report_and_exit."
 })

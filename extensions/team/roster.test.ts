@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { buildRoster } from "./roster.js";
+import { buildRoster, requireWriteAgentTeam } from "./roster.js";
 import * as teams from "../../src/utils/teams.js";
 import * as tasks from "../../src/utils/tasks.js";
 import * as claims from "../../src/utils/claims.js";
@@ -22,6 +22,53 @@ function member(name: string, overrides: Partial<Member> = {}): Member {
     ...overrides,
   };
 }
+
+describe("write-agent authorization", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("rejects an identity that is absent from the session roster", async () => {
+    vi.spyOn(teams, "readConfig").mockResolvedValue({
+      name: "session",
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "lead-session",
+      members: [member("team-lead")],
+    });
+
+    await expect(requireWriteAgentTeam("session", true, "missing-writer"))
+      .rejects.toThrow("Agent missing-writer is not a member of session session.");
+  });
+
+  it("preserves the legacy missing-role fallback only for a real roster member", async () => {
+    vi.spyOn(teams, "readConfig").mockResolvedValue({
+      name: "session",
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "lead-session",
+      members: [member("team-lead"), member("legacy-writer", { role: undefined })],
+    });
+
+    await expect(requireWriteAgentTeam("session", true, "legacy-writer")).resolves.toBe("session");
+  });
+
+  it("rejects a real read member", async () => {
+    vi.spyOn(teams, "readConfig").mockResolvedValue({
+      name: "session",
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "lead-session",
+      members: [member("team-lead"), member("reader", { role: "read" })],
+    });
+
+    await expect(requireWriteAgentTeam("session", true, "reader"))
+      .rejects.toThrow("File claim tools are only available to write agents.");
+  });
+});
 
 describe("team roster performance", () => {
   afterEach(() => {

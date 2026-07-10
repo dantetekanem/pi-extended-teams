@@ -3,8 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as paths from "../../src/utils/paths.js";
+import * as claims from "../../src/utils/claims.js";
 import { readInbox, sendPlainMessage } from "../../src/utils/messaging.js";
 import { listTeamReportEvents } from "../../src/utils/report-events.js";
+import type { Member } from "../../src/utils/models.js";
 
 const piMocks = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
@@ -41,6 +43,12 @@ function installPathSpies() {
   vi.spyOn(paths, "inboxPath").mockImplementation((teamName: unknown, agentName: unknown) => {
     return path.join(root, "teams", paths.sanitizeName(String(teamName)), "inboxes", `${paths.sanitizeName(String(agentName))}.json`);
   });
+  vi.spyOn(paths, "claimsPath").mockImplementation((teamName: unknown) => {
+    return path.join(root, "teams", paths.sanitizeName(String(teamName)), "claims.json");
+  });
+  vi.spyOn(paths, "reportEventsPath").mockImplementation((teamName: unknown) => {
+    return path.join(root, "teams", paths.sanitizeName(String(teamName)), "reports.json");
+  });
 }
 
 function writeFavoriteLevels() {
@@ -49,8 +57,33 @@ function writeFavoriteLevels() {
   fs.writeFileSync(settingsPath, JSON.stringify({
     favoriteModels: {
       "reading-default": { model: "provider/model", thinking: "high" },
+      "writing-hard": { model: "provider/model", thinking: "xhigh" },
     },
   }));
+}
+
+function writeTeamConfig(teamName: string, teammate: Member) {
+  const configFile = paths.configPath(teamName);
+  fs.mkdirSync(path.dirname(configFile), { recursive: true });
+  fs.writeFileSync(configFile, JSON.stringify({
+    name: teamName,
+    description: "",
+    createdAt: Date.now(),
+    leadAgentId: "lead",
+    leadSessionId: "lead-session",
+    members: [
+      {
+        agentId: `team-lead@${teamName}`,
+        name: "team-lead",
+        agentType: "lead",
+        joinedAt: Date.now(),
+        tmuxPaneId: "",
+        cwd: root,
+        subscriptions: [],
+      },
+      teammate,
+    ],
+  }, null, 2));
 }
 
 function makeSession() {
@@ -119,7 +152,16 @@ describe("in-process read agent tool wiring", () => {
     expect(piMocks.createAgentSession).toHaveBeenCalledTimes(1);
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
     const communicationToolNames = ["send_message", "read_inbox"];
-    expect(sessionOptions.tools).toEqual(expect.arrayContaining(communicationToolNames));
+    expect(sessionOptions.tools).toEqual([
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "grep",
+      "find",
+      "ls",
+      ...communicationToolNames,
+    ]);
     expect(sessionOptions.customTools.map((tool: any) => tool.name).sort()).toEqual([...communicationToolNames].sort());
 
     expect(piMocks.loaderOptions).toHaveLength(1);
@@ -133,6 +175,257 @@ describe("in-process read agent tool wiring", () => {
     expect(await readInbox("team", "team-lead", false, false)).toEqual([]);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader");
     expect(runningReadAgents.size).toBe(0);
+  });
+
+  it("injects the complete writer coordination surface into nested write-agent sessions", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    };
+
+    await runReadAgentInProcess("team", {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      thinking: "xhigh",
+      modelSlot: "writing-hard",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "edit an isolated file",
+    }, "edit an isolated file", {
+      modelRegistry: {
+        find: vi.fn(() => ({ provider: "provider", id: "model" })),
+      },
+    }, options);
+
+    expect(piMocks.createAgentSession).toHaveBeenCalledTimes(1);
+    const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+    const communicationToolNames = [
+      "send_message",
+      "read_inbox",
+      "claim_file",
+      "release_file",
+      "list_file_claims",
+      "report_and_exit",
+    ];
+    expect(sessionOptions.tools).toEqual([
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "grep",
+      "find",
+      "ls",
+      ...communicationToolNames,
+    ]);
+    expect(sessionOptions.customTools.map((tool: any) => tool.name).sort()).toEqual([...communicationToolNames].sort());
+    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "writer", expect.any(Number), 42, "final report", true);
+    expect(options.releaseAllClaimsForAgent).toHaveBeenCalledTimes(1);
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts only the first writer report and finalizes only the nested run", async () => {
+    const session = makeSession();
+    session.messages = [{ role: "assistant", content: "trailing assistant text" }];
+    let firstResult: any;
+    let duplicateResult: any;
+    session.prompt.mockImplementation(async () => {
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const tools = new Map<string, any>(sessionOptions.customTools.map((tool: any) => [tool.name, tool]));
+      await tools.get("claim_file").execute("claim", { paths: ["./fixtures/writer.txt"] });
+      firstResult = await tools.get("report_and_exit").execute("first", {
+        content: "authoritative report",
+        summary: "Authoritative summary",
+      });
+      duplicateResult = await tools.get("report_and_exit").execute("duplicate", {
+        content: "duplicate report",
+        summary: "Duplicate summary",
+      });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const releaseAllClaimsForAgent = vi.fn(async (teamName: string, agentName: string) => {
+      return claims.releaseAllForAgent(teamName, agentName);
+    });
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent,
+    };
+    const writer: Member = {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      thinking: "xhigh",
+      modelSlot: "writing-hard",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "edit an isolated file",
+    };
+    writeTeamConfig("team", writer);
+    const leadShutdown = vi.fn();
+    const terminalKill = vi.fn();
+
+    await runReadAgentInProcess("team", writer, "edit an isolated file", {
+      modelRegistry: {
+        find: vi.fn(() => ({ provider: "provider", id: "model" })),
+      },
+      shutdown: leadShutdown,
+      terminal: { kill: terminalKill },
+    }, options);
+
+    expect(firstResult.details).toEqual({ session: "team", accepted: true });
+    expect(duplicateResult.details).toEqual({ session: "team", accepted: false });
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledTimes(1);
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      status: "completed",
+      report: "authoritative report",
+      summary: "Authoritative summary",
+    }));
+    expect(options.emitAgentReport).toHaveBeenCalledTimes(1);
+    expect(options.emitAgentReport).toHaveBeenCalledWith(
+      "team",
+      "writer",
+      expect.any(Number),
+      42,
+      "authoritative report",
+      true
+    );
+    expect(releaseAllClaimsForAgent).toHaveBeenCalledTimes(1);
+    expect(await claims.listClaims("team")).toEqual([]);
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+    expect(leadShutdown).not.toHaveBeenCalled();
+    expect(terminalKill).not.toHaveBeenCalled();
+    expect(runningReadAgents.size).toBe(0);
+    expect(JSON.parse(fs.readFileSync(paths.configPath("team"), "utf-8")).members.map((item: Member) => item.name))
+      .toEqual(["team-lead"]);
+
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      agentName: "writer",
+      role: "write",
+      status: "completed",
+      report: "authoritative report",
+      summary: "Authoritative summary",
+      source: "read-agent",
+    });
+  });
+
+  it("reports unexpected writer errors as failures even after report submission", async () => {
+    const session = makeSession();
+    let reportResult: any;
+    session.prompt.mockImplementation(async () => {
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const reportTool = sessionOptions.customTools.find((tool: any) => tool.name === "report_and_exit");
+      reportResult = await reportTool.execute("report", {
+        content: "submitted before failure",
+        summary: "Submitted summary",
+      });
+      throw new Error("unexpected provider failure");
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const releaseAllClaimsForAgent = vi.fn(async (teamName: string, agentName: string) => {
+      return claims.releaseAllForAgent(teamName, agentName);
+    });
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent,
+    };
+    const writer: Member = {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      thinking: "xhigh",
+      modelSlot: "writing-hard",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "edit an isolated file",
+    };
+    writeTeamConfig("team", writer);
+    const leadShutdown = vi.fn();
+    const terminalKill = vi.fn();
+
+    await runReadAgentInProcess("team", writer, "edit an isolated file", {
+      modelRegistry: {
+        find: vi.fn(() => ({ provider: "provider", id: "model" })),
+      },
+      shutdown: leadShutdown,
+      terminal: { kill: terminalKill },
+    }, options);
+
+    expect(reportResult.details).toEqual({ session: "team", accepted: true });
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledTimes(1);
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      status: "failed",
+      report: "Edit agent writer failed: unexpected provider failure",
+    }));
+    expect(options.emitAgentReport).toHaveBeenCalledTimes(1);
+    expect(options.emitAgentReport).toHaveBeenCalledWith(
+      "team",
+      "writer",
+      expect.any(Number),
+      0,
+      "Edit agent writer failed: unexpected provider failure",
+      false
+    );
+    expect(releaseAllClaimsForAgent).toHaveBeenCalledTimes(1);
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+    expect(leadShutdown).not.toHaveBeenCalled();
+    expect(terminalKill).not.toHaveBeenCalled();
+    expect(runningReadAgents.size).toBe(0);
+
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      agentName: "writer",
+      role: "write",
+      status: "failed",
+      report: "Edit agent writer failed: unexpected provider failure",
+      source: "read-agent",
+    });
   });
 
   it("does not reset tool-working status for non-assistant message updates", async () => {

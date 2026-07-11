@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
-import { formatInboxMessagesForModel } from "../ui/renderers";
+import { formatInboxMessagesForModel, sanitizePlainTuiLine } from "../ui/renderers";
 import { createFileClaimTools } from "./file-claim-tools";
 
 export interface SubmittedAgentReport {
@@ -20,13 +20,48 @@ export interface AgentCommunicationToolsOptions {
   role: "read" | "write";
   getTeamName(): string | null | undefined;
   authorizeWriteMember(teamName: string, agentName: string): Promise<void>;
+  onProgress?(status: string, updatedAt: number): void;
   onReportAndExit(report: SubmittedAgentReport): Promise<AgentReportSubmissionResult>;
 }
 
-function requireCurrentSession(options: AgentCommunicationToolsOptions): string {
+function requireCurrentSession(options: Pick<AgentCommunicationToolsOptions, "getTeamName">): string {
   const teamName = options.getTeamName();
   if (!teamName) throw new Error("No active agent session context is available.");
   return teamName;
+}
+
+function normalizeProgressStatus(value: unknown): string {
+  if (typeof value !== "string") throw new Error("status must be a string.");
+  const status = sanitizePlainTuiLine(value).replace(/\s+/g, " ").trim();
+  if (!status) throw new Error("status must not be empty.");
+  if (status.length > 120) throw new Error("status must be at most 120 characters.");
+  return status;
+}
+
+export function createReportProgressTool(options: Pick<AgentCommunicationToolsOptions, "isTeammate" | "agentName" | "getTeamName" | "onProgress">): any {
+  return {
+    name: "report_progress",
+    label: "Report Progress",
+    description: "Update this agent's latest concise progress phrase without messaging or waking the lead.",
+    parameters: Type.Object({
+      status: Type.String({ minLength: 1, maxLength: 120, description: "Free-form progress phrase; normalized to one non-empty line (maximum 120 characters)." }),
+    }),
+    async execute(_toolCallId: string, params: any) {
+      if (!options.isTeammate) throw new Error("report_progress is only available to spawned agents.");
+      const teamName = requireCurrentSession(options);
+      const status = normalizeProgressStatus(params.status);
+      const updatedAt = Date.now();
+      options.onProgress?.(status, updatedAt);
+      await runtime.writeRuntimeStatus(teamName, options.agentName, {
+        latestProgress: status,
+        progressUpdatedAt: updatedAt,
+      });
+      return {
+        content: [{ type: "text", text: `Progress updated: ${status}` }],
+        details: { session: teamName, status, updatedAt },
+      };
+    },
+  };
 }
 
 export function createAgentCommunicationTools(options: AgentCommunicationToolsOptions): any[] {
@@ -48,6 +83,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         return { content: [{ type: "text", text: `Message sent to ${recipient}.` }], details: { session: teamName, recipient } };
       },
     },
+    createReportProgressTool(options),
     {
       name: "read_inbox",
       label: "Read Inbox",
@@ -73,25 +109,12 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
     },
   ];
 
-  if (options.role !== "write") return communicationTools;
-
-  const fileClaimTools = createFileClaimTools({
-    agentName: options.agentName,
-    getAuthorizedWriteTeam: async () => {
-      const teamName = requireCurrentSession(options);
-      await options.authorizeWriteMember(teamName, options.agentName);
-      return teamName;
-    },
-    getCurrentTeam: () => requireCurrentSession(options),
-    claims,
-  });
-
   const reportAndExitTool = {
     name: "report_and_exit",
     label: "Report and Exit",
-    description: "Submit a final report to the lead and finish this nested edit-agent run.",
+    description: "Submit the complete final report to the lead and finish this nested agent run.",
     parameters: Type.Object({
-      content: Type.String({ description: "Final report to send to the lead." }),
+      content: Type.String({ description: "Complete final report to send to the lead; do not replace required output with a summary." }),
       summary: Type.Optional(Type.String({ description: "Short report summary." })),
     }),
     async execute(_toolCallId: string, params: SubmittedAgentReport) {
@@ -103,6 +126,19 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
       return { content: [{ type: "text", text }], details: { session: teamName, accepted: result.accepted } };
     },
   };
+
+  if (options.role !== "write") return [...communicationTools, reportAndExitTool];
+
+  const fileClaimTools = createFileClaimTools({
+    agentName: options.agentName,
+    getAuthorizedWriteTeam: async () => {
+      const teamName = requireCurrentSession(options);
+      await options.authorizeWriteMember(teamName, options.agentName);
+      return teamName;
+    },
+    getCurrentTeam: () => requireCurrentSession(options),
+    claims,
+  });
 
   return [...communicationTools, ...fileClaimTools, reportAndExitTool];
 }

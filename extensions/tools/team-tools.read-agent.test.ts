@@ -10,6 +10,8 @@ import type { RunningReadAgent } from "../runtime/types.js";
 
 type RegisteredTool = {
   name: string;
+  description?: string;
+  parameters?: any;
   execute: (toolCallId: string, params: any, signal: AbortSignal, onUpdate: any, ctx: any) => Promise<any>;
 };
 
@@ -78,6 +80,9 @@ function makeRunningAgent(teamName: string, member: Member): RunningReadAgent {
 
 function registerTools() {
   const tools = new Map<string, RegisteredTool>();
+  const eventHandlers = new Map<string, Array<(payload: any) => void>>();
+  const sessionHandlers = new Map<string, Array<(event: any) => void | Promise<void>>>();
+  const eventUnsubscribes = new Map<string, ReturnType<typeof vi.fn>>();
   const runningReadAgents = new Map<string, RunningReadAgent>();
   const completions = new Map<string, () => void>();
   const readAgentKey = (teamName: string, agentName: string) => `${teamName}:${agentName}`;
@@ -97,7 +102,24 @@ function registerTools() {
     await teams.removeMember(teamName, member.name).catch(() => {});
   });
 
-  registerTeamTools({ registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool), events: { on: vi.fn(), emit: vi.fn() } }, {
+  const sessionCtx = makeCtx();
+  registerTeamTools({
+    registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
+    on: vi.fn((name: string, handler: (event: any) => void | Promise<void>) => {
+      sessionHandlers.set(name, [...(sessionHandlers.get(name) ?? []), handler]);
+    }),
+    events: {
+      on: vi.fn((name: string, handler: (payload: any) => void) => {
+        eventHandlers.set(name, [...(eventHandlers.get(name) ?? []), handler]);
+        const unsubscribe = vi.fn(() => {
+          eventHandlers.set(name, (eventHandlers.get(name) ?? []).filter((candidate) => candidate !== handler));
+        });
+        eventUnsubscribes.set(name, unsubscribe);
+        return unsubscribe;
+      }),
+      emit: vi.fn(),
+    },
+  }, {
     terminal: null,
     runningReadAgents,
     readAgentKey,
@@ -112,9 +134,16 @@ function registerTools() {
     isTeammate: false,
     agentName: "team-lead",
     getTeamName: () => "session-test-session",
+    getSessionCtx: () => sessionCtx,
   });
 
-  return { tools, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate };
+  const emit = (name: string, payload: any) => {
+    for (const handler of eventHandlers.get(name) ?? []) handler(payload);
+  };
+  const shutdown = async (reason = "reload") => {
+    for (const handler of sessionHandlers.get("session_shutdown") ?? []) await handler({ reason });
+  };
+  return { tools, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, shutdown, eventUnsubscribes };
 }
 
 describe("public agent spawn tools", () => {
@@ -137,6 +166,19 @@ describe("public agent spawn tools", () => {
     const { tools } = registerTools();
 
     expect(Array.from(tools.keys()).sort()).toEqual(["spawn_agent", "spawn_swarm_agents"]);
+  });
+
+  it("teaches level selection and delegation waiting through installed tool descriptions", () => {
+    const { tools } = registerTools();
+    const spawnDescription = tools.get("spawn_agent")?.description || "";
+    const swarmDescription = tools.get("spawn_swarm_agents")?.description || "";
+
+    expect(spawnDescription).toContain("default bounded research/collection to reading-fast");
+    expect(spawnDescription).toContain("reserve reading-hard for rare");
+    expect(spawnDescription).toContain("wait literally idle");
+    expect(spawnDescription).toContain("never sleep, poll");
+    expect(swarmDescription).toContain("delegation-locked");
+    expect(swarmDescription).toContain("automatic reports");
   });
 
   it("spawn_agent creates an implicit current-session group and starts an in-process read agent by level", async () => {
@@ -259,6 +301,57 @@ describe("public agent spawn tools", () => {
     completions.get("reader-1")!();
     await vi.waitFor(() => expect(runReadAgentInProcess).toHaveBeenCalledTimes(2));
     expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "reader-2", role: "read" });
+  });
+
+  it("reports running and queued child agents only for the matching Pi session", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const { tools, emit } = registerTools();
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+
+    await tools.get("spawn_agent")!.execute("spawn-1", {
+      name: "reader-1",
+      prompt: "inspect one",
+      cwd: root,
+      model_slot: "reading-fast",
+    }, abort, undefined, ctx);
+    await tools.get("spawn_agent")!.execute("spawn-2", {
+      name: "reader-2",
+      prompt: "inspect two",
+      cwd: root,
+      model_slot: "reading-fast",
+    }, abort, undefined, ctx);
+
+    const matching: any[] = [];
+    emit("pi-extended-teams:child-agent-lifecycle-probe", {
+      sessionId: "test-session",
+      respond: (snapshot: any) => matching.push(snapshot),
+    });
+    expect(matching).toEqual([{ sessionId: "test-session", running: 1, queued: 1 }]);
+
+    const mismatched: any[] = [];
+    emit("pi-extended-teams:child-agent-lifecycle-probe", {
+      sessionId: "other-session",
+      respond: (snapshot: any) => mismatched.push(snapshot),
+    });
+    expect(mismatched).toEqual([]);
+  });
+
+  it("unsubscribes the lifecycle probe listener idempotently during reload shutdown", async () => {
+    const { emit, shutdown, eventUnsubscribes } = registerTools();
+    const respond = vi.fn();
+    const payload = { sessionId: "test-session", respond };
+
+    emit("pi-extended-teams:child-agent-lifecycle-probe", payload);
+    expect(respond).toHaveBeenCalledTimes(1);
+
+    await shutdown();
+    await shutdown();
+    emit("pi-extended-teams:child-agent-lifecycle-probe", payload);
+
+    expect(eventUnsubscribes.get("pi-extended-teams:child-agent-lifecycle-probe")).toHaveBeenCalledTimes(1);
+    expect(respond).toHaveBeenCalledTimes(1);
   });
 
   it("spawn_swarm_agents requires every agent to have a configured level", async () => {

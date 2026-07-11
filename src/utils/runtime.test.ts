@@ -47,11 +47,15 @@ describe("runtime status", () => {
       pid: 123,
       startedAt: 1000,
       ready: false,
+      latestProgress: "Inspecting runtime state",
+      progressUpdatedAt: 1500,
     });
 
     await writeRuntimeStatus(teamName, agentName, {
       lastHeartbeatAt: 2000,
       ready: true,
+      currentAction: "working",
+      activeToolName: "read",
     });
 
     const runtime = await readRuntimeStatus(teamName, agentName);
@@ -59,6 +63,10 @@ describe("runtime status", () => {
     expect(runtime?.startedAt).toBe(1000);
     expect(runtime?.lastHeartbeatAt).toBe(2000);
     expect(runtime?.ready).toBe(true);
+    expect(runtime?.currentAction).toBe("working");
+    expect(runtime?.activeToolName).toBe("read");
+    expect(runtime?.latestProgress).toBe("Inspecting runtime state");
+    expect(runtime?.progressUpdatedAt).toBe(1500);
   });
 
   it("returns null when status does not exist", async () => {

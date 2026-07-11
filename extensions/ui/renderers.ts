@@ -7,10 +7,10 @@ const SAFE_SGR_SEQUENCE = /^\x1b\[[0-9;]*m$/;
 
 export function sanitizeTuiText(text: string): string {
   return text
+    .replace(ANSI_ESCAPE_SEQUENCE, (sequence) => SAFE_SGR_SEQUENCE.test(sequence) ? sequence : "")
     .replace(/\r\n?/g, "\n")
     .replace(/\t/g, "   ")
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001A\u001C-\u001F\u007F-\u009F]/g, "")
-    .replace(ANSI_ESCAPE_SEQUENCE, (sequence) => SAFE_SGR_SEQUENCE.test(sequence) ? sequence : "")
     .replace(/\x1b(?!\[[0-9;]*m)/g, "");
 }
 
@@ -18,10 +18,19 @@ export function sanitizeTuiLine(text: string): string {
   return sanitizeTuiText(text).replace(/\n/g, " ");
 }
 
+export function sanitizePlainTuiLine(text: string): string {
+  return sanitizeTuiLine(text).replace(/\x1b\[[0-9;]*m/g, "");
+}
+
 export function formatModelLabel(model?: string, thinking?: string): string {
   const shortModel = model ? model.split("/").pop() || model : "";
   const t = thinking && thinking !== "off" ? ` · ${thinking}` : "";
   return shortModel ? `${shortModel}${t}` : "";
+}
+
+export function formatAnimatedProgress(text: string, now: number): string {
+  const base = sanitizePlainTuiLine(text).replace(/\.+$/, "");
+  return `${base}${".".repeat((Math.floor(now / 1000) % 3) + 1)}`;
 }
 
 export function formatElapsed(ms: number): string {

@@ -5,11 +5,15 @@
   "contracts": [
     {
       "id": "ui.team-activity-card",
-      "description": "Live team activity renders as an above-editor pi-emote-style card with always-open bounded details. It must not use a below-editor/bottom-bar text strip. Completed reports arrive as messages/open reports and do not create report-ready or waiting-confirmation status rows."
+      "description": "Live team activity renders as a stable below-editor pi-emote-style card with always-open bounded details. It keeps the card design with its separator at the bottom (not an extra bar above the card), stays mounted while agents are active, and updates progress, elapsed time, and token counts in place without flicker. New progress phrases transition in one second by quickly fading/removing the old phrase and revealing the new phrase left-to-right, then resume the repeating one/two/three-dot animation. Completed reports arrive as messages/open reports and do not create report-ready or waiting-confirmation status rows."
     },
     {
       "id": "ui.active-reader-writer-info",
-      "description": "Active agent information remains available in the team activity card and /team for both readers and writers, including elapsed/running time, current status/action, model, thinking level, and token count when available. Duplicate active/history entries are preserved rather than hidden."
+      "description": "Active reader and writer information remains available in the team activity card and Down-key live navigation, including elapsed/running time, current status/action, model, thinking level, and token count when available."
+    },
+    {
+      "id": "ui.agent-follow-navigation",
+      "description": "From an empty main editor, Down opens the first active agent in a full-window read-only live-follow view. Down moves to the next agent; Up moves to the previous agent and returns to main only from the first agent; Escape always returns to main. The view exposes transcript, thinking, tool calls/results, progress, elapsed time, and tokens. Pressing x stops the selected subagent while keeping the live view open."
     },
     {
       "id": "helpers.requested-by-writer",
@@ -17,19 +21,19 @@
     },
     {
       "id": "writers.request-only-lead-spawns",
-      "description": "Writer agents never spawn agents directly; they only request helpers/teammates, and the lead/main runtime performs the spawn."
+      "description": "No spawned read or write agent receives agent-spawning tools or spawns agents directly. A spawned agent uses send_message to ask team-lead for help, and only the lead/main runtime decides and performs the spawn."
     },
     {
       "id": "messaging.push-on-completion",
-      "description": "Readers send completion messages to the lead; read helpers for writers send the full report to the writer and a short done notification to the lead. Messaging should push instead of requiring polling."
+      "description": "Readers send completion messages to the lead; read helpers for writers send the full report to the writer and a short done notification to the lead. Every newly unread agent message injects a deduplicated user-style follow-up into the lead prompt, even while the lead is busy, instead of relying on manual polling."
     },
     {
       "id": "completion.remove-from-active-keep-history",
-      "description": "When a reader or writer is done it is removed from active UI/status, but its final report remains visible from /team history."
+      "description": "When a reader or writer is done it is removed from active UI/status, while its final report remains visible as a pushed report message in the lead session."
     },
     {
-      "id": "team-command.no-team-safe",
-      "description": "/team works without team_create initialization by showing a no-team/no-current-team message instead of breaking."
+      "id": "runtime.reload-disposes-background-handles",
+      "description": "Session shutdown clears the lead watchdog, teammate inbox poll/wake/title/initial-trigger timers, teammate inbox file watcher, and all active in-process agent sessions/heartbeats so extension reload cannot leave stale agents, model work, filesystem work, prompt wakes, or file descriptors active."
     },
     {
       "id": "writers.tmux-closes-when-done",

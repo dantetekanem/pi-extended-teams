@@ -53,6 +53,40 @@ describe("team lifecycle performance", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("stops and restarts the lead watchdog without leaking intervals", async () => {
+    vi.useFakeTimers();
+    try {
+      const getTeamName = vi.fn(() => null);
+      const lifecycle = createLifecycleRuntime({
+        isTeammate: false,
+        terminal: null,
+        runningReadAgents: new Map(),
+        readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+        isCurrentReadAgentRun: () => true,
+        renderReadAgentStatus: vi.fn(),
+        drainWriteQueue: vi.fn(async () => {}),
+        getSessionCwd: () => root,
+        getTeamName,
+      });
+
+      lifecycle.startLeadWatchdog();
+      lifecycle.startLeadWatchdog();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(getTeamName).toHaveBeenCalledTimes(1);
+
+      lifecycle.stopLeadWatchdog();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(getTeamName).toHaveBeenCalledTimes(1);
+
+      lifecycle.startLeadWatchdog();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(getTeamName).toHaveBeenCalledTimes(2);
+      lifecycle.stopLeadWatchdog();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("batch-removes watchdog-reaped teammates and drains the write queue once", async () => {
     const config: TeamConfig = {
       name: "scale",

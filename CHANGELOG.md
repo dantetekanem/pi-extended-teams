@@ -4,15 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [2.0.0] - 2026-07-10
+## [2.0.0] - 2026-07-11
+
+### Added
+- Stable below-editor activity card with live agent-authored progress, elapsed time, token usage, and compact progress transitions.
+- Empty-editor Down navigation into a full-window live agent view; Up/Down navigates agents and `x` stops the selected agent.
+- Extension-owned lead guidance for cheapest-sufficient read levels, delegated-lane ownership, literal waiting without polling, and report-first synthesis.
+- Identity-deduplicated agent-message follow-ups that reach the lead even while another turn is active.
 
 ### Changed
 - Advanced the extension to the requested `2.0.0` major release while keeping public spawning model-slot-only.
 - Nested writer coordination is bound to the spawned member identity instead of shared process environment.
+- `reading-fast` is the normal collection/research level, `reading-default` handles normal synthesis, and `reading-hard` is reserved for rare irreducibly deep or risky reasoning.
+- Removed the redundant `/agents` and `/team` management commands; the activity card, Down-key live view, pushed reports, and `x` stop action now provide the workflow.
 
 ### Fixed
 - Restored `claim_file`, `release_file`, `list_file_claims`, and `report_and_exit` for in-process `writing-basic` and `writing-hard` agents.
 - Writer final reports and cleanup are now idempotent and owned by the outer runner, so a nested writer exits without shutting down the lead session; read agents remain limited to messaging coordination tools.
+- Session shutdown now stops active nested agents and clears their heartbeat, watchdog, inbox, wake, title, render, and file-watcher resources before reload.
+- Progress and follow-view labels are sanitized before terminal rendering.
 
 ## [1.3.17] - 2026-06-28
 

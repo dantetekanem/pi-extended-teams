@@ -37,6 +37,8 @@ interface ReapedTeammate {
 
 export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
   let leadWatchdogStarted = false;
+  let leadWatchdogTimer: NodeJS.Timeout | null = null;
+  let leadWatchdogGeneration = 0;
 
   async function killTeammate(teamName: string, member: Member) {
     if (member.name === "team-lead") return;
@@ -134,7 +136,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
     )));
   }
 
-  async function runWatchdogOnce(targetTeamName: string): Promise<void> {
+  async function runWatchdogOnce(targetTeamName: string, shouldContinue: () => boolean = () => true): Promise<void> {
     const settings = loadSettings({ projectDir: options.getSessionCwd() || process.cwd() });
     const staleMs = runtime.HEARTBEAT_STALE_MS + settings.watchdog.bufferSeconds * 1000;
     const now = Date.now();
@@ -145,6 +147,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
 
     try {
       for (const member of members) {
+        if (!shouldContinue()) return;
         const role = member.role ?? "write";
         const runtimeStatus = runtimeStatusByMember.get(member.name) ?? null;
         const runtimeStale = teammateRuntimeIsStale(runtimeStatus, staleMs, now);
@@ -168,22 +171,31 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       await flushReapedTeammates(targetTeamName, reaped);
     }
 
-    await runtime.cleanupStaleRuntimeFiles(targetTeamName);
+    if (shouldContinue()) await runtime.cleanupStaleRuntimeFiles(targetTeamName);
+  }
+
+  function stopLeadWatchdog(): void {
+    leadWatchdogGeneration += 1;
+    if (leadWatchdogTimer) clearInterval(leadWatchdogTimer);
+    leadWatchdogTimer = null;
+    leadWatchdogStarted = false;
   }
 
   function startLeadWatchdog() {
     if (leadWatchdogStarted || options.isTeammate || !options.getSessionCwd()) return;
     leadWatchdogStarted = true;
-    setInterval(async () => {
+    const generation = ++leadWatchdogGeneration;
+    leadWatchdogTimer = setInterval(async () => {
+      if (generation !== leadWatchdogGeneration) return;
       const teamName = options.getTeamName();
       if (!teamName) return;
       try {
-        await runWatchdogOnce(teamName);
+        await runWatchdogOnce(teamName, () => generation === leadWatchdogGeneration);
       } catch {
         // Keep watchdog quiet; health is visible via /team and inbox messages on actual reaps.
       }
     }, 30000);
   }
 
-  return { killTeammate, shutdownTeammate, runWatchdogOnce, startLeadWatchdog };
+  return { killTeammate, shutdownTeammate, runWatchdogOnce, startLeadWatchdog, stopLeadWatchdog };
 }

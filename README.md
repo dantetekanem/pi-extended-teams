@@ -30,7 +30,7 @@ Equivalent explicit shape:
 
 ```text
 spawn_swarm_agents({
-  defaults: { model_slot: "reading-default" },
+  defaults: { model_slot: "reading-fast" },
   agents: [
     { name: "git-check", prompt: "Inspect diffs and report risks." },
     { name: "test-gaps", prompt: "Find missing coverage and concrete test gaps." }
@@ -38,13 +38,7 @@ spawn_swarm_agents({
 })
 ```
 
-Watch active and completed agents:
-
-```text
-/agents
-```
-
-`/team` remains a compatibility alias for `/agents`.
+Watch active agents in the below-editor activity card. With the editor empty, press Down to open live navigation, Down/Up to move between agents/main, `x` to stop the selected agent, and Escape to return. Completed reports are pushed into the lead session automatically.
 
 Spawn an edit-allowed agent only when the work is isolated and safe to run in parallel:
 
@@ -61,8 +55,10 @@ spawn_agent({
 - **Implicit current-session workflow**: no public team setup step is required.
 - **Read agents as the default multiplier**: in-process, parallel, full read/test/search tool access, directed to report without editing.
 - **Optional edit agents**: in-process and followable from Pi; use them only for isolated, non-overlapping edits.
-- **Auto-delivered reports**: completed agents report back to the lead session for synthesis.
-- **`/agents` overlay**: inspect active agents, completed reports, transcripts, models, thinking levels, elapsed time, tokens, and claims.
+- **Live activity card**: active agent progress, level, elapsed time, and token usage stay visible below the editor.
+- **Auto-delivered reports**: new agent messages queue a lead follow-up even during an active turn, without manual polling.
+- **Down-key live navigation**: inspect active transcripts, models, thinking levels, elapsed time, and tokens; press `x` to stop the selected agent.
+- **Built-in orchestration guidance**: the extension teaches level selection, delegated-lane ownership, report-first synthesis, and literal waiting without polling.
 - **Advisory file claims**: edit agents coordinate file ownership with `claim_file`, `release_file`, and `list_file_claims`.
 - **Direct messaging**: agents and the lead can coordinate with `send_message` and `read_inbox`.
 - **Targeted health checks**: use `check_teammate` only when a specific agent appears stalled.
@@ -74,8 +70,15 @@ Lead/session tools:
 - `spawn_agent`
 - `spawn_swarm_agents`
 - `check_teammate`
+- `stop_teammate`
 - `send_message`
 - `read_inbox`
+
+Spawned-agent communication:
+
+- `send_message`
+- `read_inbox`
+- `report_progress`
 
 Edit-agent coordination tools:
 
@@ -111,13 +114,13 @@ Use these slots by intent:
 
 | Slot | Use when | Typical shape |
 | --- | --- | --- |
-| `reading-fast` | The task is read-only, bounded, and benefits from breadth more than deep refinement. | Many cheap agents splitting small directories, issue files, logs, routes, docs, or other collection-style datasets. |
-| `reading-default` | The task is normal read-only review or investigation. | Diff review, test-gap checks, docs validation, focused code archaeology. |
-| `reading-hard` | The task needs deep reasoning across ambiguous or risky context. | Architecture review, security analysis, root-cause work, migration risk, cross-system behavior. |
+| `reading-fast` | The normal first choice for bounded read-only work. | Research, collecting facts, inventory/lookup, docs/log/test-output inspection, narrow validation, and independent slices. This should naturally be the most-used reading slot. |
+| `reading-default` | The task needs normal synthesis or engineering judgment across bounded context. | Focused behavioral review, test-gap assessment, docs validation, and code archaeology. |
+| `reading-hard` | The task is exceptionally difficult to decompose and needs deep reasoning across ambiguous or risky context. | Subtle architecture/security boundaries, unclear cross-system root cause, migration/data correctness. This should be the rarest reading slot. |
 | `writing-basic` | The edit is narrow, isolated, and easy to verify. | Typos, docs updates, config tweaks, small one-file fixes. |
 | `writing-hard` | The edit is non-trivial and needs stronger reasoning. | Refactors, production bug fixes, multi-file implementation, difficult test repair. |
 
-For small independent collection work, several `reading-fast` agents are usually more powerful than one expensive hard-thinking agent reading everything. Split the dataset, ask each fast reader for evidence, and let the lead synthesize.
+For small independent collection work, several `reading-fast` agents are usually more powerful than one expensive hard-thinking agent reading everything. Split the dataset, ask each fast reader for evidence, and let the lead synthesize. Do not select `reading-hard` merely because work is called research, investigation, review, verification, or is important; escalate only when collected evidence exposes irreducible ambiguity.
 
 ## Common examples
 
@@ -125,11 +128,13 @@ For small independent collection work, several `reading-fast` agents are usually
 
 ```text
 spawn_agent({
-  name: "security-reviewer",
-  model_slot: "reading-hard",
-  prompt: "Review the auth module for injection and authorization risks. Report findings with file:line evidence."
+  name: "docs-facts",
+  model_slot: "reading-fast",
+  prompt: "Collect stale public tool references from README and docs. Report exact file:line evidence."
 })
 ```
+
+Use `reading-hard` only for a rare lane whose conclusion itself requires deep, ambiguous, high-risk reasoning—not for routine collection.
 
 ### Spawn a swarm
 

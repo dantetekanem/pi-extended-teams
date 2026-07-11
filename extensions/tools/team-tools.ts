@@ -13,6 +13,12 @@ import type { Member } from "../../src/utils/models";
 
 import type { RunningReadAgent } from "../runtime/types";
 
+export const CHILD_AGENT_LIFECYCLE_PROBE = "pi-extended-teams:child-agent-lifecycle-probe";
+
+interface ChildAgentLifecycleProbe {
+  sessionId: string;
+  respond(snapshot: { sessionId: string; running: number; queued: number }): void;
+}
 
 export interface TeamToolsOptions {
   terminal: any;
@@ -45,6 +51,8 @@ interface QueuedReadSpawn {
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
+  if (options.isTeammate) return;
+
   function emitOrchestrationResponse(requestId: string | undefined, type: string, payload: Record<string, any>): void {
     if (!requestId) return;
     pi.events?.emit?.("pi-extended-teams:orchestration-response", { requestId, type, ...payload });
@@ -163,6 +171,24 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   function readQueue(teamName: string): QueuedReadSpawn[] {
     return queuedReadSpawnsByTeam.get(teamName) ?? [];
   }
+
+  const lifecycleProbeUnsubscribe = pi.events?.on?.(CHILD_AGENT_LIFECYCLE_PROBE, (payload: ChildAgentLifecycleProbe) => {
+    const sessionId = getPiSessionId(options.getSessionCtx?.());
+    if (!sessionId || payload?.sessionId !== sessionId || typeof payload.respond !== "function") return;
+    const activeTeamName = options.getTeamName();
+    if (!activeTeamName) return;
+    payload.respond({
+      sessionId,
+      running: activeAgentCount(activeTeamName),
+      queued: readQueue(activeTeamName).length,
+    });
+  });
+  let lifecycleProbeCleanedUp = false;
+  pi.on?.("session_shutdown", () => {
+    if (lifecycleProbeCleanedUp) return;
+    lifecycleProbeCleanedUp = true;
+    if (typeof lifecycleProbeUnsubscribe === "function") lifecycleProbeUnsubscribe();
+  });
 
   function setReadQueue(teamName: string, queue: QueuedReadSpawn[]): void {
     if (queue.length > 0) queuedReadSpawnsByTeam.set(teamName, queue);
@@ -478,7 +504,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     }
   });
 
-  const levelDescription = "Required agent level from /agents-favorite-models. Use only these configured levels: reading-fast, reading-default, reading-hard, writing-basic, or writing-hard. The level selects read/write behavior, model, and thinking. Do not pass role, model, or thinking directly; see TIPS.md for examples.";
+  const levelDescription = "Required configured level. For read-only work, choose the cheapest sufficient level: reading-fast is the normal and most common choice for bounded research, collection, lookup, inventory, docs/log/test inspection, and independent slices; reading-default is for normal synthesis and focused engineering judgment; reading-hard must be rare and is only for irreducibly deep, ambiguous, high-risk architecture/security/root-cause/data reasoning. Never choose reading-hard merely because a task says investigate, research, review, verify, or is important. Writing levels permit edits. Do not pass role, model, or thinking directly; see TIPS.md.";
   const publicAgentBaseParams = {
     name: Type.Optional(Type.String({ description: "Stable display name. Defaults to a generated agent name." })),
     prompt: Type.String({ description: "The agent's assignment and report shape." }),
@@ -521,7 +547,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   pi.registerTool({
     name: "spawn_agent",
     label: "Spawn Agent",
-    description: "Spawn one agent in the current Pi session by configured level only. model_slot is required and is the only way to choose read/write behavior, model, and thinking. Do not pass role, model, or thinking directly; see TIPS.md for level guidance. Agents run in-process so Pi can follow, track, and control them.",
+    description: "Spawn one agent in the current Pi session by configured level only. For read agents, default bounded research/collection to reading-fast, use reading-default for normal synthesis, and reserve reading-hard for rare irreducibly deep or risky reasoning. After spawning, do not duplicate or take over its lane; work only on unrelated work, then wait literally idle for the automatic report—never sleep, poll, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
     parameters: Type.Object(publicAgentParams),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       return spawnPublicAgent(params, ctx);
@@ -531,7 +557,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   pi.registerTool({
     name: "spawn_swarm_agents",
     label: "Spawn Swarm Agents",
-    description: "Spawn a batch of agents in the current Pi session by configured levels only. Each agent must get a model_slot directly or from defaults; the level selects read/write behavior, model, and thinking. Do not pass role, model, or thinking directly; see TIPS.md for level guidance. Scheduling and tracking are handled internally.",
+    description: "Spawn a batch of agents in the current Pi session by configured levels only. Default bounded collection/research swarms to reading-fast; override only lanes needing normal synthesis, and use reading-hard only for a rare irreducibly deep or risky lane. Each spawned lane is delegation-locked: do not duplicate/take it over, and after unrelated work is done wait literally idle for automatic reports without sleep, polling, repeated inbox/status reads, or premature intervention. Synthesize only after actual reports; intervene only on blocker/error, actual failure, or explicit cancellation. Each agent gets model_slot directly or from defaults; do not pass role, model, or thinking directly.",
     parameters: Type.Object({
       defaults: Type.Optional(Type.Object({
         cwd: Type.Optional(Type.String()),

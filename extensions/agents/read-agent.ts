@@ -27,6 +27,7 @@ export interface RunReadAgentOptions {
   renderReadAgentStatus(): void;
   rememberCompletedAgentReport(teamName: string, report: CompletedAgentReport): void;
   emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean): void;
+  emitAgentProgress?(teamName: string, name: string, status: string, updatedAt: number): void;
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
   agentName?: string;
   quietTrigger?(content: string): void;
@@ -222,6 +223,8 @@ export async function runReadAgentInProcess(
   const key = options.readAgentKey(readTeamName, member.name);
   const role = member.role || "read";
   const roleLabel = role === "write" ? "edit-allowed" : "read-only";
+  let resolveFinished!: () => void;
+  const finished = new Promise<void>((resolve) => { resolveFinished = resolve; });
   const state: RunningReadAgent = {
     runId: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
     name: member.name,
@@ -235,11 +238,11 @@ export async function runReadAgentInProcess(
     model: member.model,
     thinking: member.thinking,
     modelSlot: member.modelSlot,
+    finished,
   };
   options.runningReadAgents.set(key, state);
   options.ensureReadAgentStatusTicker();
 
-  let heartbeatTimer: NodeJS.Timeout | null = null;
   let submittedFinalReport: SubmittedAgentReport | undefined;
 
   const deliverCompletion = async (report: string, completionSummary: string): Promise<void> => {
@@ -309,7 +312,7 @@ export async function runReadAgentInProcess(
       lastError: undefined,
     });
 
-    heartbeatTimer = setInterval(async () => {
+    state.heartbeatTimer = setInterval(async () => {
       try {
         await runtime.writeRuntimeStatus(readTeamName, member.name, {
           lastHeartbeatAt: Date.now(),
@@ -335,11 +338,12 @@ export async function runReadAgentInProcess(
           ? "Use read/bash/edit/write as needed for the assignment. Prefer precise edits. Stop and report if you need broader product or architecture approval."
           : "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
         "Use send_message for direct communication and read_inbox only when you were told a reply is waiting. Do not coordinate a peer-agent society; the lead controls orchestration.",
+        "Use report_progress with a concise status phrase when your meaningful milestone changes. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.",
         member.requestedBy
           ? `You are a read helper requested by '${member.requestedBy}'. When finished, send your concise report to the lead and stop.`
-          : "You cannot spawn or create other agents. If another agent is needed, report that need to the lead; the lead decides what to spawn.",
+          : "You cannot spawn or create other agents. If another agent is needed, use send_message to ask team-lead; only the lead decides and performs the spawn.",
         "NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.",
-        "When finished, send or produce your final report as instructed, then stop. Do not wait for the lead to kill you — report and exit cleanly.",
+        "When finished, use report_and_exit with the complete required deliverable in content and only a short label in summary, then stop. Never replace required output with a summary. Do not wait for the lead to kill you — report and exit cleanly.",
       ],
     });
     await loader.reload();
@@ -351,6 +355,15 @@ export async function runReadAgentInProcess(
       getTeamName: () => readTeamName,
       authorizeWriteMember: async (teamName, agentName) => {
         await requireWriteAgentTeam(teamName, true, agentName);
+      },
+      onProgress: (status, updatedAt) => {
+        options.emitAgentProgress?.(readTeamName, member.name, status, updatedAt);
+        state.latestProgress = status;
+        state.progressUpdatedAt = updatedAt;
+        state.lastActivityAt = updatedAt;
+        state.idleNudgeLevel = undefined;
+        pushReadAgentEvent(state, `progress: ${status}`);
+        options.renderReadAgentStatus();
       },
       onReportAndExit: async report => {
         if (submittedFinalReport) return { accepted: false };
@@ -484,7 +497,8 @@ export async function runReadAgentInProcess(
       }
     }
   } finally {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = undefined;
     if (state.session) await shutdownReadAgentSession(state.session);
     state.session?.dispose();
     if (options.isCurrentReadAgentRun(key, state)) {
@@ -494,5 +508,6 @@ export async function runReadAgentInProcess(
       try { await teams.removeMember(readTeamName, member.name); } catch {}
     }
     options.renderReadAgentStatus();
+    resolveFinished();
   }
 }

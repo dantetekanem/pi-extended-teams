@@ -27,7 +27,7 @@ Or spawn explicitly:
 
 ```text
 spawn_swarm_agents({
-  defaults: { model_slot: "reading-default" },
+  defaults: { model_slot: "reading-fast" },
   agents: [
     { name: "security", model_slot: "reading-hard", prompt: "Review the diff for security risks. Report file:line findings." },
     { name: "tests", prompt: "Find missing or weak test coverage. Report concrete gaps." }
@@ -35,13 +35,7 @@ spawn_swarm_agents({
 })
 ```
 
-Open the panel:
-
-```text
-/agents
-```
-
-`/team` still opens the same panel for compatibility.
+Use the below-editor activity card to watch active agents. With the editor empty, press Down for full-window live navigation, Down/Up to move through agents and back to main, `x` to stop the selected agent, and Escape to return. Final reports are pushed into the lead session automatically.
 
 ---
 
@@ -61,13 +55,13 @@ Slot guidance:
 
 | Slot | Best for | Avoid for |
 | --- | --- | --- |
-| `reading-fast` | Fast read-only collection over small independent datasets: many issue files, route files, logs, docs pages, simple conventions, or shallow yes/no checks. | Ambiguous design calls, security-sensitive conclusions, or tasks where one agent must hold the whole system in context. |
-| `reading-default` | Normal read-only work: focused diff review, test-gap analysis, README/reference checks, local convention discovery. | Expensive architecture/security/root-cause analysis. |
-| `reading-hard` | Deep read-only reasoning: architecture boundaries, security review, production-risk review, migration/data correctness, unclear root cause. | Simple inventory work that can be split across fast readers. |
+| `reading-fast` | Normal first choice for bounded read-only research: collection, inventory, lookup, docs/log/test-output inspection, evidence gathering, independent slices, and shallow yes/no checks. It should naturally be the most-used read slot. | Ambiguous design conclusions or tasks that truly require one agent to reason across the whole system. |
+| `reading-default` | Normal synthesis/judgment: focused behavioral review, test-gap assessment, README/reference validation, and bounded convention discovery. | Irreducibly deep architecture/security/root-cause analysis. |
+| `reading-hard` | Rare deep reasoning: subtle architecture/security boundaries, production-risk conclusions, migration/data correctness, or unclear cross-system root cause. | Routine research, collection, inventory, or verification that can use fast/default readers. |
 | `writing-basic` | Small isolated edits with obvious verification: docs, typos, one-file config, narrow test fixture fixes. | Broad refactors, multi-file logic, risky behavior changes. |
 | `writing-hard` | Non-trivial write work: multi-file implementation, refactors, production bug fixes, difficult test repairs. | Parallel writes to overlapping files; keep writer concurrency low. |
 
-For collection-style work, prefer breadth: five `reading-fast` agents each reading one slice often beats one `reading-hard` agent reading every file. Ask each fast reader for concise evidence, then synthesize in the lead session.
+For collection-style work, prefer breadth: several `reading-fast` agents each reading one slice often beat one `reading-hard` agent reading every file. Ask each fast reader for concise evidence, then synthesize in the lead session. Do not promote a lane merely because its prompt says research, investigate, review, verify, or because its result matters; promote only when evidence reveals ambiguity that the cheaper level cannot resolve.
 
 ---
 
@@ -239,9 +233,9 @@ If a `model_slot` fails, check `/agents-favorite-models` and confirm the slot ha
 
 If no `model_slot` is passed, pi-extended-teams rejects the spawn. Define levels with `/agents-favorite-models` first, then choose the level that matches the job.
 
-### Panel is empty
+### Activity card is absent
 
-Open `/agents`. If there is no active agent session yet, spawn an agent first or ask the lead to use agents for the current task.
+The activity card appears only while agents are active. Spawn an agent first or ask the lead to use agents for the current task, then press Down from an empty editor to navigate.
 
 ---
 

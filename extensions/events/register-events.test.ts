@@ -21,7 +21,10 @@ function installPathSpies() {
   });
 }
 
-function setupEvents(isIdle: () => boolean) {
+function setupEvents(
+  isIdle: () => boolean,
+  overrides: Partial<Parameters<typeof registerExtensionEvents>[1]> = {}
+) {
   const handlers = new Map<string, Function[]>();
   const quietTrigger = vi.fn();
   const terminal = { setTitle: vi.fn() };
@@ -41,6 +44,7 @@ function setupEvents(isIdle: () => boolean) {
     startLeadWatchdog: vi.fn(),
     buildRoster: vi.fn(async () => ({ teamName: "team", members: [] })),
     formatRosterForPrompt: vi.fn(() => "Roster: empty"),
+    ...overrides,
   });
   const ctx = {
     ui: { notify: vi.fn(), setTitle: vi.fn() },
@@ -112,6 +116,36 @@ describe("extension teammate inbox wake", () => {
     expect(output).not.toContain("ctrl+o");
   });
 
+  it("injects level selection and literal-wait rules into every lead prompt", async () => {
+    const handlers = new Map<string, Function[]>();
+    registerExtensionEvents({
+      registerMessageRenderer: vi.fn(),
+      on: vi.fn((name: string, handler: Function) => handlers.set(name, [...(handlers.get(name) || []), handler])),
+    }, {
+      isTeammate: false,
+      agentName: "team-lead",
+      getTeamName: () => "team",
+      setSessionCtx: vi.fn(),
+      terminal: {},
+      quietTrigger: vi.fn(),
+      startLeadInboxPolling: vi.fn(),
+      startLeadWatchdog: vi.fn(),
+      buildRoster: vi.fn(async () => ({ teamName: "team", members: [] })),
+      formatRosterForPrompt: vi.fn(() => "Roster: empty"),
+    });
+
+    const [handler] = handlers.get("before_agent_start") || [];
+    const result = await handler({ systemPrompt: "base" });
+
+    expect(result.systemPrompt).toContain("reading-fast is the normal first choice");
+    expect(result.systemPrompt).toContain("Reserve reading-hard as the rarest level");
+    expect(result.systemPrompt).toContain("A spawned agent owns its assigned lane");
+    expect(result.systemPrompt).toContain("wait literally idle");
+    expect(result.systemPrompt).toContain("Do not sleep, poll");
+    expect(result.systemPrompt).toContain("Wait for the actual report before synthesizing");
+    expect(result.systemPrompt).toContain("confirm it with a separate read-only agent using the cheapest sufficient read level");
+  });
+
   it("wakes teammates with implicit-session inbox instructions", async () => {
     const { handlers, quietTrigger, ctx } = setupEvents(() => true);
 
@@ -135,6 +169,8 @@ describe("extension teammate inbox wake", () => {
     expect(prompt).toContain("Start by calling read_inbox to get your initial instructions.");
     expect(prompt).toContain("use send_message to ask team-lead");
     expect(prompt).toContain("ask team-lead with send_message");
+    expect(prompt).toContain("Use report_progress with a concise status phrase when your meaningful milestone changes");
+    expect(prompt).toContain("without messaging or waking the lead");
     for (const staleText of [
       "request_read_helper",
       "request_teammate",
@@ -170,6 +206,33 @@ describe("extension teammate inbox wake", () => {
     expect(quietTrigger).toHaveBeenCalledWith("You have 1 new inbox message(s). Read them with read_inbox and act.");
   });
 
+  it("closes teammate inbox handles and prevents work after session shutdown", async () => {
+    const close = vi.fn();
+    let watchCallback: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
+    const watchInboxDirectory = vi.fn((_path: string, callback: any) => {
+      watchCallback = callback;
+      return { close } as unknown as fs.FSWatcher;
+    });
+    const runtimeWrite = vi.spyOn(runtime, "writeRuntimeStatus");
+    const { handlers, quietTrigger, terminal, ctx } = setupEvents(() => true, { watchInboxDirectory });
+
+    for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+    quietTrigger.mockClear();
+    runtimeWrite.mockClear();
+    terminal.setTitle.mockClear();
+    ctx.ui.setTitle.mockClear();
+
+    for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
+    expect(close).toHaveBeenCalledTimes(1);
+
+    watchCallback?.("change", "writer.json");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runtimeWrite).not.toHaveBeenCalled();
+    expect(quietTrigger).not.toHaveBeenCalled();
+    expect(terminal.setTitle).not.toHaveBeenCalled();
+    expect(ctx.ui.setTitle).not.toHaveBeenCalled();
+  });
+
   it("treats inbox lock-file writes as wake-worthy fs.watch events", () => {
     const inboxFile = path.join(root, "teams", "team", "inboxes", "writer.json");
 
@@ -185,21 +248,37 @@ describe("extension teammate inbox wake", () => {
     for (const handler of handlers.get("session_start") || []) {
       await handler({}, ctx);
     }
+    await runtime.writeRuntimeStatus("team", "writer", {
+      latestProgress: "Reviewing event lifecycle",
+      progressUpdatedAt: 1234,
+    });
     for (const handler of handlers.get("turn_start") || []) {
       await handler({}, ctx);
     }
-    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({ currentAction: "thinking" });
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+      currentAction: "thinking",
+      latestProgress: "Reviewing event lifecycle",
+      progressUpdatedAt: 1234,
+    });
 
     for (const handler of handlers.get("tool_execution_start") || []) {
       await handler({ toolName: "bash" }, ctx);
     }
-    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({ currentAction: "working", activeToolName: "bash" });
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+      currentAction: "working",
+      activeToolName: "bash",
+      latestProgress: "Reviewing event lifecycle",
+    });
 
     for (const handler of handlers.get("tool_execution_end") || []) {
       await handler({}, ctx);
     }
     const afterTool = await runtime.readRuntimeStatus("team", "writer");
-    expect(afterTool).toMatchObject({ currentAction: "thinking" });
+    expect(afterTool).toMatchObject({
+      currentAction: "thinking",
+      latestProgress: "Reviewing event lifecycle",
+      progressUpdatedAt: 1234,
+    });
     expect(afterTool).not.toHaveProperty("activeToolName");
   });
 

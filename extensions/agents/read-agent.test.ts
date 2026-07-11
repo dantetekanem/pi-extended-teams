@@ -151,7 +151,7 @@ describe("in-process read agent tool wiring", () => {
 
     expect(piMocks.createAgentSession).toHaveBeenCalledTimes(1);
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
-    const communicationToolNames = ["send_message", "read_inbox"];
+    const communicationToolNames = ["send_message", "report_progress", "read_inbox", "report_and_exit"];
     expect(sessionOptions.tools).toEqual([
       "read",
       "bash",
@@ -167,7 +167,12 @@ describe("in-process read agent tool wiring", () => {
     expect(piMocks.loaderOptions).toHaveLength(1);
     const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
     expect(promptText).toContain("Use send_message for direct communication and read_inbox only when you were told a reply is waiting");
-    expect(promptText).toContain("If another agent is needed, report that need to the lead");
+    expect(promptText).toContain("If another agent is needed, use send_message to ask team-lead");
+    expect(promptText).toContain("only the lead decides and performs the spawn");
+    expect(promptText).toContain("Use report_progress with a concise status phrase when your meaningful milestone changes");
+    expect(promptText).toContain("without messaging or waking the lead");
+    expect(promptText).toContain("use report_and_exit with the complete required deliverable");
+    expect(promptText).toContain("Never replace required output with a summary");
 
     expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
     expect(options.emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, "final report", true);
@@ -217,6 +222,7 @@ describe("in-process read agent tool wiring", () => {
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
     const communicationToolNames = [
       "send_message",
+      "report_progress",
       "read_inbox",
       "claim_file",
       "release_file",
@@ -428,7 +434,7 @@ describe("in-process read agent tool wiring", () => {
     });
   });
 
-  it("does not reset tool-working status for non-assistant message updates", async () => {
+  it("emits normalized progress without resetting tool-working status for non-assistant message updates", async () => {
     let subscriber: ((event: any) => void) | undefined;
     const session = makeSession();
     session.subscribe.mockImplementation((callback: (event: any) => void) => {
@@ -436,9 +442,27 @@ describe("in-process read agent tool wiring", () => {
     });
     const runningReadAgents = new Map<string, RunningReadAgent>();
     session.prompt.mockImplementation(async () => {
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const progressTool = sessionOptions.customTools.find((tool: any) => tool.name === "report_progress");
+      await progressTool.execute("progress", { status: "  Inspecting\n event   handling  " });
+      expect(runningReadAgents.get("team:reader")).toMatchObject({
+        status: "thinking",
+        latestProgress: "Inspecting event handling",
+        progressUpdatedAt: expect.any(Number),
+      });
+
       subscriber?.({ type: "tool_execution_start", toolName: "bash" });
       subscriber?.({ type: "message_update", message: { role: "toolResult", content: "not assistant text" } });
-      expect(runningReadAgents.get("team:reader")).toMatchObject({ status: "working", activeToolName: "bash" });
+      expect(runningReadAgents.get("team:reader")).toMatchObject({
+        status: "working",
+        activeToolName: "bash",
+        latestProgress: "Inspecting event handling",
+      });
+      subscriber?.({ type: "tool_execution_end", toolName: "bash" });
+      expect(runningReadAgents.get("team:reader")).toMatchObject({
+        status: "thinking",
+        latestProgress: "Inspecting event handling",
+      });
     });
     piMocks.createAgentSession.mockResolvedValue({ session });
     const options = {
@@ -451,6 +475,7 @@ describe("in-process read agent tool wiring", () => {
       renderReadAgentStatus: vi.fn(),
       rememberCompletedAgentReport: vi.fn(),
       emitAgentReport: vi.fn(),
+      emitAgentProgress: vi.fn(),
       releaseAllClaimsForAgent: vi.fn(async () => []),
     };
 
@@ -472,6 +497,8 @@ describe("in-process read agent tool wiring", () => {
         find: vi.fn(() => ({ provider: "provider", id: "model" })),
       },
     }, options);
+
+    expect(options.emitAgentProgress).toHaveBeenCalledWith("team", "reader", "Inspecting event handling", expect.any(Number));
   });
 
   it("emits prompt-build reports even when prompt-build is not the adopted lead team", async () => {

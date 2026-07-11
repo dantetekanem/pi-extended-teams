@@ -30,6 +30,8 @@ export interface AgentRuntimeStatus {
   currentAction?: "starting" | "thinking" | "working" | "finishing" | "done";
   activeToolName?: string;
   tokensUsed?: number;
+  latestProgress?: string;
+  progressUpdatedAt?: number;
   lastError?: RuntimeError;
 }
 

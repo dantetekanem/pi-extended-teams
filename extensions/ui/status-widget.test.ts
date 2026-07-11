@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { teamActivityStatusWidget, type TeamActivityStatusEntry, type TeamActivityStatusSnapshot } from "./status-widget.js";
 
 function makeSnapshot(overrides: Partial<TeamActivityStatusSnapshot> = {}): TeamActivityStatusSnapshot {
@@ -28,14 +28,63 @@ describe("agent activity status widget", () => {
       statusCounts: { thinking: 1 },
     });
 
-    const rendered = teamActivityStatusWidget(() => snapshot, () => false).render(120).join("\n");
+    const lines = teamActivityStatusWidget(() => snapshot, () => false).render(120);
+    const rendered = lines.join("\n");
 
+    expect(lines[0]).toContain("agent activity");
+    expect(lines.at(-1)).toContain("─");
     expect(rendered).toContain("1 active");
     expect(rendered).toContain("1 read");
+    expect(rendered).toContain("↓ navigate");
+    expect(rendered).not.toContain("/agents");
     expect(rendered).toContain("reader");
     expect(rendered).toContain("thinking");
     expect(rendered).not.toContain("collapse");
     expect(rendered).not.toContain("ctrl+o");
+  });
+
+  it("fades the old progress and reveals the new phrase within one second", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      let snapshot = makeSnapshot({
+        activeCount: 1,
+        readCount: 1,
+        entries: [{
+          name: "reader",
+          role: "read",
+          displayText: "(reader) model/high · reading-fast · 1s · 10 tok · Collecting files.",
+        }],
+      });
+      const requestRender = vi.fn();
+      const widget = teamActivityStatusWidget(() => snapshot, () => false, requestRender);
+      expect(widget.render(120).join("\n")).toContain("Collecting files.");
+
+      snapshot = makeSnapshot({
+        activeCount: 1,
+        readCount: 1,
+        entries: [{
+          name: "reader",
+          role: "read",
+          displayText: "(reader) model/high · reading-fast · 2s · 12 tok · Reviewing results.",
+        }],
+      });
+      const fading = widget.render(120).join("\n");
+      expect(fading).toContain("Collecting files");
+      expect(fading).not.toContain("Reviewing results");
+
+      vi.advanceTimersByTime(650);
+      const revealing = widget.render(120).join("\n");
+      expect(revealing).toContain("Reviewing");
+      expect(revealing).not.toContain("Reviewing results.");
+
+      vi.advanceTimersByTime(350);
+      expect(widget.render(120).join("\n")).toMatch(/Reviewing results\.{1,3}/);
+      expect(requestRender).toHaveBeenCalled();
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps expanded rendering bounded while surfacing the aggregate summary", () => {

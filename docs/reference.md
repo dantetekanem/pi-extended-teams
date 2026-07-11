@@ -211,15 +211,9 @@ report_and_exit({
 
 ---
 
-## UI commands
+## UI
 
-### `/agents`
-
-Open the agent panel for the current Pi session. It shows active agents, completed reports, transcripts, model/thinking metadata, elapsed time, token usage, and file claims.
-
-### `/team`
-
-Compatibility alias for `/agents`.
+Active agents appear in the below-editor activity card. From an empty editor, press Down to open the live follow view, Down/Up to navigate agents/main, `x` to stop the selected agent, and Escape to return. Completed reports are pushed into the lead session automatically.
 
 ### `/agents-favorite-models`
 
@@ -233,7 +227,7 @@ Configure the five favorite model slots used by `model_slot`:
 
 By default, all slots start empty. Run the command without arguments to open a single-screen picker for all five slots; the model column is populated from the scoped models available to the current Pi session. Pick a model and thinking level, then press Enter to save. Updates are saved to `~/.pi/agent/pi-extended-teams/settings.json`.
 
-Use the slots to communicate intent when spawning agents. For example, use `reading-fast` for many small read-only collection agents, `reading-hard` for one deep architecture/security reviewer, `writing-basic` for a narrow docs edit, and `writing-hard` for a difficult implementation agent.
+Use the slots to communicate intent while choosing the cheapest sufficient read level. `reading-fast` is the normal first choice and should naturally be the most-used read slot: bounded research, collection, inventory, lookup, evidence gathering, and docs/log/test-output inspection. Use `reading-default` for normal synthesis and bounded engineering judgment. Reserve `reading-hard` as the rarest read slot for irreducibly deep, ambiguous, high-risk architecture/security/root-cause/data reasoning; never select it merely because a task says investigate, research, review, or verify. Use `writing-basic` for a narrow docs/edit task and `writing-hard` for difficult implementation.
 
 ---
 

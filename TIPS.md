@@ -12,23 +12,33 @@ Do not pass raw model names or thinking levels when spawning agents. The selecte
 
 | Level | Agent kind | Use for |
 | --- | --- | --- |
-| `reading-fast` | read-only | Small, splitable collection work where breadth matters more than deep reasoning. |
-| `reading-default` | read-only | Normal investigation, focused review, test-gap checks, and docs/code archaeology. |
-| `reading-hard` | read-only | Deep reasoning, architecture review, security review, root-cause analysis, migration/data risk. |
+| `reading-fast` | read-only | The normal first choice: bounded research, collection, inventory, lookup, evidence gathering, docs/log/test-output inspection, and independent slices. |
+| `reading-default` | read-only | Normal synthesis and judgment across a bounded context: focused behavioral review, test-gap assessment, and code archaeology. |
+| `reading-hard` | read-only | Exceptional, irreducibly deep reasoning: ambiguous architecture/security boundaries, unclear cross-system root cause, or migration/data correctness risk. |
 | `writing-basic` | edit-allowed | Small isolated edits with clear verification: docs, typos, one-file config, narrow fixtures. |
 | `writing-hard` | edit-allowed | Non-trivial implementation, refactors, production bug fixes, difficult test repairs. |
 
 Concrete model names and thinking levels are configured outside prompts with `/agents-favorite-models`. If no levels are configured, define them there before spawning agents.
 
+## Reading-level selection hierarchy
+
+Choose the cheapest level that can produce trustworthy evidence:
+
+1. Start with `reading-fast` for bounded read-only work. Research, collecting facts, scanning files, inventorying patterns, reading docs/logs/test output, and checking narrow claims belong here. This should naturally be the most frequently used reading level.
+2. Use `reading-default` when the lane must synthesize several facts, review behavior, or exercise normal engineering judgment beyond straightforward collection.
+3. Use `reading-hard` only when the problem is genuinely difficult to decompose and needs deep reasoning across ambiguous or high-risk context. It should be the rarest reading level.
+
+Do not choose `reading-hard` merely because the prompt says investigate, research, review, validate, verify, or because the result matters. Importance sets the verification standard; it does not automatically require the most expensive reasoning level. Prefer several bounded `reading-fast` lanes plus lead synthesis over one hard agent reading everything. Escalate a specific lane only after the evidence reveals ambiguity that fast/default reasoning cannot resolve.
+
 ## Correct examples
 
-One deep read-only reviewer:
+One bounded read-only collector:
 
 ```ts
 spawn_agent({
-  name: "security-reviewer",
-  model_slot: "reading-hard",
-  prompt: "Review the auth changes for authorization bugs. Report file:line evidence. Do not edit."
+  name: "docs-facts",
+  model_slot: "reading-fast",
+  prompt: "Collect stale public tool references from README and docs. Report exact file:line evidence. Do not edit."
 })
 ```
 
@@ -45,7 +55,7 @@ spawn_swarm_agents({
 })
 ```
 
-A swarm with one harder lane:
+A mixed swarm with one rare hard lane:
 
 ```ts
 spawn_swarm_agents({
@@ -127,9 +137,9 @@ spawn_agent({
 
 ## Selection rules
 
-- If the task is read-only and simple, use `reading-fast`.
-- If the task is read-only and normal, use `reading-default`.
-- If the task is read-only and risky/ambiguous/deep, use `reading-hard`.
+- Default bounded research, collection, lookup, inventory, docs/log inspection, and narrow validation to `reading-fast`.
+- Use `reading-default` for normal synthesis, focused behavioral review, and bounded engineering judgment.
+- Reserve `reading-hard` for rare, irreducibly deep, risky, or ambiguous reasoning that cannot be split into fast/default lanes.
 - If the task edits files and is narrow/obvious, use `writing-basic`.
 - If the task edits files and is broad/risky/non-trivial, use `writing-hard`.
 - If several independent slices exist, prefer several `reading-fast` agents over one `reading-hard` agent.

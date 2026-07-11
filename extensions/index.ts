@@ -4,20 +4,20 @@ import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { findLeadTeamForSession, getPiSessionId, registerLeadSession, resolveSkillFile } from "./internal/session-files.js";
 import { buildReadAgentIdleNudgeMessage, describeReadAgentStatus, shouldNudgeReadAgentIdle, type ReadAgentStatusDescription } from "./ui/read-agent-status.js";
 import { teamActivityStatusWidget, type TeamActivityStatusEntry, type TeamActivityStatusSnapshot } from "./ui/status-widget.js";
-import { runReadAgentInProcess } from "./agents/read-agent.js";
+import { runReadAgentInProcess, shutdownReadAgentSession } from "./agents/read-agent.js";
 import { createWriteAgentRuntime } from "./agents/write-agent.js";
 import { registerExtensionEvents } from "./events/register-events.js";
 import { createLifecycleRuntime } from "./team/lifecycle.js";
 import { buildRoster as buildTeamRoster, formatRosterForPrompt, releaseAllClaimsForAgent, requireTeamContext as resolveTeamContext, requireWriteAgentTeam as resolveWriteAgentTeam } from "./team/roster.js";
 import { createWriterScreenState, registerWriterScreenShortcut, removeWriterScreenTab, upsertWriterScreenTab, type ActiveWriterTab } from "./team/writer-screens.js";
-import { registerTeamCommand } from "./ui/team-panel.js";
 import { registerFavoriteModelsCommand } from "./ui/favorite-models-command.js";
+import { installAgentNavigation } from "./ui/agent-navigation.js";
 import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordination-tools.js";
+import { createReportProgressTool } from "./tools/agent-communication-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools } from "./tools/team-tools.js";
-import { getCurrentQualifiedModel } from "./internal/model-selection.js";
 import { loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
-import { formatElapsed, formatModelLabel, formatTokenCount } from "./ui/renderers.js";
+import { formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
 import * as messaging from "../src/utils/messaging";
@@ -43,12 +43,15 @@ export default function (pi: ExtensionAPI) {
 
   // Track whether lead inbox/helper polling has been started (to avoid duplicates)
   let leadPollingStarted = false;
+  let leadInboxPollTimer: NodeJS.Timeout | null = null;
   let readHelperQueueWatchedTeam: string | null = null;
   let readHelperQueueWatcher: fs.FSWatcher | null = null;
   let readHelperQueueFallbackStarted = false;
+  let readHelperQueueFallbackTimer: NodeJS.Timeout | null = null;
   let readHelperQueueDraining = false;
   let readHelperQueueDrainPending = false;
   let sessionCtx: any = null;
+  let extensionShuttingDown = false;
   const runningReadAgents = new Map<string, RunningReadAgent>();
   const completedAgentReports = new Map<string, CompletedAgentReport[]>();
   const TEAM_ACTIVITY_RENDER_DEBOUNCE_MS = 75;
@@ -64,15 +67,16 @@ export default function (pi: ExtensionAPI) {
   let activePromptBuildTeamName: string | null = null;
   let leadInboxWidgetCleared = false;
   let leadInboxUnreadCount = 0;
-  // Highest unread count we've already nudged the lead about, so we wake once per
-  // new batch of reports (not every poll) and re-wake when more arrive.
-  let leadWakeNotifiedCount = 0;
+  // Message identities already injected into the lead prompt. Tracking identity
+  // instead of unread count prevents a read message being replaced by a new one
+  // at the same count from silently suppressing the new wake.
+  const leadWakeNotifiedMessageKeys = new Set<string>();
   const { startWriteAgent, drainWriteQueue } = createWriteAgentRuntime({
     terminal,
     onWriterActive: (tab) => upsertWriterScreenTab(writerScreenState, tab),
     onWriterInactive: (targetTeamName, member) => removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId }),
   });
-  const { shutdownTeammate, startLeadWatchdog } = createLifecycleRuntime({
+  const { shutdownTeammate, startLeadWatchdog, stopLeadWatchdog } = createLifecycleRuntime({
     isTeammate,
     terminal,
     runningReadAgents,
@@ -120,30 +124,26 @@ export default function (pi: ExtensionAPI) {
     return runtimeHeartbeatIsRecent(status, now) ? "" : "heartbeat stale";
   }
 
+  function formatAgentProgressStatus(
+    name: string,
+    model: string | undefined,
+    thinking: string | undefined,
+    modelSlot: string | undefined,
+    elapsed: string,
+    tokens: string,
+    latestProgress: string | undefined,
+    now: number
+  ): string {
+    const shortModel = model ? model.split("/").pop() || model : "";
+    const modelAndThinking = [shortModel, thinking].filter(Boolean).join("/");
+    const identity = modelAndThinking ? `(${name}) ${modelAndThinking}` : `(${name})`;
+    const progress = latestProgress ? formatAnimatedProgress(latestProgress, now) : undefined;
+    return [identity, modelSlot, elapsed, `${tokens} tok`, progress].filter(Boolean).join(" · ");
+  }
+
   function currentSessionAgentGroupName(ctx?: any): string | undefined {
     const sessionId = getPiSessionId(ctx ?? sessionCtx) || "local-session";
     return teamPaths.sanitizeName(`session-${sessionId}`);
-  }
-
-  function ensureTeamPanelName(ctx?: any): string | undefined {
-    if (teamName && teams.teamExists(teamName)) return teamName;
-
-    const sessionId = getPiSessionId(ctx ?? sessionCtx);
-    const foundTeam = findLeadTeamForSession(sessionId);
-    if (foundTeam) {
-      adoptTeamAsLead(foundTeam, ctx);
-      return foundTeam;
-    }
-
-    if (activePromptBuildTeamName && teams.teamExists(activePromptBuildTeamName)) return activePromptBuildTeamName;
-
-    const sessionName = currentSessionAgentGroupName(ctx);
-    if (!sessionName) return undefined;
-    if (!teams.teamExists(sessionName)) {
-      teams.createTeam(sessionName, sessionId || "local-session", "lead-agent", "Pi session agents", getCurrentQualifiedModel(ctx ?? sessionCtx));
-    }
-    adoptTeamAsLead(sessionName, ctx);
-    return sessionName;
   }
 
   function isCurrentReadAgentRun(key: string, state: RunningReadAgent): boolean {
@@ -202,24 +202,33 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function emitAgentProgress(progressTeamName: string, name: string, status: string, updatedAt: number): void {
+    pi.events?.emit?.("pi-extended-teams:agent-progress", { teamName: progressTeamName, name, status, updatedAt });
+  }
+
   function wakeLeadForInboxReports(unread: any[]): void {
     if (!teamName) return;
-    const count = unread.length;
-
-    // Track reads/decreases so a fresh batch of reports re-triggers a wake.
-    if (count <= leadWakeNotifiedCount) {
-      leadWakeNotifiedCount = count;
-      return;
+    const keyedUnread = unread.map((message) => ({
+      message,
+      key: String(message?.id || `${message?.from || "unknown"}:${message?.timestamp || ""}:${message?.text || ""}`),
+    }));
+    const currentKeys = new Set(keyedUnread.map(({ key }) => key));
+    for (const key of leadWakeNotifiedMessageKeys) {
+      if (!currentKeys.has(key)) leadWakeNotifiedMessageKeys.delete(key);
     }
-    // Reports grew but the lead is busy: leave the notified count untouched so the
-    // next poll (when idle) or completion retries the wake instead of dropping it.
-    if (!sessionCtx?.isIdle?.()) return;
+    const fresh = keyedUnread.filter(({ key }) => {
+      if (leadWakeNotifiedMessageKeys.has(key)) return false;
+      leadWakeNotifiedMessageKeys.add(key);
+      return true;
+    });
+    if (fresh.length === 0) return;
 
-    leadWakeNotifiedCount = count;
-    const label = count === 1 ? "1 team report" : `${count} team reports`;
-    const it = count === 1 ? "it" : "them";
+    // Always enqueue a real lead prompt, including while the current turn is busy.
+    // `quietTrigger` uses a follow-up user turn so Pi delivers it after the current
+    // turn instead of relying on another poll or the user typing manually.
+    const label = fresh.length === 1 ? "1 new agent message" : `${fresh.length} new agent messages`;
     quietTrigger(
-      `${label} ready in your inbox for ${teamName}. Read ${it} now with read_inbox, summarize the findings for the user, act on any blockers, and shut down finished teammates. If you are mid-task you may finish that first. Do not sleep or poll.`
+      `Check your agent messages now: ${label} is ready in the ${teamName} inbox. Call read_inbox, summarize the findings for the user, act on blockers, and shut down finished teammates. This instruction is an automatic user-style follow-up; do not sleep or poll.`
     );
   }
 
@@ -268,7 +277,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function queueTeamActivityStatusRender(delayMs = TEAM_ACTIVITY_RENDER_DEBOUNCE_MS): void {
-    if (teamActivityRenderTimer || teamActivityRenderInFlight) return;
+    if (extensionShuttingDown || teamActivityRenderTimer || teamActivityRenderInFlight) return;
     teamActivityRenderTimer = setTimeout(() => {
       teamActivityRenderTimer = null;
       void flushTeamActivityStatusRender();
@@ -276,11 +285,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   function markTeamActivityStatusDirty(delayMs = TEAM_ACTIVITY_RENDER_DEBOUNCE_MS): void {
+    if (extensionShuttingDown) return;
     teamActivityRenderDirty = true;
     queueTeamActivityStatusRender(delayMs);
   }
 
   async function renderTeamActivityStatus(): Promise<void> {
+    if (extensionShuttingDown) return;
     teamActivityRenderDirty = true;
     if (teamActivityRenderTimer) {
       clearTimeout(teamActivityRenderTimer);
@@ -329,9 +340,13 @@ export default function (pi: ExtensionAPI) {
       "01-pi-extended-teams-readers",
       (tui: any) => {
         teamActivityWidgetTui = tui;
-        return teamActivityStatusWidget(() => teamActivityStatusSnapshot, isTeamActivityExpanded);
+        return teamActivityStatusWidget(
+          () => teamActivityStatusSnapshot,
+          isTeamActivityExpanded,
+          () => tui.requestRender?.()
+        );
       },
-      { placement: "aboveEditor" }
+      { placement: "belowEditor" }
     );
   }
 
@@ -416,6 +431,7 @@ export default function (pi: ExtensionAPI) {
 
     const activeCount = readAgents.length + writeAgents.length + runtimeOnlyReadMembers.length + runtimeOnlyWriteMembers.length + activeWriteMembers.length;
     const entries: TeamActivityStatusEntry[] = [];
+    const footerStatuses: string[] = [];
     const statusCounts: Record<string, number> = {};
     const idleNudgeMessages: string[] = [];
     const countStatus = (status: string | undefined) => {
@@ -440,9 +456,11 @@ export default function (pi: ExtensionAPI) {
       if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
       const slotLabel = agent.modelSlot ? `slot:${agent.modelSlot}` : "";
-      const detail = [modelLabel, slotLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
+      const tokenCount = formatTokenCount(agent.tokensUsed);
+      const detail = [modelLabel, slotLabel, elapsed, `${tokenCount} tok`, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "write", status: status.label, detail });
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, tokenCount, agent.latestProgress, now));
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyWriteMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
@@ -457,6 +475,7 @@ export default function (pi: ExtensionAPI) {
       const status = runtimeOnlyStatusLabel(runtimeStatus, now);
       countStatus(status);
       entries.push({ name: member.name, role: "write", status, detail });
+      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, member.modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus.latestProgress, now));
     }
 
     for (const member of activeWriteMembers.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -478,6 +497,7 @@ export default function (pi: ExtensionAPI) {
       const detail = [screen, modelLabel, elapsed, tokens, action].filter(Boolean).join(" · ");
       countStatus("bg");
       entries.push({ name: member.name, role: "write", status: "bg", detail });
+      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, member.modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus?.latestProgress, now));
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyReadMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
@@ -491,6 +511,7 @@ export default function (pi: ExtensionAPI) {
       const status = runtimeOnlyStatusLabel(runtimeStatus, now);
       countStatus(status);
       entries.push({ name: member.name, role: "read", status, detail });
+      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, member.modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus.latestProgress, now));
     }
 
     for (const agent of readAgents) {
@@ -510,13 +531,18 @@ export default function (pi: ExtensionAPI) {
       if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
       const slotLabel = agent.modelSlot ? `slot:${agent.modelSlot}` : "";
-      const detail = [modelLabel, slotLabel, elapsed, `${formatTokenCount(agent.tokensUsed)} tok`, status.detail].filter(Boolean).join(" · ");
+      const tokenCount = formatTokenCount(agent.tokensUsed);
+      const detail = [modelLabel, slotLabel, elapsed, `${tokenCount} tok`, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "read", status: status.label, detail });
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, tokenCount, agent.latestProgress, now));
     }
 
     wakeLeadForIdleReadAgents(idleNudgeMessages);
 
+    for (const [index, entry] of entries.entries()) entry.displayText = footerStatuses[index];
+
+    sessionCtx.ui.setStatus?.("01-pi-extended-teams-read", undefined);
     sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
     updateTeamActivityWidget({
       activeCount,
@@ -638,7 +664,7 @@ export default function (pi: ExtensionAPI) {
     // no model work and only reads one small JSON queue file.
     if (!readHelperQueueFallbackStarted) {
       readHelperQueueFallbackStarted = true;
-      setInterval(() => { void drainReadHelperQueueOnce(); }, 5000);
+      readHelperQueueFallbackTimer = setInterval(() => { void drainReadHelperQueueOnce(); }, 5000);
     }
   }
 
@@ -653,18 +679,14 @@ export default function (pi: ExtensionAPI) {
     if (leadPollingStarted) return;
     leadPollingStarted = true;
 
-    setInterval(async () => {
+    leadInboxPollTimer = setInterval(async () => {
       if (!teamName) return;
-      if (sessionCtx.isIdle()) {
-        try {
-          const unread = await messaging.readInbox(teamName, agentName, true, false);
-          await renderLeadInboxStatus();
-          // Retry any wake that was deferred while the lead was busy. Internal
-          // gating ensures a batch of reports nudges at most once.
-          wakeLeadForInboxReports(unread);
-        } catch {
-          // Ignore errors for lead polling
-        }
+      try {
+        const unread = await messaging.readInbox(teamName, agentName, true, false);
+        await renderLeadInboxStatus();
+        wakeLeadForInboxReports(unread);
+      } catch {
+        // Ignore errors for lead polling
       }
     }, 30000);
   }
@@ -739,11 +761,79 @@ export default function (pi: ExtensionAPI) {
   });
 
   function setSessionCtx(ctx: any): void {
+    extensionShuttingDown = false;
     sessionCtx = ctx;
     if (!isTeammate && !teamName) {
       const foundTeam = findLeadTeamForSession(getPiSessionId(ctx));
       if (foundTeam) adoptTeamAsLead(foundTeam, ctx);
     }
+  }
+
+  async function waitForAgentFinish(state: RunningReadAgent, timeoutMs = 3000): Promise<void> {
+    if (!state.finished) return;
+    let timeout: NodeJS.Timeout | null = null;
+    try {
+      await Promise.race([
+        state.finished,
+        new Promise<void>((resolve) => { timeout = setTimeout(resolve, timeoutMs); }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  async function stopRunningAgentsForShutdown(): Promise<void> {
+    const states = Array.from(runningReadAgents.entries());
+    for (const [, state] of states) {
+      state.stopRequested = true;
+      if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+      state.heartbeatTimer = undefined;
+    }
+
+    await Promise.allSettled(states.map(async ([key, state]) => {
+      await shutdownReadAgentSession(state.session);
+      await waitForAgentFinish(state);
+      if (runningReadAgents.get(key) !== state) return;
+
+      state.session?.dispose?.();
+      runningReadAgents.delete(key);
+      await releaseAllClaimsForAgent(state.teamName, state.name).catch(() => []);
+      await runtime.deleteRuntimeStatus(state.teamName, state.name).catch(() => false);
+      await teams.removeMember(state.teamName, state.name).catch(() => {});
+    }));
+  }
+
+  async function cleanupExtensionRuntime(ctx: any): Promise<void> {
+    extensionShuttingDown = true;
+    sessionCtx = null;
+    stopLeadWatchdog();
+    if (readAgentStatusTimer) clearInterval(readAgentStatusTimer);
+    if (teamActivityRenderTimer) clearTimeout(teamActivityRenderTimer);
+    if (leadInboxPollTimer) clearInterval(leadInboxPollTimer);
+    if (readHelperQueueFallbackTimer) clearInterval(readHelperQueueFallbackTimer);
+    readHelperQueueWatcher?.close();
+
+    readAgentStatusTimer = null;
+    teamActivityRenderTimer = null;
+    leadInboxPollTimer = null;
+    readHelperQueueFallbackTimer = null;
+    readHelperQueueWatcher = null;
+    leadPollingStarted = false;
+    leadWakeNotifiedMessageKeys.clear();
+    readHelperQueueFallbackStarted = false;
+    readHelperQueueWatchedTeam = null;
+    teamActivityRenderDirty = false;
+    settleTeamActivityRenderWaiters();
+
+    await stopRunningAgentsForShutdown();
+
+    teamActivityStatusSnapshot = null;
+    teamActivityStatusSnapshotSignature = null;
+    teamActivityWidgetMounted = false;
+    teamActivityWidgetTui = null;
+    ctx?.ui?.setWidget?.("01-pi-extended-teams-readers", undefined);
+    ctx?.ui?.setWidget?.("01-pi-extended-teams-status", undefined);
+    ctx?.ui?.setStatus?.("01-pi-extended-teams-read", undefined);
   }
 
   registerExtensionEvents(pi, {
@@ -759,15 +849,28 @@ export default function (pi: ExtensionAPI) {
     formatRosterForPrompt,
   });
 
-  registerTeamCommand(pi, {
-    getTeamName: ensureTeamPanelName,
-    getLeadInboxUnreadCount: () => leadInboxUnreadCount,
-    runningReadAgents,
-    completedAgentReports,
-    readAgentKey,
-    terminal,
-    shutdownTeammate,
+  pi.on("session_shutdown", async (_event: any, ctx: any) => {
+    await cleanupExtensionRuntime(ctx);
   });
+
+  if (!isTeammate) {
+    pi.on("session_start", async (_event: any, ctx: any) => {
+      installAgentNavigation(ctx, {
+        getAgents: () => Array.from(runningReadAgents.values())
+          .filter(agent => !teamName || agent.teamName === teamName),
+        stopAgent: async (name: string) => {
+          const targetTeamName = teamName;
+          if (!targetTeamName) return;
+          const config = await teams.readConfig(targetTeamName);
+          const member = config.members.find(item => item.name === name && item.name !== "team-lead");
+          if (!member) return;
+          await shutdownTeammate(targetTeamName, member);
+          ctx.ui?.notify?.(`Stopped agent ${name}.`, "info");
+        },
+      });
+    });
+  }
+
   registerFavoriteModelsCommand(pi);
 
   registerWriterScreenShortcut(pi, {
@@ -787,6 +890,7 @@ export default function (pi: ExtensionAPI) {
       renderReadAgentStatus,
       rememberCompletedAgentReport,
       emitAgentReport,
+      emitAgentProgress,
       releaseAllClaimsForAgent,
       agentName,
       quietTrigger,
@@ -813,6 +917,14 @@ export default function (pi: ExtensionAPI) {
     setSessionCtx,
   });
 
+  if (isTeammate) {
+    pi.registerTool(createReportProgressTool({
+      isTeammate,
+      agentName,
+      getTeamName: () => teamName,
+    }));
+  }
+
   registerCoordinationTools(pi, {
     agentName,
     isTeammate,
@@ -825,7 +937,7 @@ export default function (pi: ExtensionAPI) {
     resolveSkillFile,
     adoptTeamAsLead,
     renderLeadInboxStatus,
-    resetLeadWakeNotifiedCount: () => { leadWakeNotifiedCount = 0; },
+    resetLeadWakeNotifiedCount: () => { leadWakeNotifiedMessageKeys.clear(); },
   });
 
   registerTaskRuntimeTools(pi, {

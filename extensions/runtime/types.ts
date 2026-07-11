@@ -16,7 +16,11 @@ export interface RunningReadAgent {
   thinking?: string;
   modelSlot?: string;
   latestAssistantSnippet?: string;
+  latestProgress?: string;
+  progressUpdatedAt?: number;
   session?: AgentSession;
+  heartbeatTimer?: NodeJS.Timeout;
+  finished?: Promise<void>;
   stopRequested?: boolean;
 }
 

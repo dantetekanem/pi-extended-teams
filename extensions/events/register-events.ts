@@ -11,6 +11,8 @@ import { formatElapsed, formatTokenCount } from "../ui/renderers";
 import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
 import { FAVORITE_MODEL_SLOTS, loadSettings } from "../../src/utils/settings";
 
+export const LEAD_ORCHESTRATION_GUIDANCE = `\n\npi-extended-teams lead orchestration rules:\n- Choose the cheapest sufficient read level. reading-fast is the normal first choice for bounded research, collection, inventory, lookup, evidence gathering, docs/log/test-output inspection, and independent slices; it should naturally be the most-used read level.\n- Use reading-default for normal synthesis and bounded engineering judgment. Reserve reading-hard as the rarest level, only for irreducibly deep, ambiguous, high-risk architecture/security/root-cause/data reasoning. Never choose reading-hard merely because a task says investigate, research, review, verify, or is important.\n- A spawned agent owns its assigned lane until it reports, blocks, fails, or the user cancels it. Do not duplicate, take over, test, edit, or synthesize that same lane in parallel; work only on clearly unrelated lanes.\n- When no unrelated work remains, wait literally idle for the automatic report prompt. Do not sleep, poll, repeatedly call read_inbox/check status, send nudges, do dummy work, or treat healthy silence as failure.\n- Wait for the actual report before synthesizing. Intervene only on a reported blocker/error, actual health failure, explicit user cancellation/change, or a genuinely finished agent that remains active.\n- Before implementing a durable bug/security/testing claim sourced from an agent report or backlog, confirm it with a separate read-only agent using the cheapest sufficient read level; confirmation alone does not justify reading-hard.`;
+
 export interface RegisterEventsOptions {
   isTeammate: boolean;
   agentName: string;
@@ -22,6 +24,10 @@ export interface RegisterEventsOptions {
   startLeadWatchdog(): void;
   buildRoster(teamName: string): Promise<any>;
   formatRosterForPrompt(roster: any): string;
+  watchInboxDirectory?(
+    directory: string,
+    listener: (eventType: string, filename: string | Buffer | null) => void
+  ): fs.FSWatcher;
 }
 
 export function isInboxFileWatchEvent(inboxFile: string, filename: string | Buffer | null | undefined): boolean {
@@ -34,12 +40,38 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   let teammateWakeIfUnread: (() => Promise<void>) | null = null;
   let teammatePendingInboxWake = false;
   let teammateInboxWakeTimer: NodeJS.Timeout | null = null;
+  let teammateInboxPollTimer: NodeJS.Timeout | null = null;
+  let teammateInboxWatcher: fs.FSWatcher | null = null;
+  let teammateInboxDisposed = false;
+  const teammateOneShotTimers = new Set<NodeJS.Timeout>();
+
+  const scheduleTeammateOneShot = (callback: () => void, delayMs: number) => {
+    const timer = setTimeout(() => {
+      teammateOneShotTimers.delete(timer);
+      if (!teammateInboxDisposed) callback();
+    }, delayMs);
+    teammateOneShotTimers.add(timer);
+  };
+
+  const disposeTeammateInbox = () => {
+    teammateInboxDisposed = true;
+    if (teammateInboxWakeTimer) clearTimeout(teammateInboxWakeTimer);
+    if (teammateInboxPollTimer) clearInterval(teammateInboxPollTimer);
+    for (const timer of teammateOneShotTimers) clearTimeout(timer);
+    teammateOneShotTimers.clear();
+    teammateInboxWatcher?.close();
+    teammateInboxWakeTimer = null;
+    teammateInboxPollTimer = null;
+    teammateInboxWatcher = null;
+    teammateWakeIfUnread = null;
+    teammatePendingInboxWake = false;
+  };
 
   const scheduleTeammateInboxWake = (delayMs = 0) => {
-    if (!teammateWakeIfUnread || teammateInboxWakeTimer) return;
+    if (teammateInboxDisposed || !teammateWakeIfUnread || teammateInboxWakeTimer) return;
     teammateInboxWakeTimer = setTimeout(() => {
       teammateInboxWakeTimer = null;
-      void teammateWakeIfUnread?.();
+      if (!teammateInboxDisposed) void teammateWakeIfUnread?.();
     }, delayMs);
   };
 
@@ -88,6 +120,8 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     }
 
     if (options.isTeammate) {
+      disposeTeammateInbox();
+      teammateInboxDisposed = false;
       if (teamName) {
         const pidFile = path.join(paths.teamDir(teamName), `${options.agentName}.pid`);
         fs.mkdirSync(path.dirname(pidFile), { recursive: true });
@@ -111,18 +145,19 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           options.terminal.setTitle(fullTitle);
         };
         setIt();
-        setTimeout(setIt, 500);
-        setTimeout(setIt, 2000);
-        setTimeout(setIt, 5000);
+        scheduleTeammateOneShot(setIt, 500);
+        scheduleTeammateOneShot(setIt, 2000);
+        scheduleTeammateOneShot(setIt, 5000);
       }
 
-      setTimeout(() => {
+      scheduleTeammateOneShot(() => {
         options.quietTrigger("read_inbox to get your instructions, then begin your work.");
       }, 1000);
 
       if (teamName) {
         let wakeInFlight = false;
         const wakeIfUnread = async () => {
+          if (teammateInboxDisposed) return;
           if (wakeInFlight) {
             teammatePendingInboxWake = true;
             scheduleTeammateInboxWake(250);
@@ -137,6 +172,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           teammatePendingInboxWake = false;
           try {
             const unread = await messaging.readInbox(teamName, options.agentName, true, false);
+            if (teammateInboxDisposed) return;
             await runtime.writeRuntimeStatus(teamName, options.agentName, {
               lastHeartbeatAt: Date.now(),
             });
@@ -144,10 +180,12 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
               options.quietTrigger(`You have ${unread.length} new inbox message(s). Read them with read_inbox and act.`);
             }
           } catch (e) {
-            await runtime.writeRuntimeStatus(teamName, options.agentName, {
-              lastHeartbeatAt: Date.now(),
-              lastError: runtime.createRuntimeError(e),
-            });
+            if (!teammateInboxDisposed) {
+              await runtime.writeRuntimeStatus(teamName, options.agentName, {
+                lastHeartbeatAt: Date.now(),
+                lastError: runtime.createRuntimeError(e),
+              });
+            }
           } finally {
             wakeInFlight = false;
             if (teammatePendingInboxWake) {
@@ -157,12 +195,13 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
         };
         teammateWakeIfUnread = wakeIfUnread;
 
-        setInterval(wakeIfUnread, 30000);
+        teammateInboxPollTimer = setInterval(wakeIfUnread, 30000);
         try {
           const inboxFile = paths.inboxPath(teamName, options.agentName);
           fs.mkdirSync(path.dirname(inboxFile), { recursive: true });
-          fs.watch(path.dirname(inboxFile), (_eventType, filename) => {
-            if (isInboxFileWatchEvent(inboxFile, filename)) {
+          const watchInboxDirectory = options.watchInboxDirectory ?? fs.watch;
+          teammateInboxWatcher = watchInboxDirectory(path.dirname(inboxFile), (_eventType, filename) => {
+            if (!teammateInboxDisposed && isInboxFileWatchEvent(inboxFile, filename)) {
               scheduleTeammateInboxWake();
             }
           });
@@ -174,6 +213,10 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       options.startLeadInboxPolling();
       options.startLeadWatchdog();
     }
+  });
+
+  pi.on("session_shutdown", async () => {
+    disposeTeammateInbox();
   });
 
   pi.on("turn_start", async (_event: any, ctx: any) => {
@@ -243,7 +286,10 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   let firstTurn = true;
   pi.on("before_agent_start", async (event: any) => {
     const teamName = options.getTeamName();
-    if (options.isTeammate && firstTurn) {
+    if (!options.isTeammate) {
+      return { systemPrompt: event.systemPrompt + LEAD_ORCHESTRATION_GUIDANCE };
+    }
+    if (firstTurn) {
       firstTurn = false;
 
       if (teamName) {
@@ -282,7 +328,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       }
 
       return {
-        systemPrompt: event.systemPrompt + `\n\nYou are spawned agent '${options.agentName}' in Pi session '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}\n\nCore rules for every spawned agent:\n- NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.\n- You cannot spawn, promote, or create other agents. If another agent is needed, use send_message to ask team-lead to decide and spawn.\n- Use send_message for direct communication and read_inbox when the extension wakes you or you expect a reply.\n- When your work is done, report and exit cleanly. Do not wait for the lead to shut you down.${roleSpecificGuidance}${rosterInfo}\nStart by calling read_inbox to get your initial instructions.`,
+        systemPrompt: event.systemPrompt + `\n\nYou are spawned agent '${options.agentName}' in Pi session '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}\n\nCore rules for every spawned agent:\n- NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.\n- You cannot spawn, promote, or create other agents. If another agent is needed, use send_message to ask team-lead to decide and spawn.\n- Use send_message for direct communication and read_inbox when the extension wakes you or you expect a reply.\n- Use report_progress with a concise status phrase when your meaningful milestone changes. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.\n- When your work is done, report and exit cleanly. Do not wait for the lead to shut you down.${roleSpecificGuidance}${rosterInfo}\nStart by calling read_inbox to get your initial instructions.`,
       };
     }
   });

@@ -46,10 +46,22 @@ describe("read-agent communication tools", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("exposes only simple direct communication tools to read agents", () => {
+  it("exposes direct communication and complete final reporting to read agents", () => {
     const tools = Array.from(makeTools("session", "reader", "read").keys()).sort();
 
-    expect(tools).toEqual(["read_inbox", "send_message"]);
+    expect(tools).toEqual(["read_inbox", "report_and_exit", "report_progress", "send_message"]);
+  });
+
+  it("lets a read agent submit its complete result instead of replacing it with a summary", async () => {
+    const onReportAndExit = vi.fn(async () => ({ accepted: true }));
+    const tools = new Map<string, Tool>(createAgentCommunicationTools({
+      isTeammate: true, agentName: "reader", role: "read", getTeamName: () => "session",
+      authorizeWriteMember: vi.fn(async () => {}), onReportAndExit,
+    }).map((tool: Tool) => [tool.name, tool]));
+    const content = JSON.stringify({ kind: "plan", document: { title: { kind: "title", body: "Plan", children: [] }, elements: [] } });
+
+    await expect(tools.get("report_and_exit")!.execute("report", { content, summary: "Complete plan result ready" })).resolves.toMatchObject({ details: { accepted: true } });
+    expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" });
   });
 
   it("exposes the complete coordination surface to write agents", () => {
@@ -61,6 +73,7 @@ describe("read-agent communication tools", () => {
       "read_inbox",
       "release_file",
       "report_and_exit",
+      "report_progress",
       "send_message",
     ]);
   });
@@ -81,6 +94,65 @@ describe("read-agent communication tools", () => {
       text: "I found something useful.",
       summary: "finding",
       read: false,
+    });
+  });
+
+  it("report_progress normalizes and persists progress without inbox side effects", async () => {
+    const onProgress = vi.fn();
+    const tools = new Map<string, Tool>(createAgentCommunicationTools({
+      isTeammate: true,
+      agentName: "reader",
+      role: "read",
+      getTeamName: () => "session",
+      authorizeWriteMember: vi.fn(async () => {}),
+      onProgress,
+      onReportAndExit: vi.fn(async () => ({ accepted: true })),
+    }).map((tool: Tool) => [tool.name, tool]));
+
+    const result = await tools.get("report_progress")!.execute("progress", {
+      status: "  Reviewing\n runtime   state  ",
+    });
+
+    expect(result.content[0].text).toBe("Progress updated: Reviewing runtime state");
+    expect(result.details).toMatchObject({ session: "session", status: "Reviewing runtime state" });
+    expect(onProgress).toHaveBeenCalledWith("Reviewing runtime state", expect.any(Number));
+    expect(await readRuntimeStatus("session", "reader")).toMatchObject({
+      latestProgress: "Reviewing runtime state",
+      progressUpdatedAt: expect.any(Number),
+    });
+    expect(await readInbox("session", "team-lead", false, false)).toEqual([]);
+    expect(await readInbox("session", "reader", false, false)).toEqual([]);
+  });
+
+  it("strips terminal control sequences from persisted progress", async () => {
+    const onProgress = vi.fn();
+    const tools = new Map<string, Tool>(createAgentCommunicationTools({
+      isTeammate: true,
+      agentName: "reader",
+      role: "read",
+      getTeamName: () => "session",
+      authorizeWriteMember: vi.fn(async () => {}),
+      onProgress,
+      onReportAndExit: vi.fn(async () => ({ accepted: true })),
+    }).map((tool: Tool) => [tool.name, tool]));
+
+    await tools.get("report_progress")!.execute("progress", {
+      status: "Inspecting\u001b[2J files\u001b]52;c;payload\u0007 now\u001b[31m",
+    });
+
+    expect(onProgress).toHaveBeenCalledWith("Inspecting files now", expect.any(Number));
+    expect(await readRuntimeStatus("session", "reader")).toMatchObject({ latestProgress: "Inspecting files now" });
+  });
+
+  it("report_progress rejects empty and overlong normalized statuses", async () => {
+    const tool = makeTools("session", "reader").get("report_progress")!;
+
+    await expect(tool.execute("empty", { status: " \n\t " })).rejects.toThrow("status must not be empty");
+    await expect(tool.execute("long", { status: "x".repeat(121) })).rejects.toThrow("status must be at most 120 characters");
+    expect(await readRuntimeStatus("session", "reader")).toBeNull();
+
+    await expect(tool.execute("boundary", { status: "x".repeat(120) })).resolves.toMatchObject({
+      details: { status: "x".repeat(120) },
     });
   });
 

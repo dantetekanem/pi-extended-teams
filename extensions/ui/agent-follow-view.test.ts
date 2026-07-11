@@ -85,6 +85,8 @@ describe("agent follow component", () => {
     const first = component.render(140).join("\n");
     expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 42 tok · Verifying assumptions\.{1,3}/);
     expect(first).toContain("Working now");
+    expect(first).toContain("\x1b[48;2;22;23;32m");
+    expect(first).not.toContain("\x1b[48;5;235m");
 
     tokens = 2_300_000;
     agent.latestProgress = "Writing final report";

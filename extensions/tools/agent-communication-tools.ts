@@ -95,7 +95,8 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
       async execute(_toolCallId: string, params: any) {
         const teamName = requireCurrentSession(options);
         const markAsRead = params.mark_as_read !== false;
-        const msgs = await messaging.readInbox(teamName, options.agentName, params.unread_only, markAsRead);
+        const unreadOnly = params.unread_only !== false;
+        const msgs = await messaging.readInbox(teamName, options.agentName, unreadOnly, markAsRead);
         if (markAsRead) {
           await runtime.writeRuntimeStatus(teamName, options.agentName, {
             lastHeartbeatAt: Date.now(),

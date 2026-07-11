@@ -178,6 +178,19 @@ describe("read-agent communication tools", () => {
     expect(typeof status?.lastInboxReadAt).toBe("number");
   });
 
+  it("read_inbox defaults to returning only unread messages", async () => {
+    await sendPlainMessage("session", "team-lead", "reader", "Already handled", "old");
+    await readInbox("session", "reader", true, true);
+    await sendPlainMessage("session", "team-lead", "reader", "New instruction", "new");
+    const tools = makeTools("session", "reader");
+
+    const result = await tools.get("read_inbox")!.execute("read", {});
+
+    expect(result.details.messages).toHaveLength(1);
+    expect(result.details.messages[0]).toMatchObject({ text: "New instruction", read: true });
+    expect(result.content[0].text).not.toContain("Already handled");
+  });
+
   it("read_inbox can peek without marking read or updating readiness", async () => {
     await sendPlainMessage("session", "team-lead", "reader", "Initial instructions", "assignment");
     const tools = makeTools("session", "reader");

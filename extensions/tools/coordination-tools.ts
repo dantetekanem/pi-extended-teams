@@ -156,7 +156,8 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       const targetTeamName = requireCurrentSession(options);
       const targetAgent = params.agent_name || options.agentName;
       const markAsRead = params.mark_as_read !== false;
-      const msgs = await messaging.readInbox(targetTeamName, targetAgent, params.unread_only, markAsRead);
+      const unreadOnly = params.unread_only !== false;
+      const msgs = await messaging.readInbox(targetTeamName, targetAgent, unreadOnly, markAsRead);
 
       if (markAsRead && options.isTeammate && targetAgent === options.agentName) {
         await runtime.writeRuntimeStatus(targetTeamName, options.agentName, {

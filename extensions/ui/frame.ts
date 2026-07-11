@@ -7,22 +7,22 @@ const ANSI_PANEL_BG = "\x1b[48;5;235m";
 // Fill a line to `width` visible columns with the dark panel background. Every
 // full reset emitted by pink/purple/dimAnsi/theme.fg is followed by a fresh
 // background code so embedded foreground colors don't punch holes in the fill.
-export function panelBgFill(line: string, width: number): string {
+export function panelBgFill(line: string, width: number, background = ANSI_PANEL_BG): string {
   const pad = Math.max(0, width - visibleWidth(line));
-  const reasserted = line.split(ANSI_RESET).join(ANSI_RESET + ANSI_PANEL_BG);
-  return `${ANSI_PANEL_BG}${reasserted}${" ".repeat(pad)}${ANSI_RESET}`;
+  const reasserted = line.split(ANSI_RESET).join(ANSI_RESET + background);
+  return `${background}${reasserted}${" ".repeat(pad)}${ANSI_RESET}`;
 }
 
 // Wrap content lines in a rounded border with a dark interior. `innerWidth` is
 // the column count between the one-space padding inside each side border.
-export function framePanel(contentLines: string[], innerWidth: number): string[] {
+export function framePanel(contentLines: string[], innerWidth: number, background = ANSI_PANEL_BG): string[] {
   const span = innerWidth + 2;
   const rule = "─".repeat(span);
-  const border = (text: string) => `${ANSI_PANEL_BG}${ANSI_PURPLE}${text}${ANSI_RESET}`;
+  const border = (text: string) => `${background}${ANSI_PURPLE}${text}${ANSI_RESET}`;
   const out: string[] = [border(`╭${rule}╮`)];
   for (const line of contentLines) {
     const boundedLine = truncateToWidth(line, innerWidth, "…", true);
-    out.push(border("│") + panelBgFill(` ${boundedLine} `, span) + border("│"));
+    out.push(border("│") + panelBgFill(` ${boundedLine} `, span, background) + border("│"));
   }
   out.push(border(`╰${rule}╯`));
   return out;

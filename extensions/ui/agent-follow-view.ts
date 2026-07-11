@@ -6,6 +6,7 @@ import { extractTextParts, formatAnimatedProgress, formatElapsed, formatModelLab
 
 const REFRESH_INTERVAL_MS = 250;
 const MAX_NAVIGATION_AGENTS = 6;
+const AGENT_FOLLOW_BACKGROUND = "\x1b[48;2;22;23;32m";
 
 export interface AgentFollowViewOptions {
   getAgents(): RunningReadAgent[];
@@ -112,7 +113,7 @@ export function createAgentFollowComponent(
           purple("↑  main agent"),
           dimAnsi("No active agents. Press ↑ or esc to return to main."),
           ...Array.from({ length: emptyBodyHeight }, () => ""),
-        ], innerWidth);
+        ], innerWidth, AGENT_FOLLOW_BACKGROUND);
       }
 
       const selectedIndex = Math.max(0, agents.findIndex(item => item.name === agent.name));
@@ -166,7 +167,7 @@ export function createAgentFollowComponent(
         dimAnsi(help),
         purple("─".repeat(innerWidth)),
         ...visible,
-      ], innerWidth);
+      ], innerWidth, AGENT_FOLLOW_BACKGROUND);
     },
     invalidate() {},
     dispose() {

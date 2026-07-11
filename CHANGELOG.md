@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-07-11
+
+### Changed
+- Matched the full-text spawned-agent view background to the requested dark navy color without changing other Pi panels.
+
+### Fixed
+- `read_inbox` now honors its documented unread-only default when callers omit `unread_only`, preventing previously read messages from replaying.
+
 ## [2.0.0] - 2026-07-11
 
 ### Added

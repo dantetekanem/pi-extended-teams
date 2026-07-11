@@ -57,6 +57,7 @@ function writeFavoriteLevels() {
   fs.writeFileSync(settingsPath, JSON.stringify({
     favoriteModels: {
       "reading-default": { model: "provider/model", thinking: "high" },
+      "writing-basic": { model: "provider/model", thinking: "high" },
       "writing-hard": { model: "provider/model", thinking: "xhigh" },
     },
   }));
@@ -540,6 +541,30 @@ describe("in-process read agent tool wiring", () => {
     expect(options.emitAgentReport).toHaveBeenCalledWith("prompt-build-123", "prompt-branch-1", expect.any(Number), 42, "final report", true);
     const leadInbox = await readInbox("prompt-build-123", "team-lead", false, false);
     expect(leadInbox).toEqual([]);
+  });
+
+  it("emits a private pi-prompt writer report without requesting lead injection", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "session-main",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(), renderReadAgentStatus: vi.fn(), rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(), releaseAllClaimsForAgent: vi.fn(async () => []),
+    };
+
+    await runReadAgentInProcess("session-main", {
+      agentId: "planner@session-main", name: "planner", agentType: "teammate", role: "write",
+      model: "provider/model", thinking: "high", modelSlot: "writing-basic", joinedAt: Date.now(),
+      tmuxPaneId: "", cwd: root, subscriptions: [], prompt: "write plan",
+      metadata: { piPromptPlanning: { version: 1, correlation: "private" } },
+    }, "write plan", { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } }, options);
+
+    expect(options.emitAgentReport).toHaveBeenCalledWith("session-main", "planner", expect.any(Number), 42, "final report", true, true);
   });
 
   it("suppresses lead report injection for workflow-spawned read agents while persisting report events", async () => {

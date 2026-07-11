@@ -79,6 +79,10 @@ export function workflowAllowsSkill(member: MemberMetadataLike, skillName: strin
   return allowed.includes(skillName);
 }
 
+export function isPiPromptPlanningMember(member: MemberMetadataLike): boolean {
+  return asRecord(member?.metadata?.piPromptPlanning)?.version === 1;
+}
+
 export function shouldSuppressLeadReportInjection(member: MemberMetadataLike): boolean {
-  return isWorkflowSpawnedMember(member);
+  return isWorkflowSpawnedMember(member) || isPiPromptPlanningMember(member);
 }

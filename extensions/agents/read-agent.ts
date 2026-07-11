@@ -14,7 +14,7 @@ import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, getLastAssistantText, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
 import { requireWriteAgentTeam } from "../team/roster";
-import { shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
+import { isPiPromptPlanningMember, shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 import { loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
 
 export interface RunReadAgentOptions {
@@ -26,7 +26,7 @@ export interface RunReadAgentOptions {
   ensureReadAgentStatusTicker(): void;
   renderReadAgentStatus(): void;
   rememberCompletedAgentReport(teamName: string, report: CompletedAgentReport): void;
-  emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean): void;
+  emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection?: boolean): void;
   emitAgentProgress?(teamName: string, name: string, status: string, updatedAt: number): void;
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
   agentName?: string;
@@ -288,8 +288,11 @@ export async function runReadAgentInProcess(
         options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox and continue your task. Do not poll.`);
       }
     } else if (suppressLeadReportInjection) {
+      if (isPiPromptPlanningMember(member)) {
+        options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true, true);
+      }
       // Workflow orchestrators consume full reports from TeamReportEvent storage.
-      // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
+      // Pi Prompt consumes its writer report through the private event without a lead turn.
     } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
       options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
     } else {
@@ -480,8 +483,10 @@ export async function runReadAgentInProcess(
           options.quietTrigger?.(`Read helper ${member.name} failed. Read the failure report with read_inbox and continue or report the blocker. Do not poll.`);
         }
       } else if (suppressLeadReportInjection) {
+        if (isPiPromptPlanningMember(member)) {
+          options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, failureReport, false, true);
+        }
         // Workflow orchestrators consume full failure reports from TeamReportEvent storage.
-        // Avoid injecting every workflow branch as a triggerTurn follow-up in the lead session.
       } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
         options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, failureReport, false);
       } else {

@@ -181,7 +181,7 @@ export default function (pi: ExtensionAPI) {
   // display:true also feeds the report into the lead's context as a
   // user turn (see convertToLlm), and triggerTurn makes the lead synthesize it
   // automatically — no read_inbox, no manual polling.
-  function emitAgentReport(reportTeamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean): void {
+  function emitAgentReport(reportTeamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection = false): void {
     const api = pi as any;
     const details = { name, elapsedMs: Date.now() - startedAt, tokens, ok };
     pi.events?.emit?.("pi-extended-teams:agent-report", { teamName: reportTeamName, name, startedAt, tokens, report, ok, details });
@@ -190,7 +190,7 @@ export default function (pi: ExtensionAPI) {
     // reports are consumed by pi-prompt via the event above and must not be
     // injected as visible user turns, otherwise the main agent starts answering
     // each branch report and can ask unrelated follow-up questions.
-    if (reportTeamName.startsWith("prompt-build-")) return;
+    if (suppressLeadInjection || reportTeamName.startsWith("prompt-build-")) return;
 
     if (typeof api.sendMessage === "function") {
       api.sendMessage(

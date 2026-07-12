@@ -1,6 +1,6 @@
 ---
 name: teams
-description: Multiply a coding session with parallel read-only agents (and optional isolated edit agents) via pi-extended-teams. Use whenever the user asks to investigate, review, test, audit, validate, or get parallel coverage on code — or when a build/fix has isolated independent chunks worth farming out. Trigger on hot words like "agents", "spawn agents", "use agents", "send agents", or any request to parallelize investigation/review/testing. Never use while autoresearch mode/session is active; autoresearch must stay single-agent. The lead stays the implementer; agents are the multiplier.
+description: Multiply a coding session with genuine independent read-only lanes (and optional isolated edit lanes) via pi-extended-teams. Use whenever the user asks to investigate, review, test, audit, validate, get parallel coverage, or use agents. Hot words like "agents", "spawn agents", "use agents", and "send agents" trigger outcome-to-lane mapping before spawning. Never use while autoresearch mode/session is active. The lead owns integration and final acceptance and executes work when only one substantive execution lane exists.
 ---
 
 # pi-extended-teams
@@ -17,13 +17,24 @@ If agents would otherwise be useful, stop and ask the user to turn off or finish
 
 ## The balance
 
-- **The lead is the implementer.** Plan, coordinate, and do central edits in the main session.
-- **Read agents are the default multiplier.** Use them freely for investigation, review, testing, audits, and second opinions. They run in-process and report back automatically.
-- **Edit agents are optional and rare.** Use a `writing-*` level only for isolated, non-overlapping edits. Edit agents must claim files before writing and report every changed path.
+- **The lead owns the result.** The lead retains integration, cross-lane decisions, scope tradeoffs, verification synthesis, and final acceptance. If only one substantive execution lane exists, the lead executes it.
+- **Read agents multiply genuine independent coverage.** Use them for bounded investigation, review, testing, audits, and second opinions only when each lane returns distinct useful evidence.
+- **Edit agents are optional and rare.** A writer owns exactly one isolated sub-outcome with non-overlapping files. A `writing-hard` slot allows difficult work inside that lane; it does not allow broad cross-stack ownership. Edit agents must claim files before writing and report every changed path.
+
+## Mandatory outcome-to-lane gate
+
+Before spawning for substantial work:
+
+1. Enumerate every unfinished substantive outcome in the User's request as an inspectable behavior, artifact, decision, or evidence result.
+2. Map each candidate lane to exactly one bounded sub-outcome or independent question, its owned surface, and its expected evidence. The whole User request cannot be a lane.
+3. Keep integration, cross-lane decisions, and final acceptance with the lead.
+4. Reject overlapping or fake parallel lanes. Agents are useful only for genuine independent lanes.
+5. Reject any plan in which one teammate owns every unfinished substantive outcome. Re-split only where outcomes are genuinely independent; do not rename the whole request as one lane.
+6. If only one substantive execution lane exists, the lead must execute it rather than spawn a replacement writer. Independent read-only review or evidence lanes remain allowed when they add distinct value.
 
 ## Default flow
 
-Use `spawn_agent` for one helper or `spawn_swarm_agents` for a batch. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by `model_slot` level only; never pass `role`, raw `model`, or `thinking` directly. The level selects read/write behavior, model, and effort. See `TIPS.md` for level-selection examples.
+Run the outcome-to-lane gate first, then use `spawn_agent` for one genuine helper lane or `spawn_swarm_agents` for a batch of independent lanes. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by `model_slot` level only; never pass `role`, raw `model`, or `thinking` directly. The level selects read/write behavior, model, and effort. See `TIPS.md` for level-selection examples.
 
 ```text
 spawn_swarm_agents({
@@ -69,13 +80,14 @@ spawn_agent({
 
 ## Hot-word trigger: "agents"
 
-When the user says "agents", "use agents", "spawn agents", "send agents", "agents to investigate/review/test", or any phrase meaning "delegate investigation to parallel helpers", spawn 2–3 focused read agents immediately. Do not wait for the user to explain the extension mechanics. Exception: if the autoresearch conflict guard is active, spawn nothing and explain that agent delegation is disabled until autoresearch is off.
+When the user says "agents", "use agents", "spawn agents", "send agents", "agents to investigate/review/test", or any phrase meaning "delegate to helpers", immediately run intake and map the requested outcomes to candidate lanes. Do not wait for the user to explain the extension mechanics, but do not invent a 2–3-agent swarm. Spawn only the genuine independent lanes the map supports. The whole request cannot be assigned as one lane, and a plan where one teammate owns every unfinished substantive outcome is invalid. If the map contains only one substantive execution lane, the lead executes it instead of spawning a replacement writer; use an agent only for a separate read-only question or review that adds distinct value. Exception: if the autoresearch conflict guard is active, spawn nothing and explain that agent delegation is disabled until autoresearch is off.
 
 ## Lead rules
 
 - Never spawn agents, teams, subagents, or reviewer agents while autoresearch mode/session is active, running, or being resumed.
-- Prefer read agents for parallel coverage.
-- Keep implementation in the lead unless a write task is genuinely isolated.
+- Complete outcome-to-lane mapping before delegation; agents are useful only for genuine independent lanes.
+- Keep integration, cross-lane decisions, and final acceptance in the lead.
+- Keep implementation in the lead when there is only one substantive execution lane. Otherwise, a writer may own only one isolated sub-outcome.
 - Never sleep, busy-wait, or poll. The extension wakes the lead when reports arrive.
 - Trust quiet agents. Do not ping, message, or check an agent just because it has been quiet for less than several minutes; active status remains visible in the activity card and Down-key live view.
 - Do not wake the lead just to ping idle agents.
@@ -112,7 +124,7 @@ Edit-agent coordination tools:
 
 Give every agent:
 
-- a bounded mission,
+- one bounded independent sub-outcome or question (never the whole User request),
 - relevant files or directories,
 - the right `model_slot` level (`reading-*` for read-only, `writing-*` for edit-allowed),
 - the report shape you want,

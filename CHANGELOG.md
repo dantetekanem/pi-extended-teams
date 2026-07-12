@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-07-12
+
+### Changed
+- Require outcome-based lane decomposition before delegation, keep sole execution lanes with the lead, and prevent one teammate from owning the whole request.
+- Align team guidance on `model_slot`-only spawning and isolated writer scope.
+
 ## [2.0.1] - 2026-07-11
 
 ### Changed

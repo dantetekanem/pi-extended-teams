@@ -16,9 +16,20 @@ Do not pass raw model names or thinking levels when spawning agents. The selecte
 | `reading-default` | read-only | Normal synthesis and judgment across a bounded context: focused behavioral review, test-gap assessment, and code archaeology. |
 | `reading-hard` | read-only | Exceptional, irreducibly deep reasoning: ambiguous architecture/security boundaries, unclear cross-system root cause, or migration/data correctness risk. |
 | `writing-basic` | edit-allowed | Small isolated edits with clear verification: docs, typos, one-file config, narrow fixtures. |
-| `writing-hard` | edit-allowed | Non-trivial implementation, refactors, production bug fixes, difficult test repairs. |
+| `writing-hard` | edit-allowed | One isolated non-trivial sub-outcome: a bounded refactor, production bug fix, or difficult test repair with explicit file ownership. |
 
-Concrete model names and thinking levels are configured outside prompts with `/agents-favorite-models`. If no levels are configured, define them there before spawning agents.
+Concrete model names and thinking levels are configured outside prompts with `/agents-favorite-models`. If no levels are configured, define them there before spawning agents. Spawn calls use `model_slot` only.
+
+## Lane eligibility before level selection
+
+Choose a level only after the lead has completed outcome-to-lane decomposition for substantial work:
+
+- A delegated lane must own exactly one bounded sub-outcome or genuinely independent question with distinct evidence. The whole User request cannot be a lane.
+- A plan is invalid if one teammate owns every unfinished substantive outcome.
+- Integration, cross-lane decisions, and final acceptance stay with the lead.
+- If only one substantive execution lane exists, the lead executes it rather than spawning a replacement writer.
+- A writer owns one isolated sub-outcome and non-overlapping files. `writing-hard` increases capability inside that boundary; it does not authorize broad cross-stack ownership.
+- Do not create agents merely to satisfy an "agents" hot word. The hot word triggers intake and lane mapping; spawn only the genuine independent lanes found.
 
 ## Reading-level selection hierarchy
 
@@ -42,7 +53,7 @@ spawn_agent({
 })
 ```
 
-A broad read-only swarm:
+A read-only swarm of genuinely independent lanes:
 
 ```ts
 spawn_swarm_agents({
@@ -83,7 +94,7 @@ A harder implementation agent:
 spawn_agent({
   name: "bug-fix",
   model_slot: "writing-hard",
-  prompt: "Claim only the files you need, fix the failing parser edge case, run focused tests, then call report_and_exit."
+  prompt: "Claim src/parser.ts and test/parser.test.ts only, fix the failing parser edge case, run the focused parser tests, then call report_and_exit."
 })
 ```
 
@@ -141,6 +152,7 @@ spawn_agent({
 - Use `reading-default` for normal synthesis, focused behavioral review, and bounded engineering judgment.
 - Reserve `reading-hard` for rare, irreducibly deep, risky, or ambiguous reasoning that cannot be split into fast/default lanes.
 - If the task edits files and is narrow/obvious, use `writing-basic`.
-- If the task edits files and is broad/risky/non-trivial, use `writing-hard`.
-- If several independent slices exist, prefer several `reading-fast` agents over one `reading-hard` agent.
+- If one isolated edit sub-outcome is non-trivial or risky, use `writing-hard`; the slot does not broaden its ownership.
+- If several genuine independent slices exist, prefer several `reading-fast` agents over one `reading-hard` agent.
 - If files may overlap, do not spawn multiple writing agents.
+- Never assign all unfinished substantive outcomes to one teammate; when only one substantive execution lane exists, keep it with the lead.

@@ -38,7 +38,7 @@ spawn_swarm_agents({
 })
 ```
 
-Watch active agents in the below-editor activity card. With the editor empty, press Down to open live navigation, Down/Up to move between agents/main, `x` to stop the selected agent, and Escape to return. Completed reports are pushed into the lead session automatically.
+Watch active agents in the below-editor activity card. With the editor empty, press Down to open live navigation, Down/Up to move between agents/main, `l` to expand or collapse large tool logs, `m` to message the selected agent, `x` to stop it, and Escape to return. Completed reports are pushed into the lead session automatically.
 
 Spawn an edit-allowed agent only when the work is isolated and safe to run in parallel:
 
@@ -57,7 +57,7 @@ spawn_agent({
 - **Optional edit agents**: in-process and followable from Pi; use them only for isolated, non-overlapping edits.
 - **Live activity card**: active agent progress, level, elapsed time, and token usage stay visible below the editor.
 - **Auto-delivered reports**: new agent messages queue a lead follow-up even during an active turn, without manual polling.
-- **Down-key live navigation**: inspect active transcripts, models, thinking levels, elapsed time, and tokens; press `x` to stop the selected agent.
+- **Down-key live navigation**: inspect active transcripts, models, thinking levels, elapsed time, tokens, and grouped tool activity; expand large logs with `l`, message the selected agent with `m`, or stop it with `x`.
 - **Built-in orchestration guidance**: the extension teaches level selection, delegated-lane ownership, report-first synthesis, and literal waiting without polling.
 - **Advisory file claims**: edit agents coordinate file ownership with `claim_file`, `release_file`, and `list_file_claims`.
 - **Direct messaging**: agents and the lead can coordinate with `send_message` and `read_inbox`.

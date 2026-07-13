@@ -40,29 +40,49 @@ describe("agent follow transcript", () => {
       { role: "toolResult", toolName: "bash\u001b]52;c;payload\u0007-safe\r\nnext", content: "ok" },
     ]);
 
-    expect(lines[0]).toContain("tool read-safe next");
-    expect(lines[3]).toContain("result bash-safe next");
+    expect(lines[0]).toContain("read-safe next");
+    expect(lines[4]).toContain("bash-safe next");
     expect(lines.join("\n")).not.toContain("\u001b[2J");
     expect(lines.join("\n")).not.toContain("\u001b]52");
   });
 
-  it("renders user, exposed thinking, assistant text, tool calls, and full tool results", () => {
+  it("renders user, exposed thinking, assistant text, and paired tool activity blocks", () => {
     const lines = formatAgentFollowTranscript([
       { role: "user", content: [{ type: "text", text: "Inspect the project" }] },
       { role: "assistant", content: [
         { type: "thinking", thinking: "I should inspect the files." },
         { type: "text", text: "I will inspect it." },
-        { type: "toolCall", name: "read", arguments: { path: "README.md" } },
+        { type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } },
       ] },
-      { role: "toolResult", toolName: "read", content: [{ type: "text", text: "Line one\nLine two" }] },
+      { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "Line one\nLine two" }] },
     ]).join("\n");
 
     expect(lines).toContain("Inspect the project");
     expect(lines).toContain("I should inspect the files.");
     expect(lines).toContain("I will inspect it.");
-    expect(lines).toContain("tool read");
-    expect(lines).toContain('"path": "README.md"');
-    expect(lines).toContain("Line one\nLine two");
+    expect(lines).toContain("╭─ read · README.md");
+    expect(lines).toContain("│ Line one\n│ Line two");
+    expect(lines).toContain("╰─ 2 lines");
+  });
+
+  it("collapses large tool results with head and tail context and can expand them", () => {
+    const output = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n");
+    const messages = [
+      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "rg TODO src" } }] },
+      { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: output },
+    ];
+
+    const collapsed = formatAgentFollowTranscript(messages).join("\n");
+    expect(collapsed).toContain("╭─ bash · $ rg TODO src");
+    expect(collapsed).toContain("9 lines hidden · press l to expand logs");
+    expect(collapsed).not.toContain("│ line 10");
+    expect(collapsed).toContain("│ line 20");
+    expect(collapsed).toContain("collapsed");
+
+    const expanded = formatAgentFollowTranscript(messages, { expandLargeToolResults: true }).join("\n");
+    expect(expanded).toContain("│ line 10");
+    expect(expanded).not.toContain("lines hidden");
+    expect(expanded).not.toContain("collapsed");
   });
 });
 
@@ -116,6 +136,48 @@ describe("agent follow component", () => {
 
     expect(stopAgent).toHaveBeenCalledWith("beta");
     expect(component.render(120).join("\n")).toContain("(alpha)");
+    component.dispose();
+  });
+
+  it("shows a direct-message input and sends to the selected agent", async () => {
+    const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
+    const sendMessage = vi.fn(async () => {});
+    const component = createAgentFollowComponent(tui, vi.fn(), {
+      getAgents: () => [makeAgent()],
+      sendMessage,
+    });
+
+    expect(component.render(120).join("\n")).toContain("message reader");
+    expect(component.render(120).join("\n")).toContain("Press m to start typing");
+
+    component.focused = true;
+    component.handleInput("m");
+    expect(component.render(120).join("\n")).toContain("enter send · esc cancel");
+    component.handleInput("Please inspect the failing test");
+    component.handleInput("\r");
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(sendMessage).toHaveBeenCalledWith("reader", "Please inspect the failing test");
+    expect(component.render(120).join("\n")).toContain("Message sent to reader.");
+    expect(component.render(120).join("\n")).toContain("Press m to start typing");
+    component.dispose();
+  });
+
+  it("keeps the message draft open when delivery fails", async () => {
+    const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
+    const component = createAgentFollowComponent(tui, vi.fn(), {
+      getAgents: () => [makeAgent()],
+      sendMessage: async () => { throw new Error("Cannot send message to reader: agent is not running."); },
+    });
+
+    component.handleInput("m");
+    component.handleInput("Are you still there?");
+    component.handleInput("\r");
+    await vi.advanceTimersByTimeAsync(1);
+
+    const rendered = component.render(120).join("\n");
+    expect(rendered).toContain("Cannot send message to reader: agent is not running.");
+    expect(rendered).toContain("Are you still there?");
     component.dispose();
   });
 

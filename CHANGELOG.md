@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.5] - 2026-07-12
+
+### Added
+- The live agent view now includes a direct-message composer for the selected active agent.
+
+### Changed
+- Group tool calls with their results and collapse large outputs with head/tail context plus an expansion toggle.
+
 ## [2.0.4] - 2026-07-12
 
 ### Fixed

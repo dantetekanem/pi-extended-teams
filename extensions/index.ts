@@ -867,6 +867,12 @@ export default function (pi: ExtensionAPI) {
           await shutdownTeammate(targetTeamName, member);
           ctx.ui?.notify?.(`Stopped agent ${name}.`, "info");
         },
+        sendMessage: async (name: string, content: string) => {
+          const targetTeamName = teamName;
+          if (!targetTeamName) throw new Error("No active agent session context is available.");
+          await messaging.requireRunningMessageRecipient(targetTeamName, name);
+          await messaging.sendPlainMessage(targetTeamName, "team-lead", name, content, "Message from team-lead");
+        },
       });
     });
   }

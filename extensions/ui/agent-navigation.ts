@@ -6,6 +6,7 @@ import { openAgentFollowView } from "./agent-follow-view";
 export interface AgentNavigationOptions {
   getAgents(): RunningReadAgent[];
   stopAgent?(name: string): void | Promise<void>;
+  sendMessage?(name: string, content: string): void | Promise<void>;
 }
 
 type NavigationEditorFactory = ((tui: any, theme: any, keybindings: any) => any) & {
@@ -44,6 +45,7 @@ export function installAgentNavigation(ctx: any, options: AgentNavigationOptions
         getAgents: options.getAgents,
         initialAgentName: agents.slice().sort((a, b) => a.name.localeCompare(b.name))[0]?.name,
         stopAgent: options.stopAgent,
+        sendMessage: options.sendMessage,
       }).finally(() => { opening = false; });
       return true;
     });

@@ -79,6 +79,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         const teamName = requireCurrentSession(options);
         const recipient = params.recipient || (options.isTeammate ? "team-lead" : undefined);
         if (!recipient) throw new Error("recipient is required when the lead sends a message.");
+        await messaging.requireRunningMessageRecipient(teamName, recipient);
         await messaging.sendPlainMessage(teamName, options.agentName, recipient, params.content, params.summary || "Message");
         return { content: [{ type: "text", text: `Message sent to ${recipient}.` }], details: { session: teamName, recipient } };
       },

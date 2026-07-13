@@ -31,6 +31,15 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+export async function requireRunningMessageRecipient(teamName: string, recipient: string): Promise<void> {
+  if (recipient === "team-lead") return;
+
+  const config = await readConfig(teamName);
+  if (!config.members.some(member => member.name === recipient)) {
+    throw new Error(`Cannot send message to ${recipient}: agent is not running.`);
+  }
+}
+
 function ensureInboxFile(teamName: string, agentName: string): string {
   const p = inboxPath(teamName, agentName);
   const dir = path.dirname(p);

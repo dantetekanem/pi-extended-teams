@@ -95,6 +95,41 @@ describe("coordination tools", () => {
     expect(renderLeadInboxStatus).toHaveBeenCalledOnce();
   });
 
+  it("send_message fails when the recipient subagent is not running", async () => {
+    const teamName = "message-team";
+    writeConfig({
+      name: teamName,
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead")],
+    });
+    const tools = new Map<string, any>();
+
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      agentName: "team-lead",
+      isTeammate: false,
+      terminal: undefined,
+      getTeamName: () => teamName,
+      requireWriteAgentTeam: async () => teamName,
+      requireTeamContext: (explicitTeamName?: string) => explicitTeamName || teamName,
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(),
+      renderLeadInboxStatus: vi.fn(async () => {}),
+      resetLeadWakeNotifiedCount: vi.fn(),
+    });
+
+    await expect(tools.get("send_message").execute("send", {
+      recipient: "staged-browser-designer",
+      content: "Continue the design.",
+    })).rejects.toThrow("Cannot send message to staged-browser-designer: agent is not running.");
+
+    expect(await messaging.readInbox(teamName, "staged-browser-designer", false, false)).toEqual([]);
+  });
+
   it("report_and_exit unlinks the exiting writer pid file before shutdown", async () => {
     vi.useFakeTimers();
     const teamName = "exit-team";

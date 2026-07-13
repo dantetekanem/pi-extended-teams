@@ -16,6 +16,7 @@ type Tool = {
 
 function installPathSpies() {
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName))));
+  vi.spyOn(paths, "configPath").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "config.json"));
   vi.spyOn(paths, "inboxPath").mockImplementation((teamName: unknown, agentName: unknown) => {
     return path.join(root, "teams", paths.sanitizeName(String(teamName)), "inboxes", `${paths.sanitizeName(String(agentName))}.json`);
   });
@@ -95,6 +96,20 @@ describe("read-agent communication tools", () => {
       summary: "finding",
       read: false,
     });
+  });
+
+  it("send_message fails when the recipient subagent is not running", async () => {
+    const configPath = paths.configPath("session");
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify({ name: "session", members: [{ name: "team-lead" }, { name: "reader" }] }));
+    const tools = makeTools("session", "reader");
+
+    await expect(tools.get("send_message")!.execute("send", {
+      recipient: "finished-agent",
+      content: "Please continue.",
+    })).rejects.toThrow("Cannot send message to finished-agent: agent is not running.");
+
+    expect(await readInbox("session", "finished-agent", false, false)).toEqual([]);
   });
 
   it("report_progress normalizes and persists progress without inbox side effects", async () => {

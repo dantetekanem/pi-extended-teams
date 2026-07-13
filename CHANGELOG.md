@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.4] - 2026-07-12
+
+### Fixed
+- `send_message` now fails instead of claiming delivery when its target subagent is no longer running.
+
 ## [2.0.3] - 2026-07-12
 
 ### Changed

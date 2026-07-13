@@ -138,6 +138,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       const targetTeamName = requireCurrentSession(options);
       const recipient = params.recipient || (options.isTeammate ? "team-lead" : undefined);
       if (!recipient) throw new Error("recipient is required when the lead sends a message.");
+      await messaging.requireRunningMessageRecipient(targetTeamName, recipient);
       await messaging.sendPlainMessage(targetTeamName, options.agentName, recipient, params.content, params.summary || "Message");
       return { content: [{ type: "text", text: `Message sent to ${recipient}.` }], details: { session: targetTeamName, recipient } };
     },

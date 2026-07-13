@@ -169,7 +169,10 @@ describe("extension teammate inbox wake", () => {
     expect(prompt).toContain("Start by calling read_inbox to get your initial instructions.");
     expect(prompt).toContain("use send_message to ask team-lead");
     expect(prompt).toContain("ask team-lead with send_message");
-    expect(prompt).toContain("Use report_progress with a concise status phrase when your meaningful milestone changes");
+    expect(prompt).toContain("Progress reporting is required, not optional UI polish");
+    expect(prompt).toContain("After reading your initial instructions, call report_progress before your first work tool");
+    expect(prompt).toContain("never make more than 3 work-tool calls without a fresh progress update");
+    expect(prompt).toContain("Use a new phrase describing what you are doing now");
     expect(prompt).toContain("without messaging or waking the lead");
     for (const staleText of [
       "request_read_helper",

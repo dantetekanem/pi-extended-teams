@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.3] - 2026-07-12
+
+### Changed
+- Require spawned agents to report progress before their first work tool and refresh it at concrete phase boundaries or within every three work-tool calls.
+
 ## [2.0.2] - 2026-07-12
 
 ### Changed

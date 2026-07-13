@@ -170,7 +170,10 @@ describe("in-process read agent tool wiring", () => {
     expect(promptText).toContain("Use send_message for direct communication and read_inbox only when you were told a reply is waiting");
     expect(promptText).toContain("If another agent is needed, use send_message to ask team-lead");
     expect(promptText).toContain("only the lead decides and performs the spawn");
-    expect(promptText).toContain("Use report_progress with a concise status phrase when your meaningful milestone changes");
+    expect(promptText).toContain("Progress reporting is required, not optional UI polish");
+    expect(promptText).toContain("Call report_progress before your first work tool");
+    expect(promptText).toContain("never make more than 3 work-tool calls without a fresh progress update");
+    expect(promptText).toContain("Use a new phrase describing what you are doing now");
     expect(promptText).toContain("without messaging or waking the lead");
     expect(promptText).toContain("use report_and_exit with the complete required deliverable");
     expect(promptText).toContain("Never replace required output with a summary");

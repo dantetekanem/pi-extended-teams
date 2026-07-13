@@ -341,7 +341,7 @@ export async function runReadAgentInProcess(
           ? "Use read/bash/edit/write as needed for the assignment. Prefer precise edits. Stop and report if you need broader product or architecture approval."
           : "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
         "Use send_message for direct communication and read_inbox only when you were told a reply is waiting. Do not coordinate a peer-agent society; the lead controls orchestration.",
-        "Use report_progress with a concise status phrase when your meaningful milestone changes. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.",
+        "Progress reporting is required, not optional UI polish. Call report_progress before your first work tool with a concise phrase describing what you are starting. Call it again whenever you change phase or evidence source, hit a blocker, or begin synthesis; never make more than 3 work-tool calls without a fresh progress update. Use a new phrase describing what you are doing now. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.",
         member.requestedBy
           ? `You are a read helper requested by '${member.requestedBy}'. When finished, send your concise report to the lead and stop.`
           : "You cannot spawn or create other agents. If another agent is needed, use send_message to ask team-lead; only the lead decides and performs the spawn.",

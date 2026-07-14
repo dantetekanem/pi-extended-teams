@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.0.6] - 2026-07-14
+
+### Added
+- Support Pi models that advertise the `max` thinking level in favorite agent slots.
+
+### Changed
+- Derive favorite-model thinking choices from each scoped model's capabilities and clamp the selection when switching models.
+
 ## [2.0.5] - 2026-07-12
 
 ### Added

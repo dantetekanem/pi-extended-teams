@@ -34,6 +34,7 @@ describe("qualified model helpers", () => {
 
   it("strips thinking suffixes", () => {
     expect(stripThinkingSuffix("openai-codex/gpt-5.4:high")).toBe("openai-codex/gpt-5.4");
+    expect(stripThinkingSuffix("openai-codex/gpt-5.4:max")).toBe("openai-codex/gpt-5.4");
   });
 
   it("detects qualified models", () => {

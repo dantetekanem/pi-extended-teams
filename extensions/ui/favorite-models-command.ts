@@ -10,20 +10,20 @@ import {
   THINKING_LEVEL_NAMES,
   type FavoriteModelSlot,
   type FavoriteModelConfig,
+  type ThinkingLevelName,
 } from "../../src/utils/settings";
 import { normalizeQualifiedModel } from "../../src/utils/model-resolution";
-import { getAvailableModels } from "../internal/model-selection";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "../../src/utils/thinking-levels";
+import { getAvailableModels, type AvailableRegisteredModel } from "../internal/model-selection";
 
-interface AvailableModelOption {
-  provider: string;
-  model: string;
+interface AvailableModelOption extends AvailableRegisteredModel {
   qualified: string;
 }
 
 type FavoriteModelsDraft = Partial<Record<FavoriteModelSlot, FavoriteModelConfig>>;
 type PickerColumn = "slots" | "models" | "thinking";
 
-const DEFAULT_THINKING_BY_SLOT: Record<FavoriteModelSlot, string> = {
+const DEFAULT_THINKING_BY_SLOT: Record<FavoriteModelSlot, ThinkingLevelName> = {
   "reading-fast": "low",
   "reading-default": "high",
   "reading-hard": "xhigh",
@@ -70,11 +70,11 @@ function normalizeSlot(raw: string | undefined): FavoriteModelSlot {
   return raw;
 }
 
-function normalizeThinking(raw: string | undefined): string {
+function normalizeThinking(raw: string | undefined): ThinkingLevelName {
   if (!raw || !(THINKING_LEVEL_NAMES as readonly string[]).includes(raw)) {
     throw new Error(`Invalid thinking level "${raw ?? ""}". Use one of: ${THINKING_LEVEL_NAMES.join(", ")}.`);
   }
-  return raw;
+  return raw as ThinkingLevelName;
 }
 
 function normalizeModel(raw: string | undefined): string {
@@ -89,7 +89,7 @@ function formatQualifiedModel(model: { provider: string; model: string }): strin
   return `${model.provider}/${model.model}`;
 }
 
-function sortAvailableModels(models: Array<{ provider: string; model: string }>): AvailableModelOption[] {
+function sortAvailableModels(models: AvailableRegisteredModel[]): AvailableModelOption[] {
   return models
     .map((model) => ({ ...model, qualified: formatQualifiedModel(model) }))
     .sort((a, b) => a.qualified.localeCompare(b.qualified));
@@ -145,6 +145,11 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
     const activeColumn = () => COLUMNS[activeColumnIndex];
     const selectedSlot = () => FAVORITE_MODEL_SLOTS[selectedSlotIndex];
     const selectedConfig = () => draft[selectedSlot()];
+    const selectedModel = () => availableModels.find((model) => model.qualified === selectedConfig()?.model);
+    const selectedThinkingLevels = () => {
+      const model = selectedModel();
+      return model ? getSupportedThinkingLevels(model) : [];
+    };
     const filteredModels = () => {
       const filter = modelFilter.trim().toLowerCase();
       if (!filter) return availableModels;
@@ -167,8 +172,12 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
       const currentModel = draft[slot]?.model;
       const currentIndex = models.findIndex((model) => model.qualified === currentModel);
       const nextIndex = Math.max(0, Math.min(models.length - 1, (currentIndex >= 0 ? currentIndex : delta > 0 ? -1 : models.length) + delta));
-      const currentThinking = draft[slot]?.thinking ?? DEFAULT_THINKING_BY_SLOT[slot];
-      draft[slot] = { model: models[nextIndex].qualified, thinking: currentThinking };
+      const model = models[nextIndex];
+      const currentThinking = normalizeThinking(draft[slot]?.thinking ?? DEFAULT_THINKING_BY_SLOT[slot]);
+      draft[slot] = {
+        model: model.qualified,
+        thinking: clampThinkingLevel(model, currentThinking),
+      };
       notice = undefined;
     };
 
@@ -178,12 +187,17 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
         notice = `Pick a scoped model for ${slot} before choosing thinking.`;
         return;
       }
+      const levels = selectedThinkingLevels();
+      if (levels.length === 0) {
+        notice = `The selected model for ${slot} is unavailable.`;
+        return;
+      }
       const currentThinking = draft[slot]?.thinking ?? DEFAULT_THINKING_BY_SLOT[slot];
-      const currentIndex = Math.max(0, THINKING_LEVEL_NAMES.findIndex((thinking) => thinking === currentThinking));
-      const nextIndex = Math.max(0, Math.min(THINKING_LEVEL_NAMES.length - 1, currentIndex + delta));
+      const currentIndex = Math.max(0, levels.findIndex((thinking) => thinking === currentThinking));
+      const nextIndex = Math.max(0, Math.min(levels.length - 1, currentIndex + delta));
       draft[slot] = {
         model: draft[slot]?.model ?? null,
-        thinking: THINKING_LEVEL_NAMES[nextIndex],
+        thinking: levels[nextIndex],
       };
       notice = undefined;
     };
@@ -251,8 +265,11 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
     };
 
     const buildThinkingRows = (): string[] => {
-      const currentThinking = selectedConfig()?.thinking;
-      return THINKING_LEVEL_NAMES.map((thinking) => `${thinking === currentThinking ? "›" : " "} ${thinking}`);
+      const config = selectedConfig();
+      if (!config?.model) return ["  Pick a model first."];
+      const levels = selectedThinkingLevels();
+      if (levels.length === 0) return ["  Model unavailable."];
+      return levels.map((thinking) => `${thinking === config.thinking ? "›" : " "} ${thinking}`);
     };
 
     const columnRows = (title: string, rows: string[], width: number, active: boolean): string[] => {
@@ -367,6 +384,14 @@ export function registerFavoriteModelsCommand(pi: any): void {
           const slot = normalizeSlot(parts[1]);
           const model = normalizeModel(parts[2]);
           const thinking = normalizeThinking(parts[3]);
+          const registeredModel = (await loadScopedModels(ctx)).find((candidate) => candidate.qualified === model);
+          if (!registeredModel) throw new Error(`Model "${model}" is not available in this Pi session.`);
+          const supportedThinking = getSupportedThinkingLevels(registeredModel);
+          if (!supportedThinking.includes(thinking)) {
+            throw new Error(
+              `Thinking level "${thinking}" is not available for ${model}. Use one of: ${supportedThinking.join(", ")}.`,
+            );
+          }
           setGlobalFavoriteModel(slot, { model, thinking });
           ctx.ui.notify(`Set ${slot} to ${model} · ${thinking}.`, "info");
           return;

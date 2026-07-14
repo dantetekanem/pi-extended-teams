@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { THINKING_LEVEL_NAMES } from "./thinking-levels";
 
 export interface AvailableModel {
   provider: string;
@@ -28,7 +29,7 @@ export interface SortedModel extends AvailableModel {
   providerPriorityIndex: number;
 }
 
-const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+const THINKING_LEVELS = new Set<string>(THINKING_LEVEL_NAMES);
 
 function normalizeList(values: unknown): string[] | undefined {
   if (!Array.isArray(values)) return undefined;

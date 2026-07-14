@@ -13,13 +13,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { THINKING_LEVEL_NAMES, type ThinkingLevelName } from "./thinking-levels";
+
+export { THINKING_LEVEL_NAMES, type ThinkingLevelName } from "./thinking-levels";
 
 export type AgentRole = "read" | "write";
 
 export const AGENT_ROLES: AgentRole[] = ["read", "write"];
 
-export const THINKING_LEVEL_NAMES = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-export type ThinkingLevelName = (typeof THINKING_LEVEL_NAMES)[number];
 const THINKING_LEVELS = new Set<string>(THINKING_LEVEL_NAMES);
 
 export const FAVORITE_MODEL_SLOTS = [

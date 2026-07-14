@@ -5,14 +5,20 @@ import {
   loadPiModelSettings,
   normalizeQualifiedModel,
   sortAvailableModels,
+  type AvailableModel,
 } from "../../src/utils/model-resolution";
+import type { ThinkingCapableModel } from "../../src/utils/thinking-levels";
 
-export async function getAvailableModels(ctx: any): Promise<Array<{ provider: string; model: string }>> {
+export interface AvailableRegisteredModel extends AvailableModel, ThinkingCapableModel {}
+
+export async function getAvailableModels(ctx: any): Promise<AvailableRegisteredModel[]> {
   try {
     const available = await ctx.modelRegistry.getAvailable();
     return available.map((model: any) => ({
       provider: model.provider,
       model: model.id,
+      reasoning: model.reasoning,
+      thinkingLevelMap: model.thinkingLevelMap,
     }));
   } catch {
     return [];

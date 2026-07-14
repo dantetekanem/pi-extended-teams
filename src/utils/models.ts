@@ -1,6 +1,7 @@
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+import { THINKING_LEVEL_NAMES, type ThinkingLevelName } from "./thinking-levels";
 
-export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+export const THINKING_LEVELS = THINKING_LEVEL_NAMES;
+export type ThinkingLevel = ThinkingLevelName;
 
 export interface Member {
   agentId: string;

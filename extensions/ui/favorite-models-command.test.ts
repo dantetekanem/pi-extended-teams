@@ -11,7 +11,12 @@ function setupCommand() {
   const commands = new Map<string, any>();
   const pi = { registerCommand: vi.fn((name: string, command: any) => commands.set(name, command)) };
   registerFavoriteModelsCommand(pi);
-  const ctx = { ui: { notify: vi.fn() } };
+  const ctx = {
+    modelRegistry: {
+      getAvailable: vi.fn(async (): Promise<any[]> => [{ provider: "provider", id: "model", reasoning: true }]),
+    },
+    ui: { notify: vi.fn() },
+  };
   return { commands, ctx, pi };
 }
 
@@ -61,7 +66,7 @@ describe("/agents-favorite-models", () => {
     const ctx = {
       mode: "tui",
       modelRegistry: {
-        getAvailable: vi.fn(async () => [{ provider: "provider", id: "model" }]),
+        getAvailable: vi.fn(async () => [{ provider: "provider", id: "model", reasoning: true }]),
       },
       ui: { notify, custom },
     };
@@ -72,6 +77,69 @@ describe("/agents-favorite-models", () => {
     expect(raw.favoriteModels["reading-fast"]).toEqual({ model: "provider/model", thinking: "low" });
     expect(custom).toHaveBeenCalled();
     expect(notify).toHaveBeenCalledWith("Agent favorite models saved.", "info");
+  });
+
+  it("shows max only when the selected Pi model advertises it", async () => {
+    const { commands } = setupCommand();
+    const custom = vi.fn(async (factory: any) => {
+      const component = factory(
+        { requestRender: vi.fn(), terminal: { rows: 30 } },
+        testTheme(),
+        {},
+        vi.fn(),
+      );
+
+      component.handleInput("l");
+      component.handleInput("\x1b[B");
+      component.handleInput("l");
+      const rendered = component.render(120).join("\n");
+      expect(rendered).toContain("  max");
+      expect(rendered).not.toContain("  xhigh");
+      return "cancelled";
+    });
+    const ctx = {
+      mode: "tui",
+      modelRegistry: {
+        getAvailable: vi.fn(async () => [{
+          provider: "provider",
+          id: "max-model",
+          reasoning: true,
+          thinkingLevelMap: { max: "max", xhigh: null },
+        }]),
+      },
+      ui: { notify: vi.fn(), custom },
+    };
+
+    await commands.get("agents-favorite-models").handler("", ctx);
+  });
+
+  it("hides opt-in levels that the selected Pi model does not advertise", async () => {
+    const { commands } = setupCommand();
+    const custom = vi.fn(async (factory: any) => {
+      const component = factory(
+        { requestRender: vi.fn(), terminal: { rows: 30 } },
+        testTheme(),
+        {},
+        vi.fn(),
+      );
+
+      component.handleInput("l");
+      component.handleInput("\x1b[B");
+      component.handleInput("l");
+      const rendered = component.render(120).join("\n");
+      expect(rendered).not.toContain("  max");
+      expect(rendered).not.toContain("  xhigh");
+      return "cancelled";
+    });
+    const ctx = {
+      mode: "tui",
+      modelRegistry: {
+        getAvailable: vi.fn(async () => [{ provider: "provider", id: "standard-model", reasoning: true }]),
+      },
+      ui: { notify: vi.fn(), custom },
+    };
+
+    await commands.get("agents-favorite-models").handler("", ctx);
   });
 
   it("does not save a thinking-only empty slot from the picker", async () => {
@@ -93,7 +161,7 @@ describe("/agents-favorite-models", () => {
     const ctx = {
       mode: "tui",
       modelRegistry: {
-        getAvailable: vi.fn(async () => [{ provider: "provider", id: "model" }]),
+        getAvailable: vi.fn(async () => [{ provider: "provider", id: "model", reasoning: true }]),
       },
       ui: { notify, custom },
     };
@@ -119,6 +187,33 @@ describe("/agents-favorite-models", () => {
     raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
     expect(raw.favoriteModels).not.toHaveProperty("reading-fast");
     expect(ctx.ui.notify).toHaveBeenLastCalledWith("Cleared reading-fast.", "info");
+  });
+
+  it("accepts max only for a Pi model that advertises it", async () => {
+    const { commands, ctx } = setupCommand();
+    ctx.modelRegistry.getAvailable.mockResolvedValue([{
+      provider: "provider",
+      id: "max-model",
+      reasoning: true,
+      thinkingLevelMap: { max: "max" },
+    }]);
+
+    await commands.get("agents-favorite-models").handler("set reading-hard provider/max-model max", ctx);
+
+    const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.favoriteModels["reading-hard"]).toEqual({ model: "provider/max-model", thinking: "max" });
+  });
+
+  it("rejects max when the Pi model does not advertise it", async () => {
+    const { commands, ctx } = setupCommand();
+
+    await commands.get("agents-favorite-models").handler("set reading-hard provider/model max", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining('Thinking level "max" is not available for provider/model'),
+      "warning",
+    );
+    expect(fs.existsSync(globalSettingsPath(homeDir))).toBe(false);
   });
 
   it("warns for invalid input without writing settings", async () => {

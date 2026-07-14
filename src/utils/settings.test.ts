@@ -152,12 +152,14 @@ describe("loadSettings", () => {
     writeGlobal({
       favoriteModels: {
         "reading-fast": { model: "provider/fast", thinking: "low" },
+        "writing-hard": { model: "provider/max", thinking: "max" },
         unknown: { model: "provider/ignored", thinking: "high" },
         "reading-hard": { model: "provider/hard", thinking: "ultra" },
       },
     });
     const s = loadSettings({ homeDir, projectDir });
     expect(s.favoriteModels["reading-fast"]).toEqual({ model: "provider/fast", thinking: "low" });
+    expect(s.favoriteModels["writing-hard"]).toEqual({ model: "provider/max", thinking: "max" });
     expect(s.favoriteModels["reading-hard"]).toEqual({ model: "provider/hard", thinking: null });
     expect(s.favoriteModels).not.toHaveProperty("unknown");
   });

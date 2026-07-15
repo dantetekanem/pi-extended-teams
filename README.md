@@ -78,7 +78,6 @@ Spawned-agent communication:
 
 - `send_message`
 - `read_inbox`
-- `report_progress`
 
 Edit-agent coordination tools:
 

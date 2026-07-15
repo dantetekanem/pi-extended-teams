@@ -7,8 +7,6 @@ import { extractTextParts, formatAnimatedProgress, formatElapsed, formatModelLab
 const REFRESH_INTERVAL_MS = 250;
 const MAX_NAVIGATION_AGENTS = 6;
 const AGENT_FOLLOW_BACKGROUND = "\x1b[48;2;22;23;32m";
-const PROGRESS_BAND_BACKGROUND = "\x1b[48;2;31;33;47m";
-const PROGRESS_RULE_FOREGROUND = "\x1b[38;2;75;79;103m";
 const ACTION_FOREGROUND = "\x1b[38;5;117m";
 const PATH_FOREGROUND = "\x1b[38;5;213m";
 const SUCCESS_FOREGROUND = "\x1b[38;5;114m";
@@ -161,30 +159,7 @@ function renderActionPathState(action: string, path: string, state: string, widt
   );
 }
 
-function progressBandLine(content: string, width: number): string {
-  const bounded = truncateToWidth(content, width, "…", true);
-  const reassertedBackground = bounded.split(ANSI_RESET).join(`${ANSI_RESET}${PROGRESS_BAND_BACKGROUND}`);
-  return `${PROGRESS_BAND_BACKGROUND}${reassertedBackground}${ANSI_RESET}`;
-}
-
-function renderProgressBlock(status: string, failed: boolean, width?: number): string[] {
-  const content = ` ${actionAnsi("progress")}${mutedAnsi(" · ")}${bodyAnsi(status)}${failed ? `${mutedAnsi(" · ")}${failureAnsi("failed")}` : ""}`;
-  const bandWidth = Math.max(1, width ?? visibleWidth(content));
-  const rule = `${PROGRESS_BAND_BACKGROUND}${PROGRESS_RULE_FOREGROUND}${"─".repeat(bandWidth)}${ANSI_FOREGROUND_RESET}${ANSI_RESET}`;
-  const bottomPadding = `${PROGRESS_BAND_BACKGROUND}${" ".repeat(bandWidth)}${ANSI_RESET}`;
-  return [rule, progressBandLine(content, bandWidth), bottomPadding];
-}
-
 function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, width?: number): string[] | undefined {
-  if (block.name === "report_progress") {
-    const details = asRecord(block.details);
-    const args = asRecord(block.args);
-    const resultStatus = block.result?.replace(/^Progress updated:\s*/i, "");
-    const rawStatus = details?.status ?? args?.status ?? resultStatus ?? (block.isError ? "failed" : "working");
-    const status = compactTranscriptLine(String(rawStatus)) || (block.isError ? "failed" : "working");
-    return renderProgressBlock(status, block.isError === true, width);
-  }
-
   if (block.name === "edit") {
     const path = toolPath(block.args);
     if (block.result === undefined) return [renderActionPathState("edit", path, "working", width)];
@@ -470,9 +445,12 @@ export function createAgentFollowComponent(
       const model = formatModelLabel(agent.model, agent.thinking).replace(" · ", "/");
       const slot = agent.modelSlot || "level inherited";
       const elapsed = formatElapsed(renderNow - agent.startedAt);
-      const progress = stoppingAgents.has(agent.name) ? "stopping" : (agent.latestProgress || agent.status);
-      const animatedProgress = formatAnimatedProgress(progress, renderNow);
-      const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatTokenCount(agent.tokensUsed)} tok · ${animatedProgress}`;
+      const activity = stoppingAgents.has(agent.name)
+        ? "stopping"
+        : agent.latestProgress
+          ? `progress: ${formatAnimatedProgress(agent.latestProgress, renderNow)}`
+          : agent.status;
+      const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatTokenCount(agent.tokensUsed)} tok · ${activity}`;
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";
       const messageAction = options.sendMessage ? " · m message" : "";
       const help = composingMessage

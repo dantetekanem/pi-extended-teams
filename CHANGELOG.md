@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-07-14
+
+### Changed
+- Show retained progress as an ordinary labeled activity field instead of bespoke follow-view chrome.
+
+### Fixed
+- Stop spawned agents from receiving or being instructed to call the removed explicit progress-update tool.
+
 ## [2.1.0] - 2026-07-14
 
 ### Added

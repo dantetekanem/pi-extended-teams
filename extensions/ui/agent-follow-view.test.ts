@@ -93,8 +93,7 @@ describe("agent follow transcript", () => {
     expect(expanded).not.toContain("collapsed");
   });
 
-  it("renders report progress as an exact full-width restrained band", () => {
-    const width = 48;
+  it("renders historical report_progress calls as ordinary generic tool blocks", () => {
     const lines = formatAgentFollowTranscript([
       { role: "assistant", content: [
         { type: "toolCall", id: "progress-1", name: "report_progress", arguments: { status: "Checking the follow renderer" } },
@@ -107,20 +106,13 @@ describe("agent follow transcript", () => {
         details: { session: "team", status: "Checking the follow renderer", updatedAt: 1 },
         isError: false,
       },
-    ], { width });
+    ], { width: 80 });
+    const plain = lines.map(stripAnsi);
 
-    expect(lines).toHaveLength(3);
-    expect(lines[0]).toBe(`\x1b[48;2;31;33;47m\x1b[38;2;75;79;103m${"─".repeat(width)}\x1b[39m\x1b[0m`);
-    expect(lines[1]).toContain("\x1b[48;2;31;33;47m");
-    expect(lines[1]).toContain("\x1b[38;5;117mprogress\x1b[39m");
-    expect(lines[1]).toContain("\x1b[38;5;253mChecking the follow renderer\x1b[39m");
-    expect(lines[2]).toBe(`\x1b[48;2;31;33;47m${" ".repeat(width)}\x1b[0m`);
-    expect(lines.map(visibleWidth)).toEqual([width, width, width]);
-    expect(lines.join("\n")).not.toContain("\x1b[48;5;250m");
-    expect(lines.join("\n")).not.toContain("Progress updated:");
-    expect(lines.join("\n")).not.toContain("{\"status\"");
-    expect(lines.join("\n")).not.toContain("╭─");
-    expect(lines.join("\n")).not.toContain("line ·");
+    expect(plain[0]).toContain("╭─ report_progress ·");
+    expect(plain).toContain("│ Progress updated: Checking the follow renderer");
+    expect(plain.at(-2)).toContain("╰─ 1 line");
+    expect(lines.join("\n")).not.toContain("\x1b[48;2;31;33;47m");
   });
 
   it("renders successful and failed edits without source or result noise", () => {
@@ -321,7 +313,7 @@ describe("agent follow component", () => {
     const component = createAgentFollowComponent(tui, done, { getAgents: () => [agent] });
 
     const first = component.render(140).join("\n");
-    expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 42 tok · Verifying assumptions\.{1,3}/);
+    expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 42 tok · progress: Verifying assumptions\.{1,3}/);
     expect(first).toContain("Working now");
     expect(first).toContain("\x1b[48;2;22;23;32m");
     expect(first).not.toContain("\x1b[48;5;235m");
@@ -329,46 +321,21 @@ describe("agent follow component", () => {
     tokens = 2_300_000;
     agent.latestProgress = "Writing final report";
     const updated = component.render(140).join("\n");
-    expect(updated).toMatch(/2\.3M tok · Writing final report\.{1,3}/);
+    expect(updated).toMatch(/2\.3M tok · progress: Writing final report\.{1,3}/);
 
     component.handleInput("\x1b[A");
     expect(done).toHaveBeenCalledOnce();
     component.dispose();
   });
 
-  it("keeps a long progress update on one row at narrow widths", () => {
+  it("uses the ordinary agent status when no stored progress is present", () => {
     const tui = { terminal: { rows: 20 }, requestRender: vi.fn() };
-    const agent = makeAgent({
-      session: {
-        messages: [
-          { role: "assistant", content: [
-            {
-              type: "toolCall",
-              id: "progress-1",
-              name: "report_progress",
-              arguments: { status: "Inspecting a deliberately long renderer status that would previously wrap across multiple rows" },
-            },
-          ] },
-          {
-            role: "toolResult",
-            toolCallId: "progress-1",
-            toolName: "report_progress",
-            content: "Progress updated",
-            details: { status: "Inspecting a deliberately long renderer status that would previously wrap across multiple rows" },
-            isError: false,
-          },
-        ],
-        getSessionStats: () => ({ tokens: { total: 42 } }),
-      } as any,
-    });
+    const agent = makeAgent({ latestProgress: undefined, status: "working" });
     const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [agent] });
 
-    const rendered = component.render(52);
-    const progressRows = rendered.filter(line => stripAnsi(line).includes("progress ·"));
-    const bandRows = rendered.filter(line => line.includes("\x1b[48;2;31;33;47m"));
-    expect(progressRows).toHaveLength(1);
-    expect(bandRows).toHaveLength(3);
-    expect(bandRows.map(visibleWidth)).toEqual([52, 52, 52]);
+    const rendered = stripAnsi(component.render(80).join("\n"));
+    expect(rendered).toContain("42 tok · working");
+    expect(rendered).not.toContain("progress:");
     component.dispose();
   });
 

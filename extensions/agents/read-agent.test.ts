@@ -346,7 +346,7 @@ describe("in-process read agent tool wiring", () => {
 
     expect(piMocks.createAgentSession).toHaveBeenCalledTimes(1);
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
-    const communicationToolNames = ["send_message", "report_progress", "read_inbox", "report_and_exit"];
+    const communicationToolNames = ["send_message", "read_inbox", "report_and_exit"];
     expect(sessionOptions.tools).toEqual([
       "read",
       "bash",
@@ -373,11 +373,8 @@ describe("in-process read agent tool wiring", () => {
     expect(promptText).toContain("Use send_message for direct communication and read_inbox only when you were told a reply is waiting");
     expect(promptText).toContain("If another agent is needed, use send_message to ask team-lead");
     expect(promptText).toContain("only the lead decides and performs the spawn");
-    expect(promptText).toContain("Progress reporting is required, not optional UI polish");
-    expect(promptText).toContain("Call report_progress before your first work tool");
-    expect(promptText).toContain("never make more than 3 work-tool calls without a fresh progress update");
-    expect(promptText).toContain("Use a new phrase describing what you are doing now");
-    expect(promptText).toContain("without messaging or waking the lead");
+    expect(promptText).not.toContain("Progress reporting is required");
+    expect(promptText).not.toContain("fresh progress update");
     expect(promptText).toContain("use report_and_exit with the complete required deliverable");
     expect(promptText).toContain("Never replace required output with a summary");
 
@@ -502,7 +499,6 @@ describe("in-process read agent tool wiring", () => {
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
     const communicationToolNames = [
       "send_message",
-      "report_progress",
       "read_inbox",
       "claim_file",
       "release_file",
@@ -1012,73 +1008,6 @@ describe("in-process read agent tool wiring", () => {
       metadata: { initialPrompt: "edit an isolated file", modelSlot: "write-system" },
     });
     expect(JSON.stringify({ state: options.rememberCompletedAgentReport.mock.calls, leadInbox, reports })).not.toContain("writing-hard");
-  });
-
-  it("emits normalized progress without resetting tool-working status for non-assistant message updates", async () => {
-    let subscriber: ((event: any) => void) | undefined;
-    const session = makeSession();
-    session.subscribe.mockImplementation((callback: (event: any) => void) => {
-      subscriber = callback;
-    });
-    const runningReadAgents = new Map<string, RunningReadAgent>();
-    session.prompt.mockImplementation(async () => {
-      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
-      const progressTool = sessionOptions.customTools.find((tool: any) => tool.name === "report_progress");
-      await progressTool.execute("progress", { status: "  Inspecting\n event   handling  " });
-      expect(runningReadAgents.get("team:reader")).toMatchObject({
-        status: "thinking",
-        latestProgress: "Inspecting event handling",
-        progressUpdatedAt: expect.any(Number),
-      });
-
-      subscriber?.({ type: "tool_execution_start", toolName: "bash" });
-      subscriber?.({ type: "message_update", message: { role: "toolResult", content: "not assistant text" } });
-      expect(runningReadAgents.get("team:reader")).toMatchObject({
-        status: "working",
-        activeToolName: "bash",
-        latestProgress: "Inspecting event handling",
-      });
-      subscriber?.({ type: "tool_execution_end", toolName: "bash" });
-      expect(runningReadAgents.get("team:reader")).toMatchObject({
-        status: "thinking",
-        latestProgress: "Inspecting event handling",
-      });
-    });
-    piMocks.createAgentSession.mockResolvedValue({ session });
-    const options = {
-      isTeammate: false,
-      getTeamName: () => "team",
-      runningReadAgents,
-      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
-      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
-      ensureReadAgentStatusTicker: vi.fn(),
-      renderReadAgentStatus: vi.fn(),
-      rememberCompletedAgentReport: vi.fn(),
-      emitAgentReport: vi.fn(),
-      emitAgentProgress: vi.fn(),
-      releaseAllClaimsForAgent: vi.fn(async () => []),
-    };
-
-    await runReadAgentInProcess("team", {
-      agentId: "reader@team",
-      name: "reader",
-      agentType: "teammate",
-      role: "read",
-      model: "provider/model",
-      thinking: "high",
-      modelSlot: "reading-default",
-      joinedAt: Date.now(),
-      tmuxPaneId: "",
-      cwd: root,
-      subscriptions: [],
-      prompt: "investigate",
-    }, "investigate", {
-      modelRegistry: {
-        find: vi.fn(() => ({ provider: "provider", id: "model" })),
-      },
-    }, options);
-
-    expect(options.emitAgentProgress).toHaveBeenCalledWith("team", "reader", "Inspecting event handling", expect.any(Number));
   });
 
   it("emits prompt-build reports even when prompt-build is not the adopted lead team", async () => {

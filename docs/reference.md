@@ -18,14 +18,14 @@ This reference documents the current public surface for pi-extended-teams. The e
 
 ### `spawn_agent`
 
-Spawn one agent in the current Pi session by configured level only.
+Spawn one agent in the current Pi session by configured intent tier only.
 
 **Parameters**
 
 - `name` (optional): Stable display name. If omitted, pi-extended-teams generates a unique name.
 - `prompt` (required): Assignment and expected report shape.
 - `cwd` (optional): Working directory. Defaults to the lead session cwd.
-- `model_slot` (required): One of `reading-fast`, `reading-default`, `reading-hard`, `writing-basic`, or `writing-hard`. This level selects read/write behavior, model, and thinking from `/agents-favorite-models`.
+- `model_slot` (required): One of the eight canonical tiers: `read-collect`, `read-review`, `read-analyze`, `read-critical`, `write-patch`, `write-feature`, `write-system`, or `write-critical`. The schema recommends `read-review` as the normal default. The tier selects read/write behavior, model, and thinking from `/agents-favorite-models`.
 - `metadata` (optional): Extra structured metadata for runtime/orchestration use.
 
 Do not pass `role`, `model`, or `thinking` directly. Spawn calls reject them; see `TIPS.md` for examples.
@@ -35,24 +35,24 @@ Do not pass `role`, `model`, or `thinking` directly. Spawn calls reject them; se
 ```javascript
 spawn_agent({
   name: "security-reviewer",
-  model_slot: "reading-hard",
+  model_slot: "read-critical",
   prompt: "Review src/auth for authorization bugs. Report findings with file:line evidence."
 })
 ```
 
-Use a `writing-*` level only for isolated edit work. Edit agents should claim files before writing and finish with `report_and_exit`.
+Use a `write-*` tier only for isolated edit work. Edit agents should claim files before writing and finish with `report_and_exit`.
 
 ```javascript
 spawn_agent({
   name: "docs-fix",
-  model_slot: "writing-basic",
+  model_slot: "write-patch",
   prompt: "Claim docs/guide.md, fix stale public tool references only, verify, then call report_and_exit."
 })
 ```
 
 ### `spawn_swarm_agents`
 
-Spawn a batch of agents in the current Pi session. Use `defaults` for shared level/cwd/metadata and per-agent fields for overrides.
+Spawn a batch of agents in the current Pi session. Use `defaults` for shared intent tier/cwd/metadata and per-agent fields for overrides.
 
 **Parameters**
 
@@ -63,11 +63,11 @@ Spawn a batch of agents in the current Pi session. Use `defaults` for shared lev
 
 ```javascript
 spawn_swarm_agents({
-  defaults: { model_slot: "reading-default" },
+  defaults: { model_slot: "read-review" },
   agents: [
-    { name: "architecture", model_slot: "reading-hard", prompt: "Review module boundaries and coupling." },
+    { name: "architecture", model_slot: "read-analyze", prompt: "Explain module-boundary and coupling risks from connected evidence." },
     { name: "tests", prompt: "Run focused tests and report failures or gaps." },
-    { name: "docs", model_slot: "reading-fast", prompt: "Check docs for stale tool references." }
+    { name: "docs", model_slot: "read-collect", prompt: "Check docs for stale tool references." }
   ]
 })
 ```
@@ -217,17 +217,36 @@ Active agents appear in the below-editor activity card. From an empty editor, pr
 
 ### `/agents-favorite-models`
 
-Configure the five favorite model slots used by `model_slot`:
+Configure the eight canonical favorite intent tiers used by `model_slot`:
 
-- `reading-fast`
-- `reading-default`
-- `reading-hard`
-- `writing-basic`
-- `writing-hard`
+| Tier | Intent | Picker thinking default |
+| --- | --- | --- |
+| `read-collect` | Bounded fact/evidence gathering without owning the conclusion (Luna calibration). | `high` |
+| `read-review` | Normal default for focused review, verification, and bounded synthesis (Luna). | `xhigh` |
+| `read-analyze` | Behavioral or root-cause explanation across connected evidence (Sol). | `medium` |
+| `read-critical` | Irreducible high-stakes security/architecture/concurrency/migration/data reasoning (Sol). | `xhigh` |
+| `write-patch` | Narrow localized change (Luna). | `max` |
+| `write-feature` | Bounded feature with a known design (Sol). | `medium` |
+| `write-system` | Cross-cutting integration/refactor within explicitly claimed files (Sol). | `high` |
+| `write-critical` | High-risk security/concurrency/recovery/migration/data-integrity change (Sol). | `max` |
 
-By default, all slots start empty. Run the command without arguments to open a single-screen picker for all five slots; the model column is populated from the scoped models available to the current Pi session. Pick a model and thinking level, then press Enter to save. Updates are saved to `~/.pi/agent/pi-extended-teams/settings.json`.
+Luna and Sol are calibration families, not provider model IDs built into pi-extended-teams. All tiers start empty; select the corresponding scoped models available in the current Pi session. Press Enter to save to `~/.pi/agent/pi-extended-teams/settings.json`.
 
-Use the slots to communicate intent while choosing the cheapest sufficient read level. `reading-fast` is the normal first choice and should naturally be the most-used read slot: bounded research, collection, inventory, lookup, evidence gathering, and docs/log/test-output inspection. Use `reading-default` for normal synthesis and bounded engineering judgment. Reserve `reading-hard` as the rarest read slot for irreducibly deep, ambiguous, high-risk architecture/security/root-cause/data reasoning; never select it merely because a task says investigate, research, review, or verify. Use `writing-basic` for a narrow docs/edit task and `writing-hard` for difficult implementation.
+For this minor release, these public/settings compatibility aliases remain accepted. Resolution normalizes aliases deterministically, canonical values win if both forms exist, and subsequent favorite-model saves remove legacy duplicates.
+
+| Compatibility alias | Canonical intent tier |
+| --- | --- |
+| `reading-fast` | `read-collect` |
+| `reading-default` | `read-review` |
+| `reading-hard` | `read-critical` |
+| `writing-basic` | `write-patch` |
+| `writing-hard` | `write-system` |
+
+### `/agents-extensions`
+
+Inspect or choose the external Pi extension entrypoints loaded by spawned agents. `list` prints the effective plan; no argument opens the picker in TUI mode. `default` saves `extensions.allow: null`, so the global policy selects all observable loaded command/tool extensions, not all effective extensions: event-, provider-, renderer-, and shortcut-only extensions are not observable by this policy. `none` saves `extensions.allow: []`, so the global policy selects no external extensions. Observed picker selections save canonical absolute extension identities, never display names; stale or blocked preserved entries may remain legacy names. Legacy bare-name entries remain supported as wildcards across all same-name extensions; a block match always takes precedence over allow. Skills are always enabled, and pi-extended-teams itself is internal rather than a selectable spawned-agent extension.
+
+All `/agents-extensions` saves write only the global file, `~/.pi/agent/pi-extended-teams/settings.json`; the command never edits or removes `.pi/pi-extended-teams.json`. A trusted project-local `extensions.allow` (whether `null`, `[]`, or an array) takes precedence over the global policy for that project. In that case the command saves the global choice but reports a warning naming both settings files, because the project override remains authoritative. An untrusted project override is ignored and does not produce that warning.
 
 ---
 
@@ -245,11 +264,14 @@ Common runtime settings:
 ```json
 {
   "favoriteModels": {
-    "reading-fast": { "model": "provider/model", "thinking": "low" },
-    "reading-default": { "model": "provider/model", "thinking": "high" },
-    "reading-hard": { "model": "provider/model", "thinking": "xhigh" },
-    "writing-basic": { "model": "provider/model", "thinking": "high" },
-    "writing-hard": { "model": "provider/model", "thinking": "xhigh" }
+    "read-collect": { "model": "provider/luna-model", "thinking": "high" },
+    "read-review": { "model": "provider/luna-model", "thinking": "xhigh" },
+    "read-analyze": { "model": "provider/sol-model", "thinking": "medium" },
+    "read-critical": { "model": "provider/sol-model", "thinking": "xhigh" },
+    "write-patch": { "model": "provider/luna-model", "thinking": "max" },
+    "write-feature": { "model": "provider/sol-model", "thinking": "medium" },
+    "write-system": { "model": "provider/sol-model", "thinking": "high" },
+    "write-critical": { "model": "provider/sol-model", "thinking": "max" }
   },
   "readAgents": {
     "maxConcurrent": 8,
@@ -266,7 +288,7 @@ Common runtime settings:
 
 Provider-priority sorting for the `/agents-favorite-models` picker also supports `providerPriority` in `~/.pi/pi-extended-teams.json` or `.pi/pi-extended-teams.json`.
 
-Spawn calls use `model_slot` only. They reject raw `model`, direct `thinking`, and direct `role` fields. In `spawn_swarm_agents`, each agent must receive a configured level directly or inherit one from `defaults`.
+Spawn calls use `model_slot` only. They reject raw `model`, direct `thinking`, and direct `role` fields. In `spawn_swarm_agents`, each agent must receive a configured tier directly or inherit one from `defaults`.
 
 ---
 
@@ -275,7 +297,7 @@ Spawn calls use `model_slot` only. They reject raw `model`, direct `thinking`, a
 - The lead controls orchestration. Spawned agents should not create other agents.
 - Agents run in-process and are followable from Pi.
 - Read agents should not edit files or make mutating changes.
-- Prefer multiple `reading-fast` agents for splitable collection work; use `reading-hard` for deep synthesis, risky analysis, or ambiguous root cause. See `TIPS.md` for level-selection examples.
+- Use `read-review` as the normal default, `read-collect` for bounded evidence gathering, `read-analyze` for connected explanation, and `read-critical` only for irreducible high-stakes reasoning. See `TIPS.md` for tier-selection examples.
 - Edit agents should keep diffs small, claim files before editing, and use `report_and_exit` when finished.
 - Do not use sleep loops or polling to wait for reports; pi-extended-teams wakes the lead when agent reports arrive.
 - Internal source files still use `team` terminology in places for persisted state and backward compatibility. That terminology is not part of the current public workflow.

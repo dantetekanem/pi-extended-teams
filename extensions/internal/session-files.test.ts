@@ -142,4 +142,23 @@ describe("session file cleanup", () => {
     expect(fs.existsSync(paths.teamDir("fresh-orphan"))).toBe(true);
     expect(terminal.kill).toHaveBeenCalledWith("%7");
   });
+
+  it("never TTL-cleans a team with a lifecycle quarantine file, even when corrupt", () => {
+    const terminal = { kill: vi.fn() };
+    const now = Date.now();
+    writeTeam("quarantined-orphan", { createdAt: now - 2 * 60 * 60 * 1000 });
+    const quarantineDir = path.join(paths.teamDir("quarantined-orphan"), "lifecycle", "quarantine");
+    fs.mkdirSync(quarantineDir, { recursive: true });
+    fs.writeFileSync(path.join(quarantineDir, "writer.json"), "{ malformed");
+
+    const cleaned = cleanupOrphanedTeams(terminal, {
+      teamsRoot,
+      now,
+      maxAgeMs: 60 * 60 * 1000,
+    });
+
+    expect(cleaned).toBe(0);
+    expect(fs.existsSync(paths.teamDir("quarantined-orphan"))).toBe(true);
+    expect(terminal.kill).not.toHaveBeenCalled();
+  });
 });

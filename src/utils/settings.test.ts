@@ -3,15 +3,22 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  ACCEPTED_FAVORITE_MODEL_SLOTS,
   DEFAULT_SETTINGS,
   DEFAULT_READ_AGENT_MAX_CONCURRENT,
   DEFAULT_READ_HELPER_MAX_CONCURRENT,
   DEFAULT_WRITE_AGENT_MAX_CONCURRENT,
+  FAVORITE_MODEL_SLOTS,
+  LEGACY_FAVORITE_MODEL_SLOT_ALIASES,
+  canonicalPersistedModelSlot,
   clearGlobalFavoriteModels,
   globalSettingsPath,
   loadSettings,
+  normalizeFavoriteModelSlot,
   projectSettingsPath,
-  resolveAllowedExtensions,
+  readProjectExtensionAllowOverride,
+  replaceGlobalExtensionAllow,
+  replaceGlobalFavoriteModels,
   resolveModel,
   resolveRole,
   roleForFavoriteModelSlot,
@@ -56,7 +63,7 @@ describe("loadSettings", () => {
     expect(s.readHelpers.queueOverflow).toBe(true);
     expect(s.roles.read.model).toBeNull();
     expect(s.favoriteModels).toEqual({});
-    expect(s.extensions.allow).toEqual([]);
+    expect(s.extensions.allow).toBeNull();
     expect(s.debug.enabled).toBe(false);
   });
 
@@ -89,12 +96,17 @@ describe("loadSettings", () => {
     expect(s.debug.enabled).toBe(true);
   });
 
-  it("lets project settings override global", () => {
-    writeGlobal({ watchdog: { bufferSeconds: 45 }, writeAgents: { maxConcurrent: 5 } });
-    writeProject({ watchdog: { bufferSeconds: 10 } });
+  it("lets project settings override global, including resetting extension selection to default", () => {
+    writeGlobal({
+      watchdog: { bufferSeconds: 45 },
+      writeAgents: { maxConcurrent: 5 },
+      extensions: { allow: ["global-extension"] },
+    });
+    writeProject({ watchdog: { bufferSeconds: 10 }, extensions: { allow: null } });
     const s = loadSettings({ homeDir, projectDir });
     expect(s.watchdog.bufferSeconds).toBe(10); // project wins
     expect(s.writeAgents.maxConcurrent).toBe(5); // global retained
+    expect(s.extensions.allow).toBeNull();
   });
 
   it("accepts high configured concurrency for large fanouts", () => {
@@ -148,58 +160,89 @@ describe("loadSettings", () => {
     expect(s.categories.bad.thinking).toBeNull();
   });
 
-  it("loads configured favorite model slots and ignores unknown slots", () => {
+  it("normalizes legacy favorite slots and lets canonical values win deterministically", () => {
     writeGlobal({
       favoriteModels: {
-        "reading-fast": { model: "provider/fast", thinking: "low" },
-        "writing-hard": { model: "provider/max", thinking: "max" },
+        "read-collect": { thinking: "high" },
+        "reading-fast": { model: "provider/legacy-collect", thinking: "low" },
+        "writing-hard": { model: "provider/legacy-system", thinking: "max" },
+        "write-system": { model: "provider/system" },
         unknown: { model: "provider/ignored", thinking: "high" },
         "reading-hard": { model: "provider/hard", thinking: "ultra" },
       },
     });
     const s = loadSettings({ homeDir, projectDir });
-    expect(s.favoriteModels["reading-fast"]).toEqual({ model: "provider/fast", thinking: "low" });
-    expect(s.favoriteModels["writing-hard"]).toEqual({ model: "provider/max", thinking: "max" });
-    expect(s.favoriteModels["reading-hard"]).toEqual({ model: "provider/hard", thinking: null });
+    expect(s.favoriteModels["read-collect"]).toEqual({ model: "provider/legacy-collect", thinking: "high" });
+    expect(s.favoriteModels["write-system"]).toEqual({ model: "provider/system", thinking: "max" });
+    expect(s.favoriteModels["read-critical"]).toEqual({ model: "provider/hard", thinking: null });
+    expect(s.favoriteModels).not.toHaveProperty("reading-fast");
+    expect(s.favoriteModels).not.toHaveProperty("writing-hard");
     expect(s.favoriteModels).not.toHaveProperty("unknown");
   });
 
   it("keeps favorite model slots global-only even when project settings exist", () => {
-    writeGlobal({ favoriteModels: { "reading-default": { model: "global/model", thinking: "high" } } });
-    writeProject({ favoriteModels: { "reading-default": { model: "project/model", thinking: "xhigh" } } });
+    writeGlobal({ favoriteModels: { "read-review": { model: "global/model", thinking: "xhigh" } } });
+    writeProject({ favoriteModels: { "read-review": { model: "project/model", thinking: "high" } } });
     const s = loadSettings({ homeDir, projectDir });
-    expect(s.favoriteModels["reading-default"]).toEqual({ model: "global/model", thinking: "high" });
+    expect(s.favoriteModels["read-review"]).toEqual({ model: "global/model", thinking: "xhigh" });
   });
 });
 
 describe("favorite model persistence", () => {
-  it("writes favorite slots to the global settings path while preserving other keys", () => {
-    writeGlobal({ readAgents: { maxConcurrent: 3 }, unknownKey: true });
+  it("accepts a legacy slot on write and saves only canonical keys while preserving other settings", () => {
+    writeGlobal({
+      readAgents: { maxConcurrent: 3 },
+      unknownKey: true,
+      favoriteModels: {
+        "reading-fast": { model: "provider/legacy-collect", thinking: "low" },
+        "read-collect": { thinking: "high" },
+      },
+    });
 
-    setGlobalFavoriteModel("writing-hard", { model: "provider/writer", thinking: "xhigh" }, { homeDir });
+    setGlobalFavoriteModel("writing-hard", { model: "provider/writer", thinking: "max" }, { homeDir });
 
     const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
     expect(raw.readAgents).toEqual({ maxConcurrent: 3 });
     expect(raw.unknownKey).toBe(true);
-    expect(raw.favoriteModels["writing-hard"]).toEqual({ model: "provider/writer", thinking: "xhigh" });
+    expect(raw.favoriteModels["read-collect"]).toEqual({ model: "provider/legacy-collect", thinking: "high" });
+    expect(raw.favoriteModels["write-system"]).toEqual({ model: "provider/writer", thinking: "max" });
+    for (const legacySlot of Object.keys(LEGACY_FAVORITE_MODEL_SLOT_ALIASES)) {
+      expect(raw.favoriteModels).not.toHaveProperty(legacySlot);
+    }
   });
 
-  it("clears one or all favorite slots", () => {
+  it("clears canonical tiers through legacy aliases and canonicalizes retained values", () => {
     writeGlobal({
       favoriteModels: {
-        "reading-fast": { model: "provider/fast", thinking: "low" },
-        "reading-hard": { model: "provider/hard", thinking: "xhigh" },
+        "reading-fast": { model: "provider/collect", thinking: "high" },
+        "reading-hard": { model: "provider/critical", thinking: "xhigh" },
       },
     });
 
     clearGlobalFavoriteModels({ homeDir, slot: "reading-fast" });
     let raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
     expect(raw.favoriteModels).not.toHaveProperty("reading-fast");
-    expect(raw.favoriteModels).toHaveProperty("reading-hard");
+    expect(raw.favoriteModels).not.toHaveProperty("read-collect");
+    expect(raw.favoriteModels).not.toHaveProperty("reading-hard");
+    expect(raw.favoriteModels).toHaveProperty("read-critical");
 
     clearGlobalFavoriteModels({ homeDir });
     raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
     expect(raw.favoriteModels).toEqual({});
+  });
+
+  it("replaces mixed legacy/canonical input with canonical keys and canonical precedence", () => {
+    replaceGlobalFavoriteModels({
+      "reading-default": { model: "provider/legacy-review", thinking: "high" },
+      "read-review": { model: "provider/review", thinking: "xhigh" },
+      "writing-basic": { model: "provider/patch", thinking: "max" },
+    }, { homeDir });
+
+    const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.favoriteModels).toEqual({
+      "read-review": { model: "provider/review", thinking: "xhigh" },
+      "write-patch": { model: "provider/patch", thinking: "max" },
+    });
   });
 });
 
@@ -221,7 +264,7 @@ describe("resolveModel", () => {
     const settings = withCategories({
       impl: { role: "write", model: "cat/model", thinking: null },
     });
-    settings.favoriteModels["writing-hard"] = { model: "favorite/model", thinking: "xhigh" };
+    settings.favoriteModels["write-critical"] = { model: "favorite/model", thinking: "max" };
     settings.roles.write = { model: "role/model", thinking: "medium" };
 
     expect(
@@ -237,13 +280,13 @@ describe("resolveModel", () => {
     const favorite = resolveModel(settings, {
       role: "write",
       category: "impl",
-      modelSlot: "writing-hard",
+      modelSlot: "write-critical",
       teamDefaultModel: "team/model",
       currentModel: "current/model",
     });
     expect(favorite.model).toBe("favorite/model");
     expect(favorite.modelSource).toBe("favorite-slot");
-    expect(favorite.thinking).toBe("xhigh");
+    expect(favorite.thinking).toBe("max");
 
     expect(
       resolveModel(settings, {
@@ -306,38 +349,87 @@ describe("resolveModel", () => {
   });
 });
 
-describe("resolveAllowedExtensions", () => {
-  it("returns allow minus block", () => {
-    const s = structuredClone(DEFAULT_SETTINGS);
-    s.extensions.allow = ["pi-emote", "my-ext", "noisy"];
-    s.extensions.block = ["noisy"];
-    expect(resolveAllowedExtensions(s, { homeDir })).toEqual(["pi-emote", "my-ext"]);
+describe("extension selection persistence", () => {
+  it("identifies a project-local extension policy without using merged settings", () => {
+    writeGlobal({ extensions: { allow: ["global-extension"] } });
+    writeProject({ extensions: { allow: [] } });
+
+    expect(readProjectExtensionAllowOverride(projectDir)).toEqual({
+      filePath: projectSettingsPath(projectDir),
+      allow: [],
+    });
+    expect(loadSettings({ homeDir, projectDir }).extensions.allow).toEqual([]);
+
+    writeProject({ extensions: { allow: null } });
+    expect(readProjectExtensionAllowOverride(projectDir)?.allow).toBeNull();
+
+    writeProject({ extensions: { block: ["only-block"] } });
+    expect(readProjectExtensionAllowOverride(projectDir)).toBeNull();
   });
 
-  it("is empty by default", () => {
-    expect(resolveAllowedExtensions(structuredClone(DEFAULT_SETTINGS), { homeDir })).toEqual([]);
-  });
+  it("writes explicit/default choices while preserving unknown and block settings", () => {
+    writeGlobal({
+      unknownKey: true,
+      extensions: { block: ["unsafe"], unknownNested: "keep" },
+    });
 
-  it("auto-loads an installed provider bootstrap extension", () => {
-    const bootstrap = path.join(homeDir, ".pi", "agent", "extensions", "shopify-proxy");
-    fs.mkdirSync(bootstrap, { recursive: true });
+    replaceGlobalExtensionAllow(["/one.ts", "/one.ts", " /two.ts "], { homeDir });
+    let raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw).toMatchObject({
+      unknownKey: true,
+      extensions: {
+        allow: ["/one.ts", "/two.ts"],
+        block: ["unsafe"],
+        unknownNested: "keep",
+      },
+    });
 
-    expect(resolveAllowedExtensions(structuredClone(DEFAULT_SETTINGS), { homeDir })).toEqual([bootstrap]);
-  });
-
-  it("blocks provider bootstrap extensions by name", () => {
-    const bootstrap = path.join(homeDir, ".pi", "agent", "extensions", "shopify-proxy");
-    fs.mkdirSync(bootstrap, { recursive: true });
-    const s = structuredClone(DEFAULT_SETTINGS);
-    s.extensions.allow = ["custom-ext"];
-    s.extensions.block = ["shopify-proxy"];
-
-    expect(resolveAllowedExtensions(s, { homeDir })).toEqual(["custom-ext"]);
+    replaceGlobalExtensionAllow(null, { homeDir });
+    raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.extensions.allow).toBeNull();
+    expect(raw.extensions.block).toEqual(["unsafe"]);
   });
 });
 
-describe("roleForFavoriteModelSlot", () => {
-  it("derives agent role from the selected level", () => {
+describe("favorite model tier names", () => {
+  it("defines exactly four canonical read and four canonical write tiers", () => {
+    expect(FAVORITE_MODEL_SLOTS).toEqual([
+      "read-collect",
+      "read-review",
+      "read-analyze",
+      "read-critical",
+      "write-patch",
+      "write-feature",
+      "write-system",
+      "write-critical",
+    ]);
+    expect(FAVORITE_MODEL_SLOTS.filter((slot) => slot.startsWith("read-"))).toHaveLength(4);
+    expect(FAVORITE_MODEL_SLOTS.filter((slot) => slot.startsWith("write-"))).toHaveLength(4);
+  });
+
+  it("normalizes every compatibility alias to its canonical tier", () => {
+    expect(ACCEPTED_FAVORITE_MODEL_SLOTS).toEqual([
+      ...FAVORITE_MODEL_SLOTS,
+      ...Object.keys(LEGACY_FAVORITE_MODEL_SLOT_ALIASES),
+    ]);
+    for (const [legacy, canonical] of Object.entries(LEGACY_FAVORITE_MODEL_SLOT_ALIASES)) {
+      expect(normalizeFavoriteModelSlot(legacy)).toBe(canonical);
+    }
+    expect(normalizeFavoriteModelSlot("not-a-tier")).toBeNull();
+  });
+
+  it("projects persisted aliases without changing canonical, unknown, or absent values", () => {
+    expect(canonicalPersistedModelSlot("writing-hard")).toBe("write-system");
+    expect(canonicalPersistedModelSlot("write-critical")).toBe("write-critical");
+    expect(canonicalPersistedModelSlot("future-write-tier")).toBe("future-write-tier");
+    expect(canonicalPersistedModelSlot(null)).toBeNull();
+    expect(canonicalPersistedModelSlot(undefined)).toBeUndefined();
+  });
+
+  it("preserves read/write role mapping for canonical tiers and aliases", () => {
+    for (const slot of FAVORITE_MODEL_SLOTS) {
+      expect(roleForFavoriteModelSlot(slot)).toBe(slot.startsWith("read-") ? "read" : "write");
+    }
     expect(roleForFavoriteModelSlot("reading-fast")).toBe("read");
     expect(roleForFavoriteModelSlot("reading-default")).toBe("read");
     expect(roleForFavoriteModelSlot("reading-hard")).toBe("read");

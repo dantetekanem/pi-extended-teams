@@ -31,6 +31,7 @@ function makeTools(teamName: string | null = "session", agentName = "reader", ro
     agentName,
     role,
     getTeamName: () => teamName ?? undefined,
+    getLifecycleRunId: () => "reader-run",
     authorizeWriteMember: vi.fn(async () => {}),
     onReportAndExit: vi.fn(async () => ({ accepted: true })),
   } as any).map((tool: Tool) => [tool.name, tool]));
@@ -40,6 +41,16 @@ describe("read-agent communication tools", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-agent-tools-"));
     installPathSpies();
+    const configFile = paths.configPath("session");
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    fs.writeFileSync(configFile, JSON.stringify({
+      name: "session",
+      members: [
+        { name: "team-lead" },
+        { name: "reader", lifecycleRunId: "reader-run", isActive: true },
+        { name: "writer", lifecycleRunId: "reader-run", isActive: true },
+      ],
+    }));
   });
 
   afterEach(() => {
@@ -54,14 +65,21 @@ describe("read-agent communication tools", () => {
   });
 
   it("lets a read agent submit its complete result instead of replacing it with a summary", async () => {
-    const onReportAndExit = vi.fn(async () => ({ accepted: true }));
+    const onReportAndExit = vi.fn(async () => ({
+      accepted: true,
+      cancelledDeliveries: 2,
+      deliveryOutcome: "cancelled" as const,
+    }));
     const tools = new Map<string, Tool>(createAgentCommunicationTools({
       isTeammate: true, agentName: "reader", role: "read", getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run",
       authorizeWriteMember: vi.fn(async () => {}), onReportAndExit,
     }).map((tool: Tool) => [tool.name, tool]));
     const content = JSON.stringify({ kind: "plan", document: { title: { kind: "title", body: "Plan", children: [] }, elements: [] } });
 
-    await expect(tools.get("report_and_exit")!.execute("report", { content, summary: "Complete plan result ready" })).resolves.toMatchObject({ details: { accepted: true } });
+    await expect(tools.get("report_and_exit")!.execute("report", { content, summary: "Complete plan result ready" })).resolves.toMatchObject({
+      details: { accepted: true, cancelledDeliveries: 2, deliveryOutcome: "cancelled" },
+    });
     expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" });
   });
 
@@ -119,6 +137,7 @@ describe("read-agent communication tools", () => {
       agentName: "reader",
       role: "read",
       getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run",
       authorizeWriteMember: vi.fn(async () => {}),
       onProgress,
       onReportAndExit: vi.fn(async () => ({ accepted: true })),
@@ -146,6 +165,7 @@ describe("read-agent communication tools", () => {
       agentName: "reader",
       role: "read",
       getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run",
       authorizeWriteMember: vi.fn(async () => {}),
       onProgress,
       onReportAndExit: vi.fn(async () => ({ accepted: true })),

@@ -10,13 +10,15 @@ import {
   readInbox,
   readInboxTail,
   sendPlainMessage,
+  sendPlainMessageIfRunning,
   sendPlainMessageOnce,
 } from "./messaging";
 import type { InboxMessage } from "./models";
 import * as paths from "./paths";
+import { closePersistedRecipient } from "../../extensions/team/recipient-closure";
 
-// Mock the paths to use a temporary directory
-const testDir = path.join(os.tmpdir(), "pi-extended-teams-test-" + Date.now());
+// Keep this suite isolated from task tests and parallel Vitest workers.
+let testDir: string;
 
 function writeInbox(agentName: string, messages: InboxMessage[]) {
   const inboxFilePath = path.join(testDir, "inboxes", `${agentName}.json`);
@@ -26,8 +28,7 @@ function writeInbox(agentName: string, messages: InboxMessage[]) {
 
 describe("Messaging Utilities", () => {
   beforeEach(() => {
-    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
-    fs.mkdirSync(testDir, { recursive: true });
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-messaging-"));
     
     // Override paths to use testDir
     vi.spyOn(paths, "inboxPath").mockImplementation((teamName, agentName) => {
@@ -36,6 +37,9 @@ describe("Messaging Utilities", () => {
     vi.spyOn(paths, "teamDir").mockReturnValue(testDir);
     vi.spyOn(paths, "configPath").mockImplementation((teamName) => {
       return path.join(testDir, "config.json");
+    });
+    vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((_teamName, agentName) => {
+      return path.join(testDir, "lifecycle", "quarantine", `${agentName}.json`);
     });
   });
 
@@ -197,6 +201,66 @@ describe("Messaging Utilities", () => {
 
     const mismatchedWorkflow = await findInboxMessageByOperation("test-team", "receiver", "op-1", "other-workflow");
     expect(mismatchedWorkflow).toBeUndefined();
+  });
+
+  it("orders a send that acquires the lifecycle fence before close", async () => {
+    const configFilePath = path.join(testDir, "config.json");
+    fs.writeFileSync(configFilePath, JSON.stringify({
+      name: "test-team",
+      members: [{ name: "receiver", lifecycleRunId: "receiver-run", isActive: true }],
+    }));
+
+    const delivery = sendPlainMessageIfRunning("test-team", "sender", "receiver", "before stop", "summary", undefined, {
+      expectedRecipientRunId: "receiver-run",
+    });
+    const stop = closePersistedRecipient("test-team", "receiver", "receiver-run");
+    await Promise.all([delivery, stop]);
+
+    expect((await readInbox("test-team", "receiver", false, false)).map(message => message.text)).toEqual(["before stop"]);
+    await expect(
+      sendPlainMessageIfRunning("test-team", "sender", "receiver", "after stop", "summary")
+    ).rejects.toThrow("lifecycle-quarantined");
+  });
+
+  it("rejects a send that follows close without creating or changing the inbox", async () => {
+    fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({
+      name: "test-team",
+      members: [{ name: "receiver", lifecycleRunId: "receiver-run", isActive: true }],
+    }));
+    await closePersistedRecipient("test-team", "receiver", "receiver-run");
+
+    await expect(
+      sendPlainMessageIfRunning("test-team", "sender", "receiver", "too late", "summary")
+    ).rejects.toThrow("lifecycle-quarantined");
+    expect(await readInbox("test-team", "receiver", false, false)).toEqual([]);
+  });
+
+  it("rejects occupied and corrupt lifecycle tombstones before inbox admission", async () => {
+    fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({
+      name: "test-team",
+      members: [{ name: "receiver", lifecycleRunId: "receiver-run", isActive: true }],
+    }));
+    const tombstonePath = paths.lifecycleTombstonePath("test-team", "receiver");
+    fs.mkdirSync(path.dirname(tombstonePath), { recursive: true });
+    fs.writeFileSync(tombstonePath, JSON.stringify({
+      version: 1,
+      team: "test-team",
+      agent: "receiver",
+      runId: "receiver-run",
+      role: "read",
+      reason: "quit",
+      phase: "closing",
+      ownerPid: process.pid,
+      extensionInstanceId: "test-instance",
+      timestamps: { createdAt: Date.now(), updatedAt: Date.now() },
+    }));
+    await expect(sendPlainMessageIfRunning("test-team", "sender", "receiver", "blocked", "summary"))
+      .rejects.toThrow("lifecycle-quarantined for run receiver-run");
+
+    fs.writeFileSync(tombstonePath, "not-json");
+    await expect(sendPlainMessageIfRunning("test-team", "sender", "receiver", "blocked", "summary"))
+      .rejects.toThrow("corrupt tombstone");
+    expect(await readInbox("test-team", "receiver", false, false)).toEqual([]);
   });
 
   it("should broadcast message to all members except the sender", async () => {

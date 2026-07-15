@@ -19,12 +19,16 @@ function installPathSpies() {
   vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName: unknown, agentName: unknown) => {
     return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "runtime", `${paths.sanitizeName(String(agentName))}.json`);
   });
+  vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => {
+    return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`);
+  });
 }
 
 function setupEvents(
   isIdle: () => boolean,
   overrides: Partial<Parameters<typeof registerExtensionEvents>[1]> = {}
 ) {
+  if (!fs.existsSync(paths.configPath("team"))) writeTeamConfig();
   const handlers = new Map<string, Function[]>();
   const quietTrigger = vi.fn();
   const terminal = { setTitle: vi.fn() };
@@ -64,7 +68,7 @@ function writeTeamConfig(role: "read" | "write" = "write", metadata: Record<stri
     leadSessionId: "session",
     members: [
       { agentId: "lead-agent", name: "team-lead", agentType: "lead", joinedAt: Date.now(), tmuxPaneId: "", cwd: root, subscriptions: [] },
-      { agentId: "writer@team", name: "writer", agentType: "teammate", role, joinedAt: Date.now(), tmuxPaneId: "", cwd: root, subscriptions: [], metadata },
+      { agentId: "writer@team", name: "writer", agentType: "teammate", role, lifecycleRunId: "writer-run", joinedAt: Date.now(), tmuxPaneId: "", cwd: root, subscriptions: [], metadata },
     ],
   }, null, 2));
 }
@@ -72,6 +76,7 @@ function writeTeamConfig(role: "read" | "write" = "write", metadata: Record<stri
 describe("extension teammate inbox wake", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", "writer-run");
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-events-"));
     teamsRoot = path.join(root, "teams");
     fs.mkdirSync(teamsRoot, { recursive: true });
@@ -80,6 +85,7 @@ describe("extension teammate inbox wake", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
@@ -137,13 +143,19 @@ describe("extension teammate inbox wake", () => {
     const [handler] = handlers.get("before_agent_start") || [];
     const result = await handler({ systemPrompt: "base" });
 
-    expect(result.systemPrompt).toContain("reading-fast is the normal first choice");
-    expect(result.systemPrompt).toContain("Reserve reading-hard as the rarest level");
+    expect(result.systemPrompt).toContain("read-review is the normal default");
+    expect(result.systemPrompt).toContain("Use read-collect when the lane gathers bounded facts");
+    expect(result.systemPrompt).toContain("Use read-analyze when it must explain behavior or root cause");
+    expect(result.systemPrompt).toContain("Reserve read-critical for irreducible high-stakes");
+    expect(result.systemPrompt).toContain("write-patch for a narrow localized change");
+    expect(result.systemPrompt).toContain("write-feature for a bounded feature");
+    expect(result.systemPrompt).toContain("write-system for a cross-cutting integration/refactor");
+    expect(result.systemPrompt).toContain("write-critical only for high-risk");
     expect(result.systemPrompt).toContain("A spawned agent owns its assigned lane");
     expect(result.systemPrompt).toContain("wait literally idle");
     expect(result.systemPrompt).toContain("Do not sleep, poll");
     expect(result.systemPrompt).toContain("Wait for the actual report before synthesizing");
-    expect(result.systemPrompt).toContain("confirm it with a separate read-only agent using the cheapest sufficient read level");
+    expect(result.systemPrompt).toContain("confirm it with a separate read-only agent using the intent tier that fits the confirmation");
   });
 
   it("wakes teammates with implicit-session inbox instructions", async () => {
@@ -160,7 +172,8 @@ describe("extension teammate inbox wake", () => {
 
   it("injects teammate prompts without removed public tools or legacy parameters", async () => {
     writeTeamConfig("write", { workflowRunId: "run-1" });
-    const { handlers } = setupEvents(() => true);
+    const { handlers, ctx } = setupEvents(() => true);
+    for (const sessionStart of handlers.get("session_start") || []) await sessionStart({}, ctx);
     const [handler] = handlers.get("before_agent_start") || [];
 
     const result = await handler({ systemPrompt: "base" });
@@ -251,7 +264,7 @@ describe("extension teammate inbox wake", () => {
     for (const handler of handlers.get("session_start") || []) {
       await handler({}, ctx);
     }
-    await runtime.writeRuntimeStatus("team", "writer", {
+    await runtime.writeRuntimeStatus("team", "writer", "writer-run", {
       latestProgress: "Reviewing event lifecycle",
       progressUpdatedAt: 1234,
     });

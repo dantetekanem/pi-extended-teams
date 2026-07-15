@@ -27,9 +27,9 @@ Or spawn explicitly:
 
 ```text
 spawn_swarm_agents({
-  defaults: { model_slot: "reading-fast" },
+  defaults: { model_slot: "read-review" },
   agents: [
-    { name: "security", model_slot: "reading-hard", prompt: "Review the diff for security risks. Report file:line findings." },
+    { name: "security", model_slot: "read-critical", prompt: "Review the diff for security risks. Report file:line findings." },
     { name: "tests", prompt: "Find missing or weak test coverage. Report concrete gaps." }
   ]
 })
@@ -41,27 +41,30 @@ Use the below-editor activity card to watch active agents. With the editor empty
 
 ## Choosing favorite model slots
 
-Use `/agents-favorite-models` to save five named model/thinking favorites from one screen. The picker lists the scoped models available to the current Pi session, lets you move across slots, models, and thinking levels, then saves the global settings file when you press Enter. After that, spawn agents by declaring the workload slot only. The slot is the level: it selects read/write behavior, model, and thinking. Do not pass `role`, raw model names, or `thinking` in spawn calls; see `TIPS.md` for examples.
+Use `/agents-favorite-models` to save eight canonical intent-tier model/thinking favorites from one screen. The picker lists the scoped models available to the current Pi session, lets you move across slots, models, and thinking levels, then saves the global settings file when you press Enter. After that, spawn agents by declaring the intent tier only. The tier selects read/write behavior, model, and thinking. Do not pass `role`, raw model names, or `thinking` in spawn calls; see `TIPS.md` for examples.
 
 ```text
 spawn_agent({
   name: "auth-security",
-  model_slot: "reading-hard",
+  model_slot: "read-critical",
   prompt: "Review src/auth for authorization bugs. Report file:line evidence."
 })
 ```
 
-Slot guidance:
+Tier guidance:
 
-| Slot | Best for | Avoid for |
+| Tier | Best for | Calibration |
 | --- | --- | --- |
-| `reading-fast` | Normal first choice for bounded read-only research: collection, inventory, lookup, docs/log/test-output inspection, evidence gathering, independent slices, and shallow yes/no checks. It should naturally be the most-used read slot. | Ambiguous design conclusions or tasks that truly require one agent to reason across the whole system. |
-| `reading-default` | Normal synthesis/judgment: focused behavioral review, test-gap assessment, README/reference validation, and bounded convention discovery. | Irreducibly deep architecture/security/root-cause analysis. |
-| `reading-hard` | Rare deep reasoning: subtle architecture/security boundaries, production-risk conclusions, migration/data correctness, or unclear cross-system root cause. | Routine research, collection, inventory, or verification that can use fast/default readers. |
-| `writing-basic` | Small isolated edits with obvious verification: docs, typos, one-file config, narrow test fixture fixes. | Broad refactors, multi-file logic, risky behavior changes. |
-| `writing-hard` | Non-trivial write work: multi-file implementation, refactors, production bug fixes, difficult test repairs. | Parallel writes to overlapping files; keep writer concurrency low. |
+| `read-collect` | Bounded fact/evidence gathering without owning the conclusion. | Luna / `high` |
+| `read-review` | Normal default for focused review, verification, test gaps, and bounded synthesis. | Luna / `xhigh` |
+| `read-analyze` | Behavioral or root-cause explanation across connected evidence. | Sol / `medium` |
+| `read-critical` | Irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning. | Sol / `xhigh` |
+| `write-patch` | Narrow localized docs, config, fixture, or bug fix. | Luna / `max` |
+| `write-feature` | Bounded feature with a known design. | Sol / `medium` |
+| `write-system` | Cross-cutting integration/refactor within explicitly claimed files. | Sol / `high` |
+| `write-critical` | High-risk security, concurrency, recovery, migration, or data-integrity change. | Sol / `max` |
 
-For collection-style work, prefer breadth: several `reading-fast` agents each reading one slice often beat one `reading-hard` agent reading every file. Ask each fast reader for concise evidence, then synthesize in the lead session. Do not promote a lane merely because its prompt says research, investigate, review, verify, or because its result matters; promote only when evidence reveals ambiguity that the cheaper level cannot resolve.
+Luna/Sol are calibration families rather than built-in provider IDs. For this minor release the old `reading-fast/default/hard` and `writing-basic/hard` names remain accepted aliases, but canonical settings saves use the eight names above.
 
 ---
 
@@ -71,9 +74,9 @@ For collection-style work, prefer breadth: several `reading-fast` agents each re
 
 ```text
 spawn_swarm_agents({
-  defaults: { model_slot: "reading-default" },
+  defaults: { model_slot: "read-review" },
   agents: [
-    { name: "security-reviewer", model_slot: "reading-hard", prompt: "Review src/auth for authn/authz bugs. Report severity, file:line, and suggested fix." },
+    { name: "security-reviewer", model_slot: "read-critical", prompt: "Review src/auth for authn/authz bugs. Report severity, file:line, and suggested fix." },
     { name: "performance-reviewer", prompt: "Review the diff for avoidable performance regressions. Include evidence." },
     { name: "test-reviewer", prompt: "Inspect tests around this change. Report missing regression coverage." }
   ]
@@ -89,7 +92,7 @@ Use an edit agent only when the change is narrow and isolated.
 ```text
 spawn_agent({
   name: "docs-fix",
-  model_slot: "writing-basic",
+  model_slot: "write-patch",
   prompt: "Claim README.md and docs/guide.md, update only stale public tool references, run the focused docs checks, then call report_and_exit. Do not commit or push."
 })
 ```
@@ -106,11 +109,11 @@ A good edit-agent prompt includes:
 
 ```text
 spawn_swarm_agents({
-  defaults: { cwd: "/path/to/project", model_slot: "reading-fast" },
+  defaults: { cwd: "/path/to/project", model_slot: "read-collect" },
   agents: [
     { name: "routes", prompt: "Collect route patterns and public endpoints from config/routes*. Report concise evidence." },
     { name: "jobs", prompt: "Collect queue/retry conventions from background jobs. Report concise evidence." },
-    { name: "architect", model_slot: "reading-hard", prompt: "Use the collected facts plus direct inspection to review architecture and coupling risks." }
+    { name: "architect", model_slot: "read-analyze", prompt: "Use direct inspection to explain how the collected routing and job evidence affects module coupling." }
   ]
 })
 ```
@@ -158,11 +161,11 @@ Read agents are the safest multiplier. Use them for:
 - release-readiness checks,
 - unfamiliar-code investigation.
 
-Match slot strength to the job. Use `reading-fast` for splitable collection and `reading-hard` only when depth is needed.
+Match the tier to the intended outcome: `read-review` is the normal default, `read-collect` gathers facts, `read-analyze` explains connected evidence, and `read-critical` is reserved for irreducible high-stakes reasoning.
 
 ### Keep edit agents rare
 
-Use a `writing-*` level only when:
+Use a `write-*` tier only when:
 
 - files do not overlap with the lead or another edit agent,
 - the task is easy to bound,
@@ -231,7 +234,7 @@ list_file_claims({})
 
 If a `model_slot` fails, check `/agents-favorite-models` and confirm the slot has a fully qualified `provider/model` plus a valid thinking level.
 
-If no `model_slot` is passed, pi-extended-teams rejects the spawn. Define levels with `/agents-favorite-models` first, then choose the level that matches the job.
+If no `model_slot` is passed, pi-extended-teams rejects the spawn. Define tiers with `/agents-favorite-models` first, then choose the tier that matches the intended outcome.
 
 ### Activity card is absent
 

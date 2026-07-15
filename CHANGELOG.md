@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-14
+
+### Added
+- Add four canonical read intent tiers and four write intent tiers, with backward-compatible normalization for legacy slot names.
+- Let spawned agents use selected extensions observable in the lead Pi session while retaining normal trusted skill discovery.
+- Persist run-scoped lifecycle tombstones so timed-out agents remain fenced across member removal and extension reloads.
+
+### Changed
+- Improve the live agent view with compact semantic tool rows, width-bounded output, and darker progress-band styling.
+- Route active-agent messages directly into in-process sessions while preserving atomic inbox fallback for other agents.
+
+### Fixed
+- Make teardown, messaging, runtime cleanup, writer rollback, watchdog handling, and same-name replacement run-aware and fail-closed.
+- Keep repeated stop and shutdown requests bounded while late cleanup remains safely observed.
+- Canonicalize legacy model-slot names across public results, reports, queues, and status interfaces.
+
 ## [2.0.6] - 2026-07-14
 
 ### Added

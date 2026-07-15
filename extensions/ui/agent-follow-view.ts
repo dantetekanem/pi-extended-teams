@@ -1,12 +1,24 @@
-import { Input, Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import type { RunningReadAgent } from "../runtime/types";
 import { dimAnsi, pink, purple } from "./ansi";
 import { framePanel } from "./frame";
-import { extractTextParts, formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount, sanitizeTuiLine, sanitizeTuiText } from "./renderers";
+import { extractTextParts, formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount, sanitizePlainTuiLine, sanitizeTuiLine, sanitizeTuiText } from "./renderers";
 
 const REFRESH_INTERVAL_MS = 250;
 const MAX_NAVIGATION_AGENTS = 6;
 const AGENT_FOLLOW_BACKGROUND = "\x1b[48;2;22;23;32m";
+const PROGRESS_BAND_BACKGROUND = "\x1b[48;2;31;33;47m";
+const PROGRESS_RULE_FOREGROUND = "\x1b[38;2;75;79;103m";
+const ACTION_FOREGROUND = "\x1b[38;5;117m";
+const PATH_FOREGROUND = "\x1b[38;5;213m";
+const SUCCESS_FOREGROUND = "\x1b[38;5;114m";
+const FAILURE_FOREGROUND = "\x1b[38;5;210m";
+const PENDING_FOREGROUND = "\x1b[38;5;222m";
+const BODY_FOREGROUND = "\x1b[38;5;253m";
+const MUTED_FOREGROUND = "\x1b[38;5;247m";
+const STRUCTURAL_FOREGROUND = "\x1b[38;5;141m";
+const ANSI_FOREGROUND_RESET = "\x1b[39m";
+const ANSI_RESET = "\x1b[0m";
 const COLLAPSED_TOOL_RESULT_LINE_LIMIT = 14;
 const COLLAPSED_TOOL_RESULT_HEAD_LINES = 8;
 const COLLAPSED_TOOL_RESULT_TAIL_LINES = 3;
@@ -20,11 +32,12 @@ export interface AgentFollowViewOptions {
 
 export interface AgentFollowTranscriptOptions {
   expandLargeToolResults?: boolean;
+  width?: number;
 }
 
 type TranscriptBlock =
   | { kind: "section"; label: "user" | "thinking" | "assistant"; text: string }
-  | { kind: "tool"; id?: string; name: string; args: unknown; result?: string };
+  | { kind: "tool"; id?: string; name: string; args: unknown; result?: string; details?: unknown; isError?: boolean };
 
 function stringifyToolArgs(args: unknown): string {
   if (args === undefined) return "";
@@ -56,10 +69,183 @@ function formatResultSize(text: string): string {
   return `${(size / 1_024).toFixed(size < 10_240 ? 1 : 0)} KB`;
 }
 
-function renderToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, expandLargeToolResults: boolean): string[] {
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function compactTranscriptLine(text: string): string {
+  return sanitizePlainTuiLine(text).replace(/\s+/g, " ").trim();
+}
+
+function semanticAnsi(text: string, foreground: string): string {
+  return `${foreground}${text}${ANSI_FOREGROUND_RESET}`;
+}
+
+function actionAnsi(text: string): string {
+  return semanticAnsi(text, ACTION_FOREGROUND);
+}
+
+function pathAnsi(text: string): string {
+  return semanticAnsi(text, PATH_FOREGROUND);
+}
+
+function successAnsi(text: string): string {
+  return semanticAnsi(text, SUCCESS_FOREGROUND);
+}
+
+function failureAnsi(text: string): string {
+  return semanticAnsi(text, FAILURE_FOREGROUND);
+}
+
+function pendingAnsi(text: string): string {
+  return semanticAnsi(text, PENDING_FOREGROUND);
+}
+
+function bodyAnsi(text: string): string {
+  return semanticAnsi(text, BODY_FOREGROUND);
+}
+
+function mutedAnsi(text: string): string {
+  return semanticAnsi(text, MUTED_FOREGROUND);
+}
+
+function structuralAnsi(text: string): string {
+  return semanticAnsi(text, STRUCTURAL_FOREGROUND);
+}
+
+function boundTranscriptLine(line: string, width?: number): string {
+  return width === undefined ? line : truncateToWidth(line, Math.max(1, width), "…");
+}
+
+function toolPath(args: unknown): string {
+  const path = asRecord(args)?.path;
+  return compactTranscriptLine(typeof path === "string" ? path : "(unknown file)");
+}
+
+function toolPaths(args: unknown): string {
+  const paths = asRecord(args)?.paths;
+  if (!Array.isArray(paths)) return toolPath(args);
+  const compactPaths = paths
+    .filter((path): path is string => typeof path === "string")
+    .map(compactTranscriptLine)
+    .filter(Boolean);
+  return compactPaths.length > 0 ? compactPaths.join(", ") : "(unknown file)";
+}
+
+function editDiffCounts(details: unknown): { added: number; removed: number } | undefined {
+  const diff = asRecord(details)?.diff;
+  if (typeof diff !== "string") return undefined;
+
+  let added = 0;
+  let removed = 0;
+  for (const line of diff.split("\n")) {
+    if (/^\+\s*\d+(?:\s|$)/.test(line)) added += 1;
+    else if (/^-\s*\d+(?:\s|$)/.test(line)) removed += 1;
+  }
+  return { added, removed };
+}
+
+function renderState(state: string): string {
+  if (state === "failed") return failureAnsi(state);
+  if (state === "working" || state === "submitting") return pendingAnsi(state);
+  if (state === "duplicate") return mutedAnsi(state);
+  return successAnsi(state);
+}
+
+function renderActionPathState(action: string, path: string, state: string, width?: number): string {
+  return boundTranscriptLine(
+    `${actionAnsi(action)}${mutedAnsi(" · ")}${pathAnsi(path)}${mutedAnsi(" · ")}${renderState(state)}`,
+    width,
+  );
+}
+
+function progressBandLine(content: string, width: number): string {
+  const bounded = truncateToWidth(content, width, "…", true);
+  const reassertedBackground = bounded.split(ANSI_RESET).join(`${ANSI_RESET}${PROGRESS_BAND_BACKGROUND}`);
+  return `${PROGRESS_BAND_BACKGROUND}${reassertedBackground}${ANSI_RESET}`;
+}
+
+function renderProgressBlock(status: string, failed: boolean, width?: number): string[] {
+  const content = ` ${actionAnsi("progress")}${mutedAnsi(" · ")}${bodyAnsi(status)}${failed ? `${mutedAnsi(" · ")}${failureAnsi("failed")}` : ""}`;
+  const bandWidth = Math.max(1, width ?? visibleWidth(content));
+  const rule = `${PROGRESS_BAND_BACKGROUND}${PROGRESS_RULE_FOREGROUND}${"─".repeat(bandWidth)}${ANSI_FOREGROUND_RESET}${ANSI_RESET}`;
+  const bottomPadding = `${PROGRESS_BAND_BACKGROUND}${" ".repeat(bandWidth)}${ANSI_RESET}`;
+  return [rule, progressBandLine(content, bandWidth), bottomPadding];
+}
+
+function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, width?: number): string[] | undefined {
+  if (block.name === "report_progress") {
+    const details = asRecord(block.details);
+    const args = asRecord(block.args);
+    const resultStatus = block.result?.replace(/^Progress updated:\s*/i, "");
+    const rawStatus = details?.status ?? args?.status ?? resultStatus ?? (block.isError ? "failed" : "working");
+    const status = compactTranscriptLine(String(rawStatus)) || (block.isError ? "failed" : "working");
+    return renderProgressBlock(status, block.isError === true, width);
+  }
+
+  if (block.name === "edit") {
+    const path = toolPath(block.args);
+    if (block.result === undefined) return [renderActionPathState("edit", path, "working", width)];
+    if (block.isError) return [renderActionPathState("edit", path, "failed", width)];
+    const counts = editDiffCounts(block.details);
+    const added = counts ? `+${counts.added}` : "+?";
+    const removed = counts ? `−${counts.removed}` : "−?";
+    return [boundTranscriptLine(
+      `${actionAnsi("edit")}${mutedAnsi(" · ")}${pathAnsi(path)}${mutedAnsi(" · ")}${successAnsi(added)} ${failureAnsi(removed)}${mutedAnsi(" · ")}${successAnsi("worked")}`,
+      width,
+    )];
+  }
+
+  if (block.name === "write") {
+    const state = block.result === undefined ? "working" : block.isError ? "failed" : "worked";
+    return [renderActionPathState("write", toolPath(block.args), state, width)];
+  }
+
+  if (block.name === "claim_file" || block.name === "release_file") {
+    const details = asRecord(block.details);
+    const conflicts = Array.isArray(details?.conflicts) ? details.conflicts : [];
+    const state = block.result === undefined
+      ? "working"
+      : block.isError || conflicts.length > 0
+        ? "failed"
+        : "worked";
+    const action = block.name === "claim_file" ? "claim" : "release";
+    return [renderActionPathState(action, toolPaths(block.args), state, width)];
+  }
+
+  if (block.name === "report_and_exit") {
+    const accepted = asRecord(block.details)?.accepted;
+    const state = block.result === undefined
+      ? "submitting"
+      : block.isError
+        ? "failed"
+        : accepted === false
+          ? "duplicate"
+          : "accepted";
+    return [boundTranscriptLine(`${actionAnsi("final report")}${mutedAnsi(" · ")}${renderState(state)}`, width)];
+  }
+
+  return undefined;
+}
+
+function renderToolHeader(block: Extract<TranscriptBlock, { kind: "tool" }>): string {
   const detail = compactToolArgs(block.name, block.args);
-  const header = `╭─ ${block.name}${detail ? ` · ${block.name === "bash" ? "$ " : ""}${detail}` : ""}`;
-  if (block.result === undefined) return [purple(header), dimAnsi("│ waiting for result…"), purple("╰─ running"), ""];
+  if (!detail) return `${structuralAnsi("╭─")} ${actionAnsi(block.name)}`;
+  const isPath = typeof asRecord(block.args)?.path === "string";
+  const renderedDetail = isPath ? pathAnsi(detail) : bodyAnsi(`${block.name === "bash" ? "$ " : ""}${detail}`);
+  return `${structuralAnsi("╭─")} ${actionAnsi(block.name)}${mutedAnsi(" · ")}${renderedDetail}`;
+}
+
+function renderToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, expandLargeToolResults: boolean, width?: number): string[] {
+  const compactBlock = renderCompactToolBlock(block, width);
+  if (compactBlock) return compactBlock;
+
+  const header = renderToolHeader(block);
+  if (block.result === undefined) {
+    return [header, `${structuralAnsi("│")} ${pendingAnsi("waiting for result…")}`, `${structuralAnsi("╰─")} ${pendingAnsi("running")}`, ""];
+  }
 
   const result = block.result || "(no output)";
   const resultLines = result.split("\n");
@@ -71,11 +257,16 @@ function renderToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, expa
         ...resultLines.slice(-COLLAPSED_TOOL_RESULT_TAIL_LINES),
       ]
     : resultLines;
-  const body = visibleLines.map((line, index) => isCollapsed && index === COLLAPSED_TOOL_RESULT_HEAD_LINES
-    ? dimAnsi(`│ ${line}`)
-    : `│ ${line}`);
+  const resultLineWidth = width === undefined ? undefined : Math.max(1, width - visibleWidth("│ "));
+  const boundedLines = visibleLines.map((line) => resultLineWidth === undefined
+    ? line
+    : truncateToWidth(line, resultLineWidth, "…"));
+  const body = boundedLines.map((line, index) => isCollapsed && index === COLLAPSED_TOOL_RESULT_HEAD_LINES
+    ? `${structuralAnsi("│")} ${mutedAnsi(line)}`
+    : `${structuralAnsi("│")} ${line}`);
   const summary = `${resultLines.length} line${resultLines.length === 1 ? "" : "s"} · ${formatResultSize(result)}${isCollapsed ? " · collapsed" : ""}`;
-  return [purple(header), ...body, purple(`╰─ ${summary}`), ""];
+  const renderedSummary = block.isError ? failureAnsi(summary) : successAnsi(summary);
+  return [header, ...body, `${structuralAnsi("╰─")} ${renderedSummary}`, ""];
 }
 
 export function formatAgentFollowTranscript(messages: any[], options: AgentFollowTranscriptOptions = {}): string[] {
@@ -116,14 +307,20 @@ export function formatAgentFollowTranscript(messages: any[], options: AgentFollo
       const matchingTool = (id ? toolsById.get(id) : undefined)
         ?? blocks.slice().reverse().find((block): block is Extract<TranscriptBlock, { kind: "tool" }> => block.kind === "tool" && block.result === undefined && block.name === name);
       const result = sanitizeTuiText(extractTextParts(message.content));
-      if (matchingTool) matchingTool.result = result;
-      else blocks.push({ kind: "tool", id, name, args: undefined, result });
+      const isError = typeof message.isError === "boolean" ? message.isError : undefined;
+      if (matchingTool) {
+        matchingTool.result = result;
+        matchingTool.details = message.details;
+        matchingTool.isError = isError;
+      } else {
+        blocks.push({ kind: "tool", id, name, args: undefined, result, details: message.details, isError });
+      }
     }
   }
 
   const lines = blocks.flatMap(block => block.kind === "section"
     ? [block.label === "user" ? pink(block.label) : purple(block.label), block.text, ""]
-    : renderToolBlock(block, options.expandLargeToolResults === true));
+    : renderToolBlock(block, options.expandLargeToolResults === true, options.width));
   return lines.length > 0 ? lines : [dimAnsi("Waiting for the agent's first transcript event…")];
 }
 
@@ -285,8 +482,10 @@ export function createAgentFollowComponent(
           : `↑/esc main · ${logAction}${messageAction} · x stop · pgup/pgdn scroll · end follow`;
 
       const transcriptWidth = Math.max(20, innerWidth);
-      const transcriptLines = formatAgentFollowTranscript(agent.session?.messages || [], { expandLargeToolResults })
-        .flatMap(line => wrapTextWithAnsi(line, transcriptWidth));
+      const transcriptLines = formatAgentFollowTranscript(agent.session?.messages || [], {
+        expandLargeToolResults,
+        width: transcriptWidth,
+      }).flatMap(line => wrapTextWithAnsi(line, transcriptWidth));
       lastTranscriptRows = transcriptLines.length;
       const maxOffset = Math.max(0, transcriptLines.length - bodyHeight);
       offsetFromBottom = Math.min(offsetFromBottom, maxOffset);

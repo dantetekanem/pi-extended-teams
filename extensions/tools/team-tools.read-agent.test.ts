@@ -2,11 +2,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { registerTeamTools } from "./team-tools.js";
+import { CHILD_AGENT_LIFECYCLE_PROBE, registerTeamTools } from "./team-tools.js";
+import { createLifecycleRuntime } from "../team/lifecycle.js";
+import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "../agents/read-agent-session-lifecycle.js";
 import * as paths from "../../src/utils/paths.js";
 import * as teams from "../../src/utils/teams.js";
+import * as writeQueue from "../../src/utils/write-queue.js";
 import type { Member } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
+import { ACCEPTED_FAVORITE_MODEL_SLOTS, FAVORITE_MODEL_SLOTS } from "../../src/utils/settings.js";
+import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 
 type RegisteredTool = {
   name: string;
@@ -25,6 +30,7 @@ function installPathSpies() {
   vi.spyOn(paths, "configPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "config.json"));
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "write-queue.json"));
   vi.spyOn(paths, "leadSessionPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lead-session.json"));
+  vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`));
 }
 
 function writeProjectSettings(settings: unknown) {
@@ -41,11 +47,14 @@ function writeGlobalSettings(settings: unknown) {
 function writeFavoriteLevels() {
   writeGlobalSettings({
     favoriteModels: {
-      "reading-fast": { model: "provider/model", thinking: "low" },
-      "reading-default": { model: "provider/model", thinking: "high" },
-      "reading-hard": { model: "provider/model", thinking: "xhigh" },
-      "writing-basic": { model: "provider/model", thinking: "high" },
-      "writing-hard": { model: "provider/model", thinking: "xhigh" },
+      "read-collect": { model: "provider/model", thinking: "high" },
+      "read-review": { model: "provider/model", thinking: "xhigh" },
+      "read-analyze": { model: "provider/model", thinking: "medium" },
+      "read-critical": { model: "provider/model", thinking: "xhigh" },
+      "write-patch": { model: "provider/model", thinking: "max" },
+      "write-feature": { model: "provider/model", thinking: "medium" },
+      "write-system": { model: "provider/model", thinking: "high" },
+      "write-critical": { model: "provider/model", thinking: "max" },
     },
   });
 }
@@ -64,7 +73,7 @@ function makeCtx() {
 
 function makeRunningAgent(teamName: string, member: Member): RunningReadAgent {
   return {
-    runId: `${member.name}-run`,
+    runId: member.lifecycleRunId || `${member.name}-run`,
     name: member.name,
     teamName,
     role: member.role,
@@ -97,9 +106,23 @@ function registerTools() {
     });
   });
   const adoptTeamAsLead = vi.fn();
+  const piEventEmit = vi.fn();
   const shutdownTeammate = vi.fn(async (teamName: string, member: Member) => {
     runningReadAgents.delete(readAgentKey(teamName, member.name));
     await teams.removeMember(teamName, member.name).catch(() => {});
+    return {
+      status: "settled" as const,
+      reason: "quit" as const,
+      extensionShutdown: "no_handlers" as const,
+      abort: "unavailable" as const,
+      delivery: "settled" as const,
+      dispose: "settled" as const,
+      cancelledDeliveries: 0,
+      persistenceClosed: true,
+      finalized: true,
+      removedMember: true,
+      releasedClaims: [],
+    };
   });
 
   const sessionCtx = makeCtx();
@@ -117,7 +140,7 @@ function registerTools() {
         eventUnsubscribes.set(name, unsubscribe);
         return unsubscribe;
       }),
-      emit: vi.fn(),
+      emit: piEventEmit,
     },
   }, {
     terminal: null,
@@ -140,10 +163,13 @@ function registerTools() {
   const emit = (name: string, payload: any) => {
     for (const handler of eventHandlers.get(name) ?? []) handler(payload);
   };
+  const emitAsync = async (name: string, payload: any) => {
+    await Promise.all((eventHandlers.get(name) ?? []).map((handler) => handler(payload)));
+  };
   const shutdown = async (reason = "reload") => {
     for (const handler of sessionHandlers.get("session_shutdown") ?? []) await handler({ reason });
   };
-  return { tools, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, shutdown, eventUnsubscribes };
+  return { tools, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes };
 }
 
 describe("public agent spawn tools", () => {
@@ -168,17 +194,27 @@ describe("public agent spawn tools", () => {
     expect(Array.from(tools.keys()).sort()).toEqual(["spawn_agent", "spawn_swarm_agents"]);
   });
 
-  it("teaches level selection and delegation waiting through installed tool descriptions", () => {
+  it("publishes all canonical intent tiers, compatibility aliases, and agent-friendly defaults", () => {
     const { tools } = registerTools();
-    const spawnDescription = tools.get("spawn_agent")?.description || "";
-    const swarmDescription = tools.get("spawn_swarm_agents")?.description || "";
+    const spawn = tools.get("spawn_agent")!;
+    const swarm = tools.get("spawn_swarm_agents")!;
+    const spawnSlot = spawn.parameters.properties.model_slot;
+    const swarmDefaultSlot = swarm.parameters.properties.defaults.properties.model_slot;
+    const swarmAgentSlot = swarm.parameters.properties.agents.items.properties.model_slot;
 
-    expect(spawnDescription).toContain("default bounded research/collection to reading-fast");
-    expect(spawnDescription).toContain("reserve reading-hard for rare");
-    expect(spawnDescription).toContain("wait literally idle");
-    expect(spawnDescription).toContain("never sleep, poll");
-    expect(swarmDescription).toContain("delegation-locked");
-    expect(swarmDescription).toContain("automatic reports");
+    expect(FAVORITE_MODEL_SLOTS.filter((slot) => slot.startsWith("read-"))).toHaveLength(4);
+    expect(FAVORITE_MODEL_SLOTS.filter((slot) => slot.startsWith("write-"))).toHaveLength(4);
+    expect(spawnSlot.enum).toEqual(ACCEPTED_FAVORITE_MODEL_SLOTS);
+    expect(spawnSlot.default).toBe("read-review");
+    expect(swarmDefaultSlot.enum).toEqual(ACCEPTED_FAVORITE_MODEL_SLOTS);
+    expect(swarmAgentSlot.enum).toEqual(ACCEPTED_FAVORITE_MODEL_SLOTS);
+    expect(spawnSlot.description).toContain("read-review is the normal default");
+    expect(spawnSlot.description).toContain("write-system owns a cross-cutting integration");
+    expect(spawn.description).toContain("read-analyze for connected explanation/root cause");
+    expect(spawn.description).toContain("wait literally idle");
+    expect(spawn.description).toContain("never sleep, poll");
+    expect(swarm.description).toContain("delegation-locked");
+    expect(swarm.description).toContain("automatic reports");
   });
 
   it("spawn_agent creates an implicit current-session group and starts an in-process read agent by level", async () => {
@@ -191,21 +227,183 @@ describe("public agent spawn tools", () => {
       name: "reader",
       prompt: "inspect one",
       cwd: root,
-      model_slot: "reading-default",
+      model_slot: "read-review",
     }, abort, undefined, ctx);
 
-    expect(result.details).toMatchObject({ name: "reader", role: "read", mode: "in-process", terminalId: null, session: "session-test-session", modelSlot: "reading-default" });
+    expect(result.details).toMatchObject({ name: "reader", role: "read", mode: "in-process", terminalId: null, session: "session-test-session", modelSlot: "read-review" });
     expect(adoptTeamAsLead).toHaveBeenCalledWith("session-test-session", ctx);
     expect(runReadAgentInProcess).toHaveBeenCalledWith(
       "session-test-session",
-      expect.objectContaining({ name: "reader", role: "read", model: "provider/model", thinking: "high", modelSlot: "reading-default" }),
+      expect.objectContaining({ name: "reader", role: "read", model: "provider/model", thinking: "xhigh", modelSlot: "read-review" }),
       "inspect one",
       ctx,
       expect.any(Object),
     );
   });
 
-  it("spawn_agent uses a configured favorite model slot", async () => {
+  it("canonicalizes persisted legacy model slots when reusing an existing member", async () => {
+    const { runReadAgentInProcess, emitAsync, piEventEmit } = registerTools();
+    const ctx = makeCtx();
+    teams.createTeam("session-test-session", "test-session", "lead-agent", "Pi session agents", "provider/model");
+    await teams.addMember("session-test-session", {
+      agentId: "writer@session-test-session",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      thinking: "high",
+      modelSlot: "writing-hard",
+      joinedAt: Date.now(),
+      tmuxPaneId: "%1",
+      cwd: root,
+      subscriptions: [],
+      isActive: true,
+    });
+
+    await emitAsync("pi-extended-teams:orchestration-request", {
+      requestId: "reuse-writer",
+      type: "spawn_teammate_once",
+      params: {
+        team_name: "session-test-session",
+        name: "writer",
+        prompt: "continue existing work",
+        cwd: root,
+        model_slot: "writing-hard",
+      },
+      ctx,
+    });
+
+    expect(piEventEmit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response", expect.objectContaining({
+      requestId: "reuse-writer",
+      ok: true,
+      details: expect.objectContaining({
+        existing: true,
+        idempotent: true,
+        requestedModelSlot: "write-system",
+        modelSlot: "write-system",
+        role: "write",
+      }),
+    }));
+    expect(runReadAgentInProcess).not.toHaveBeenCalled();
+    expect((await teams.readConfig("session-test-session")).members.find((member) => member.name === "writer")?.modelSlot).toBe("writing-hard");
+  });
+
+  it("canonicalizes legacy requested slots when reusing a queued write", async () => {
+    writeFavoriteLevels();
+    const { runReadAgentInProcess, emitAsync, piEventEmit } = registerTools();
+    const ctx = makeCtx();
+    teams.createTeam("session-test-session", "test-session", "lead-agent", "Pi session agents", "provider/model");
+    await writeQueue.enqueueWriteSpawn("session-test-session", {
+      name: "writer",
+      prompt: "continue queued work",
+      cwd: root,
+      modelSlot: "writing-hard",
+    });
+
+    await emitAsync("pi-extended-teams:orchestration-request", {
+      requestId: "reuse-queued-writer",
+      type: "spawn_teammate_once",
+      params: {
+        team_name: "session-test-session",
+        name: "writer",
+        prompt: "continue queued work",
+        cwd: root,
+        model_slot: "writing-hard",
+      },
+      ctx,
+    });
+
+    expect(piEventEmit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response", expect.objectContaining({
+      requestId: "reuse-queued-writer",
+      ok: true,
+      details: expect.objectContaining({
+        queued: true,
+        existing: true,
+        idempotent: true,
+        requestedModelSlot: "write-system",
+        modelSlot: "write-system",
+        modelSource: "queued",
+        role: "write",
+      }),
+    }));
+    expect(runReadAgentInProcess).not.toHaveBeenCalled();
+  });
+
+  it("rejects a public same-name spawn during quarantine and succeeds after old settlement", async () => {
+    vi.useFakeTimers();
+    try {
+      writeFavoriteLevels();
+      const { tools, runningReadAgents, runReadAgentInProcess, shutdownTeammate } = registerTools();
+      const ctx = makeCtx();
+      const abort = new AbortController().signal;
+      const params = {
+        name: "reader",
+        prompt: "inspect one",
+        cwd: root,
+        model_slot: "read-review",
+      };
+
+      await tools.get("spawn_agent")!.execute("spawn-1", params, abort, undefined, ctx);
+      const oldState = runningReadAgents.get("session-test-session:reader")!;
+      let settleDelivery!: () => void;
+      oldState.messageDeliveryTail = new Promise<void>((resolve) => { settleDelivery = resolve; });
+      oldState.session = {
+        hasExtensionHandlers: vi.fn(() => false),
+        clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
+        abort: vi.fn(async () => {}),
+        dispose: vi.fn(),
+      } as any;
+      const lifecycle = createLifecycleRuntime({
+        isTeammate: false,
+        terminal: null,
+        runningReadAgents,
+        readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+        isCurrentReadAgentRun: (key, state) => runningReadAgents.get(key) === state,
+        renderReadAgentStatus: vi.fn(),
+        drainWriteQueue: vi.fn(async () => {}),
+        getSessionCwd: () => root,
+        getTeamName: () => "session-test-session",
+      });
+      shutdownTeammate.mockImplementation(lifecycle.shutdownTeammate as any);
+      // Simulate an inactive-update implementation that reports success without
+      // writing. Matching removal closes admission, but the run fence must stay.
+      vi.spyOn(teams, "updateMember").mockResolvedValueOnce();
+
+      const retry = tools.get("spawn_agent")!.execute("spawn-2", params, abort, undefined, ctx);
+      const retryRejection = expect(retry).rejects.toThrow("Retry after lifecycle cleanup settles");
+      await vi.advanceTimersByTimeAsync(NESTED_SESSION_TEARDOWN_TIMEOUT_MS);
+      await retryRejection;
+      expect(oldState.teardownState).toBe("quarantined");
+      expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+      expect(runningReadAgents.get("session-test-session:reader")).toBe(oldState);
+      expect((await teams.readConfig("session-test-session")).members.some(member => member.name === "reader")).toBe(false);
+      await expect(readLifecycleTombstone("session-test-session", "reader")).resolves.toMatchObject({
+        status: "occupied",
+        tombstone: { runId: oldState.runId },
+      });
+
+      await expect(tools.get("spawn_agent")!.execute("spawn-fenced", params, abort, undefined, ctx))
+        .rejects.toThrow("lifecycle-quarantined");
+      expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+      expect(runningReadAgents.get("session-test-session:reader")).toBe(oldState);
+
+      settleDelivery();
+      await oldState.teardownFinalizationPromise;
+      expect(runningReadAgents.has("session-test-session:reader")).toBe(false);
+      expect((await teams.readConfig("session-test-session")).members.some(member => member.name === "reader")).toBe(false);
+      await expect(readLifecycleTombstone("session-test-session", "reader")).resolves.toEqual({ status: "absent" });
+
+      await expect(tools.get("spawn_agent")!.execute("spawn-3", params, abort, undefined, ctx)).resolves.toMatchObject({
+        details: { name: "reader", role: "read" },
+      });
+      expect(runReadAgentInProcess).toHaveBeenCalledTimes(2);
+      expect(runningReadAgents.get("session-test-session:reader")?.runId).not.toBe(oldState.runId);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts legacy public/settings aliases and normalizes spawned members", async () => {
     writeGlobalSettings({
       favoriteModels: {
         "reading-fast": { model: "provider/model", thinking: "low" },
@@ -222,10 +420,10 @@ describe("public agent spawn tools", () => {
       model_slot: "reading-fast",
     }, abort, undefined, ctx);
 
-    expect(result.details).toMatchObject({ modelSource: "favorite-slot", modelSlot: "reading-fast" });
+    expect(result.details).toMatchObject({ modelSource: "favorite-slot", modelSlot: "read-collect" });
     expect(runReadAgentInProcess).toHaveBeenCalledWith(
       "session-test-session",
-      expect.objectContaining({ name: "fast-reader", model: "provider/model", thinking: "low", modelSlot: "reading-fast" }),
+      expect.objectContaining({ name: "fast-reader", model: "provider/model", thinking: "low", modelSlot: "read-collect" }),
       "inspect quickly",
       ctx,
       expect.any(Object),
@@ -241,14 +439,14 @@ describe("public agent spawn tools", () => {
       name: "missing-level",
       prompt: "inspect quickly",
       cwd: root,
-    }, abort, undefined, ctx)).rejects.toThrow(/requires a configured model_slot level/);
+    }, abort, undefined, ctx)).rejects.toThrow(/requires a configured model_slot intent tier/);
 
     await expect(tools.get("spawn_agent")!.execute("spawn", {
       name: "unset-level",
       prompt: "inspect quickly",
       cwd: root,
       model_slot: "reading-fast",
-    }, abort, undefined, ctx)).rejects.toThrow(/Favorite model slot "reading-fast" is not configured/);
+    }, abort, undefined, ctx)).rejects.toThrow(/Favorite model slot "read-collect" is not configured/);
   });
 
   it("rejects direct model, thinking, or role selection", async () => {
@@ -301,6 +499,132 @@ describe("public agent spawn tools", () => {
     completions.get("reader-1")!();
     await vi.waitFor(() => expect(runReadAgentInProcess).toHaveBeenCalledTimes(2));
     expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "reader-2", role: "read" });
+  });
+
+  it("drains one queued read only after the completed run's finalization releases capacity", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const { tools, runningReadAgents, runReadAgentInProcess } = registerTools();
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    let resolveRun!: () => void;
+    let resolveFinalization!: () => void;
+
+    runReadAgentInProcess.mockImplementationOnce((teamName: string, member: Member) => {
+      const key = `${teamName}:${member.name}`;
+      const state = {
+        ...makeRunningAgent(teamName, member),
+        teardownFinalizationPromise: new Promise<void>((resolve) => { resolveFinalization = resolve; }),
+      } as any;
+      runningReadAgents.set(key, state);
+      return new Promise<void>((resolve) => { resolveRun = resolve; });
+    });
+
+    await tools.get("spawn_agent")!.execute("spawn-1", {
+      name: "reader-1",
+      prompt: "inspect one",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    await tools.get("spawn_agent")!.execute("spawn-2", {
+      name: "reader-2",
+      prompt: "inspect two",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    resolveRun();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+
+    runningReadAgents.delete("session-test-session:reader-1");
+    await teams.removeMember("session-test-session", "reader-1");
+    resolveFinalization();
+
+    await vi.waitFor(() => expect(runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "reader-2", role: "read" });
+  });
+
+  it("reserves queued read capacity before an async runner registers its running state", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const { tools, runningReadAgents, runReadAgentInProcess, emit } = registerTools();
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    let resolveARun!: () => void;
+    let resolveAFinalization!: () => void;
+    let allowBRegistration!: () => void;
+    let resolveBRun!: () => void;
+    let resolveBFinalization!: () => void;
+    const aRun = new Promise<void>((resolve) => { resolveARun = resolve; });
+    const aFinalization = new Promise<void>((resolve) => { resolveAFinalization = resolve; });
+    const bRegistrationGate = new Promise<void>((resolve) => { allowBRegistration = resolve; });
+    const bRun = new Promise<void>((resolve) => { resolveBRun = resolve; });
+    const bFinalization = new Promise<void>((resolve) => { resolveBFinalization = resolve; });
+
+    runReadAgentInProcess.mockImplementation((teamName: string, member: Member) => {
+      const key = `${teamName}:${member.name}`;
+      if (member.name === "reader-a") {
+        runningReadAgents.set(key, {
+          ...makeRunningAgent(teamName, member),
+          teardownFinalizationPromise: aFinalization,
+        } as any);
+        return aRun;
+      }
+      if (member.name === "reader-b") {
+        return (async () => {
+          await bRegistrationGate;
+          runningReadAgents.set(key, {
+            ...makeRunningAgent(teamName, member),
+            teardownFinalizationPromise: bFinalization,
+          } as any);
+          await bRun;
+        })();
+      }
+      runningReadAgents.set(key, makeRunningAgent(teamName, member));
+      return new Promise<void>(() => {});
+    });
+
+    for (const name of ["reader-a", "reader-b", "reader-c"]) {
+      await tools.get("spawn_agent")!.execute(`spawn-${name}`, {
+        name,
+        prompt: `inspect ${name}`,
+        cwd: root,
+        model_slot: "read-review",
+      }, abort, undefined, ctx);
+    }
+
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    resolveARun();
+    await Promise.resolve();
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+
+    runningReadAgents.delete("session-test-session:reader-a");
+    await teams.removeMember("session-test-session", "reader-a");
+    resolveAFinalization();
+
+    await vi.waitFor(() => expect(runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    expect(runReadAgentInProcess.mock.calls.map(call => call[1].name)).toEqual(["reader-a", "reader-b"]);
+    expect(runningReadAgents.has("session-test-session:reader-b")).toBe(false);
+    const respond = vi.fn();
+    emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+    expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 0, queued: 1 });
+
+    allowBRegistration();
+    await vi.waitFor(() => expect(runningReadAgents.has("session-test-session:reader-b")).toBe(true));
+    resolveBRun();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(2);
+
+    runningReadAgents.delete("session-test-session:reader-b");
+    await teams.removeMember("session-test-session", "reader-b");
+    resolveBFinalization();
+
+    await vi.waitFor(() => expect(runReadAgentInProcess).toHaveBeenCalledTimes(3));
+    expect(runReadAgentInProcess.mock.calls[2][1]).toMatchObject({ name: "reader-c", role: "read" });
   });
 
   it("reports running and queued child agents only for the matching Pi session", async () => {
@@ -365,7 +689,7 @@ describe("public agent spawn tools", () => {
       agents: [
         { name: "a", prompt: "inspect a" },
       ],
-    }, abort, undefined, ctx)).rejects.toThrow(/requires a configured model_slot level/);
+    }, abort, undefined, ctx)).rejects.toThrow(/requires a configured model_slot intent tier/);
 
     expect(runReadAgentInProcess).not.toHaveBeenCalled();
   });
@@ -377,16 +701,16 @@ describe("public agent spawn tools", () => {
     const abort = new AbortController().signal;
 
     const result = await tools.get("spawn_swarm_agents")!.execute("swarm", {
-      defaults: { cwd: root, model_slot: "reading-default" },
+      defaults: { cwd: root, model_slot: "read-review" },
       agents: [
         { name: "a", prompt: "inspect a" },
-        { name: "b", prompt: "inspect b", model_slot: "reading-hard" },
+        { name: "b", prompt: "inspect b", model_slot: "read-critical" },
       ],
     }, abort, undefined, ctx);
 
     expect(result.details.spawned).toHaveLength(2);
-    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "high", modelSlot: "reading-default" });
-    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh", modelSlot: "reading-hard" });
+    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "xhigh", modelSlot: "read-review" });
+    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh", modelSlot: "read-critical" });
   });
 
   it("spawn_swarm_agents applies default and per-agent favorite model slots", async () => {
@@ -409,8 +733,8 @@ describe("public agent spawn tools", () => {
     }, abort, undefined, ctx);
 
     expect(result.details.spawned).toHaveLength(2);
-    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "low", modelSlot: "reading-fast" });
-    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh", modelSlot: "reading-hard" });
+    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ name: "a", thinking: "low", modelSlot: "read-collect" });
+    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "b", thinking: "xhigh", modelSlot: "read-critical" });
   });
 
   it("spawn_swarm_agents rejects per-agent direct model/thinking even with a default level", async () => {
@@ -453,11 +777,11 @@ describe("public agent spawn tools", () => {
     const abort = new AbortController().signal;
 
     const first = await tools.get("spawn_swarm_agents")!.execute("swarm-1", {
-      defaults: { cwd: root, model_slot: "reading-default" },
+      defaults: { cwd: root, model_slot: "read-review" },
       agents: [{ prompt: "inspect one" }, { prompt: "inspect two" }],
     }, abort, undefined, ctx);
     const second = await tools.get("spawn_swarm_agents")!.execute("swarm-2", {
-      defaults: { cwd: root, model_slot: "reading-default" },
+      defaults: { cwd: root, model_slot: "read-review" },
       agents: [{ prompt: "inspect three" }, { prompt: "inspect four" }],
     }, abort, undefined, ctx);
 

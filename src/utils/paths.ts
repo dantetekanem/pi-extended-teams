@@ -36,6 +36,10 @@ export function runtimeStatusPath(teamName: string, agentName: string) {
   return path.join(teamDir(teamName), "runtime", `${sanitizeName(agentName)}.json`);
 }
 
+export function lifecycleTombstonePath(teamName: string, agentName: string) {
+  return path.join(teamDir(teamName), "lifecycle", "quarantine", `${sanitizeName(agentName)}.json`);
+}
+
 export function configPath(teamName: string) {
   return path.join(teamDir(teamName), "config.json");
 }

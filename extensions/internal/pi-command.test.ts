@@ -28,30 +28,6 @@ describe("pi command helpers", () => {
     restoreEnv();
   });
 
-  it("uses the local pi-extended-teams package configured in Pi settings when module-relative lookup misses", () => {
-    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pet-pi-home-"));
-    try {
-      const settingsPath = path.join(homeDir, ".pi", "agent", "settings.json");
-      const packageDir = path.join(homeDir, "src", "pi-extended-teams");
-      const extensionPath = path.join(packageDir, "extensions", "index.ts");
-      fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-      fs.mkdirSync(path.dirname(extensionPath), { recursive: true });
-      fs.writeFileSync(extensionPath, "export default function () {}\n");
-      fs.writeFileSync(settingsPath, JSON.stringify({
-        packages: [{ source: "../../src/pi-extended-teams", extensions: ["+extensions/index.ts"] }],
-      }));
-
-      expect(resolvePiExtendedTeamsExtensionSource({
-        env: {},
-        filename: path.join(homeDir, "missing-install", "extensions", "internal", "pi-command.js"),
-        cwd: path.join(homeDir, "other-project"),
-        homeDir,
-      })).toBe(extensionPath);
-    } finally {
-      fs.rmSync(homeDir, { recursive: true, force: true });
-    }
-  });
-
   it("falls back to a nearby checkout from cwd when the installed module path cannot find the extension", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pet-pi-cwd-"));
     try {
@@ -64,7 +40,6 @@ describe("pi command helpers", () => {
         env: {},
         filename: path.join(root, "missing-install", "extensions", "internal", "pi-command.js"),
         cwd,
-        homeDir: path.join(root, "home"),
       })).toBe(extensionPath);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -83,16 +58,49 @@ describe("pi command helpers", () => {
     expect(buildPiCommand("pi", "provider/model")).toContain("/extensions/index.");
   });
 
-  it("adds --no-skills when workflow governance disables ambient skill loading", () => {
-    expect(buildPiCommand("pi", "provider/model", "high", [], true)).toContain("--no-skills --model 'provider/model:high'");
+  it("keeps normal Pi skill discovery enabled and propagates an untrusted parent", () => {
+    const command = buildPiCommand("pi", "provider/model", "high", [], false);
+    expect(command).toContain("--no-approve --no-extensions");
+    expect(command).toContain("--model 'provider/model:high'");
+    expect(command).not.toContain("--no-skills");
   });
 
-  it("still honors explicit extension source environment overrides", () => {
+  it("still honors explicit extension source environment overrides and loads self exactly once", () => {
     process.env.PI_EXTENDED_TEAMS_EXTENSION_SOURCE = "/tmp/custom-extension.ts";
     delete process.env.PI_TEAMS_EXTENSION_SOURCE;
 
     expect(getPiExtendedTeamsExtensionSource()).toBe("/tmp/custom-extension.ts");
-    expect(buildExtensionArgs()).toContain("'/tmp/custom-extension.ts'");
+    const args = buildExtensionArgs(["/tmp/custom-extension.ts", "/tmp/external.ts", "/tmp/external.ts"]);
+    expect(args.match(/'\/tmp\/custom-extension\.ts'/g)).toHaveLength(1);
+    expect(args.match(/'\/tmp\/external\.ts'/g)).toHaveLength(1);
+  });
+
+  it("canonical-dedupes self and selected extension symlinks", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pet-pi-extension-args-"));
+    try {
+      const self = path.join(root, "self.ts");
+      const selfLink = path.join(root, "self-link.ts");
+      const selected = path.join(root, "selected.ts");
+      const selectedLink = path.join(root, "selected-link.ts");
+      fs.writeFileSync(self, "export default function () {}\n");
+      fs.writeFileSync(selected, "export default function () {}\n");
+      fs.symlinkSync(self, selfLink);
+      fs.symlinkSync(selected, selectedLink);
+
+      const args = buildExtensionArgs([selfLink, selected, selectedLink], true, self);
+      expect(args).toContain(`--approve --no-extensions --extension '${self}'`);
+      expect(args.match(/--extension/g)).toHaveLength(2);
+      expect(args).toContain(`--extension '${selected}'`);
+      expect(args).not.toContain(selfLink);
+      expect(args).not.toContain(selectedLink);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("single-quotes arbitrary selected paths so sh -c cannot expand dollar signs", () => {
+    const args = buildExtensionArgs(["/tmp/$HOME/selected extension.ts"]);
+    expect(args).toContain("--extension '/tmp/$HOME/selected extension.ts'");
   });
 
   it("matches fully qualified models in pi list output", () => {
@@ -111,6 +119,7 @@ describe("pi command helpers", () => {
     delete process.env.PI_TEAMS_MODEL_PREFLIGHT;
 
     const result = checkChildPiModelAvailability("pi", "provider/model", ["/tmp/bootstrap"], {
+      projectTrusted: true,
       run: (command) => ({
         status: 0,
         stdout: command.includes("--extension '/tmp/bootstrap'") ? "provider  model  context" : "",
@@ -119,7 +128,7 @@ describe("pi command helpers", () => {
     });
 
     expect(result.status).toBe("available");
-    expect(result.command).toContain("--no-extensions");
+    expect(result.command).toContain("--approve --no-extensions");
     expect(result.command).toContain("--extension '/tmp/bootstrap'");
   });
 

@@ -12,6 +12,8 @@ export interface SubmittedAgentReport {
 
 export interface AgentReportSubmissionResult {
   accepted: boolean;
+  cancelledDeliveries?: number;
+  deliveryOutcome?: "cancelled" | "none";
 }
 
 export interface AgentCommunicationToolsOptions {
@@ -19,6 +21,7 @@ export interface AgentCommunicationToolsOptions {
   agentName: string;
   role: "read" | "write";
   getTeamName(): string | null | undefined;
+  getLifecycleRunId(): string | undefined;
   authorizeWriteMember(teamName: string, agentName: string): Promise<void>;
   onProgress?(status: string, updatedAt: number): void;
   onReportAndExit(report: SubmittedAgentReport): Promise<AgentReportSubmissionResult>;
@@ -30,6 +33,12 @@ function requireCurrentSession(options: Pick<AgentCommunicationToolsOptions, "ge
   return teamName;
 }
 
+function requireLifecycleRunId(options: Pick<AgentCommunicationToolsOptions, "getLifecycleRunId">): string {
+  const runId = options.getLifecycleRunId();
+  if (!runId) throw new Error("No lifecycle run identity is available for runtime telemetry.");
+  return runId;
+}
+
 function normalizeProgressStatus(value: unknown): string {
   if (typeof value !== "string") throw new Error("status must be a string.");
   const status = sanitizePlainTuiLine(value).replace(/\s+/g, " ").trim();
@@ -38,7 +47,7 @@ function normalizeProgressStatus(value: unknown): string {
   return status;
 }
 
-export function createReportProgressTool(options: Pick<AgentCommunicationToolsOptions, "isTeammate" | "agentName" | "getTeamName" | "onProgress">): any {
+export function createReportProgressTool(options: Pick<AgentCommunicationToolsOptions, "isTeammate" | "agentName" | "getTeamName" | "getLifecycleRunId" | "onProgress">): any {
   return {
     name: "report_progress",
     label: "Report Progress",
@@ -52,7 +61,7 @@ export function createReportProgressTool(options: Pick<AgentCommunicationToolsOp
       const status = normalizeProgressStatus(params.status);
       const updatedAt = Date.now();
       options.onProgress?.(status, updatedAt);
-      await runtime.writeRuntimeStatus(teamName, options.agentName, {
+      await runtime.writeRuntimeStatus(teamName, options.agentName, requireLifecycleRunId(options), {
         latestProgress: status,
         progressUpdatedAt: updatedAt,
       });
@@ -79,8 +88,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         const teamName = requireCurrentSession(options);
         const recipient = params.recipient || (options.isTeammate ? "team-lead" : undefined);
         if (!recipient) throw new Error("recipient is required when the lead sends a message.");
-        await messaging.requireRunningMessageRecipient(teamName, recipient);
-        await messaging.sendPlainMessage(teamName, options.agentName, recipient, params.content, params.summary || "Message");
+        await messaging.sendPlainMessageIfRunning(teamName, options.agentName, recipient, params.content, params.summary || "Message");
         return { content: [{ type: "text", text: `Message sent to ${recipient}.` }], details: { session: teamName, recipient } };
       },
     },
@@ -99,7 +107,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         const unreadOnly = params.unread_only !== false;
         const msgs = await messaging.readInbox(teamName, options.agentName, unreadOnly, markAsRead);
         if (markAsRead) {
-          await runtime.writeRuntimeStatus(teamName, options.agentName, {
+          await runtime.writeRuntimeStatus(teamName, options.agentName, requireLifecycleRunId(options), {
             lastHeartbeatAt: Date.now(),
             lastInboxReadAt: Date.now(),
             ready: true,
@@ -125,7 +133,17 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
       const text = result.accepted
         ? "Final report accepted. Finish immediately; the outer runner will release claims and stop this nested session."
         : "A final report was already accepted for this run. This duplicate was ignored; finish immediately.";
-      return { content: [{ type: "text", text }], details: { session: teamName, accepted: result.accepted } };
+      return {
+        content: [{ type: "text", text }],
+        details: {
+          session: teamName,
+          accepted: result.accepted,
+          ...(result.cancelledDeliveries === undefined ? {} : {
+            cancelledDeliveries: result.cancelledDeliveries,
+            deliveryOutcome: result.deliveryOutcome,
+          }),
+        },
+      };
     },
   };
 

@@ -17,13 +17,12 @@ import {
 import * as paths from "./paths";
 import * as teams from "./teams";
 
-// Mock the paths to use a temporary directory
-const testDir = path.join(os.tmpdir(), "pi-extended-teams-test-" + Date.now());
+// Keep this suite isolated from messaging tests and parallel Vitest workers.
+let testDir: string;
 
 describe("Tasks Utilities", () => {
   beforeEach(() => {
-    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
-    fs.mkdirSync(testDir, { recursive: true });
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-tasks-"));
     
     // Override paths to use testDir
     vi.spyOn(paths, "taskDir").mockReturnValue(testDir);

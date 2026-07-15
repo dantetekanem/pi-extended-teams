@@ -49,6 +49,7 @@ function writeFavoriteLevels() {
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify({
     favoriteModels: {
+      "read-review": { model: "provider/model", thinking: "xhigh" },
       "writing-basic": { model: "provider/model", thinking: "high" },
       "writing-hard": { model: "provider/model", thinking: "xhigh" },
     },
@@ -205,6 +206,19 @@ describe("write queue utilities", () => {
     expect((await listWriteQueue("team")).map(item => item.id)).toEqual(["three"]);
   });
 
+  it("uses canonical write-* intent-tier wording for read-tier validation failures", () => {
+    expect(() => queuedWriteSpawnToMember("team", {
+      id: "queued-read",
+      name: "reader-a",
+      prompt: "Inspect it",
+      cwd: testDir,
+      modelSlot: "read-review",
+      requestedAt: 1,
+    })).toThrow(
+      "Queued writer reader-a requires a write-* intent tier configured via /agents-favorite-models, got read-review."
+    );
+  });
+
   it("converts a queued spawn into a write member", () => {
     const member = queuedWriteSpawnToMember("team", {
       id: "queued",
@@ -224,7 +238,7 @@ describe("write queue utilities", () => {
       role: "write",
       category: "feature",
       model: "provider/model",
-      modelSlot: "writing-hard",
+      modelSlot: "write-system",
       cwd: testDir,
       prompt: "Implement it",
       color: "blue",

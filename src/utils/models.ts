@@ -21,6 +21,8 @@ export interface Member {
   isActive?: boolean;
   /** Optional programmatic orchestration/idempotency metadata. */
   metadata?: Record<string, any>;
+  /** Authoritative identity for one admitted lifecycle run. Never stored in user metadata. */
+  lifecycleRunId?: string;
   /** "read" agents run in-process (no pane); "write" agents spawn in tmux. */
   role?: "read" | "write";
   /** Optional category preset name from settings.json. */

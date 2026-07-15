@@ -175,7 +175,7 @@ export async function findQueuedWriteSpawn(
 export function queuedWriteSpawnToMember(teamName: string, queued: QueuedWriteSpawn): Member {
   const level = requireFavoriteModelLevel(loadSettings({ projectDir: queued.cwd }), queued.modelSlot);
   if (level.role !== "write") {
-    throw new Error(`Queued writer ${queued.name} requires a writing-* level, got ${level.slot}.`);
+    throw new Error(`Queued writer ${queued.name} requires a write-* intent tier configured via /agents-favorite-models, got ${level.slot}.`);
   }
   return {
     agentId: `${queued.name}@${teamName}`,

@@ -49,7 +49,7 @@ export interface ObserveRuntimeOptions {
 export interface EnsureTeamRequest extends OrchestrationOperationMetadata {
   teamName: string;
   description?: string;
-  /** Favorite level used for the team's internal default model. Defaults to reading-default. */
+  /** Intent tier used for the team's internal default model. Defaults to read-review. */
   defaultModelSlot?: FavoriteModelSlot;
   sessionId?: string;
   leadAgentId?: string;
@@ -66,7 +66,7 @@ export interface SpawnTeammateOnceRequest extends OrchestrationOperationMetadata
   name: string;
   prompt: string;
   cwd: string;
-  /** Required favorite level; selects read/write behavior, model, and thinking. */
+  /** Required intent tier; selects read/write behavior, configured model, and thinking. */
   modelSlot: FavoriteModelSlot;
   planModeRequired?: boolean;
   color?: string;

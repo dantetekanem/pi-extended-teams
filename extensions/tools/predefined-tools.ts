@@ -5,10 +5,13 @@ import { getModelSelectionState, requireQualifiedKnownModel } from "../internal/
 import * as predefined from "../../src/utils/predefined-teams";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
+import * as runtime from "../../src/utils/runtime";
 import * as paths from "../../src/utils/paths";
-import { loadSettings, requireFavoriteModelLevel, resolveAllowedExtensions } from "../../src/utils/settings";
+import { loadSettings, normalizeFavoriteModelSlot, requireFavoriteModelLevel } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import { requestLeadForTeammateSpawn } from "./delegation-guard";
+import { createSpawnResourcePlan, parentProjectTrustForSpawn } from "../resources/spawn-resource-plan";
+import { withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
 
 export interface PredefinedToolsOptions {
   terminal: any;
@@ -55,12 +58,12 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
   pi.registerTool({
     name: "create_predefined_team",
     label: "Create Predefined Team",
-    description: "Create a team from a predefined team configuration by configured level only. model_slot selects write-agent behavior, model, and thinking; direct model/thinking/default_model overrides are not allowed.",
+    description: "Create a team from a predefined team configuration by configured intent tier only. model_slot selects write-agent behavior, model, and thinking; it defaults to write-critical. Canonical tiers are reported outward; minor-release compatibility aliases remain accepted. Direct model/thinking/default_model overrides are not allowed.",
     parameters: Type.Object({
       team_name: Type.String({ description: "Name for the new team instance" }),
       predefined_team: Type.String({ description: "Name of the predefined team template from teams.yaml" }),
       cwd: Type.String({ description: "Working directory for spawned agents" }),
-      model_slot: Type.Optional(Type.String({ description: "Favorite writing level from /agents-favorite-models. Defaults to writing-hard." })),
+      model_slot: Type.Optional(Type.String({ description: "Configured write-* intent tier from /agents-favorite-models. Defaults to write-critical; legacy compatibility aliases are accepted." })),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       if (options.isTeammate) {
@@ -83,12 +86,18 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
         throw new Error("create_predefined_team must use model_slot only; direct model, thinking, role, or default_model is not allowed.");
       }
       const settings = loadSettings({ projectDir: ctx.cwd });
-      const level = requireFavoriteModelLevel(settings, params.model_slot || "writing-hard");
-      if (level.role !== "write") throw new Error(`create_predefined_team requires a writing-* level, got ${level.slot}.`);
+      const requestedSlot = params.model_slot ?? "write-critical";
+      const canonicalSlot = normalizeFavoriteModelSlot(requestedSlot);
+      const level = requireFavoriteModelLevel(settings, canonicalSlot ?? requestedSlot);
+      if (level.role !== "write") throw new Error(`create_predefined_team requires a write-* intent tier configured via /agents-favorite-models, got ${level.slot}.`);
       const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [level.model]);
       const defaultModel = requireQualifiedKnownModel(level.model, availableModels, "model_slot");
-      if (!defaultModel) throw new Error(`Favorite level ${level.slot} resolved to unavailable model ${level.model}.`);
-      const allowedExtensions = resolveAllowedExtensions(settings);
+      if (!defaultModel) throw new Error(`Intent tier ${level.slot} resolved to unavailable model ${level.model}.`);
+      const resourcePlan = createSpawnResourcePlan({
+        cwd: params.cwd,
+        projectTrusted: parentProjectTrustForSpawn(ctx, params.cwd),
+        pi,
+      });
 
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
       options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
@@ -109,7 +118,7 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
             throw new Error(`Predefined agent \"${agentName}\" must not declare direct model or thinking; choose model_slot when creating the team.`);
           }
           const chosenModel = defaultModel || config.defaultModel;
-          if (!chosenModel) throw new Error(`No configured model found for favorite level ${level.slot}.`);
+          if (!chosenModel) throw new Error(`No configured model found for intent tier ${level.slot}.`);
 
           const member: Member = {
             agentId: `${safeName}@${safeTeamName}`,
@@ -128,10 +137,40 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
           };
 
           await teams.addMember(safeTeamName, member);
-          await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, agentDef.prompt, "Initial prompt from predefined team");
+          const runId = member.lifecycleRunId!;
+          const bootstrapOperationId = `bootstrap:${runId}:initial-prompt`;
+          await runtime.writeRuntimeStatus(safeTeamName, safeName, runId, {
+            startedAt: member.joinedAt,
+            lastHeartbeatAt: member.joinedAt,
+            ready: false,
+            currentAction: "starting",
+          });
+          await messaging.sendPlainMessageOnceIfRunning(
+            safeTeamName,
+            "team-lead",
+            safeName,
+            agentDef.prompt,
+            "Initial prompt from predefined team",
+            {
+              operationId: bootstrapOperationId,
+              expectedRecipientRunId: runId,
+            }
+          );
           const piBinary = getPiLaunchCommand();
-          const piCmd = buildPiCommand(piBinary, chosenModel, agentDef.thinking, allowedExtensions);
-          const env: Record<string, string> = { ...process.env, PI_TEAM_NAME: safeTeamName, PI_AGENT_NAME: safeName };
+          const piCmd = buildPiCommand(
+            piBinary,
+            chosenModel,
+            member.thinking,
+            resourcePlan.extensionPaths,
+            resourcePlan.trust.projectTrusted,
+            resourcePlan.selfExtensionPath,
+          );
+          const env: Record<string, string> = {
+            ...process.env,
+            PI_TEAM_NAME: safeTeamName,
+            PI_AGENT_NAME: safeName,
+            PI_LIFECYCLE_RUN_ID: runId,
+          };
 
           try {
             const leadMember = (await teams.readConfig(safeTeamName)).members.find(m => m.name === "team-lead");
@@ -141,6 +180,19 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
             spawnResults.push({ name: agentName, status: "spawned", error: undefined });
           } catch (e) {
             spawnResults.push({ name: agentName, status: "error", error: `Failed to spawn: ${e}` });
+            await withLifecycleTombstoneLock(safeTeamName, safeName, async lifecycleLock => {
+              const fence = lifecycleLock.read();
+              if (fence.status === "corrupt") return;
+              if (fence.status === "occupied" && fence.tombstone.runId !== runId) return;
+
+              const currentConfig = await teams.readConfig(safeTeamName).catch(() => null);
+              const currentMember = currentConfig?.members.find(item => item.name === safeName);
+              if (!currentMember || currentMember.lifecycleRunId !== runId) return;
+
+              await messaging.removeInboxMessagesByOperationUnderLifecycleLock(safeTeamName, safeName, bootstrapOperationId);
+              await runtime.deleteRuntimeStatusUnderLifecycleLock(safeTeamName, safeName, runId);
+              await teams.removeMemberMatchingRun(safeTeamName, safeName, runId);
+            });
           }
         } catch (e) {
           spawnResults.push({ name: agentName, status: "error", error: String(e) });
@@ -150,7 +202,7 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
       const summary = spawnResults.map(r => `${r.name}: ${r.status}${r.error ? ` (${r.error})` : ""}`).join("\n");
       return {
         content: [{ type: "text", text: `Team "${params.team_name}" created from predefined team "${params.predefined_team}".\n\nAgent spawn results:\n${summary}` }],
-        details: { teamName: params.team_name, predefinedTeam: params.predefined_team, results: spawnResults },
+        details: { teamName: params.team_name, predefinedTeam: params.predefined_team, modelSlot: level.slot, results: spawnResults },
       };
     },
   });

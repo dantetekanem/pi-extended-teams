@@ -204,6 +204,13 @@ export function cleanupOrphanedTeams(
       const lastTouchedAt = teamLastTouchedAt(dir, teamDirectory);
       const oldEnough = maxAgeMs <= 0 || (lastTouchedAt > 0 && (now - lastTouchedAt) > maxAgeMs);
       const deadLeadPid = !!session?.pid && !isPidAlive(Number(session.pid));
+      const quarantineDir = path.join(teamDirectory, "lifecycle", "quarantine");
+      const hasLifecycleFence = fs.existsSync(quarantineDir)
+        && fs.readdirSync(quarantineDir).some(file => file.endsWith(".json"));
+
+      // Lifecycle tombstones have no TTL. Even corrupt files are occupied and
+      // must keep the team directory out of orphan cleanup.
+      if (hasLifecycleFence) continue;
 
       if (deadLeadPid || (missingLiveLead && oldEnough)) {
         if (forceCleanupTeam(dir, terminal)) cleaned++;

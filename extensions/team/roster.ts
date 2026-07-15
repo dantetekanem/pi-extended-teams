@@ -7,6 +7,7 @@ import * as writeQueue from "../../src/utils/write-queue";
 import type { TaskFile } from "../../src/utils/models";
 import type { FileClaim } from "../../src/utils/claims";
 import type { RunningReadAgent } from "../runtime/types";
+import { listLifecycleTombstones } from "../../src/utils/lifecycle-tombstone";
 
 type RosterTask = Pick<TaskFile, "id" | "subject" | "status">;
 
@@ -50,11 +51,7 @@ export async function requireWriteAgentTeam(
 }
 
 export async function releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]> {
-  try {
-    return await claims.releaseAllForAgent(teamName, agentName);
-  } catch {
-    return [];
-  }
+  return claims.releaseAllForAgent(teamName, agentName);
 }
 
 export function isWriteMemberAlive(member: any, terminal: any): boolean {
@@ -101,6 +98,8 @@ export async function buildRoster(teamName: string, options: BuildRosterOptions)
   const queue = await writeQueue.listWriteQueue(teamName).catch(() => []);
   const tasksByOwner = indexOpenTasksByOwner(allTasks);
   const claimsByAgent = indexClaimsByAgent(allClaims);
+  const tombstones = await listLifecycleTombstones(teamName).catch(() => []);
+  const tombstoneByAgent = new Map(tombstones.map(entry => [entry.agentName, entry.result]));
 
   const members = await Promise.all(config.members.map(async (member) => {
     const role = member.role ?? (member.name === "team-lead" ? "lead" : "write");
@@ -113,10 +112,11 @@ export async function buildRoster(teamName: string, options: BuildRosterOptions)
       ? true
       : !!readState || !!runtimeStatus?.ready || (role === "write" && isWriteMemberAlive(member, options.terminal));
 
+    const tombstone = tombstoneByAgent.get(member.name);
     return {
       name: member.name,
       role,
-      status: member.name === "team-lead" ? "lead" : alive ? (readState?.status || "running") : "dead/idle",
+      status: member.name === "team-lead" ? "lead" : tombstone ? "quarantined" : alive ? (readState?.status || "running") : "dead/idle",
       model: member.model,
       cwd: member.cwd,
       unreadCount,
@@ -126,6 +126,23 @@ export async function buildRoster(teamName: string, options: BuildRosterOptions)
       runtime: runtimeStatus,
     };
   }));
+
+  const knownNames = new Set(config.members.map(member => member.name));
+  for (const { agentName, result } of tombstones) {
+    if (knownNames.has(agentName)) continue;
+    members.push({
+      name: agentName,
+      role: result.status === "occupied" ? result.tombstone.role : "read",
+      status: "quarantined",
+      model: undefined,
+      cwd: "",
+      unreadCount: 0,
+      tasks: tasksByOwner.get(agentName) ?? [],
+      claims: claimsByAgent.get(agentName) ?? [],
+      tmuxPaneId: undefined,
+      runtime: await runtime.readRuntimeStatus(teamName, agentName).catch(() => null),
+    });
+  }
 
   return {
     teamName,

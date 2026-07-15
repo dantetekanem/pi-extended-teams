@@ -43,7 +43,8 @@ describe("/agents-favorite-models", () => {
 
     await commands.get("agents-favorite-models").handler("", ctx);
 
-    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("reading-fast: (empty)"), "info");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("read-collect: (empty)"), "info");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("write-critical: (empty)"), "info");
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Saved in:"), "info");
   });
 
@@ -59,7 +60,7 @@ describe("/agents-favorite-models", () => {
 
       expect(component.render(120).join("\n")).toContain("provider/model");
       component.handleInput("l"); // focus scoped models
-      component.handleInput("\x1b[B"); // select first scoped model for reading-fast
+      component.handleInput("\x1b[B"); // select first scoped model for read-collect
       component.handleInput("\r"); // save
       return doneValue;
     });
@@ -74,9 +75,60 @@ describe("/agents-favorite-models", () => {
     await commands.get("agents-favorite-models").handler("", ctx);
 
     const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
-    expect(raw.favoriteModels["reading-fast"]).toEqual({ model: "provider/model", thinking: "low" });
+    expect(raw.favoriteModels["read-collect"]).toEqual({ model: "provider/model", thinking: "high" });
     expect(custom).toHaveBeenCalled();
     expect(notify).toHaveBeenCalledWith("Agent favorite models saved.", "info");
+  });
+
+  it("applies the calibrated thinking default for all eight canonical tiers", async () => {
+    const { commands } = setupCommand();
+    const custom = vi.fn(async (factory: any) => {
+      let doneValue: "saved" | "cancelled" | undefined;
+      const component = factory(
+        { requestRender: vi.fn(), terminal: { rows: 30 } },
+        testTheme(),
+        {},
+        (value: "saved" | "cancelled") => { doneValue = value; },
+      );
+
+      component.handleInput("l");
+      for (let index = 0; index < 8; index += 1) {
+        component.handleInput("\x1b[B");
+        if (index < 7) {
+          component.handleInput("h");
+          component.handleInput("\x1b[B");
+          component.handleInput("l");
+        }
+      }
+      component.handleInput("\r");
+      return doneValue;
+    });
+    const ctx = {
+      mode: "tui",
+      modelRegistry: {
+        getAvailable: vi.fn(async () => [{
+          provider: "provider",
+          id: "model",
+          reasoning: true,
+          thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+        }]),
+      },
+      ui: { notify: vi.fn(), custom },
+    };
+
+    await commands.get("agents-favorite-models").handler("", ctx);
+
+    const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.favoriteModels).toEqual({
+      "read-collect": { model: "provider/model", thinking: "high" },
+      "read-review": { model: "provider/model", thinking: "xhigh" },
+      "read-analyze": { model: "provider/model", thinking: "medium" },
+      "read-critical": { model: "provider/model", thinking: "xhigh" },
+      "write-patch": { model: "provider/model", thinking: "max" },
+      "write-feature": { model: "provider/model", thinking: "medium" },
+      "write-system": { model: "provider/model", thinking: "high" },
+      "write-critical": { model: "provider/model", thinking: "max" },
+    });
   });
 
   it("shows max only when the selected Pi model advertises it", async () => {
@@ -154,7 +206,7 @@ describe("/agents-favorite-models", () => {
       component.handleInput("l");
       component.handleInput("l"); // focus thinking with no model selected
       component.handleInput("\x1b[B");
-      expect(component.render(120).join("\n")).toContain("Pick a scoped model for reading-fast before choosing thinking.");
+      expect(component.render(120).join("\n")).toContain("Pick a scoped model for read-collect before choosing thinking.");
       component.handleInput("\r");
       return doneValue;
     });
@@ -172,21 +224,22 @@ describe("/agents-favorite-models", () => {
     expect(raw.favoriteModels).toEqual({});
   });
 
-  it("sets and clears favorite model slots", async () => {
+  it("sets and clears canonical tiers while accepting legacy CLI aliases", async () => {
     const { commands, ctx } = setupCommand();
     const command = commands.get("agents-favorite-models");
 
-    await command.handler("set reading-fast provider/model low", ctx);
+    await command.handler("set reading-fast provider/model high", ctx);
 
     let raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
-    expect(raw.favoriteModels["reading-fast"]).toEqual({ model: "provider/model", thinking: "low" });
-    expect(ctx.ui.notify).toHaveBeenLastCalledWith("Set reading-fast to provider/model · low.", "info");
+    expect(raw.favoriteModels["read-collect"]).toEqual({ model: "provider/model", thinking: "high" });
+    expect(raw.favoriteModels).not.toHaveProperty("reading-fast");
+    expect(ctx.ui.notify).toHaveBeenLastCalledWith("Set read-collect to provider/model · high.", "info");
 
     await command.handler("clear reading-fast", ctx);
 
     raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
-    expect(raw.favoriteModels).not.toHaveProperty("reading-fast");
-    expect(ctx.ui.notify).toHaveBeenLastCalledWith("Cleared reading-fast.", "info");
+    expect(raw.favoriteModels).not.toHaveProperty("read-collect");
+    expect(ctx.ui.notify).toHaveBeenLastCalledWith("Cleared read-collect.", "info");
   });
 
   it("accepts max only for a Pi model that advertises it", async () => {
@@ -198,16 +251,16 @@ describe("/agents-favorite-models", () => {
       thinkingLevelMap: { max: "max" },
     }]);
 
-    await commands.get("agents-favorite-models").handler("set reading-hard provider/max-model max", ctx);
+    await commands.get("agents-favorite-models").handler("set read-critical provider/max-model max", ctx);
 
     const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
-    expect(raw.favoriteModels["reading-hard"]).toEqual({ model: "provider/max-model", thinking: "max" });
+    expect(raw.favoriteModels["read-critical"]).toEqual({ model: "provider/max-model", thinking: "max" });
   });
 
   it("rejects max when the Pi model does not advertise it", async () => {
     const { commands, ctx } = setupCommand();
 
-    await commands.get("agents-favorite-models").handler("set reading-hard provider/model max", ctx);
+    await commands.get("agents-favorite-models").handler("set read-critical provider/model max", ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining('Thinking level "max" is not available for provider/model'),

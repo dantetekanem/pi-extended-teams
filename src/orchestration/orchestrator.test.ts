@@ -7,7 +7,7 @@ import * as teams from "../utils/teams";
 import * as messaging from "../utils/messaging";
 import * as runtime from "../utils/runtime";
 import * as writeQueue from "../utils/write-queue";
-import { appendTeamReportEvent, listTeamReportEvents, observeTeam, observeTeammate, sendMessageOnce, spawnTeammateOnce, spawnTeammatesOnce } from "./index";
+import { appendTeamReportEvent, broadcastMessageOnce, ensureTeam, listTeamReportEvents, observeTeam, observeTeammate, sendMessageOnce, spawnTeammateOnce, spawnTeammatesOnce } from "./index";
 import { roleForFavoriteModelSlot } from "../utils/settings";
 import type { SpawnTeammateOnceRequest } from "./types";
 
@@ -21,6 +21,7 @@ function installPathSpies() {
   vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "runtime", `${paths.sanitizeName(String(agentName))}.json`));
   vi.spyOn(paths, "claimsPath").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "claims.json"));
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "write-queue.json"));
+  vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`));
 }
 
 function writeFavoriteLevels() {
@@ -47,6 +48,13 @@ describe("orchestration primitives", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("uses read-review as the canonical team default while loading its legacy settings alias", async () => {
+    const result = await ensureTeam({ teamName: "default-tier-team", description: "default tier" });
+
+    expect(result.created).toBe(true);
+    expect(result.config.defaultModel).toBe("provider/model");
+  });
+
   it("observes teammate state without marking inbox read or mutating runtime/team state", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
@@ -61,8 +69,9 @@ describe("orchestration primitives", () => {
       subscriptions: [],
       prompt: "work",
     });
+    const writerRunId = (await teams.readConfig("team")).members.find(member => member.name === "writer")!.lifecycleRunId!;
     await messaging.sendPlainMessage("team", "lead", "writer", "hello", "hello");
-    await runtime.writeRuntimeStatus("team", "writer", { ready: true, lastHeartbeatAt: Date.now() });
+    await runtime.writeRuntimeStatus("team", "writer", writerRunId, { ready: true, lastHeartbeatAt: Date.now() });
 
     const observed = await observeTeammate("team", "writer", { terminal: { isAlive: () => false } });
     expect(observed.health).toBe("dead");
@@ -97,47 +106,62 @@ describe("orchestration primitives", () => {
     expect(readConfigSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("reuses existing members for spawnTeammateOnce", async () => {
+  it("reuses existing members with canonical outward slots without rewriting persisted state", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
-    await teams.addMember("team", {
-      agentId: "reader@team",
-      name: "reader",
+    const joinedAt = Date.now();
+    const persistedMember = {
+      agentId: "writer@team",
+      name: "writer",
       agentType: "teammate",
-      role: "read",
+      role: "write" as const,
       model: "provider/model",
-      modelSlot: "reading-default",
-      joinedAt: Date.now(),
-      tmuxPaneId: "",
+      thinking: "xhigh" as const,
+      modelSlot: "writing-hard",
+      joinedAt,
+      tmuxPaneId: "%1",
       cwd: root,
       subscriptions: [],
-      prompt: "read",
-      metadata: { operationId: "op-1", workflowRunId: "run-1" },
-    });
+      prompt: "write",
+      metadata: { operationId: "op-1", workflowRunId: "run-1", modelSlot: "writing-hard" },
+    };
+    await teams.addMember("team", persistedMember);
     const start = vi.fn();
 
     const result = await spawnTeammateOnce({
       teamName: "team",
-      name: "reader",
-      prompt: "read again",
+      name: "writer",
+      prompt: "write again",
       cwd: root,
-      modelSlot: "reading-default",
+      modelSlot: "writing-hard",
       operationId: "op-1",
       workflowRunId: "run-1",
     }, { start });
 
-    expect(result.status).toBe("existing");
-    expect(result.member?.name).toBe("reader");
-    expect(result.details).toMatchObject({
-      existing: true,
-      idempotent: true,
-      queued: false,
-      role: "read",
-      requestedRole: "read",
-      resolvedRole: "read",
-      requestedModelSlot: "reading-default",
-      modelSlot: "reading-default",
-      model: "provider/model",
-      modelSource: "existing",
+    expect(result).toEqual({
+      status: "existing",
+      member: {
+        ...persistedMember,
+        modelSlot: "write-system",
+        metadata: { operationId: "op-1", workflowRunId: "run-1", modelSlot: "write-system" },
+      },
+      details: {
+        agentId: "writer@team",
+        role: "write",
+        requestedRole: "write",
+        resolvedRole: "write",
+        requestedModelSlot: "write-system",
+        modelSlot: "write-system",
+        model: "provider/model",
+        thinking: "xhigh",
+        existing: true,
+        idempotent: true,
+        queued: false,
+        modelSource: "existing",
+      },
+    });
+    expect((await teams.readConfig("team")).members.find(member => member.name === "writer")).toMatchObject({
+      modelSlot: "writing-hard",
+      metadata: { modelSlot: "writing-hard" },
     });
     expect(start).not.toHaveBeenCalled();
   });
@@ -252,8 +276,8 @@ describe("orchestration primitives", () => {
       role: "write",
       requestedRole: "write",
       resolvedRole: "write",
-      requestedModelSlot: "writing-hard",
-      modelSlot: "writing-hard",
+      requestedModelSlot: "write-system",
+      modelSlot: "write-system",
       model: "provider/model",
       thinking: "xhigh",
       modelSource: "favorite-slot",
@@ -320,7 +344,7 @@ describe("orchestration primitives", () => {
     ]);
   });
 
-  it("sends orchestration messages once", async () => {
+  it("sends and broadcasts orchestration messages once through active-recipient admission", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
       agentId: "reader@team",
@@ -339,5 +363,33 @@ describe("orchestration primitives", () => {
     expect(first.delivered).toBe(true);
     expect(second.delivered).toBe(false);
     expect((await messaging.peekInbox("team", "reader", false)).map(message => message.text)).toEqual(["one"]);
+
+    await teams.addMember("team", {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    });
+    const firstBroadcast = await broadcastMessageOnce({
+      teamName: "team",
+      fromName: "team-lead",
+      text: "broadcast one",
+      summary: "broadcast",
+      operationId: "broadcast-op",
+    });
+    const secondBroadcast = await broadcastMessageOnce({
+      teamName: "team",
+      fromName: "team-lead",
+      text: "broadcast two",
+      summary: "broadcast",
+      operationId: "broadcast-op",
+    });
+    expect(firstBroadcast.every(result => result.delivered)).toBe(true);
+    expect(secondBroadcast.every(result => !result.delivered)).toBe(true);
+    expect((await messaging.peekInbox("team", "writer", false)).map(message => message.text)).toEqual(["broadcast one"]);
   });
 });

@@ -10,8 +10,9 @@ import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
 import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
 import { FAVORITE_MODEL_SLOTS, loadSettings } from "../../src/utils/settings";
+import { generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
 
-export const LEAD_ORCHESTRATION_GUIDANCE = `\n\npi-extended-teams lead orchestration rules:\n- Choose the cheapest sufficient read level. reading-fast is the normal first choice for bounded research, collection, inventory, lookup, evidence gathering, docs/log/test-output inspection, and independent slices; it should naturally be the most-used read level.\n- Use reading-default for normal synthesis and bounded engineering judgment. Reserve reading-hard as the rarest level, only for irreducibly deep, ambiguous, high-risk architecture/security/root-cause/data reasoning. Never choose reading-hard merely because a task says investigate, research, review, verify, or is important.\n- A spawned agent owns its assigned lane until it reports, blocks, fails, or the user cancels it. Do not duplicate, take over, test, edit, or synthesize that same lane in parallel; work only on clearly unrelated lanes.\n- When no unrelated work remains, wait literally idle for the automatic report prompt. Do not sleep, poll, repeatedly call read_inbox/check status, send nudges, do dummy work, or treat healthy silence as failure.\n- Wait for the actual report before synthesizing. Intervene only on a reported blocker/error, actual health failure, explicit user cancellation/change, or a genuinely finished agent that remains active.\n- Before implementing a durable bug/security/testing claim sourced from an agent report or backlog, confirm it with a separate read-only agent using the cheapest sufficient read level; confirmation alone does not justify reading-hard.`;
+export const LEAD_ORCHESTRATION_GUIDANCE = `\n\npi-extended-teams lead orchestration rules:\n- Choose tiers by the agent's intended outcome, not by vague task importance. read-review is the normal default for focused review, verification, and bounded synthesis.\n- Use read-collect when the lane gathers bounded facts without owning the conclusion. Use read-analyze when it must explain behavior or root cause across connected evidence. Reserve read-critical for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning.\n- For edits, use write-patch for a narrow localized change, write-feature for a bounded feature with a known design, write-system for a cross-cutting integration/refactor within explicitly claimed files, and write-critical only for high-risk security, concurrency, recovery, migration, or data-integrity changes.\n- Prefer the canonical read-*/write-* tiers. Legacy reading-*/writing-* names are compatibility aliases for this minor release, not intent guidance.\n- A spawned agent owns its assigned lane until it reports, blocks, fails, or the user cancels it. Do not duplicate, take over, test, edit, or synthesize that same lane in parallel; work only on clearly unrelated lanes.\n- When no unrelated work remains, wait literally idle for the automatic report prompt. Do not sleep, poll, repeatedly call read_inbox/check status, send nudges, do dummy work, or treat healthy silence as failure.\n- Wait for the actual report before synthesizing. Intervene only on a reported blocker/error, actual health failure, explicit user cancellation/change, or a genuinely finished agent that remains active.\n- Before implementing a durable bug/security/testing claim sourced from an agent report or backlog, confirm it with a separate read-only agent using the intent tier that fits the confirmation; importance alone does not justify read-critical.`;
 
 export interface RegisterEventsOptions {
   isTeammate: boolean;
@@ -43,6 +44,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   let teammateInboxPollTimer: NodeJS.Timeout | null = null;
   let teammateInboxWatcher: fs.FSWatcher | null = null;
   let teammateInboxDisposed = false;
+  let teammateLifecycleRunId: string | undefined = process.env.PI_LIFECYCLE_RUN_ID;
   const teammateOneShotTimers = new Set<NodeJS.Timeout>();
 
   const scheduleTeammateOneShot = (callback: () => void, delayMs: number) => {
@@ -83,6 +85,21 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     };
   };
 
+  const writeTeammateRuntimeStatus = async (
+    teamName: string,
+    updates: Omit<Partial<runtime.AgentRuntimeStatus>, "teamName" | "agentName" | "lifecycleRunId">
+  ): Promise<runtime.AgentRuntimeStatus | null> => {
+    if (!teammateLifecycleRunId) throw new Error(`Missing lifecycle run id for ${options.agentName}.`);
+    try {
+      return await runtime.writeRuntimeStatus(teamName, options.agentName, teammateLifecycleRunId, updates);
+    } catch (error) {
+      // report_and_exit closes persistence before Pi emits its trailing
+      // tool/message/turn events. Those telemetry writes are benign no-ops.
+      if (runtime.isRuntimeStatusWriteRejectedError(error)) return null;
+      throw error;
+    }
+  };
+
   pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, _renderOptions: any, theme: any) => {
     const d = message.details || {};
     const meta = [
@@ -107,13 +124,13 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
 
     if (!options.isTeammate) {
       const settings = loadSettings({ projectDir: ctx.cwd });
-      const configuredLevels = FAVORITE_MODEL_SLOTS.filter((slot) => {
+      const configuredTiers = FAVORITE_MODEL_SLOTS.filter((slot) => {
         const config = settings.favoriteModels[slot];
         return !!config?.model && !!config.thinking;
       });
-      if (configuredLevels.length === 0) {
+      if (configuredTiers.length === 0) {
         ctx.ui?.notify?.(
-          "No agent levels are configured. Define them with /agents-favorite-models before spawning agents. See TIPS.md for level examples.",
+          "No agent intent tiers are configured. Define them with /agents-favorite-models before spawning agents. See TIPS.md for intent-tier examples.",
           "warning"
         );
       }
@@ -123,10 +140,21 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       disposeTeammateInbox();
       teammateInboxDisposed = false;
       if (teamName) {
+        if (teams.teamExists(teamName)) {
+          const persistedRunId = await teams.ensureMemberLifecycleRunId(teamName, options.agentName, teammateLifecycleRunId);
+          if (teammateLifecycleRunId && persistedRunId !== teammateLifecycleRunId) {
+            throw new Error(`Refusing to start stale run ${teammateLifecycleRunId} for ${options.agentName}; current run is ${persistedRunId}.`);
+          }
+          teammateLifecycleRunId = persistedRunId;
+        } else {
+          // Compatibility for standalone/testing teammate contexts that have no
+          // persisted roster. Real spawned members are admitted before startup.
+          teammateLifecycleRunId ||= `compat-${generateLifecycleRunId()}`;
+        }
         const pidFile = path.join(paths.teamDir(teamName), `${options.agentName}.pid`);
         fs.mkdirSync(path.dirname(pidFile), { recursive: true });
         fs.writeFileSync(pidFile, process.pid.toString());
-        await runtime.writeRuntimeStatus(teamName, options.agentName, {
+        await runtime.writeRuntimeStatus(teamName, options.agentName, teammateLifecycleRunId, {
           pid: process.pid,
           startedAt: Date.now(),
           lastHeartbeatAt: Date.now(),
@@ -173,7 +201,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           try {
             const unread = await messaging.readInbox(teamName, options.agentName, true, false);
             if (teammateInboxDisposed) return;
-            await runtime.writeRuntimeStatus(teamName, options.agentName, {
+            await writeTeammateRuntimeStatus(teamName, {
               lastHeartbeatAt: Date.now(),
             });
             if (unread.length > 0) {
@@ -181,7 +209,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             }
           } catch (e) {
             if (!teammateInboxDisposed) {
-              await runtime.writeRuntimeStatus(teamName, options.agentName, {
+              await writeTeammateRuntimeStatus(teamName, {
                 lastHeartbeatAt: Date.now(),
                 lastError: runtime.createRuntimeError(e),
               });
@@ -226,7 +254,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       if ((ctx.ui as any).setTitle) (ctx.ui as any).setTitle(fullTitle);
       if (options.terminal) options.terminal.setTitle(fullTitle);
       if (teamName) {
-        await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
+        await writeTeammateRuntimeStatus(teamName, teammateRuntimeUpdates(ctx, {
           lastHeartbeatAt: Date.now(),
           currentAction: "thinking",
           activeToolName: undefined,
@@ -238,7 +266,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   pi.on("tool_execution_start", async (event: any, ctx: any) => {
     const teamName = options.getTeamName();
     if (options.isTeammate && teamName) {
-      await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
+      await writeTeammateRuntimeStatus(teamName, teammateRuntimeUpdates(ctx, {
         lastHeartbeatAt: Date.now(),
         currentAction: "working",
         activeToolName: event?.toolName,
@@ -249,7 +277,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   pi.on("tool_execution_end", async (_event: any, ctx: any) => {
     const teamName = options.getTeamName();
     if (options.isTeammate && teamName) {
-      await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
+      await writeTeammateRuntimeStatus(teamName, teammateRuntimeUpdates(ctx, {
         lastHeartbeatAt: Date.now(),
         currentAction: "thinking",
         activeToolName: undefined,
@@ -260,7 +288,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   pi.on("message_end", async (event: any, ctx: any) => {
     const teamName = options.getTeamName();
     if (options.isTeammate && teamName && event.message?.role === "assistant") {
-      await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
+      await writeTeammateRuntimeStatus(teamName, teammateRuntimeUpdates(ctx, {
         lastHeartbeatAt: Date.now(),
       }, event.message));
     }
@@ -269,7 +297,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   pi.on("turn_end", async (_event: any, ctx: any) => {
     const teamName = options.getTeamName();
     if (options.isTeammate && teamName) {
-      await runtime.writeRuntimeStatus(teamName, options.agentName, teammateRuntimeUpdates(ctx, {
+      await writeTeammateRuntimeStatus(teamName, teammateRuntimeUpdates(ctx, {
         lastHeartbeatAt: Date.now(),
         currentAction: "thinking",
         activeToolName: undefined,
@@ -293,7 +321,8 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       firstTurn = false;
 
       if (teamName) {
-        await runtime.writeRuntimeStatus(teamName, options.agentName, {
+        if (!teammateLifecycleRunId) throw new Error(`Missing lifecycle run id for ${options.agentName}.`);
+        await runtime.writeRuntimeStatus(teamName, options.agentName, teammateLifecycleRunId, {
           lastHeartbeatAt: Date.now(),
           ready: true,
           currentAction: "thinking",

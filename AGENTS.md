@@ -36,10 +36,18 @@ Agents running either in-process for read-only work or in tmux panes for write w
 ## 🛠 Capabilities
 
 ### 🚀 Specialist Spawning
-You can create teammates with custom identities, models, and reasoning depths:
-- **Custom Roles**: "Spawn a 'CSS Expert' to fix the layout shifts."
-- **Model Selection**: Use `gpt-4o` for complex architecture and `haiku` for fast, repetitive tasks.
-- **Thinking Levels**: Set thinking to `high` for deep reasoning or `off` for maximum speed.
+Create teammates for a bounded outcome and select one canonical intent tier configured in `/agents-favorite-models`; never pass a raw model or thinking level.
+
+- `read-collect`: bounded fact and evidence gathering.
+- `read-review`: normal default for focused review, verification, and bounded synthesis.
+- `read-analyze`: explanation across connected evidence.
+- `read-critical`: irreducible high-stakes reasoning.
+- `write-patch`: narrow localized edit.
+- `write-feature`: bounded feature with a known design.
+- `write-system`: normal complex implementation, integration, or refactor within explicitly claimed files.
+- `write-critical`: rare high-risk security, concurrency, recovery, migration, or data-integrity work.
+
+`/agents-favorite-models` maps these tiers to the available scoped models and thinking settings.
 
 ### 📋 Shared Task Board
 A centralized source of truth for the entire team:
@@ -98,5 +106,6 @@ When the user says "agents", "use agents", "spawn agents", "send agents", or any
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.
 - **Clear Prompts**: Be specific about the teammate's role and boundaries when spawning.
 - **Check-ins**: Use `task_list` regularly to see the "big picture" of your team's progress.
+- **Scope updates go to active owners**: When requirements change while an agent is still running, use `send_message` so it can continue with the new context. Active in-process read agents receive a steering turn; active tmux writers wake through their inbox.
 - **NEVER sleep, busy-wait, or poll**: Do not use bash `sleep`, `while true`, or any wait/poll loop to check for messages or agent completion. The extension delivers reports and wakes you.
-- **Agents self-exit**: Write agents call `report_and_exit` when done; read agents report and stop. Do not manually kill agents unless they stall.
+- **Agents self-exit**: Write agents call `report_and_exit` when done; read agents report and stop. Once a final report is accepted, new message admission is closed and session teardown is underway, so no manual `stop_teammate` call is needed after normal completion. Spawn a fresh bounded `read-collect` agent if new work appears after that point; manually stop only an active agent that the user cancels or no longer needs.

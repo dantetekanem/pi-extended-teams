@@ -3,12 +3,12 @@ import {
   clearGlobalFavoriteModels,
   FAVORITE_MODEL_SLOTS,
   globalSettingsPath,
-  isFavoriteModelSlot,
   loadSettings,
+  normalizeFavoriteModelSlot,
   replaceGlobalFavoriteModels,
   setGlobalFavoriteModel,
   THINKING_LEVEL_NAMES,
-  type FavoriteModelSlot,
+  type CanonicalFavoriteModelSlot,
   type FavoriteModelConfig,
   type ThinkingLevelName,
 } from "../../src/utils/settings";
@@ -20,20 +20,23 @@ interface AvailableModelOption extends AvailableRegisteredModel {
   qualified: string;
 }
 
-type FavoriteModelsDraft = Partial<Record<FavoriteModelSlot, FavoriteModelConfig>>;
+type FavoriteModelsDraft = Partial<Record<CanonicalFavoriteModelSlot, FavoriteModelConfig>>;
 type PickerColumn = "slots" | "models" | "thinking";
 
-const DEFAULT_THINKING_BY_SLOT: Record<FavoriteModelSlot, ThinkingLevelName> = {
-  "reading-fast": "low",
-  "reading-default": "high",
-  "reading-hard": "xhigh",
-  "writing-basic": "high",
-  "writing-hard": "xhigh",
+const DEFAULT_THINKING_BY_SLOT: Record<CanonicalFavoriteModelSlot, ThinkingLevelName> = {
+  "read-collect": "high",
+  "read-review": "xhigh",
+  "read-analyze": "medium",
+  "read-critical": "xhigh",
+  "write-patch": "max",
+  "write-feature": "medium",
+  "write-system": "high",
+  "write-critical": "max",
 };
 
 const COLUMNS: PickerColumn[] = ["slots", "models", "thinking"];
 
-function formatSlot(slot: FavoriteModelSlot, config?: FavoriteModelConfig): string {
+function formatSlot(slot: CanonicalFavoriteModelSlot, config?: FavoriteModelConfig): string {
   if (!config?.model || !config.thinking) return `- ${slot}: (empty)`;
   return `- ${slot}: ${config.model} · ${config.thinking}`;
 }
@@ -63,11 +66,12 @@ function formatCurrentSettings(homeDir?: string): string {
   ].join("\n");
 }
 
-function normalizeSlot(raw: string | undefined): FavoriteModelSlot {
-  if (!isFavoriteModelSlot(raw)) {
+function normalizeSlot(raw: string | undefined): CanonicalFavoriteModelSlot {
+  const slot = normalizeFavoriteModelSlot(raw);
+  if (!slot) {
     throw new Error(`Unknown slot "${raw ?? ""}". Use one of: ${FAVORITE_MODEL_SLOTS.join(", ")}.`);
   }
-  return raw;
+  return slot;
 }
 
 function normalizeThinking(raw: string | undefined): ThinkingLevelName {

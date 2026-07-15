@@ -19,7 +19,7 @@ If agents would otherwise be useful, stop and ask the user to turn off or finish
 
 - **The lead owns the result.** The lead retains integration, cross-lane decisions, scope tradeoffs, verification synthesis, and final acceptance. If only one substantive execution lane exists, the lead executes it.
 - **Read agents multiply genuine independent coverage.** Use them for bounded investigation, review, testing, audits, and second opinions only when each lane returns distinct useful evidence.
-- **Edit agents are optional and rare.** A writer owns exactly one isolated sub-outcome with non-overlapping files. A `writing-hard` slot allows difficult work inside that lane; it does not allow broad cross-stack ownership. Edit agents must claim files before writing and report every changed path.
+- **Edit agents are optional and rare.** A writer owns exactly one isolated sub-outcome with non-overlapping files. Use `write-system` for normal complex implementation, integration, or refactoring inside that lane; reserve `write-critical` for rare high-risk security, concurrency, recovery, migration, or data-integrity work. Neither tier allows broad cross-stack ownership. Edit agents must claim files before writing and report every changed path.
 
 ## Mandatory outcome-to-lane gate
 
@@ -34,11 +34,11 @@ Before spawning for substantial work:
 
 ## Default flow
 
-Run the outcome-to-lane gate first, then use `spawn_agent` for one genuine helper lane or `spawn_swarm_agents` for a batch of independent lanes. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by `model_slot` level only; never pass `role`, raw `model`, or `thinking` directly. The level selects read/write behavior, model, and effort. See `TIPS.md` for level-selection examples.
+Run the outcome-to-lane gate first, then use `spawn_agent` for one genuine helper lane or `spawn_swarm_agents` for a batch of independent lanes. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by canonical `model_slot` intent tier only; never pass `role`, raw `model`, or `thinking` directly. `/agents-favorite-models` maps the eight tiers—`read-collect`, `read-review`, `read-analyze`, `read-critical`, `write-patch`, `write-feature`, `write-system`, and `write-critical`—to read/write behavior, model, and effort. See `TIPS.md` for tier-selection examples.
 
 ```text
 spawn_swarm_agents({
-  defaults: { model_slot: "reading-default" },
+  defaults: { model_slot: "read-review" },
   agents: [
     {
       name: "git-check",
@@ -63,7 +63,7 @@ Spawn one more focused helper when needed:
 ```text
 spawn_agent({
   name: "docs-review",
-  model_slot: "reading-default",
+  model_slot: "read-review",
   prompt: "Review README.md and docs/guide.md for stale agent-tool references. Report exact lines and replacements."
 })
 ```
@@ -73,7 +73,7 @@ Spawn an edit agent only for isolated work:
 ```text
 spawn_agent({
   name: "docs-fix",
-  model_slot: "writing-basic",
+  model_slot: "write-patch",
   prompt: "Fix only stale tool names in docs/guide.md. Claim the file first, keep the diff small, then call report_and_exit."
 })
 ```
@@ -90,9 +90,11 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 - Keep implementation in the lead when there is only one substantive execution lane. Otherwise, a writer may own only one isolated sub-outcome.
 - Never sleep, busy-wait, or poll. The extension wakes the lead when reports arrive.
 - Trust quiet agents. Do not ping, message, or check an agent just because it has been quiet for less than several minutes; active status remains visible in the activity card and Down-key live view.
+- When requirements or evidence change while an agent is still active, use `send_message` to update that owner instead of replacing or stopping it. Active in-process read agents receive the message as a steering turn and can continue intelligently; active tmux writers wake through their inbox.
+- Once a final report is accepted, new message admission is closed and the agent is self-exiting; teardown may still be finishing. Do not call `stop_teammate` after normal completion. If genuinely new work appears after the report, spawn a fresh bounded `read-collect` lane rather than trying to revive that closing session.
 - Do not wake the lead just to ping idle agents.
 - Use `check_teammate` only when a specific agent appears stalled or unhealthy after several minutes, not immediately after sending a message.
-- Use `stop_teammate` only when the user explicitly asks to cancel/stop an agent or an agent is no longer needed.
+- Use `stop_teammate` only when the user explicitly asks to cancel/stop an active agent or an active agent is no longer needed.
 - Ask before applying fixes during an investigation.
 - Never commit, push, deploy, install packages, or start services unless the user authorizes that side effect.
 
@@ -126,7 +128,7 @@ Give every agent:
 
 - one bounded independent sub-outcome or question (never the whole User request),
 - relevant files or directories,
-- the right `model_slot` level (`reading-*` for read-only, `writing-*` for edit-allowed),
+- the right `model_slot` tier (`read-*` for read-only, `write-*` for edit-allowed),
 - the report shape you want,
 - and verification expectations.
 

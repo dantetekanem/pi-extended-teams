@@ -1,13 +1,7 @@
-import {
-  createAgentSession,
-  DefaultResourceLoader,
-  getAgentDir,
-  SessionManager,
-  type AgentSession,
-} from "@mariozechner/pi-coding-agent";
+import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import * as runtime from "../../src/utils/runtime";
-import * as messaging from "../../src/utils/messaging";
 import * as teams from "../../src/utils/teams";
+import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
@@ -15,7 +9,25 @@ import { extractTextParts, getLastAssistantText, sanitizeTuiLine } from "../ui/r
 import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
 import { requireWriteAgentTeam } from "../team/roster";
 import { isPiPromptPlanningMember, shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
-import { loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
+import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
+import { closePersistedRecipient } from "../team/recipient-closure";
+import { generateExtensionInstanceId, generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
+import { createLifecycleRuntime, type ShutdownTeammateOptions } from "../team/lifecycle";
+import {
+  createSpawnResourcePlan,
+  parentProjectTrustForSpawn,
+  type SpawnResourcePlan,
+} from "../resources/spawn-resource-plan";
+import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
+import {
+  closeReadAgentMessageDelivery,
+  enqueueReadAgentMessageDelivery,
+  installReadAgentSessionLifecycle,
+  type ReadAgentDeliveryCloseResult,
+  type ReadAgentTeardownResult,
+} from "./read-agent-session-lifecycle";
+
+export { closeReadAgentMessageDelivery } from "./read-agent-session-lifecycle";
 
 export interface RunReadAgentOptions {
   isTeammate: boolean;
@@ -29,9 +41,17 @@ export interface RunReadAgentOptions {
   emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection?: boolean): void;
   emitAgentProgress?(teamName: string, name: string, status: string, updatedAt: number): void;
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
+  shutdownTeammate?(
+    teamName: string,
+    member: Member,
+    options?: ShutdownTeammateOptions
+  ): Promise<ReadAgentTeardownResult>;
   agentName?: string;
-  quietTrigger?(content: string): void;
   renderLeadInboxStatus?(): Promise<void>;
+  notifyLeadOfInboxReports?(teamName: string): Promise<void>;
+  deliverMessageToActiveAgent?(teamName: string, recipient: string, content: string): Promise<boolean>;
+  createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
+  extensionInstanceId?: string;
 }
 
 function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
@@ -78,24 +98,37 @@ function updateAssistantProgress(agent: RunningReadAgent, message: any, recordEv
   return true;
 }
 
-export async function shutdownReadAgentSession(session: AgentSession | undefined): Promise<void> {
-  if (!session?.abort) return;
-
-  try {
-    await Promise.race([
-      session.abort(),
-      new Promise<void>((resolve) => setTimeout(resolve, 2500)),
-    ]);
-  } catch {
-    // Ignore abort races: the read-agent should continue teardown regardless.
+export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | undefined, content: string): Promise<boolean> {
+  if (!agent) return false;
+  if (!agent.session || !agent.acceptingMessages || agent.messageDeliveryClosed || agent.stopRequested) {
+    throw new Error(`Cannot send message to ${agent.name}: agent is finishing.`);
   }
+
+  const session = agent.session;
+  const delivery = session.isStreaming ? { deliverAs: "steer" as const } : undefined;
+  await enqueueReadAgentMessageDelivery(
+    agent,
+    agent.name,
+    () => session.sendUserMessage(content, delivery)
+  );
+  markReadAgentActivity(agent, "received lead message", "thinking");
+  return true;
 }
 
-async function hasRecentMessageFrom(teamName: string, fromName: string, toName: string, sinceMs: number): Promise<boolean> {
+async function hasRecentMessageFrom(
+  teamName: string,
+  fromName: string,
+  toName: string,
+  sinceMs: number,
+  matches: (message: any) => boolean = () => true
+): Promise<boolean> {
   const messages = await messaging.readInbox(teamName, toName, false, false).catch(() => []);
   return messages.some((message: any) => {
     const timestamp = message.timestamp ? new Date(message.timestamp).getTime() : 0;
-    return message.from === fromName && timestamp >= sinceMs - 1000 && String(message.text || "").trim().length > 0;
+    return message.from === fromName
+      && timestamp >= sinceMs - 1000
+      && String(message.text || "").trim().length > 0
+      && matches(message);
   });
 }
 
@@ -118,6 +151,7 @@ async function recordReadAgentReportEvent(
   color?: string
 ): Promise<void> {
   const operation = operationMetadataFromMember(member);
+  const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
   await reportEvents.appendTeamReportEvent(teamName, {
     agentName: member.name,
     role: member.role || "read",
@@ -130,13 +164,13 @@ async function recordReadAgentReportEvent(
     costUsd,
     model: member.model,
     thinking: member.thinking,
-    modelSlot: member.modelSlot,
+    modelSlot,
     color: color || member.color,
     requestedBy: member.requestedBy,
     source: "read-agent",
     operationId: operation.operationId,
     workflowRunId: operation.workflowRunId,
-    metadata: { ...(member.prompt ? { initialPrompt: member.prompt } : {}), ...(member.modelSlot ? { modelSlot: member.modelSlot } : {}) },
+    metadata: { ...(member.prompt ? { initialPrompt: member.prompt } : {}), ...(modelSlot ? { modelSlot } : {}) },
   }).catch(() => {});
 }
 
@@ -167,35 +201,67 @@ async function ensureReadHelperCompletionMessages(
   teamName: string,
   member: Member,
   startedAt: number,
+  runId: string,
   report: string,
   outcome: "completed" | "failed" = "completed",
-  color = member.color
+  color = member.color,
+  deliverMessageToActiveAgent?: RunReadAgentOptions["deliverMessageToActiveAgent"]
 ): Promise<void> {
   if (!member.requestedBy) return;
 
-  const requesterHasReport = await hasRecentMessageFrom(teamName, member.name, member.requestedBy, startedAt);
-  if (!requesterHasReport) {
-    await messaging.sendPlainMessage(
-      teamName,
-      member.name,
-      member.requestedBy,
-      report,
-      outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
-      color
-    );
+  let requesterReceivedReport = false;
+  try {
+    const deliveredDirectly = await deliverMessageToActiveAgent?.(teamName, member.requestedBy, report) === true;
+    if (deliveredDirectly) {
+      requesterReceivedReport = true;
+    } else {
+      requesterReceivedReport = await hasRecentMessageFrom(
+        teamName,
+        member.name,
+        member.requestedBy,
+        startedAt,
+        message => message?.metadata?.helperReport === true && message?.metadata?.runId === runId
+      );
+      if (!requesterReceivedReport) {
+        await messaging.sendPlainMessageIfRunning(
+          teamName,
+          member.name,
+          member.requestedBy,
+          report,
+          outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
+          color,
+          { metadata: { helperReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy } }
+        );
+        requesterReceivedReport = true;
+      }
+    }
+  } catch {
+    requesterReceivedReport = false;
   }
 
-  const leadHasNotice = await hasRecentMessageFrom(teamName, member.name, "team-lead", startedAt);
-  if (!leadHasNotice) {
+  const leadHasClassifiedNotice = await hasRecentMessageFrom(
+    teamName,
+    member.name,
+    "team-lead",
+    startedAt,
+    message => message?.metadata?.finalReport === true
+      && message?.metadata?.helperCompletion === true
+      && message?.metadata?.runId === runId
+  );
+  if (!leadHasClassifiedNotice) {
+    const delivery = requesterReceivedReport
+      ? `Report sent to ${member.requestedBy}.`
+      : `${member.requestedBy} is no longer running; the report is retained here.`;
     await messaging.sendPlainMessage(
       teamName,
       member.name,
       "team-lead",
       outcome === "failed"
-        ? `Read helper ${member.name} failed for ${member.requestedBy}. Failure report sent to ${member.requestedBy}.`
-        : `Read helper ${member.name} completed for ${member.requestedBy}. Report sent to ${member.requestedBy}.`,
+        ? `Read helper ${member.name} failed for ${member.requestedBy}. ${delivery}`
+        : `Read helper ${member.name} completed for ${member.requestedBy}. ${delivery}`,
       outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} done`,
-      color
+      color,
+      { metadata: { finalReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy } }
     );
   }
 }
@@ -223,10 +289,21 @@ export async function runReadAgentInProcess(
   const key = options.readAgentKey(readTeamName, member.name);
   const role = member.role || "read";
   const roleLabel = role === "write" ? "edit-allowed" : "read-only";
+  const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
   let resolveFinished!: () => void;
   const finished = new Promise<void>((resolve) => { resolveFinished = resolve; });
+  let resolveSessionCreation!: (session: AgentSession | undefined) => void;
+  const sessionCreation = new Promise<AgentSession | undefined>((resolve) => {
+    resolveSessionCreation = resolve;
+  });
+  let lifecycleRunId = member.lifecycleRunId ?? generateLifecycleRunId();
+  if (teams.teamExists(readTeamName)) {
+    lifecycleRunId = await teams.ensureMemberLifecycleRunId(readTeamName, member.name, lifecycleRunId);
+  }
+  member.lifecycleRunId = lifecycleRunId;
+  const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
   const state: RunningReadAgent = {
-    runId: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    runId: lifecycleRunId,
     name: member.name,
     teamName: readTeamName,
     role,
@@ -237,13 +314,53 @@ export async function runReadAgentInProcess(
     lastActivityAt: Date.now(),
     model: member.model,
     thinking: member.thinking,
-    modelSlot: member.modelSlot,
+    modelSlot,
     finished,
+    resolveFinished,
+    startupState: "pending",
+    sessionCreation,
+    teardownState: "active",
+  };
+  let sessionCreationSettled = false;
+  const settleSessionCreation = (session: AgentSession | undefined): void => {
+    if (sessionCreationSettled) return;
+    sessionCreationSettled = true;
+    state.startupState = session ? "session_created" : "failed";
+    resolveSessionCreation(session);
   };
   options.runningReadAgents.set(key, state);
   options.ensureReadAgentStatusTicker();
+  // Production injects the shared lifecycle runtime. The fallback keeps direct
+  // library/test callers on that same owner instead of duplicating cleanup here.
+  const shutdownTeammate = options.shutdownTeammate ?? createLifecycleRuntime({
+    isTeammate: options.isTeammate,
+    terminal: null,
+    runningReadAgents: options.runningReadAgents,
+    readAgentKey: options.readAgentKey,
+    isCurrentReadAgentRun: options.isCurrentReadAgentRun,
+    renderReadAgentStatus: options.renderReadAgentStatus,
+    releaseAllClaimsForAgent: options.releaseAllClaimsForAgent,
+    drainWriteQueue: async () => {},
+    getSessionCwd: () => member.cwd,
+    getTeamName: () => readTeamName,
+  }).shutdownTeammate;
 
   let submittedFinalReport: SubmittedAgentReport | undefined;
+  let finalReportSubmissionInProgress = false;
+
+  const closeRecipient = async (): Promise<ReadAgentDeliveryCloseResult> => {
+    const deliveryClose = closeReadAgentMessageDelivery(state);
+    if (!state.recipientClosurePromise) {
+      state.recipientClosurePromise = closePersistedRecipient(
+        readTeamName,
+        member.name,
+        state.runId,
+        { removeOnFailure: true, role, reason: "quit", extensionInstanceId }
+      ).then(() => { state.persistedRecipientClosed = true; });
+    }
+    await state.recipientClosurePromise;
+    return deliveryClose;
+  };
 
   const deliverCompletion = async (report: string, completionSummary: string): Promise<void> => {
     const session = state.session;
@@ -262,7 +379,7 @@ export async function runReadAgentInProcess(
       costUsd: completionStats.cost,
       model: member.model,
       thinking: member.thinking,
-      modelSlot: member.modelSlot,
+      modelSlot,
       color: member.color,
       requestedBy: member.requestedBy,
       initialPrompt: member.prompt || prompt,
@@ -276,17 +393,24 @@ export async function runReadAgentInProcess(
       costUsd: completionStats.cost,
       model: member.model,
       thinking: member.thinking,
-      modelSlot: member.modelSlot,
+      modelSlot,
       initialPrompt: member.prompt || prompt,
     };
     await recordReadAgentReportEvent(readTeamName, member, "completed", report, completionSummary, state.startedAt, state.tokensUsed, completionStats.cost);
     const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
     if (member.requestedBy) {
-      await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, report);
+      await ensureReadHelperCompletionMessages(
+        readTeamName,
+        member,
+        state.startedAt,
+        state.runId,
+        report,
+        "completed",
+        member.color,
+        options.deliverMessageToActiveAgent
+      );
       await options.renderLeadInboxStatus?.().catch(() => {});
-      if (member.requestedBy === options.agentName) {
-        options.quietTrigger?.(`Read helper ${member.name} finished. Read its report now with read_inbox and continue your task. Do not poll.`);
-      }
+      await options.notifyLeadOfInboxReports?.(readTeamName).catch(() => {});
     } else if (suppressLeadReportInjection) {
       if (isPiPromptPlanningMember(member)) {
         options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true, true);
@@ -307,7 +431,7 @@ export async function runReadAgentInProcess(
       throw new Error(`Read agent model "${member.model}" is not available.`);
     }
 
-    await runtime.writeRuntimeStatus(readTeamName, member.name, {
+    await runtime.writeRuntimeStatus(readTeamName, member.name, state.runId, {
       pid: process.pid,
       startedAt: state.startedAt,
       lastHeartbeatAt: Date.now(),
@@ -315,23 +439,46 @@ export async function runReadAgentInProcess(
       lastError: undefined,
     });
 
-    state.heartbeatTimer = setInterval(async () => {
-      try {
-        await runtime.writeRuntimeStatus(readTeamName, member.name, {
-          lastHeartbeatAt: Date.now(),
-        });
-      } catch {
-        // Ignore heartbeat races during shutdown.
-      }
-    }, 5000);
+    if (!state.stopRequested) {
+      state.heartbeatTimer = setInterval(async () => {
+        try {
+          await runtime.writeRuntimeStatus(readTeamName, member.name, state.runId, {
+            lastHeartbeatAt: Date.now(),
+          });
+        } catch {
+          // Ignore heartbeat races during shutdown.
+        }
+      }, 5000);
+    }
 
+    const {
+      createAgentSession,
+      DefaultResourceLoader,
+      getAgentDir,
+      SessionManager,
+      SettingsManager,
+    } = await loadPiRuntimeApi();
+    const agentDir = getAgentDir();
+    const projectTrusted = parentProjectTrustForSpawn(ctx, member.cwd);
+    const resourcePlan = await (options.createResourcePlan ?? createSpawnResourcePlan)({
+      cwd: member.cwd,
+      projectTrusted,
+    });
+    const createSettingsManager = SettingsManager.create as unknown as (
+      cwd: string,
+      agentDir: string,
+      options: { projectTrusted: boolean },
+    ) => any;
+    const childSettingsManager = createSettingsManager(member.cwd, agentDir, {
+      projectTrusted: resourcePlan.trust.projectTrusted,
+    });
     const loader = new DefaultResourceLoader({
       cwd: member.cwd,
-      agentDir: getAgentDir(),
+      agentDir,
+      settingsManager: childSettingsManager,
       noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
+      additionalExtensionPaths: [...resourcePlan.extensionPaths],
+      noSkills: false,
       appendSystemPrompt: [
         `You are ${roleLabel} agent '${member.name}' in Pi session '${readTeamName}', running in-process so the lead can follow and control you from Pi.`,
         role === "write"
@@ -356,6 +503,7 @@ export async function runReadAgentInProcess(
       agentName: member.name,
       role,
       getTeamName: () => readTeamName,
+      getLifecycleRunId: () => state.runId,
       authorizeWriteMember: async (teamName, agentName) => {
         await requireWriteAgentTeam(teamName, true, agentName);
       },
@@ -369,25 +517,65 @@ export async function runReadAgentInProcess(
         options.renderReadAgentStatus();
       },
       onReportAndExit: async report => {
-        if (submittedFinalReport) return { accepted: false };
-        submittedFinalReport = report;
-        return { accepted: true };
+        if (submittedFinalReport || finalReportSubmissionInProgress) return { accepted: false };
+        finalReportSubmissionInProgress = true;
+        try {
+          const deliveryClose = await closeRecipient();
+          submittedFinalReport = report;
+          return {
+            accepted: true,
+            cancelledDeliveries: deliveryClose.cancelledDeliveries,
+            deliveryOutcome: deliveryClose.cancelledDeliveries > 0 ? "cancelled" : "none",
+          };
+        } finally {
+          finalReportSubmissionInProgress = false;
+        }
       },
     });
     const communicationToolNames = communicationTools.map(tool => tool.name);
+    const communicationToolNameSet = new Set(communicationToolNames);
+    const extensionToolNames = loader.getExtensions().extensions.flatMap(extension => {
+      return Array.from(extension.tools.keys()).filter(name => !communicationToolNameSet.has(name));
+    });
+    const activeToolNames = Array.from(new Set([
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "grep",
+      "find",
+      "ls",
+      ...extensionToolNames,
+      ...communicationToolNames,
+    ]));
 
     const { session } = await createAgentSession({
       cwd: member.cwd,
       model,
       thinkingLevel: member.thinking as any,
       modelRegistry: ctx.modelRegistry,
-      tools: ["read", "bash", "edit", "write", "grep", "find", "ls", ...communicationToolNames],
+      tools: activeToolNames,
       customTools: communicationTools,
       resourceLoader: loader,
+      settingsManager: childSettingsManager,
       sessionManager: SessionManager.inMemory(member.cwd),
     });
 
     state.session = session;
+    installReadAgentSessionLifecycle(session);
+    try {
+      if (typeof session.bindExtensions === "function") {
+        await (session.bindExtensions as (bindings: { mode: "print" }) => Promise<void>)({ mode: "print" });
+      }
+    } finally {
+      // Selected extensions emit session_start while binding. Open the startup gate
+      // to teardown only after binding settles so session_shutdown cannot precede start.
+      settleSessionCreation(session);
+    }
+    if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) {
+      if (state.teardownState !== "persistence_failed") await state.teardownPromise;
+      return;
+    }
     markReadAgentActivity(state, "started", "thinking");
     options.renderReadAgentStatus();
 
@@ -425,7 +613,13 @@ export async function runReadAgentInProcess(
       }
     });
 
-    await session.prompt(prompt, { source: "extension" as any });
+    state.acceptingMessages = true;
+    try {
+      await session.prompt(prompt, { source: "extension" as any });
+    } finally {
+      state.acceptingMessages = false;
+    }
+    await closeRecipient();
     state.status = "finishing";
     state.activeToolName = undefined;
     refreshReadAgentStats(state, session);
@@ -440,6 +634,8 @@ export async function runReadAgentInProcess(
       ?? `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
     await deliverCompletion(report, completionSummary);
   } catch (e) {
+    settleSessionCreation(state.session);
+    await closeRecipient();
     if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
       const failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
       const failureStats = state.session?.getSessionStats();
@@ -456,7 +652,7 @@ export async function runReadAgentInProcess(
         costUsd: failureStats?.cost,
         model: member.model,
         thinking: member.thinking,
-        modelSlot: member.modelSlot,
+        modelSlot,
         color: "red",
         requestedBy: member.requestedBy,
         initialPrompt: member.prompt || prompt,
@@ -471,17 +667,24 @@ export async function runReadAgentInProcess(
         costUsd: failureStats?.cost,
         model: member.model,
         thinking: member.thinking,
-        modelSlot: member.modelSlot,
+        modelSlot,
         initialPrompt: member.prompt || prompt,
       };
       await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, failureSummary, state.startedAt, state.tokensUsed, failureStats?.cost, "red");
       const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
       if (member.requestedBy) {
-        await ensureReadHelperCompletionMessages(readTeamName, member, state.startedAt, failureReport, "failed", "red");
+        await ensureReadHelperCompletionMessages(
+          readTeamName,
+          member,
+          state.startedAt,
+          state.runId,
+          failureReport,
+          "failed",
+          "red",
+          options.deliverMessageToActiveAgent
+        );
         await options.renderLeadInboxStatus?.().catch(() => {});
-        if (member.requestedBy === options.agentName) {
-          options.quietTrigger?.(`Read helper ${member.name} failed. Read the failure report with read_inbox and continue or report the blocker. Do not poll.`);
-        }
+        await options.notifyLeadOfInboxReports?.(readTeamName).catch(() => {});
       } else if (suppressLeadReportInjection) {
         if (isPiPromptPlanningMember(member)) {
           options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, failureReport, false, true);
@@ -493,7 +696,7 @@ export async function runReadAgentInProcess(
         await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, failureReport, failureSummary, "red", failureMetadata);
       }
       try {
-        await runtime.writeRuntimeStatus(readTeamName, member.name, {
+        await runtime.writeRuntimeStatus(readTeamName, member.name, state.runId, {
           lastHeartbeatAt: Date.now(),
           lastError: runtime.createRuntimeError(e),
         });
@@ -502,17 +705,8 @@ export async function runReadAgentInProcess(
       }
     }
   } finally {
-    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
-    state.heartbeatTimer = undefined;
-    if (state.session) await shutdownReadAgentSession(state.session);
-    state.session?.dispose();
-    if (options.isCurrentReadAgentRun(key, state)) {
-      options.runningReadAgents.delete(key);
-      await options.releaseAllClaimsForAgent(readTeamName, member.name);
-      try { await runtime.deleteRuntimeStatus(readTeamName, member.name); } catch {}
-      try { await teams.removeMember(readTeamName, member.name); } catch {}
-    }
-    options.renderReadAgentStatus();
-    resolveFinished();
+    settleSessionCreation(state.session);
+    const teardown = await shutdownTeammate(readTeamName, member, { reason: "quit" });
+    if (!teardown.finalized) options.renderReadAgentStatus();
   }
 }

@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { withLock } from "./lock";
-import { runtimeStatusPath, teamDir } from "./paths";
+import { configPath, runtimeStatusPath, teamDir } from "./paths";
+import type { TeamConfig } from "./models";
+import { withLifecycleTombstoneLock } from "./lifecycle-tombstone";
 
 /**
  * Runtime constants for health checking.
@@ -22,6 +24,7 @@ export interface RuntimeError {
 export interface AgentRuntimeStatus {
   teamName: string;
   agentName: string;
+  lifecycleRunId?: string;
   pid?: number;
   startedAt?: number;
   lastHeartbeatAt?: number;
@@ -35,42 +38,81 @@ export interface AgentRuntimeStatus {
   lastError?: RuntimeError;
 }
 
+export class RuntimeStatusWriteRejectedError extends Error {
+  readonly code = "RUNTIME_STATUS_WRITE_REJECTED";
+}
+
+export function isRuntimeStatusWriteRejectedError(error: unknown): error is RuntimeStatusWriteRejectedError {
+  return error instanceof RuntimeStatusWriteRejectedError
+    || (error instanceof Error && (error as Error & { code?: string }).code === "RUNTIME_STATUS_WRITE_REJECTED");
+}
+
+function rejectRuntimeWrite(teamName: string, agentName: string, reason: string): never {
+  throw new RuntimeStatusWriteRejectedError(
+    `Refusing runtime status write for ${agentName} in ${teamName}: ${reason}`
+  );
+}
+
 /**
- * Write runtime status for an agent. Merges with existing status.
+ * Write runtime status for one admitted lifecycle run. Merges with existing
+ * status while holding lifecycle -> config -> runtime locks.
  */
 export async function writeRuntimeStatus(
   teamName: string,
   agentName: string,
-  updates: Partial<AgentRuntimeStatus>
+  expectedRunId: string,
+  updates: Omit<Partial<AgentRuntimeStatus>, "teamName" | "agentName" | "lifecycleRunId">
 ): Promise<AgentRuntimeStatus> {
+  if (!expectedRunId) rejectRuntimeWrite(teamName, agentName, "expected lifecycle run id is missing.");
   const p = runtimeStatusPath(teamName, agentName);
-  const dir = path.dirname(p);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const teamConfigPath = configPath(teamName);
 
-  return await withLock(p, async () => {
-    let current: AgentRuntimeStatus = {
-      teamName,
-      agentName,
-    };
+  return withLifecycleTombstoneLock(teamName, agentName, async lifecycleLock => {
+    const fence = lifecycleLock.read();
+    if (fence.status === "corrupt") rejectRuntimeWrite(teamName, agentName, `lifecycle tombstone is corrupt: ${fence.error}`);
+    if (fence.status === "occupied") rejectRuntimeWrite(teamName, agentName, `lifecycle run ${fence.tombstone.runId} is ${fence.tombstone.phase}.`);
 
-    if (fs.existsSync(p)) {
+    return withLock(teamConfigPath, async () => {
+      if (!fs.existsSync(teamConfigPath)) rejectRuntimeWrite(teamName, agentName, "team config is absent.");
+      let config: TeamConfig;
       try {
-        current = JSON.parse(fs.readFileSync(p, "utf-8")) as AgentRuntimeStatus;
+        config = JSON.parse(fs.readFileSync(teamConfigPath, "utf-8")) as TeamConfig;
       } catch {
-        // Corrupted file, start fresh
-        current = { teamName, agentName };
+        rejectRuntimeWrite(teamName, agentName, "team config is unreadable.");
       }
-    }
+      const member = Array.isArray(config.members)
+        ? config.members.find(item => item.name === agentName)
+        : undefined;
+      if (!member || member.isActive === false) rejectRuntimeWrite(teamName, agentName, "matching active roster member is absent.");
+      if (member.lifecycleRunId !== expectedRunId) {
+        rejectRuntimeWrite(teamName, agentName, `roster belongs to lifecycle run ${member.lifecycleRunId || "unknown"}, not ${expectedRunId}.`);
+      }
 
-    const next: AgentRuntimeStatus = {
-      ...current,
-      ...updates,
-      teamName,
-      agentName,
-    };
+      return withLock(p, async () => {
+        let current: AgentRuntimeStatus = { teamName, agentName, lifecycleRunId: expectedRunId };
+        if (fs.existsSync(p)) {
+          try {
+            current = JSON.parse(fs.readFileSync(p, "utf-8")) as AgentRuntimeStatus;
+          } catch {
+            current = { teamName, agentName, lifecycleRunId: expectedRunId };
+          }
+        }
+        if (current.lifecycleRunId && current.lifecycleRunId !== expectedRunId) {
+          rejectRuntimeWrite(teamName, agentName, `runtime file belongs to lifecycle run ${current.lifecycleRunId}.`);
+        }
 
-    fs.writeFileSync(p, JSON.stringify(next, null, 2));
-    return next;
+        const next: AgentRuntimeStatus = {
+          ...current,
+          ...updates,
+          teamName,
+          agentName,
+          lifecycleRunId: expectedRunId,
+        };
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.writeFileSync(p, JSON.stringify(next, null, 2));
+        return next;
+      });
+    });
   });
 }
 
@@ -98,15 +140,25 @@ export async function readRuntimeStatus(
 /**
  * Delete runtime status for an agent. Called during shutdown.
  */
-export async function deleteRuntimeStatus(
+async function deleteRuntimeStatusFile(
   teamName: string,
-  agentName: string
+  agentName: string,
+  expectedRunId?: string
 ): Promise<boolean> {
   const p = runtimeStatusPath(teamName, agentName);
   if (!fs.existsSync(p)) return false;
 
-  return await withLock(p, async () => {
+  return withLock(p, async () => {
     if (!fs.existsSync(p)) return false;
+    if (expectedRunId) {
+      let current: AgentRuntimeStatus;
+      try {
+        current = JSON.parse(fs.readFileSync(p, "utf-8")) as AgentRuntimeStatus;
+      } catch {
+        return false;
+      }
+      if (current.lifecycleRunId !== expectedRunId) return false;
+    }
     try {
       fs.unlinkSync(p);
       return true;
@@ -116,14 +168,37 @@ export async function deleteRuntimeStatus(
   });
 }
 
+export async function deleteRuntimeStatus(
+  teamName: string,
+  agentName: string,
+  expectedRunId?: string
+): Promise<boolean> {
+  return deleteRuntimeStatusFile(teamName, agentName, expectedRunId);
+}
+
+/** Runtime-file deletion for finalizers that already hold the lifecycle lock. */
+export async function deleteRuntimeStatusUnderLifecycleLock(
+  teamName: string,
+  agentName: string,
+  expectedRunId: string
+): Promise<boolean> {
+  return deleteRuntimeStatusFile(teamName, agentName, expectedRunId);
+}
+
 /**
  * Clean up stale runtime files for a team.
  * Removes files older than RUNTIME_STALE_MS that have no recent heartbeat.
  * Returns the number of files cleaned up.
  */
+export interface CleanupStaleRuntimeHooks {
+  afterLifecycleLock?(agentName: string): void | Promise<void>;
+  beforeDelete?(agentName: string): void | Promise<void>;
+}
+
 export async function cleanupStaleRuntimeFiles(
   teamName: string,
-  now: number = Date.now()
+  now: number = Date.now(),
+  hooks: CleanupStaleRuntimeHooks = {}
 ): Promise<number> {
   const runtimeDir = path.join(teamDir(teamName), "runtime");
   if (!fs.existsSync(runtimeDir)) return 0;
@@ -133,30 +208,32 @@ export async function cleanupStaleRuntimeFiles(
 
   for (const file of files) {
     const p = path.join(runtimeDir, file);
-    try {
-      const status = JSON.parse(fs.readFileSync(p, "utf-8")) as AgentRuntimeStatus;
-      
-      // Check if the file is stale
-      const lastActivity = status.lastHeartbeatAt || status.startedAt || 0;
-      const isStale = (now - lastActivity) > RUNTIME_STALE_MS;
-      
-      if (isStale) {
-        await withLock(p, async () => {
-          if (fs.existsSync(p)) {
-            fs.unlinkSync(p);
-            cleaned++;
-          }
-        });
-      }
-    } catch {
-      // Corrupted file, remove it
-      try {
-        fs.unlinkSync(p);
-        cleaned++;
-      } catch {
-        // Ignore removal errors
-      }
-    }
+    const agentName = file.slice(0, -".json".length);
+    await withLifecycleTombstoneLock(teamName, agentName, async lifecycleLock => {
+      await hooks.afterLifecycleLock?.(agentName);
+      await withLock(p, async () => {
+        const fence = lifecycleLock.read();
+        if (fence.status !== "absent" || !fs.existsSync(p)) return;
+
+        let shouldDelete = false;
+        try {
+          const status = JSON.parse(fs.readFileSync(p, "utf-8")) as AgentRuntimeStatus;
+          const lastActivity = status.lastHeartbeatAt || status.startedAt || 0;
+          shouldDelete = (now - lastActivity) > RUNTIME_STALE_MS;
+        } catch {
+          shouldDelete = true;
+        }
+        if (!shouldDelete) return;
+
+        await hooks.beforeDelete?.(agentName);
+        try {
+          fs.unlinkSync(p);
+          cleaned++;
+        } catch {
+          // Best-effort janitor; another cleanup may already have removed it.
+        }
+      });
+    });
   }
 
   return cleaned;

@@ -6,7 +6,7 @@ import * as runtime from "../utils/runtime";
 import * as writeQueue from "../utils/write-queue";
 import * as reports from "../utils/report-events";
 import type { Member } from "../utils/models";
-import { loadSettings, requireFavoriteModelLevel, roleForFavoriteModelSlot } from "../utils/settings";
+import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel, roleForFavoriteModelSlot } from "../utils/settings";
 import type {
   BroadcastMessageOnceRequest,
   EnsureTeamRequest,
@@ -57,6 +57,33 @@ function metadataForOperation(request: { operationId?: string; workflowRunId?: s
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
+function canonicalPersistedMetadata(metadata: Record<string, any> | undefined): Record<string, any> | undefined {
+  if (!metadata || !Object.prototype.hasOwnProperty.call(metadata, "modelSlot")) return metadata;
+  return { ...metadata, modelSlot: canonicalPersistedModelSlot(metadata.modelSlot) };
+}
+
+function canonicalPersistedMember(member: Member): Member {
+  const projected = { ...member };
+  if (Object.prototype.hasOwnProperty.call(member, "modelSlot")) {
+    projected.modelSlot = canonicalPersistedModelSlot(member.modelSlot);
+  }
+  if (Object.prototype.hasOwnProperty.call(member, "metadata")) {
+    projected.metadata = canonicalPersistedMetadata(member.metadata);
+  }
+  return projected;
+}
+
+function canonicalPersistedQueuedSpawn(queued: writeQueue.QueuedWriteSpawn): writeQueue.QueuedWriteSpawn {
+  const projected = {
+    ...queued,
+    modelSlot: canonicalPersistedModelSlot(queued.modelSlot),
+  };
+  if (Object.prototype.hasOwnProperty.call(queued, "metadata")) {
+    projected.metadata = canonicalPersistedMetadata(queued.metadata);
+  }
+  return projected;
+}
+
 function memberResolutionDetails(member: Member, request: Partial<SpawnTeammateOnceRequest>, extras: Record<string, any> = {}): TeammateResolutionDetails & Record<string, any> {
   const role = member.role ?? "write";
   return {
@@ -64,8 +91,8 @@ function memberResolutionDetails(member: Member, request: Partial<SpawnTeammateO
     role,
     requestedRole: request.modelSlot ? roleForFavoriteModelSlot(request.modelSlot) : role,
     resolvedRole: role,
-    requestedModelSlot: request.modelSlot ?? null,
-    modelSlot: member.modelSlot ?? null,
+    requestedModelSlot: canonicalPersistedModelSlot(request.modelSlot ?? null),
+    modelSlot: canonicalPersistedModelSlot(member.modelSlot ?? null),
     model: member.model ?? null,
     thinking: member.thinking ?? null,
     ...extras,
@@ -79,7 +106,7 @@ function queuedResolutionDetails(teamName: string, queued: writeQueue.QueuedWrit
     role: "write",
     requestedRole: request.modelSlot ? roleForFavoriteModelSlot(request.modelSlot) : level.role,
     resolvedRole: "write",
-    requestedModelSlot: request.modelSlot ?? null,
+    requestedModelSlot: canonicalPersistedModelSlot(request.modelSlot ?? null),
     modelSlot: level.slot,
     model: level.model,
     thinking: level.thinking,
@@ -213,8 +240,8 @@ function responseFromStartedSpawn(
       : {};
   return {
     status: started.queued ? "queued" : "started",
-    member: started.member,
-    queued: started.queued,
+    member: started.member ? canonicalPersistedMember(started.member) : undefined,
+    queued: started.queued ? canonicalPersistedQueuedSpawn(started.queued) : undefined,
     details: { ...baseDetails, ...started.details },
   };
 }
@@ -314,7 +341,7 @@ export async function observeTeam(
 }
 
 export async function ensureTeam(request: EnsureTeamRequest): Promise<EnsureTeamResponse> {
-  const level = requireFavoriteModelLevel(loadSettings(), request.defaultModelSlot || "reading-default");
+  const level = requireFavoriteModelLevel(loadSettings(), request.defaultModelSlot || "read-review");
   const result = await teams.ensureTeam({
     name: request.teamName,
     sessionId: request.sessionId,
@@ -356,7 +383,7 @@ export async function spawnTeammatesOnce(
     if (existing) {
       results.push({
         status: "existing",
-        member: existing,
+        member: canonicalPersistedMember(existing),
         details: memberResolutionDetails(existing, request, { existing: true, idempotent: true, queued: false, modelSource: "existing" }),
       });
       continue;
@@ -366,7 +393,7 @@ export async function spawnTeammatesOnce(
     if (queued) {
       results.push({
         status: "queued",
-        queued,
+        queued: canonicalPersistedQueuedSpawn(queued),
         details: queuedResolutionDetails(request.teamName, queued, request, { existing: true, idempotent: true, queued: true }),
       });
       continue;
@@ -379,7 +406,7 @@ export async function spawnTeammatesOnce(
 }
 
 export async function sendMessageOnce(request: SendMessageOnceRequest) {
-  return await messaging.sendPlainMessageOnce(
+  return await messaging.sendPlainMessageOnceIfRunning(
     request.teamName,
     request.fromName,
     request.toName,

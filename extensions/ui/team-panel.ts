@@ -8,13 +8,15 @@ import * as claims from "../../src/utils/claims";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as reportEvents from "../../src/utils/report-events";
-import { FAVORITE_MODEL_SLOTS } from "../../src/utils/settings";
+import { canonicalPersistedModelSlot, FAVORITE_MODEL_SLOTS } from "../../src/utils/settings";
 import { dimAnsi, pink, purple } from "./ansi";
 import { framePanel, logWindowStart } from "./frame";
 import { isDownInput, isLeftInput, isRightInput, isUpInput } from "./input";
 import { formatElapsed, formatTokenCount, formatTranscriptLines, sanitizeTuiLine } from "./renderers";
 import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
+import type { ReadAgentTeardownResult } from "../agents/read-agent-session-lifecycle";
 import type { InboxMessage, Member, TeamConfig, TeamReportEvent } from "../../src/utils/models";
+import { listLifecycleTombstones } from "../../src/utils/lifecycle-tombstone";
 
 export interface TeamPanelOptions {
   getTeamName(ctx?: any): string | null | undefined | Promise<string | null | undefined>;
@@ -23,7 +25,7 @@ export interface TeamPanelOptions {
   completedAgentReports: Map<string, CompletedAgentReport[]>;
   readAgentKey(teamName: string, agentName: string): string;
   terminal: any;
-  shutdownTeammate(teamName: string, member: Member): Promise<void>;
+  shutdownTeammate(teamName: string, member: Member): Promise<ReadAgentTeardownResult>;
 }
 
 export interface TeamPanelMessage {
@@ -69,6 +71,10 @@ const MAX_COMMUNICATION_TEXT_CHARS = 1_500;
 const MAX_TRANSCRIPT_MESSAGES = 20;
 const MAX_TRANSCRIPT_LINES = 80;
 const RECENT_EVENT_DISPLAY_LIMIT = 12;
+
+function panelStatusIsInactive(status: string): boolean {
+  return status === "stopping" || status === "quarantined" || status === "persistence-failed" || status === "idle/dead" || status.includes("dead");
+}
 
 function inferRequestedBy(summary: string, text: string): string | undefined {
   const source = `${summary}\n${text}`;
@@ -162,7 +168,9 @@ function completedReportFromLeadInboxMessage(message: any): CompletedAgentReport
     costUsd: typeof metadata.costUsd === "number" ? metadata.costUsd : undefined,
     model: typeof metadata.model === "string" ? metadata.model : undefined,
     thinking: typeof metadata.thinking === "string" ? metadata.thinking : undefined,
-    modelSlot: typeof metadata.modelSlot === "string" ? metadata.modelSlot : inferModelSlotFromText(summary, text, initialPrompt),
+    modelSlot: canonicalPersistedModelSlot(
+      typeof metadata.modelSlot === "string" ? metadata.modelSlot : inferModelSlotFromText(summary, text, initialPrompt)
+    ),
     color: message.color,
     requestedBy: inferRequestedBy(summary, text),
     initialPrompt,
@@ -188,7 +196,9 @@ function completedReportFromReportEvent(event: TeamReportEvent): CompletedAgentR
     costUsd: event.costUsd,
     model: event.model,
     thinking: event.thinking,
-    modelSlot: event.modelSlot || (typeof event.metadata?.modelSlot === "string" ? event.metadata.modelSlot : inferModelSlotFromText(event.summary, report, initialPrompt)),
+    modelSlot: canonicalPersistedModelSlot(
+      event.modelSlot || (typeof event.metadata?.modelSlot === "string" ? event.metadata.modelSlot : inferModelSlotFromText(event.summary, report, initialPrompt))
+    ),
     color: event.color,
     requestedBy: event.requestedBy,
     initialPrompt,
@@ -315,6 +325,8 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
     collectTeamCommunications(panelTeamName, config).catch(() => []),
     reportEvents.listTeamReportEvents(panelTeamName).catch(() => []),
   ]);
+  const tombstones = await listLifecycleTombstones(panelTeamName).catch(() => []);
+  const tombstoneByAgent = new Map(tombstones.map(entry => [entry.agentName, entry.result]));
   const taskSubjectsByOwner = buildTaskSubjectIndex(allTasks);
   const claimPathsByAgent = buildClaimPathIndex(allClaims);
   const now = Date.now();
@@ -340,8 +352,20 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
       messaging.readInbox(panelTeamName, member.name, true, false).catch(() => []),
     ]);
     const role = member.role || "write";
-    const alive = !!readState || !!runtimeStatus?.ready || (role === "write" && !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId)));
-    const status = readState?.status || runtimeStatus?.currentAction || (alive ? "running" : "idle/dead");
+    const hasRecentHeartbeat = !!runtimeStatus?.lastHeartbeatAt
+      && (now - runtimeStatus.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
+    const memberActive = member.isActive !== false;
+    const paneAlive = memberActive && !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
+    const lifecycleStatus = tombstoneByAgent.has(member.name) ? "quarantined"
+      : readState?.teardownState === "persistence_failed" ? "persistence-failed"
+        : readState?.teardownState === "quarantined" ? "quarantined"
+          : readState?.teardownState === "stopping" ? "stopping"
+            : undefined;
+    const inProcessAlive = !!readState && !lifecycleStatus && readState.teardownState !== "finalized";
+    const alive = inProcessAlive || (memberActive && (hasRecentHeartbeat || paneAlive));
+    const status = lifecycleStatus
+      ?? (inProcessAlive ? readState?.status : undefined)
+      ?? (alive ? runtimeStatus?.currentAction || (runtimeStatus?.ready ? "ready" : "running") : "idle/dead");
     const startedAt = readState?.startedAt || runtimeStatus?.startedAt || member.joinedAt;
     const tokensUsed = readState?.tokensUsed ?? runtimeStatus?.tokensUsed ?? 0;
 
@@ -351,7 +375,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
       status,
       model: member.model,
       thinking: member.thinking,
-      modelSlot: member.modelSlot,
+      modelSlot: canonicalPersistedModelSlot(member.modelSlot),
       unreadCount: inboxMessages.length,
       elapsedMs: now - startedAt,
       tokensUsed,
@@ -369,13 +393,42 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
     };
   }));
 
+  const knownMemberNames = new Set(members.map(member => member.name));
+  const quarantinedItems: TeamPanelItem[] = await Promise.all(tombstones
+    .filter(({ agentName }) => !knownMemberNames.has(agentName))
+    .map(async ({ agentName, result }) => {
+      const runtimeStatus = await runtime.readRuntimeStatus(panelTeamName, agentName).catch(() => null);
+      const role = result.status === "occupied" ? result.tombstone.role : "read";
+      const startedAt = result.status === "occupied" ? result.tombstone.timestamps.createdAt : now;
+      return {
+        name: agentName,
+        role,
+        status: "quarantined",
+        model: undefined,
+        thinking: undefined,
+        modelSlot: undefined,
+        unreadCount: 0,
+        elapsedMs: now - startedAt,
+        tokensUsed: runtimeStatus?.tokensUsed ?? 0,
+        taskSubjects: taskSubjectsByOwner.get(agentName) ?? [],
+        claimPaths: claimPathsByAgent.get(agentName) ?? [],
+        recentEvents: [result.status === "occupied"
+          ? `lifecycle: ${result.tombstone.phase} (${result.tombstone.runId})`
+          : `lifecycle: corrupt tombstone (${result.error})`],
+        runtimeStatus,
+        completed: false,
+        communications: communicationsForAgent(teamCommunications, agentName),
+        helperNames: helperNamesByRequester.get(agentName) ?? [],
+      } satisfies TeamPanelItem;
+    }));
+
   const completedItems: TeamPanelItem[] = completedReports.map((report) => ({
     name: report.name,
     role: report.role,
     status: report.status,
     model: report.model,
     thinking: report.thinking,
-    modelSlot: report.modelSlot,
+    modelSlot: canonicalPersistedModelSlot(report.modelSlot),
     unreadCount: 0,
     elapsedMs: report.elapsedMs ?? (report.startedAt ? report.completedAt - report.startedAt : 0),
     tokensUsed: report.tokensUsed || 0,
@@ -393,7 +446,7 @@ export async function buildTeamPanelItems(panelTeamName: string, options: TeamPa
     helperNames: helperNamesByRequester.get(report.name) ?? [],
   }));
 
-  return [...activeItems, ...completedItems].sort((a, b) => {
+  return [...activeItems, ...quarantinedItems, ...completedItems].sort((a, b) => {
     if (a.completed !== b.completed) return a.completed ? 1 : -1;
     if (a.completed && b.completed) return (b.completedAt || 0) - (a.completedAt || 0);
     return a.name.localeCompare(b.name);
@@ -433,8 +486,8 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
 
         const itemNeedsAutoRefresh = (item: TeamPanelItem): boolean => {
           if (item.completed) return false;
-          if (item.status === "idle/dead" || item.status.includes("dead")) return false;
-          return true;
+          if (item.status === "stopping" || item.status === "quarantined" || item.status === "persistence-failed") return true;
+          return !panelStatusIsInactive(item.status);
         };
 
         const shouldAutoRefresh = (): boolean => {
@@ -572,6 +625,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
           let completed = 0;
           for (const item of items) {
             if (item.completed) completed++;
+            else if (panelStatusIsInactive(item.status)) continue;
             else if (item.role === "read") activeReaders++;
             else activeWriters++;
           }
@@ -705,10 +759,18 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
               ctx.ui.notify(`Could not find agent ${item.name} in session state.`, "warning");
               return;
             }
-            await options.shutdownTeammate(panelTeamName, member);
+            const result = await options.shutdownTeammate(panelTeamName, member);
             items = await buildTeamPanelItems(panelTeamName, options);
             selectedIndex = Math.min(selectedIndex, Math.max(0, items.length));
-            ctx.ui.notify(`Stopped ${item.name}.`, "info");
+            if (result.status === "settled" && result.finalized && result.removedMember) {
+              ctx.ui.notify(`Stopped ${item.name}.`, "info");
+            } else if (result.status === "timed_out") {
+              ctx.ui.notify(`Agent ${item.name} is inactive but quarantined after teardown timed out.`, "warning");
+            } else if (result.status === "persistence_failed") {
+              ctx.ui.notify(`Agent ${item.name} teardown is persistence-failed; cleanup is blocked.`, "warning");
+            } else {
+              ctx.ui.notify(`Agent ${item.name} cleanup is blocked${result.error ? `: ${result.error}` : "."}`, "warning");
+            }
           } catch (error) {
             ctx.ui.notify(`Failed to stop ${item.name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
           } finally {

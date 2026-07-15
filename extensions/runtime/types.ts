@@ -1,6 +1,7 @@
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { ManagedReadAgentLifecycleState } from "../agents/read-agent-session-lifecycle";
 
-export interface RunningReadAgent {
+export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   runId: string;
   name: string;
   teamName: string;
@@ -19,9 +20,7 @@ export interface RunningReadAgent {
   latestProgress?: string;
   progressUpdatedAt?: number;
   session?: AgentSession;
-  heartbeatTimer?: NodeJS.Timeout;
   finished?: Promise<void>;
-  stopRequested?: boolean;
 }
 
 export interface CompletedAgentReport {

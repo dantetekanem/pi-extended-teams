@@ -74,6 +74,18 @@ export async function dequeueReadHelperRequest(teamName: string): Promise<Queued
   });
 }
 
+export async function removeQueuedReadHelperRequest(teamName: string, id: string): Promise<QueuedReadHelperRequest | null> {
+  const queuePath = ensureQueuePath(teamName);
+  return await withLock(queuePath, async () => {
+    const queue = readQueueRaw(queuePath);
+    const index = queue.findIndex(item => item.id === id);
+    if (index === -1) return null;
+    const [removed] = queue.splice(index, 1);
+    writeQueueRaw(queuePath, queue);
+    return removed;
+  });
+}
+
 export async function removeQueuedReadHelpersByName(teamName: string, name: string): Promise<QueuedReadHelperRequest[]> {
   const queuePath = ensureQueuePath(teamName);
   return await withLock(queuePath, async () => {

@@ -24,14 +24,34 @@ export const AGENT_ROLES: AgentRole[] = ["read", "write"];
 const THINKING_LEVELS = new Set<string>(THINKING_LEVEL_NAMES);
 
 export const FAVORITE_MODEL_SLOTS = [
-  "reading-fast",
-  "reading-default",
-  "reading-hard",
-  "writing-basic",
-  "writing-hard",
+  "read-collect",
+  "read-review",
+  "read-analyze",
+  "read-critical",
+  "write-patch",
+  "write-feature",
+  "write-system",
+  "write-critical",
 ] as const;
-export type FavoriteModelSlot = (typeof FAVORITE_MODEL_SLOTS)[number];
-const FAVORITE_MODEL_SLOT_SET = new Set<string>(FAVORITE_MODEL_SLOTS);
+export type CanonicalFavoriteModelSlot = (typeof FAVORITE_MODEL_SLOTS)[number];
+
+export const LEGACY_FAVORITE_MODEL_SLOT_ALIASES = {
+  "reading-fast": "read-collect",
+  "reading-default": "read-review",
+  "reading-hard": "read-critical",
+  "writing-basic": "write-patch",
+  "writing-hard": "write-system",
+} as const satisfies Record<string, CanonicalFavoriteModelSlot>;
+export type LegacyFavoriteModelSlot = keyof typeof LEGACY_FAVORITE_MODEL_SLOT_ALIASES;
+/** Canonical tier or a minor-release compatibility alias accepted at public boundaries. */
+export type FavoriteModelSlot = CanonicalFavoriteModelSlot | LegacyFavoriteModelSlot;
+export const LEGACY_FAVORITE_MODEL_SLOTS = Object.keys(LEGACY_FAVORITE_MODEL_SLOT_ALIASES) as LegacyFavoriteModelSlot[];
+export const ACCEPTED_FAVORITE_MODEL_SLOTS = [
+  ...FAVORITE_MODEL_SLOTS,
+  ...LEGACY_FAVORITE_MODEL_SLOTS,
+] as readonly FavoriteModelSlot[];
+const CANONICAL_FAVORITE_MODEL_SLOT_SET = new Set<string>(FAVORITE_MODEL_SLOTS);
+const FAVORITE_MODEL_SLOT_SET = new Set<string>(ACCEPTED_FAVORITE_MODEL_SLOTS);
 
 /** Per-role default model/thinking. `null`/omitted means "inherit". */
 export interface RoleModelConfig {
@@ -79,8 +99,8 @@ export interface ReadHelpersConfig {
 }
 
 export interface ExtensionsConfig {
-  /** Extensions loaded into spawned agents (e.g. "pi-emote"). */
-  allow: string[];
+  /** `null` inherits every effective Pi extension; an array is an explicit selection. */
+  allow: string[] | null;
   /** Extensions explicitly kept out of spawned agents. */
   block: string[];
 }
@@ -117,7 +137,7 @@ export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
   },
   favoriteModels: {},
   categories: {},
-  extensions: { allow: [], block: [] },
+  extensions: { allow: null, block: [] },
   debug: { enabled: false },
 };
 
@@ -127,6 +147,25 @@ export function globalSettingsPath(homeDir: string = os.homedir()): string {
 
 export function projectSettingsPath(projectDir: string): string {
   return path.join(projectDir, ".pi", "pi-extended-teams.json");
+}
+
+export interface ProjectExtensionAllowOverride {
+  filePath: string;
+  allow: string[] | null;
+}
+
+/**
+ * Read only the project-local `extensions.allow` layer, without merging it with
+ * global/default settings. Callers must establish project trust before using it.
+ */
+export function readProjectExtensionAllowOverride(projectDir: string): ProjectExtensionAllowOverride | null {
+  const filePath = projectSettingsPath(projectDir);
+  const raw = readJson(filePath);
+  const extensions = raw?.extensions;
+  if (!extensions || typeof extensions !== "object" || Array.isArray(extensions)) return null;
+  if (extensions.allow === null) return { filePath, allow: null };
+  const allow = toStringList(extensions.allow);
+  return allow === undefined ? null : { filePath, allow };
 }
 
 function readJson(filePath: string): any | null {
@@ -155,16 +194,36 @@ function normalizeRole(value: unknown): AgentRole | undefined {
   return value === "read" || value === "write" ? value : undefined;
 }
 
+export function isCanonicalFavoriteModelSlot(value: unknown): value is CanonicalFavoriteModelSlot {
+  return typeof value === "string" && CANONICAL_FAVORITE_MODEL_SLOT_SET.has(value);
+}
+
 export function isFavoriteModelSlot(value: unknown): value is FavoriteModelSlot {
   return typeof value === "string" && FAVORITE_MODEL_SLOT_SET.has(value);
 }
 
+export function normalizeFavoriteModelSlot(value: unknown): CanonicalFavoriteModelSlot | null {
+  if (isCanonicalFavoriteModelSlot(value)) return value;
+  if (typeof value !== "string") return null;
+  return LEGACY_FAVORITE_MODEL_SLOT_ALIASES[value as LegacyFavoriteModelSlot] ?? null;
+}
+
+/**
+ * Project a value read from persisted state to its canonical slot without
+ * mutating storage or changing the contract for absent/unknown values.
+ */
+export function canonicalPersistedModelSlot<T>(value: T): T | CanonicalFavoriteModelSlot {
+  return normalizeFavoriteModelSlot(value) ?? value;
+}
+
 export function roleForFavoriteModelSlot(slot: FavoriteModelSlot): AgentRole {
-  return slot.startsWith("writing-") ? "write" : "read";
+  const canonical = normalizeFavoriteModelSlot(slot);
+  if (!canonical) throw new Error(`Unknown favorite model slot "${String(slot)}".`);
+  return canonical.startsWith("write-") ? "write" : "read";
 }
 
 export interface ResolvedFavoriteModelLevel {
-  slot: FavoriteModelSlot;
+  slot: CanonicalFavoriteModelSlot;
   role: AgentRole;
   model: string;
   thinking: ThinkingLevelName;
@@ -180,6 +239,17 @@ function mergeRoleConfig(base: RoleModelConfig, raw: any): RoleModelConfig {
   return {
     model: "model" in raw ? toStringOrNull(raw.model) : base.model,
     thinking: "thinking" in raw ? normalizeThinking(raw.thinking) : base.thinking,
+  };
+}
+
+function favoriteModelConfigFromRaw(
+  raw: any,
+  base?: FavoriteModelConfig
+): FavoriteModelConfig | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    model: "model" in raw ? toStringOrNull(raw.model) : (base?.model ?? null),
+    thinking: "thinking" in raw ? normalizeThinking(raw.thinking) : (base?.thinking ?? null),
   };
 }
 
@@ -225,12 +295,18 @@ function applyLayer(acc: PiExtendedTeamsSettings, raw: any, options: { favoriteM
   }
 
   if (includeFavoriteModels && raw.favoriteModels && typeof raw.favoriteModels === "object") {
-    for (const [slot, value] of Object.entries<any>(raw.favoriteModels)) {
-      if (!isFavoriteModelSlot(slot) || !value || typeof value !== "object") continue;
-      acc.favoriteModels[slot] = {
-        model: toStringOrNull(value.model),
-        thinking: normalizeThinking(value.thinking),
-      };
+    // Read aliases first, then canonical tiers, so canonical keys win regardless
+    // of JSON property order when both forms are present.
+    for (const legacySlot of LEGACY_FAVORITE_MODEL_SLOTS) {
+      const config = favoriteModelConfigFromRaw(raw.favoriteModels[legacySlot]);
+      if (config) acc.favoriteModels[LEGACY_FAVORITE_MODEL_SLOT_ALIASES[legacySlot]] = config;
+    }
+    for (const canonicalSlot of FAVORITE_MODEL_SLOTS) {
+      const config = favoriteModelConfigFromRaw(
+        raw.favoriteModels[canonicalSlot],
+        acc.favoriteModels[canonicalSlot]
+      );
+      if (config) acc.favoriteModels[canonicalSlot] = config;
     }
   }
 
@@ -246,9 +322,13 @@ function applyLayer(acc: PiExtendedTeamsSettings, raw: any, options: { favoriteM
   }
 
   if (raw.extensions && typeof raw.extensions === "object") {
-    const allow = toStringList(raw.extensions.allow);
+    if (raw.extensions.allow === null) {
+      acc.extensions.allow = null;
+    } else {
+      const allow = toStringList(raw.extensions.allow);
+      if (allow) acc.extensions.allow = allow;
+    }
     const block = toStringList(raw.extensions.block);
-    if (allow) acc.extensions.allow = allow;
     if (block) acc.extensions.block = block;
   }
 
@@ -290,23 +370,54 @@ function writeRawSettingsObject(filePath: string, raw: Record<string, any>): voi
   fs.writeFileSync(filePath, `${JSON.stringify(raw, null, 2)}\n`);
 }
 
+function mergeRawFavoriteModelValues(base: any, override: any): any {
+  const baseIsObject = base && typeof base === "object" && !Array.isArray(base);
+  const overrideIsObject = override && typeof override === "object" && !Array.isArray(override);
+  return baseIsObject && overrideIsObject ? { ...base, ...override } : override;
+}
+
+function canonicalizeFavoriteModelKeys(
+  favoriteModels: Record<string, any>,
+  options: { preserveUnknown: boolean }
+): Record<string, any> {
+  const next: Record<string, any> = {};
+  if (options.preserveUnknown) {
+    for (const [slot, config] of Object.entries(favoriteModels)) {
+      if (!isFavoriteModelSlot(slot)) next[slot] = config;
+    }
+  }
+  for (const legacySlot of LEGACY_FAVORITE_MODEL_SLOTS) {
+    if (Object.prototype.hasOwnProperty.call(favoriteModels, legacySlot)) {
+      next[LEGACY_FAVORITE_MODEL_SLOT_ALIASES[legacySlot]] = favoriteModels[legacySlot];
+    }
+  }
+  for (const canonicalSlot of FAVORITE_MODEL_SLOTS) {
+    if (Object.prototype.hasOwnProperty.call(favoriteModels, canonicalSlot)) {
+      next[canonicalSlot] = mergeRawFavoriteModelValues(next[canonicalSlot], favoriteModels[canonicalSlot]);
+    }
+  }
+  return next;
+}
+
 export function setGlobalFavoriteModel(
   slot: FavoriteModelSlot,
   config: FavoriteModelConfig,
   options?: { homeDir?: string }
 ): void {
-  if (!isFavoriteModelSlot(slot)) throw new Error(`Unknown favorite model slot "${slot}".`);
+  const canonicalSlot = normalizeFavoriteModelSlot(slot);
+  if (!canonicalSlot) throw new Error(`Unknown favorite model slot "${slot}".`);
   const model = toStringOrNull(config.model);
   const thinking = normalizeThinking(config.thinking);
-  if (!model) throw new Error(`Favorite model slot "${slot}" requires a fully qualified provider/model.`);
-  if (!thinking) throw new Error(`Favorite model slot "${slot}" requires a valid thinking level.`);
+  if (!model) throw new Error(`Favorite model slot "${canonicalSlot}" requires a fully qualified provider/model.`);
+  if (!thinking) throw new Error(`Favorite model slot "${canonicalSlot}" requires a valid thinking level.`);
 
   const filePath = globalSettingsPath(options?.homeDir ?? os.homedir());
   const raw = readRawSettingsObject(filePath);
-  const favoriteModels = raw.favoriteModels && typeof raw.favoriteModels === "object" && !Array.isArray(raw.favoriteModels)
-    ? { ...raw.favoriteModels }
+  const existing = raw.favoriteModels && typeof raw.favoriteModels === "object" && !Array.isArray(raw.favoriteModels)
+    ? raw.favoriteModels
     : {};
-  favoriteModels[slot] = { model, thinking };
+  const favoriteModels = canonicalizeFavoriteModelKeys(existing, { preserveUnknown: true });
+  favoriteModels[canonicalSlot] = { model, thinking };
   raw.favoriteModels = favoriteModels;
   writeRawSettingsObject(filePath, raw);
 }
@@ -315,17 +426,19 @@ export function clearGlobalFavoriteModels(options?: {
   homeDir?: string;
   slot?: FavoriteModelSlot;
 }): void {
-  if (options?.slot && !isFavoriteModelSlot(options.slot)) {
+  const canonicalSlot = options?.slot ? normalizeFavoriteModelSlot(options.slot) : null;
+  if (options?.slot && !canonicalSlot) {
     throw new Error(`Unknown favorite model slot "${options.slot}".`);
   }
 
   const filePath = globalSettingsPath(options?.homeDir ?? os.homedir());
   const raw = readRawSettingsObject(filePath);
-  const favoriteModels = raw.favoriteModels && typeof raw.favoriteModels === "object" && !Array.isArray(raw.favoriteModels)
-    ? { ...raw.favoriteModels }
+  const existing = raw.favoriteModels && typeof raw.favoriteModels === "object" && !Array.isArray(raw.favoriteModels)
+    ? raw.favoriteModels
     : {};
+  const favoriteModels = canonicalizeFavoriteModelKeys(existing, { preserveUnknown: true });
 
-  if (options?.slot) delete favoriteModels[options.slot];
+  if (canonicalSlot) delete favoriteModels[canonicalSlot];
   else for (const slot of FAVORITE_MODEL_SLOTS) delete favoriteModels[slot];
 
   raw.favoriteModels = favoriteModels;
@@ -336,9 +449,10 @@ export function replaceGlobalFavoriteModels(
   favoriteModels: Partial<Record<FavoriteModelSlot, FavoriteModelConfig>>,
   options?: { homeDir?: string }
 ): void {
-  const next: Partial<Record<FavoriteModelSlot, FavoriteModelConfig>> = {};
+  const canonicalInput = canonicalizeFavoriteModelKeys(favoriteModels, { preserveUnknown: false });
+  const next: Partial<Record<CanonicalFavoriteModelSlot, FavoriteModelConfig>> = {};
   for (const slot of FAVORITE_MODEL_SLOTS) {
-    const config = favoriteModels[slot];
+    const config = canonicalInput[slot];
     if (!config) continue;
     const model = toStringOrNull(config.model);
     const thinking = normalizeThinking(config.thinking);
@@ -352,24 +466,41 @@ export function replaceGlobalFavoriteModels(
   writeRawSettingsObject(filePath, raw);
 }
 
+/** Persist the spawned-agent extension policy without replacing unrelated settings. */
+export function replaceGlobalExtensionAllow(
+  allow: string[] | null,
+  options?: { homeDir?: string }
+): void {
+  const filePath = globalSettingsPath(options?.homeDir ?? os.homedir());
+  const raw = readRawSettingsObject(filePath);
+  const extensions = raw.extensions && typeof raw.extensions === "object" && !Array.isArray(raw.extensions)
+    ? { ...raw.extensions }
+    : {};
+  extensions.allow = allow === null ? null : (toStringList(allow) ?? []);
+  raw.extensions = extensions;
+  writeRawSettingsObject(filePath, raw);
+}
+
 export function requireConfiguredFavoriteModel(
   settings: PiExtendedTeamsSettings,
   slot: unknown
-): { slot: FavoriteModelSlot; config: FavoriteModelConfig } | null {
+): { slot: CanonicalFavoriteModelSlot; config: FavoriteModelConfig } | null {
   if (slot === undefined || slot === null || slot === "") return null;
-  if (!isFavoriteModelSlot(slot)) {
+  const canonicalSlot = normalizeFavoriteModelSlot(slot);
+  if (!canonicalSlot) {
     throw new Error(
       `Unknown favorite model slot "${String(slot)}". Use one of: ${FAVORITE_MODEL_SLOTS.join(", ")}.`
     );
   }
 
-  const config = settings.favoriteModels[slot];
+  const config = settings.favoriteModels[canonicalSlot]
+    ?? (typeof slot === "string" && isFavoriteModelSlot(slot) ? settings.favoriteModels[slot] : undefined);
   if (!config?.model || !config.thinking) {
     throw new Error(
-      `Favorite model slot "${slot}" is not configured. Run /agents-favorite-models set ${slot} <provider/model> <thinking>.`
+      `Favorite model slot "${canonicalSlot}" is not configured. Run /agents-favorite-models set ${canonicalSlot} <provider/model> <thinking>.`
     );
   }
-  return { slot, config };
+  return { slot: canonicalSlot, config };
 }
 
 export function requireFavoriteModelLevel(
@@ -482,47 +613,6 @@ export function resolveModel(
     null;
 
   return { model, thinking, modelSource };
-}
-
-/**
- * Resolve which extension sources spawned agents should load.
- *
- * Spawned agents launch with `--no-extensions` (nothing auto-discovered) plus
- * the pi-extended-teams extension itself. This returns provider bootstrap
- * extensions plus any extra sources from the allow list, minus anything in the
- * block list.
- */
-const PROVIDER_BOOTSTRAP_EXTENSION_NAMES = ["shopify-proxy"];
-
-function isBlockedExtension(source: string, blocked: Set<string>): boolean {
-  const normalized = source.replace(/\\/g, "/");
-  return blocked.has(source) || blocked.has(normalized) || blocked.has(path.basename(normalized));
-}
-
-function resolveProviderBootstrapExtensions(options?: {
-  homeDir?: string;
-  fileSystem?: Pick<typeof fs, "existsSync">;
-}): string[] {
-  const homeDir = options?.homeDir ?? os.homedir();
-  const fileSystem = options?.fileSystem ?? fs;
-  const extensionDir = path.join(homeDir, ".pi", "agent", "extensions");
-
-  return PROVIDER_BOOTSTRAP_EXTENSION_NAMES
-    .map((name) => path.join(extensionDir, name))
-    .filter((source) => fileSystem.existsSync(source));
-}
-
-export function resolveAllowedExtensions(settings: PiExtendedTeamsSettings, options?: {
-  homeDir?: string;
-  fileSystem?: Pick<typeof fs, "existsSync">;
-}): string[] {
-  const blocked = new Set(settings.extensions.block);
-  const sources = [
-    ...resolveProviderBootstrapExtensions(options),
-    ...settings.extensions.allow,
-  ];
-
-  return Array.from(new Set(sources.filter((source) => !isBlockedExtension(source, blocked))));
 }
 
 /**

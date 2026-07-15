@@ -11,6 +11,7 @@ import * as runtime from "../../src/utils/runtime.js";
 import { sendPlainMessage } from "../../src/utils/messaging.js";
 import { appendTeamReportEvent } from "../../src/utils/report-events.js";
 import type { RunningReadAgent } from "../runtime/types.js";
+import { withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone.js";
 
 let root: string;
 let teamsRoot: string;
@@ -27,6 +28,7 @@ function installPathSpies() {
     return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "runtime", `${paths.sanitizeName(String(agentName))}.json`);
   });
   vi.spyOn(paths, "claimsPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "claims.json"));
+  vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`));
 }
 
 function panelOptions(overrides: any = {}) {
@@ -37,7 +39,19 @@ function panelOptions(overrides: any = {}) {
     completedAgentReports: new Map(),
     readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
     terminal: { isAlive: vi.fn(() => true), focusPane: vi.fn(() => true) },
-    shutdownTeammate: vi.fn(),
+    shutdownTeammate: vi.fn(async () => ({
+      status: "settled" as const,
+      reason: "quit" as const,
+      extensionShutdown: "no_handlers" as const,
+      abort: "unavailable" as const,
+      delivery: "settled" as const,
+      dispose: "settled" as const,
+      cancelledDeliveries: 0,
+      persistenceClosed: true,
+      finalized: true,
+      removedMember: true,
+      releasedClaims: [],
+    })),
     ...overrides,
   };
 }
@@ -186,6 +200,79 @@ describe("team panel items", () => {
     });
   });
 
+  it("surfaces a tombstoned absent member as an inactive quarantined diagnostic", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await withLifecycleTombstoneLock("team", "missing-reader", async lock => {
+      lock.occupy({
+        team: "team",
+        agent: "missing-reader",
+        runId: "old-run",
+        role: "read",
+        reason: "quit",
+        phase: "timed_out",
+        extensionInstanceId: "extension-a",
+      });
+    });
+
+    const items = await buildTeamPanelItems("team", panelOptions());
+
+    expect(items).toContainEqual(expect.objectContaining({
+      name: "missing-reader",
+      role: "read",
+      status: "quarantined",
+      completed: false,
+      recentEvents: ["lifecycle: timed_out (old-run)"],
+    }));
+  });
+
+  it.each([
+    { label: "stopping read state", teardownState: "stopping", isActive: false, heartbeatAge: 0, paneAlive: false, expected: "stopping" },
+    { label: "quarantined read state", teardownState: "quarantined", isActive: false, heartbeatAge: 0, paneAlive: false, expected: "quarantined" },
+    { label: "persistence-failed read state", teardownState: "persistence_failed", isActive: false, heartbeatAge: 0, paneAlive: false, expected: "persistence-failed" },
+    { label: "fresh runtime", teardownState: undefined, isActive: true, heartbeatAge: 0, paneAlive: false, expected: "working" },
+    { label: "stale ready file with dead pane", teardownState: undefined, isActive: true, heartbeatAge: runtime.HEARTBEAT_STALE_MS + 1, paneAlive: false, expected: "idle/dead" },
+    { label: "inactive ready file and live pane", teardownState: undefined, isActive: false, heartbeatAge: 0, paneAlive: true, expected: "idle/dead" },
+    { label: "live legacy pane with stale runtime", teardownState: undefined, isActive: true, heartbeatAge: runtime.HEARTBEAT_STALE_MS + 1, paneAlive: true, expected: "working" },
+  ])("classifies panel status coherently: $label", async ({ teardownState, isActive, heartbeatAge, paneAlive, expected }) => {
+    const now = Date.now();
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", {
+      agentId: "subject@team",
+      name: "subject",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      joinedAt: now - 60_000,
+      tmuxPaneId: "%subject",
+      cwd: root,
+      subscriptions: [],
+      isActive,
+    });
+    vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue({
+      teamName: "team",
+      agentName: "subject",
+      ready: true,
+      startedAt: now - 60_000,
+      lastHeartbeatAt: now - heartbeatAge,
+      currentAction: "working",
+    });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    if (teardownState) {
+      runningReadAgents.set("team:subject", {
+        ...makeRunningReadAgent("subject", now - 60_000),
+        status: "working",
+        teardownState: teardownState as RunningReadAgent["teardownState"],
+      });
+    }
+
+    const items = await buildTeamPanelItems("team", panelOptions({
+      runningReadAgents,
+      terminal: { isAlive: vi.fn(() => paneAlive), focusPane: vi.fn() },
+    }));
+
+    expect(items.find(item => item.name === "subject")?.status).toBe(expected);
+  });
+
   it("focuses the selected agent log from /agents without attaching tmux panes", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
@@ -232,6 +319,98 @@ describe("team panel items", () => {
     component.dispose();
   });
 
+  it("warns without claiming Stopped when x-key teardown is quarantined", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", {
+      agentId: "reader@team",
+      name: "reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    });
+
+    let component: any;
+    const notify = vi.fn();
+    const shutdownTeammate = vi.fn(async () => ({
+      status: "timed_out" as const,
+      reason: "quit" as const,
+      extensionShutdown: "emitted" as const,
+      abort: "timed_out" as const,
+      delivery: "settled" as const,
+      dispose: "deferred" as const,
+      cancelledDeliveries: 0,
+      persistenceClosed: true,
+      finalized: false,
+      removedMember: false,
+      releasedClaims: [],
+    }));
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => { pi.command = command; }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, panelOptions({ shutdownTeammate }));
+    await pi.command.handler("team", {
+      ui: {
+        notify,
+        custom: vi.fn(async (factory: any) => {
+          component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, { fg: (_name: string, text: string) => text }, {}, vi.fn());
+        }),
+      },
+    });
+
+    component.handleInput("j");
+    component.handleInput("x");
+    await vi.waitFor(() => expect(shutdownTeammate).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(
+      "Agent reader is inactive but quarantined after teardown timed out.",
+      "warning"
+    ));
+    expect(notify.mock.calls.some(([message]) => String(message).includes("Stopped"))).toBe(false);
+    component.dispose();
+  });
+
+  it("retains the x-key Stopped info for settled teardown", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", {
+      agentId: "reader@team",
+      name: "reader",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    });
+
+    let component: any;
+    const notify = vi.fn();
+    const options = panelOptions();
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => { pi.command = command; }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, options);
+    await pi.command.handler("team", {
+      ui: {
+        notify,
+        custom: vi.fn(async (factory: any) => {
+          component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, { fg: (_name: string, text: string) => text }, {}, vi.fn());
+        }),
+      },
+    });
+
+    component.handleInput("j");
+    component.handleInput("x");
+    await vi.waitFor(() => expect(options.shutdownTeammate).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith("Stopped reader.", "info"));
+    component.dispose();
+  });
+
   it("infers completed read-agent role from read helper lead inbox summaries", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await sendPlainMessage("team", "writer-reader", "team-lead", "Read helper writer-reader completed for writer. Report sent to writer.", "Read helper writer-reader done", "cyan");
@@ -256,6 +435,8 @@ describe("team panel items", () => {
       summary: "Read agent writer-reader completed",
       source: "read-agent",
       requestedBy: "writer",
+      modelSlot: "writing-hard",
+      metadata: { modelSlot: "writing-hard" },
     });
     await sendPlainMessage("team", "writer-reader", "team-lead", "Read helper writer-reader completed for writer. Report sent to writer.", "Read helper writer-reader done", "cyan");
 
@@ -263,7 +444,8 @@ describe("team panel items", () => {
     const completed = items.filter(item => item.name === "writer-reader" && item.completed);
 
     expect(completed).toHaveLength(1);
-    expect(completed[0]).toMatchObject({ reportText: "full helper report", requestedBy: "writer" });
+    expect(completed[0]).toMatchObject({ reportText: "full helper report", requestedBy: "writer", modelSlot: "write-system" });
+    expect(JSON.stringify(completed[0])).not.toContain("writing-hard");
   });
 
   it("does not treat active-agent progress messages as completed reports", async () => {
@@ -331,7 +513,8 @@ describe("team panel items", () => {
       thinking: "high",
     });
 
-    await runtime.writeRuntimeStatus("team", "writer", {
+    const writerRunId = (await teams.readConfig("team")).members.find(member => member.name === "writer")!.lifecycleRunId!;
+    await runtime.writeRuntimeStatus("team", "writer", writerRunId, {
       startedAt: now - 12_000,
       ready: true,
       currentAction: "working",
@@ -474,7 +657,8 @@ describe("team panel items", () => {
 
     expect(writerItems).toHaveLength(2);
     expect(writerItems.some(item => !item.completed && item.status === "running")).toBe(true);
-    expect(completedWriter).toMatchObject({ tokensUsed: 321, elapsedMs: 4567, model: "provider/model", thinking: "xhigh", modelSlot: "writing-hard" });
+    expect(completedWriter).toMatchObject({ tokensUsed: 321, elapsedMs: 4567, model: "provider/model", thinking: "xhigh", modelSlot: "write-system" });
+    expect(JSON.stringify(completedWriter)).not.toContain("writing-hard");
   });
 
   it("preserves same-name completed selection across refresh", async () => {
@@ -524,18 +708,18 @@ describe("team panel items", () => {
     component.dispose();
   });
 
-  it("renders level, model, and thinking for active agents", async () => {
+  it("renders canonical level, model, and thinking for active legacy members without rewriting them", async () => {
     teams.createTeam("team", "session", "lead", "", "provider/model");
     await teams.addMember("team", {
-      agentId: "reader@team",
-      name: "reader",
+      agentId: "writer@team",
+      name: "writer",
       agentType: "teammate",
-      role: "read",
+      role: "write",
       model: "provider/model",
       thinking: "high",
-      modelSlot: "reading-fast",
+      modelSlot: "writing-hard",
       joinedAt: Date.now(),
-      tmuxPaneId: "",
+      tmuxPaneId: "%42",
       cwd: root,
       subscriptions: [],
     });
@@ -562,11 +746,13 @@ describe("team panel items", () => {
     const output = component.render(160).join("\n");
 
     expect(output).toContain("level");
-    expect(output).toContain("reading-fast");
+    expect(output).toContain("write-system");
+    expect(output).not.toContain("writing-hard");
     expect(output).toContain("model");
     expect(output).toContain("provider/model");
     expect(output).toContain("thinking");
     expect(output).toContain("high");
+    expect((await teams.readConfig("team")).members.find(member => member.name === "writer")?.modelSlot).toBe("writing-hard");
 
     component.dispose();
   });
@@ -600,7 +786,8 @@ describe("team panel items", () => {
 
     expect(output).toContain("provider/model");
     expect(output).toContain("xhigh");
-    expect(output).toContain("writing-hard");
+    expect(output).toContain("write-system");
+    expect(output).not.toContain("writing-hard");
 
     component.dispose();
   });

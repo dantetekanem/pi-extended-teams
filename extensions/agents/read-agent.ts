@@ -513,7 +513,7 @@ export async function runReadAgentInProcess(
         state.progressUpdatedAt = updatedAt;
         state.lastActivityAt = updatedAt;
         state.idleNudgeLevel = undefined;
-        pushReadAgentEvent(state, `progress: ${status}`);
+        pushReadAgentEvent(state, status);
         options.renderReadAgentStatus();
       },
       onReportAndExit: async report => {

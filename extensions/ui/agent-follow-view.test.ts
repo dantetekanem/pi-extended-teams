@@ -109,7 +109,7 @@ describe("agent follow transcript", () => {
     ], { width: 80 });
     const plain = lines.map(stripAnsi);
 
-    expect(plain[0]).toBe("progress: Checking the follow renderer");
+    expect(plain[0]).toBe("Checking the follow renderer");
     expect(plain.join("\n")).not.toContain("report_progress");
     expect(lines[0]).not.toContain("\x1b[");
     expect(lines.join("\n")).not.toContain("\x1b[48;2;31;33;47m");
@@ -313,15 +313,17 @@ describe("agent follow component", () => {
     const component = createAgentFollowComponent(tui, done, { getAgents: () => [agent] });
 
     const first = component.render(140).join("\n");
-    expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 42 tok · progress: Verifying assumptions\.{1,3}/);
+    expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 42 tok · Verifying assumptions\.{1,3}/);
     expect(first).toContain("Working now");
+    expect(stripAnsi(first)).not.toContain("progress:");
     expect(first).toContain("\x1b[48;2;22;23;32m");
     expect(first).not.toContain("\x1b[48;5;235m");
 
     tokens = 2_300_000;
     agent.latestProgress = "Writing final report";
     const updated = component.render(140).join("\n");
-    expect(updated).toMatch(/2\.3M tok · progress: Writing final report\.{1,3}/);
+    expect(updated).toMatch(/2\.3M tok · Writing final report\.{1,3}/);
+    expect(stripAnsi(updated)).not.toContain("progress:");
 
     component.handleInput("\x1b[A");
     expect(done).toHaveBeenCalledOnce();

@@ -694,7 +694,7 @@ describe("extension integration", () => {
       const widget = widgetCall![1]({ requestRender });
       const initialRendered = widget.render(160).join("\n");
       expect(initialRendered).toContain("agent activity");
-      expect(initialRendered).toMatch(/\(reader\) model\/high · read-review · 1s · 12 tok · progress: Reviewing focused test coverage\.{1,3}/);
+      expect(initialRendered).toMatch(/\(reader\) model\/high · read-review · 1s · 12 tok · Reviewing focused test coverage\.{1,3}/);
       expect(initialRendered).not.toContain("secret agent thought");
       expect(initialRendered).not.toContain("reader read thinking");
       expect(ctx.ui.setStatus).toHaveBeenCalledWith("01-pi-extended-teams-read", undefined);
@@ -710,7 +710,7 @@ describe("extension integration", () => {
       expect(updatedRendered).not.toContain("Writing the final report");
       await vi.advanceTimersByTimeAsync(1_000);
       updatedRendered = widget.render(160).join("\n");
-      expect(updatedRendered).toMatch(/\(reader\) model\/high · read-review · 3s · 2\.3M tok · progress: Writing the final report\.{1,3}/);
+      expect(updatedRendered).toMatch(/\(reader\) model\/high · read-review · 3s · 2\.3M tok · Writing the final report\.{1,3}/);
       expect(requestRender).toHaveBeenCalled();
       expect(ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function")).toHaveLength(1);
       expect(ctx.ui.setWidget.mock.calls.slice(firstWidgetCallIndex + 1).some((call: any[]) => call[0] === "01-pi-extended-teams-readers" && call[1] === undefined)).toBe(false);
@@ -1148,9 +1148,9 @@ describe("extension integration", () => {
       const rendered = widget.render(160).join("\n");
       expect(rendered).toContain("3 active · 1 read · 2 write");
       expect(rendered).toContain("fresh-reader");
-      expect(rendered).toContain("progress: Fresh runtime work");
+      expect(rendered).toContain("Fresh runtime work");
       expect(rendered).toContain("runtime-writer");
-      expect(rendered).toContain("progress: Canonical runtime slot");
+      expect(rendered).toContain("Canonical runtime slot");
       expect(rendered).toContain("legacy-writer");
       expect(rendered).toContain("write-system");
       expect(rendered).not.toContain("writing-hard");

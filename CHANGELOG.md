@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.3] - 2026-07-14
+
+### Changed
+- Remove the visible `progress:` label prefix while preserving live progress updates and neutral rendering.
+
 ## [2.1.2] - 2026-07-14
 
 ### Changed

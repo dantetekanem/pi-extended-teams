@@ -175,7 +175,7 @@ export default function (pi: ExtensionAPI) {
     const shortModel = model ? model.split("/").pop() || model : "";
     const modelAndThinking = [shortModel, thinking].filter(Boolean).join("/");
     const identity = modelAndThinking ? `(${name}) ${modelAndThinking}` : `(${name})`;
-    const progress = latestProgress ? `progress: ${formatAnimatedProgress(latestProgress, now)}` : undefined;
+    const progress = latestProgress ? formatAnimatedProgress(latestProgress, now) : undefined;
     return [identity, modelSlot, elapsed, `${tokens} tok`, progress].filter(Boolean).join(" · ");
   }
 

@@ -167,7 +167,7 @@ function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }
     const rawStatus = details?.status ?? args?.status ?? resultStatus ?? "updating";
     const status = compactTranscriptLine(String(rawStatus)) || "updating";
     const failureSuffix = block.isError ? " (failed)" : "";
-    return [boundTranscriptLine(`progress: ${status}${failureSuffix}`, width)];
+    return [boundTranscriptLine(`${status}${failureSuffix}`, width)];
   }
 
   if (block.name === "edit") {
@@ -458,7 +458,7 @@ export function createAgentFollowComponent(
       const activity = stoppingAgents.has(agent.name)
         ? "stopping"
         : agent.latestProgress
-          ? `progress: ${formatAnimatedProgress(agent.latestProgress, renderNow)}`
+          ? formatAnimatedProgress(agent.latestProgress, renderNow)
           : agent.status;
       const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatTokenCount(agent.tokensUsed)} tok · ${activity}`;
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";

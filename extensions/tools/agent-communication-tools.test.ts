@@ -61,7 +61,7 @@ describe("read-agent communication tools", () => {
   it("exposes direct communication and complete final reporting to read agents", () => {
     const tools = Array.from(makeTools("session", "reader", "read").keys()).sort();
 
-    expect(tools).toEqual(["read_inbox", "report_and_exit", "send_message"]);
+    expect(tools).toEqual(["read_inbox", "report_and_exit", "report_progress", "send_message"]);
   });
 
   it("lets a read agent submit its complete result instead of replacing it with a summary", async () => {
@@ -92,6 +92,7 @@ describe("read-agent communication tools", () => {
       "read_inbox",
       "release_file",
       "report_and_exit",
+      "report_progress",
       "send_message",
     ]);
   });
@@ -127,6 +128,99 @@ describe("read-agent communication tools", () => {
     })).rejects.toThrow("Cannot send message to finished-agent: agent is not running.");
 
     expect(await readInbox("session", "finished-agent", false, false)).toEqual([]);
+  });
+
+  it("report_progress normalizes and persists progress without inbox side effects", async () => {
+    const onProgress = vi.fn();
+    const tools = new Map<string, Tool>(createAgentCommunicationTools({
+      isTeammate: true,
+      agentName: "reader",
+      role: "read",
+      getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run",
+      authorizeWriteMember: vi.fn(async () => {}),
+      onProgress,
+      onReportAndExit: vi.fn(async () => ({ accepted: true })),
+    }).map((tool: Tool) => [tool.name, tool]));
+
+    const result = await tools.get("report_progress")!.execute("progress", {
+      status: "  Reviewing\n runtime   state  ",
+    });
+
+    expect(result.content[0].text).toBe("Progress updated: Reviewing runtime state");
+    expect(result.details).toMatchObject({ session: "session", status: "Reviewing runtime state", updated: true });
+    expect(onProgress).toHaveBeenCalledWith("Reviewing runtime state", expect.any(Number));
+    expect(await readRuntimeStatus("session", "reader")).toMatchObject({
+      latestProgress: "Reviewing runtime state",
+      progressUpdatedAt: expect.any(Number),
+    });
+    expect(await readInbox("session", "team-lead", false, false)).toEqual([]);
+    expect(await readInbox("session", "reader", false, false)).toEqual([]);
+  });
+
+  it("strips terminal control sequences from persisted progress", async () => {
+    const onProgress = vi.fn();
+    const tools = new Map<string, Tool>(createAgentCommunicationTools({
+      isTeammate: true,
+      agentName: "reader",
+      role: "read",
+      getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run",
+      authorizeWriteMember: vi.fn(async () => {}),
+      onProgress,
+      onReportAndExit: vi.fn(async () => ({ accepted: true })),
+    }).map((tool: Tool) => [tool.name, tool]));
+
+    await tools.get("report_progress")!.execute("progress", {
+      status: "Inspecting\u001b[2J files\u001b]52;c;payload\u0007 now\u001b[31m",
+    });
+
+    expect(onProgress).toHaveBeenCalledWith("Inspecting files now", expect.any(Number));
+    expect(await readRuntimeStatus("session", "reader")).toMatchObject({ latestProgress: "Inspecting files now" });
+  });
+
+  it("report_progress rejects empty and overlong normalized statuses", async () => {
+    const tool = makeTools("session", "reader").get("report_progress")!;
+
+    await expect(tool.execute("empty", { status: " \n\t " })).rejects.toThrow("status must not be empty");
+    await expect(tool.execute("long", { status: "x".repeat(121) })).rejects.toThrow("status must be at most 120 characters");
+    expect(await readRuntimeStatus("session", "reader")).toBeNull();
+
+    await expect(tool.execute("boundary", { status: "x".repeat(120) })).resolves.toMatchObject({
+      details: { status: "x".repeat(120) },
+    });
+  });
+
+  it("report_progress skips lifecycle-closed persistence without failing the agent turn", async () => {
+    const configFile = paths.configPath("session");
+    const config = JSON.parse(fs.readFileSync(configFile, "utf-8"));
+    config.members = config.members.map((member: any) => member.name === "reader" ? { ...member, isActive: false } : member);
+    fs.writeFileSync(configFile, JSON.stringify(config));
+    const onProgress = vi.fn();
+    const tools = new Map<string, Tool>(createAgentCommunicationTools({
+      isTeammate: true,
+      agentName: "reader",
+      role: "read",
+      getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run",
+      authorizeWriteMember: vi.fn(async () => {}),
+      onProgress,
+      onReportAndExit: vi.fn(async () => ({ accepted: true })),
+    }).map((tool: Tool) => [tool.name, tool]));
+
+    const result = await tools.get("report_progress")!.execute("closing-progress", {
+      status: "Preparing final report",
+    });
+
+    expect(result.content[0].text).toBe("Progress update skipped: Preparing final report");
+    expect(result.details).toMatchObject({
+      session: "session",
+      status: "Preparing final report",
+      updated: false,
+      reason: "lifecycle-closed",
+    });
+    expect(onProgress).toHaveBeenCalledWith("Preparing final report", expect.any(Number));
+    expect(await readRuntimeStatus("session", "reader")).toBeNull();
   });
 
   it("read_inbox reads the current agent inbox and records readiness", async () => {

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-07-14
+
+### Changed
+- Restore subagent progress reporting while keeping each update as one ordinary neutral `progress:` field without the colored progress band.
+
+### Fixed
+- Treat lifecycle-closed progress persistence as a skipped best-effort update instead of failing the agent turn.
+
 ## [2.1.1] - 2026-07-14
 
 ### Changed

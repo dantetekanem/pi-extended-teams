@@ -14,6 +14,7 @@ import { registerFavoriteModelsCommand } from "./ui/favorite-models-command.js";
 import { registerExtensionsCommand } from "./ui/extensions-command.js";
 import { installAgentNavigation } from "./ui/agent-navigation.js";
 import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordination-tools.js";
+import { createReportProgressTool } from "./tools/agent-communication-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools } from "./tools/team-tools.js";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
@@ -237,6 +238,10 @@ export default function (pi: ExtensionAPI) {
     } else {
       pi.sendUserMessage(`Report from ${name}:\n${report}`);
     }
+  }
+
+  function emitAgentProgress(progressTeamName: string, name: string, status: string, updatedAt: number): void {
+    pi.events?.emit?.("pi-extended-teams:agent-progress", { teamName: progressTeamName, name, status, updatedAt });
   }
 
   function wakeLeadForInboxReports(unread: any[]): void {
@@ -1012,6 +1017,7 @@ export default function (pi: ExtensionAPI) {
       renderReadAgentStatus,
       rememberCompletedAgentReport,
       emitAgentReport,
+      emitAgentProgress,
       releaseAllClaimsForAgent,
       shutdownTeammate,
       agentName,
@@ -1041,6 +1047,15 @@ export default function (pi: ExtensionAPI) {
     getSessionCtx: () => sessionCtx,
     setSessionCtx,
   });
+
+  if (isTeammate) {
+    pi.registerTool(createReportProgressTool({
+      isTeammate,
+      agentName,
+      getTeamName: () => teamName,
+      getLifecycleRunId: () => process.env.PI_LIFECYCLE_RUN_ID,
+    }));
+  }
 
   registerCoordinationTools(pi, {
     agentName,

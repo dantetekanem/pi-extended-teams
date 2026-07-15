@@ -160,6 +160,16 @@ function renderActionPathState(action: string, path: string, state: string, widt
 }
 
 function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, width?: number): string[] | undefined {
+  if (block.name === "report_progress") {
+    const details = asRecord(block.details);
+    const args = asRecord(block.args);
+    const resultStatus = block.result?.replace(/^Progress (?:updated|update skipped):\s*/i, "");
+    const rawStatus = details?.status ?? args?.status ?? resultStatus ?? "updating";
+    const status = compactTranscriptLine(String(rawStatus)) || "updating";
+    const failureSuffix = block.isError ? " (failed)" : "";
+    return [boundTranscriptLine(`progress: ${status}${failureSuffix}`, width)];
+  }
+
   if (block.name === "edit") {
     const path = toolPath(block.args);
     if (block.result === undefined) return [renderActionPathState("edit", path, "working", width)];

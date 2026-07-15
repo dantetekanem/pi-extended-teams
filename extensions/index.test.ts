@@ -222,13 +222,52 @@ describe("extension integration", () => {
     }
   });
 
-  it.each([
-    ["lead", {}],
-    ["teammate", { PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer", PI_LIFECYCLE_RUN_ID: "writer-run" }],
-  ])("does not expose an agent-authored progress tool in %s sessions", async (_label, env) => {
-    const setup = await setupExtension(env);
+  it("does not expose report_progress in the lead session", async () => {
+    const setup = await setupExtension();
     try {
-      expect([...setup.tools.keys()].filter((name) => name.includes("progress"))).toEqual([]);
+      expect(setup.tools.has("report_progress")).toBe(false);
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("report_progress updates runtime-backed agents without inbox or lead-turn side effects", async () => {
+    const setup = await setupExtension({ PI_TEAM_NAME: "team", PI_AGENT_NAME: "writer", PI_LIFECYCLE_RUN_ID: "writer-run" });
+    try {
+      const paths = await import("../src/utils/paths.js");
+      const config = setup.teams.createTeam("team", "writer-session", "lead", "", "provider/model");
+      config.members.push({
+        agentId: "writer@team",
+        name: "writer",
+        agentType: "teammate",
+        role: "write",
+        lifecycleRunId: "writer-run",
+        joinedAt: Date.now(),
+        tmuxPaneId: "%writer",
+        cwd: setup.root,
+        subscriptions: [],
+      });
+      fs.writeFileSync(paths.configPath("team"), JSON.stringify(config, null, 2));
+      expect(setup.tools.has("spawn_agent")).toBe(false);
+      expect(setup.tools.has("spawn_swarm_agents")).toBe(false);
+      expect(setup.tools.has("send_message")).toBe(true);
+      const runtime = await import("../src/utils/runtime.js");
+      const messaging = await import("../src/utils/messaging.js");
+      const ctx = makeCtx(setup.root, "writer-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+
+      const result = await setup.tools.get("report_progress")!.execute("progress", {
+        status: "  Running\n focused   tests  ",
+      }, new AbortController().signal, undefined, ctx);
+
+      expect(result.details).toMatchObject({ session: "team", status: "Running focused tests" });
+      expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+        currentAction: "starting",
+        latestProgress: "Running focused tests",
+        progressUpdatedAt: expect.any(Number),
+      });
+      expect(await messaging.readInbox("team", "team-lead", false, false)).toEqual([]);
+      expect(setup.pi.sendUserMessage).not.toHaveBeenCalled();
     } finally {
       setup.restoreEnv();
     }
@@ -313,6 +352,36 @@ describe("extension integration", () => {
       expect(plan.selfExtensionPath).toBe(selfPath);
       expect(plan.extensionPaths).toEqual([externalPath]);
       expect(plan.extensions.map((extension: any) => extension.name)).toEqual(["pi-extended-teams", "external"]);
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("emits only the minimal correlated nested-agent progress event", async () => {
+    const setup = await setupExtension();
+    try {
+      writeFavoriteLevels(setup.root);
+      const ctx = makeCtx(setup.root, "progress-event-session");
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "planner-private",
+        prompt: "Inspect the repository",
+        cwd: setup.root,
+        model_slot: "read-critical",
+      }, new AbortController().signal, undefined, ctx);
+
+      const options = setup.readAgentMock.runReadAgentInProcess.mock.calls[0]![4];
+      options.emitAgentProgress("session-progress-event-session", "planner-private", "Reviewing focused tests", 1_720_000_000_000);
+
+      expect(setup.pi.events.emit).toHaveBeenCalledWith("pi-extended-teams:agent-progress", {
+        teamName: "session-progress-event-session",
+        name: "planner-private",
+        status: "Reviewing focused tests",
+        updatedAt: 1_720_000_000_000,
+      });
+      const payload = vi.mocked(setup.pi.events.emit).mock.calls.at(-1)?.[1];
+      for (const denied of ["model", "prompt", "cwd", "path", "tool", "result", "assistant", "tokens", "nonce", "skills", "thinking", "report"]) {
+        expect(Object.keys(payload as object).join(" ").toLowerCase()).not.toContain(denied);
+      }
     } finally {
       setup.restoreEnv();
     }

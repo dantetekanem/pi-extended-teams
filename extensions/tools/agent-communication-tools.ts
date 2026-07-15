@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
-import { formatInboxMessagesForModel } from "../ui/renderers";
+import { formatInboxMessagesForModel, sanitizePlainTuiLine } from "../ui/renderers";
 import { createFileClaimTools } from "./file-claim-tools";
 
 export interface SubmittedAgentReport {
@@ -23,6 +23,7 @@ export interface AgentCommunicationToolsOptions {
   getTeamName(): string | null | undefined;
   getLifecycleRunId(): string | undefined;
   authorizeWriteMember(teamName: string, agentName: string): Promise<void>;
+  onProgress?(status: string, updatedAt: number): void;
   onReportAndExit(report: SubmittedAgentReport): Promise<AgentReportSubmissionResult>;
 }
 
@@ -36,6 +37,48 @@ function requireLifecycleRunId(options: Pick<AgentCommunicationToolsOptions, "ge
   const runId = options.getLifecycleRunId();
   if (!runId) throw new Error("No lifecycle run identity is available for runtime telemetry.");
   return runId;
+}
+
+function normalizeProgressStatus(value: unknown): string {
+  if (typeof value !== "string") throw new Error("status must be a string.");
+  const status = sanitizePlainTuiLine(value).replace(/\s+/g, " ").trim();
+  if (!status) throw new Error("status must not be empty.");
+  if (status.length > 120) throw new Error("status must be at most 120 characters.");
+  return status;
+}
+
+export function createReportProgressTool(options: Pick<AgentCommunicationToolsOptions, "isTeammate" | "agentName" | "getTeamName" | "getLifecycleRunId" | "onProgress">): any {
+  return {
+    name: "report_progress",
+    label: "Report Progress",
+    description: "Update this agent's latest concise progress phrase without messaging or waking the lead.",
+    parameters: Type.Object({
+      status: Type.String({ minLength: 1, maxLength: 120, description: "Free-form progress phrase; normalized to one non-empty line (maximum 120 characters)." }),
+    }),
+    async execute(_toolCallId: string, params: any) {
+      if (!options.isTeammate) throw new Error("report_progress is only available to spawned agents.");
+      const teamName = requireCurrentSession(options);
+      const status = normalizeProgressStatus(params.status);
+      const updatedAt = Date.now();
+      options.onProgress?.(status, updatedAt);
+      try {
+        await runtime.writeRuntimeStatus(teamName, options.agentName, requireLifecycleRunId(options), {
+          latestProgress: status,
+          progressUpdatedAt: updatedAt,
+        });
+      } catch (error) {
+        if (!runtime.isRuntimeStatusWriteRejectedError(error)) throw error;
+        return {
+          content: [{ type: "text", text: `Progress update skipped: ${status}` }],
+          details: { session: teamName, status, updatedAt, updated: false, reason: "lifecycle-closed" },
+        };
+      }
+      return {
+        content: [{ type: "text", text: `Progress updated: ${status}` }],
+        details: { session: teamName, status, updatedAt, updated: true },
+      };
+    },
+  };
 }
 
 export function createAgentCommunicationTools(options: AgentCommunicationToolsOptions): any[] {
@@ -57,6 +100,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         return { content: [{ type: "text", text: `Message sent to ${recipient}.` }], details: { session: teamName, recipient } };
       },
     },
+    createReportProgressTool(options),
     {
       name: "read_inbox",
       label: "Read Inbox",

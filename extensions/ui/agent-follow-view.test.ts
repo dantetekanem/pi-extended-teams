@@ -93,7 +93,7 @@ describe("agent follow transcript", () => {
     expect(expanded).not.toContain("collapsed");
   });
 
-  it("renders historical report_progress calls as ordinary generic tool blocks", () => {
+  it("renders report_progress calls as one ordinary neutral field", () => {
     const lines = formatAgentFollowTranscript([
       { role: "assistant", content: [
         { type: "toolCall", id: "progress-1", name: "report_progress", arguments: { status: "Checking the follow renderer" } },
@@ -109,9 +109,9 @@ describe("agent follow transcript", () => {
     ], { width: 80 });
     const plain = lines.map(stripAnsi);
 
-    expect(plain[0]).toContain("╭─ report_progress ·");
-    expect(plain).toContain("│ Progress updated: Checking the follow renderer");
-    expect(plain.at(-2)).toContain("╰─ 1 line");
+    expect(plain[0]).toBe("progress: Checking the follow renderer");
+    expect(plain.join("\n")).not.toContain("report_progress");
+    expect(lines[0]).not.toContain("\x1b[");
     expect(lines.join("\n")).not.toContain("\x1b[48;2;31;33;47m");
   });
 

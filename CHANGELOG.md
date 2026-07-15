@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [2.1.0] - 2026-07-14
+## [2.4.0] - 2026-07-14
 
 ### Added
 - Add four canonical read intent tiers and four write intent tiers, with backward-compatible normalization for legacy slot names.

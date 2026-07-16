@@ -198,9 +198,9 @@ Bad mission:
 Check agents.
 ```
 
-### Do not create an agent society
+### Keep nested read delegation restricted
 
-Spawned agents should not spawn more agents. If they need help, they should use `send_message` to ask the lead.
+Nested delegation is off by default. Set `allow_nested_read_agents: true` only on a depth-0 `write-feature` or `write-critical` spawn that needs independent read-only evidence. That writer receives restricted `spawn_agent` / `spawn_swarm_agents`, may choose any canonical `read-*` tier and any helper count subject to global capacity, and receives each helper's report. Children cannot delegate. Read agents, depth-1 children, `write-patch`, and `write-system` remain denied and ask the lead with `send_message`.
 
 ### Do not poll
 

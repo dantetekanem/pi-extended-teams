@@ -1,4 +1,5 @@
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { RuntimeError } from "../../src/utils/runtime";
 import type { ManagedReadAgentLifecycleState } from "../agents/read-agent-session-lifecycle";
 
 export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
@@ -11,6 +12,7 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   recentEvents: string[];
   lastActivityAt: number;
   activeToolName?: string;
+  lastError?: RuntimeError;
   idleNudgeLevel?: "soft" | "hard";
   role?: string;
   model?: string;

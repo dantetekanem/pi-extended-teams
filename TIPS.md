@@ -102,15 +102,18 @@ spawn_agent({
 })
 ```
 
-A bounded feature agent:
+A bounded feature agent with explicit nested read-helper opt-in:
 
 ```ts
 spawn_agent({
   name: "parser-feature",
   model_slot: "write-feature",
+  allow_nested_read_agents: true,
   prompt: "Claim src/parser.ts and test/parser.test.ts only, fix the failing parser edge case, run the focused parser tests, then call report_and_exit."
 })
 ```
+
+Only opted-in depth-0 `write-feature` and `write-critical` agents receive restricted `spawn_agent` / `spawn_swarm_agents`. They may use any canonical `read-*` tier and any helper count, subject to global capacity. Children cannot delegate. Read agents, depth-1 children, `write-patch`, and `write-system` remain denied.
 
 ## Wrong examples
 

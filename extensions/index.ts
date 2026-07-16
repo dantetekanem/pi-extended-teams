@@ -16,7 +16,7 @@ import { installAgentNavigation } from "./ui/agent-navigation.js";
 import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordination-tools.js";
 import { createReportProgressTool } from "./tools/agent-communication-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
-import { registerTeamTools } from "./tools/team-tools.js";
+import { registerTeamTools, type TeamToolsRuntime } from "./tools/team-tools.js";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
 import { formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
@@ -81,6 +81,7 @@ export default function (pi: ExtensionAPI) {
   const createCurrentSpawnResourcePlan = (input: { cwd: string; projectTrusted: boolean }) => {
     return createSpawnResourcePlan({ ...input, pi });
   };
+  let teamToolsRuntime: TeamToolsRuntime | undefined;
   const { startWriteAgent, drainWriteQueue } = createWriteAgentRuntime({
     terminal,
     getProjectTrusted: (cwd) => parentProjectTrustForSpawn(sessionCtx, cwd),
@@ -124,6 +125,45 @@ export default function (pi: ExtensionAPI) {
   function memberActivityRole(member: Member): "read" | "write" {
     if (member.role === "read" || member.role === "write") return member.role;
     return member.modelSlot?.startsWith("reading-") ? "read" : "write";
+  }
+
+  function isNestedReadHelperMember(member: Member | undefined): boolean {
+    return !!member
+      && memberActivityRole(member) === "read"
+      && member.delegationDepth === 1
+      && member.helperKind === "read_helper";
+  }
+
+  function readAgentHasLastError(agent: RunningReadAgent): boolean {
+    return !!agent.lastError;
+  }
+
+  function countActiveNestedReadHelpersByWriter(
+    members: Member[],
+    activeReadMemberNames: Set<string>,
+    excludedReadMemberNames: Set<string> = new Set()
+  ): Map<string, number> {
+    const membersByName = new Map(members.map(member => [member.name, member]));
+    const counts = new Map<string, number>();
+
+    for (const child of members) {
+      const writerName = child.requestedBy;
+      if (!activeReadMemberNames.has(child.name)
+        || excludedReadMemberNames.has(child.name)
+        || !isNestedReadHelperMember(child)
+        || !writerName
+        || child.parentAgentName !== writerName
+        || !child.parentLifecycleRunId) continue;
+
+      const parent = membersByName.get(writerName);
+      if (!parent
+        || memberActivityRole(parent) !== "write"
+        || parent.lifecycleRunId !== child.parentLifecycleRunId) continue;
+
+      counts.set(writerName, (counts.get(writerName) ?? 0) + 1);
+    }
+
+    return counts;
   }
 
   function runtimeHeartbeatIsRecent(status: runtime.AgentRuntimeStatus, now: number): boolean {
@@ -170,13 +210,15 @@ export default function (pi: ExtensionAPI) {
     elapsed: string,
     tokens: string,
     latestProgress: string | undefined,
-    now: number
+    now: number,
+    activeReadHelperCount = 0
   ): string {
     const shortModel = model ? model.split("/").pop() || model : "";
     const modelAndThinking = [shortModel, thinking].filter(Boolean).join("/");
     const identity = modelAndThinking ? `(${name}) ${modelAndThinking}` : `(${name})`;
+    const helperSuffix = activeReadHelperCount > 0 ? `+${activeReadHelperCount}` : undefined;
     const progress = latestProgress ? formatAnimatedProgress(latestProgress, now) : undefined;
-    return [identity, modelSlot, elapsed, `${tokens} tok`, progress].filter(Boolean).join(" · ");
+    return [identity, helperSuffix, modelSlot, elapsed, `${tokens} tok`, progress].filter(Boolean).join(" · ");
   }
 
   function currentSessionAgentGroupName(ctx?: any): string | undefined {
@@ -457,6 +499,26 @@ export default function (pi: ExtensionAPI) {
     const runtimeOnlyMemberNames = new Set(runtimeOnlyMembers.map(({ member }) => member.name));
     const runtimeOnlyReadMembers = runtimeOnlyMembers.filter(({ member }) => memberActivityRole(member) === "read");
     const runtimeOnlyWriteMembers = runtimeOnlyMembers.filter(({ member }) => memberActivityRole(member) === "write");
+    const activeReadMemberNames = new Set([
+      ...readAgents.map(agent => agent.name),
+      ...runtimeOnlyReadMembers
+        .filter(({ runtimeStatus }) => runtimeStatus.currentAction !== "done")
+        .map(({ member }) => member.name),
+    ]);
+    const activityMembersByName = new Map(activityMembers.map(member => [member.name, member]));
+    const failedNestedReadHelperNames = new Set([
+      ...readAgents
+        .filter(agent => readAgentHasLastError(agent) && isNestedReadHelperMember(activityMembersByName.get(agent.name)))
+        .map(agent => agent.name),
+      ...runtimeOnlyMembers
+        .filter(({ member, runtimeStatus }) => runtimeStatus.lastError && isNestedReadHelperMember(member))
+        .map(({ member }) => member.name),
+    ]);
+    const activeReadHelperCounts = countActiveNestedReadHelpersByWriter(
+      activityMembers,
+      activeReadMemberNames,
+      failedNestedReadHelperNames
+    );
     const activeWriteMembers = activityTeamName
       ? activityMembers
         .filter(member => member.name !== "team-lead" && member.isActive !== false && memberActivityRole(member) === "write")
@@ -512,7 +574,7 @@ export default function (pi: ExtensionAPI) {
       const detail = [modelLabel, slotLabel, elapsed, `${tokenCount} tok`, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "write", status: status.label, detail });
-      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, tokenCount, agent.latestProgress, now));
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, tokenCount, agent.latestProgress, now, activeReadHelperCounts.get(agent.name)));
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyWriteMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
@@ -528,7 +590,7 @@ export default function (pi: ExtensionAPI) {
       const status = runtimeOnlyStatusLabel(runtimeStatus, now);
       countStatus(status);
       entries.push({ name: member.name, role: "write", status, detail });
-      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus.latestProgress, now));
+      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus.latestProgress, now, activeReadHelperCounts.get(member.name)));
     }
 
     for (const member of activeWriteMembers.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -551,7 +613,7 @@ export default function (pi: ExtensionAPI) {
       const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
       countStatus("bg");
       entries.push({ name: member.name, role: "write", status: "bg", detail });
-      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus?.latestProgress, now));
+      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus?.latestProgress, now, activeReadHelperCounts.get(member.name)));
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyReadMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
@@ -1026,10 +1088,13 @@ export default function (pi: ExtensionAPI) {
       deliverMessageToActiveAgent,
       createResourcePlan: createCurrentSpawnResourcePlan,
       extensionInstanceId,
+      createNestedReadAgentTools: (binding: Parameters<TeamToolsRuntime["createNestedReadAgentTools"]>[0]) => {
+        return teamToolsRuntime?.createNestedReadAgentTools(binding) ?? [];
+      },
     };
   }
 
-  registerTeamTools(pi, {
+  teamToolsRuntime = registerTeamTools(pi, {
     terminal,
     runningReadAgents,
     readAgentKey,

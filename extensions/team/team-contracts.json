@@ -5,7 +5,7 @@
   "contracts": [
     {
       "id": "ui.team-activity-card",
-      "description": "Live team activity renders as a stable below-editor pi-emote-style card with always-open bounded details. It keeps the card design with its separator at the bottom (not an extra bar above the card), stays mounted while agents are active, and updates progress, elapsed time, and token counts in place without flicker. New progress phrases transition in one second by quickly fading/removing the old phrase and revealing the new phrase left-to-right, then resume the repeating one/two/three-dot animation. Completed reports arrive as messages/open reports and do not create report-ready or waiting-confirmation status rows."
+      "description": "Live team activity renders as a stable below-editor pi-emote-style card with always-open bounded details. It keeps the card design with its separator at the bottom (not an extra bar above the card), stays mounted while agents are active, and updates progress, elapsed time, and token counts in place without flicker. Each active writer row shows +N for its currently active, runtime-attributed depth-1 read helpers without changing global active/read/write counts; queued, completed, failed, stale, and historical helpers do not contribute. New progress phrases transition in one second by quickly fading/removing the old phrase and revealing the new phrase left-to-right, then resume the repeating one/two/three-dot animation. Completed reports arrive as messages/open reports and do not create report-ready or waiting-confirmation status rows."
     },
     {
       "id": "ui.active-reader-writer-info",
@@ -21,11 +21,11 @@
     },
     {
       "id": "writers.request-only-lead-spawns",
-      "description": "No spawned read or write agent receives agent-spawning tools or spawns agents directly. A spawned agent uses send_message to ask team-lead for help, and only the lead/main runtime decides and performs the spawn."
+      "description": "Nested delegation is off by default. Only explicitly opted-in depth-0 write-feature/write-critical agents receive restricted read-only spawn_agent/spawn_swarm_agents tools; they may request any canonical read tier and any count subject to global capacity. Read agents, depth-1 children, write-patch, and write-system remain denied. Children report to the requesting writer and cannot delegate."
     },
     {
       "id": "messaging.push-on-completion",
-      "description": "Readers send completion messages to the lead; read helpers for writers send the full report to the writer and a short done notification to the lead. Every newly unread agent message injects a deduplicated user-style follow-up into the lead prompt, even while the lead is busy, instead of relying on manual polling."
+      "description": "Readers send completion messages to the lead; read helpers for writers send the full report to the requesting writer and a classified completion notice to the lead. Every newly unread agent message injects a deduplicated user-style follow-up into the lead prompt, even while the lead is busy, instead of relying on manual polling."
     },
     {
       "id": "completion.remove-from-active-keep-history",

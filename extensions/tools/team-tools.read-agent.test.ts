@@ -12,6 +12,8 @@ import type { Member } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 import { ACCEPTED_FAVORITE_MODEL_SLOTS, FAVORITE_MODEL_SLOTS } from "../../src/utils/settings.js";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
+import { NESTED_READ_MODEL_SLOTS } from "../runtime/nested-read-agents.js";
+import { closePersistedRecipient } from "../team/recipient-closure.js";
 
 type RegisteredTool = {
   name: string;
@@ -126,7 +128,7 @@ function registerTools() {
   });
 
   const sessionCtx = makeCtx();
-  registerTeamTools({
+  const teamToolsRuntime = registerTeamTools({
     registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
     on: vi.fn((name: string, handler: (event: any) => void | Promise<void>) => {
       sessionHandlers.set(name, [...(sessionHandlers.get(name) ?? []), handler]);
@@ -169,7 +171,36 @@ function registerTools() {
   const shutdown = async (reason = "reload") => {
     for (const handler of sessionHandlers.get("session_shutdown") ?? []) await handler({ reason });
   };
-  return { tools, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes };
+  return { tools, teamToolsRuntime, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes };
+}
+
+async function admitNestedReadParent(
+  harness: ReturnType<typeof registerTools>,
+  overrides: Partial<Member> = {}
+): Promise<Member> {
+  const teamName = "session-test-session";
+  if (!teams.teamExists(teamName)) {
+    teams.createTeam(teamName, "test-session", "lead-agent", "Pi session agents", "provider/model");
+  }
+  const parent: Member = {
+    agentId: `writer@${teamName}`,
+    name: "writer",
+    agentType: "teammate",
+    role: "write",
+    model: "provider/model",
+    thinking: "medium",
+    modelSlot: "write-feature",
+    joinedAt: Date.now(),
+    tmuxPaneId: "",
+    cwd: root,
+    subscriptions: [],
+    delegationDepth: 0,
+    allowNestedReadAgents: true,
+    ...overrides,
+  };
+  await teams.addMember(teamName, parent);
+  harness.runningReadAgents.set(`${teamName}:${parent.name}`, makeRunningAgent(teamName, parent));
+  return parent;
 }
 
 describe("public agent spawn tools", () => {
@@ -201,6 +232,9 @@ describe("public agent spawn tools", () => {
     const spawnSlot = spawn.parameters.properties.model_slot;
     const swarmDefaultSlot = swarm.parameters.properties.defaults.properties.model_slot;
     const swarmAgentSlot = swarm.parameters.properties.agents.items.properties.model_slot;
+    const spawnNestedOptIn = spawn.parameters.properties.allow_nested_read_agents;
+    const swarmDefaultNestedOptIn = swarm.parameters.properties.defaults.properties.allow_nested_read_agents;
+    const swarmAgentNestedOptIn = swarm.parameters.properties.agents.items.properties.allow_nested_read_agents;
 
     expect(FAVORITE_MODEL_SLOTS.filter((slot) => slot.startsWith("read-"))).toHaveLength(4);
     expect(FAVORITE_MODEL_SLOTS.filter((slot) => slot.startsWith("write-"))).toHaveLength(4);
@@ -208,6 +242,10 @@ describe("public agent spawn tools", () => {
     expect(spawnSlot.default).toBe("read-review");
     expect(swarmDefaultSlot.enum).toEqual(ACCEPTED_FAVORITE_MODEL_SLOTS);
     expect(swarmAgentSlot.enum).toEqual(ACCEPTED_FAVORITE_MODEL_SLOTS);
+    expect(spawnNestedOptIn.default).toBe(false);
+    expect(swarmDefaultNestedOptIn.default).toBe(false);
+    expect(swarmAgentNestedOptIn.default).toBe(false);
+    expect(spawnNestedOptIn.description).toContain("write-feature/write-critical");
     expect(spawnSlot.description).toContain("read-review is the normal default");
     expect(spawnSlot.description).toContain("write-system owns a cross-cutting integration");
     expect(spawn.description).toContain("read-analyze for connected explanation/root cause");
@@ -789,5 +827,682 @@ describe("public agent spawn tools", () => {
     expect(new Set(names).size).toBe(4);
     expect(names.every((name: string) => name.startsWith("agent-"))).toBe(true);
     expect(shutdownTeammate).not.toHaveBeenCalled();
+  });
+
+  it("stamps public agents at depth zero and honors only the dedicated single/default/per-agent opt-in", async () => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess } = registerTools();
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+
+    await tools.get("spawn_agent")!.execute("single-default", {
+      name: "single-default",
+      prompt: "implement without delegation",
+      cwd: root,
+      model_slot: "write-feature",
+      metadata: { allowNestedReadAgents: true, delegationDepth: 99 },
+    }, abort, undefined, ctx);
+    await tools.get("spawn_agent")!.execute("single-opt-in", {
+      name: "single-opt-in",
+      prompt: "implement with read helpers",
+      cwd: root,
+      model_slot: "write-critical",
+      allow_nested_read_agents: true,
+    }, abort, undefined, ctx);
+    await tools.get("spawn_swarm_agents")!.execute("swarm-opt-in", {
+      defaults: {
+        cwd: root,
+        model_slot: "write-feature",
+        allow_nested_read_agents: true,
+      },
+      agents: [
+        { name: "swarm-inherited", prompt: "inherit delegation" },
+        { name: "swarm-disabled", prompt: "disable delegation", allow_nested_read_agents: false },
+      ],
+    }, abort, undefined, ctx);
+
+    const spawnedMembers = runReadAgentInProcess.mock.calls.map((call) => call[1]);
+    expect(spawnedMembers).toHaveLength(4);
+    expect(spawnedMembers[0]).toMatchObject({
+      name: "single-default",
+      delegationDepth: 0,
+      allowNestedReadAgents: false,
+      metadata: { allowNestedReadAgents: true, delegationDepth: 99 },
+    });
+    expect(spawnedMembers[1]).toMatchObject({
+      name: "single-opt-in",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+    });
+    expect(spawnedMembers[2]).toMatchObject({
+      name: "swarm-inherited",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+    });
+    expect(spawnedMembers[3]).toMatchObject({
+      name: "swarm-disabled",
+      delegationDepth: 0,
+      allowNestedReadAgents: false,
+    });
+  });
+
+  it("creates restricted child tools only for a live canonical opted-in parent and rejects non-read or extra fields", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const outerCtx = makeCtx();
+    const binding = {
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx,
+    };
+    const nestedTools = new Map(harness.teamToolsRuntime.createNestedReadAgentTools(binding).map((tool: any) => [tool.name, tool]));
+
+    expect(Array.from(nestedTools.keys()).sort()).toEqual(["spawn_agent", "spawn_swarm_agents"]);
+    expect(nestedTools.get("spawn_agent")!.parameters.properties.model_slot.enum).toEqual(NESTED_READ_MODEL_SLOTS);
+    expect(nestedTools.get("spawn_swarm_agents")!.parameters.properties.defaults.properties.model_slot.enum).toEqual(NESTED_READ_MODEL_SLOTS);
+    expect(nestedTools.get("spawn_swarm_agents")!.parameters.properties.agents.items.properties.model_slot.enum).toEqual(NESTED_READ_MODEL_SLOTS);
+
+    for (const ineligibleParent of [
+      { ...parent, allowNestedReadAgents: false, metadata: { allowNestedReadAgents: true, allow_nested_read_agents: true } },
+      { ...parent, delegationDepth: 1 },
+      { ...parent, modelSlot: "write-patch" },
+      { ...parent, modelSlot: "write-system" },
+      { ...parent, role: "read" as const, modelSlot: "read-critical" },
+    ]) {
+      expect(harness.teamToolsRuntime.createNestedReadAgentTools({ ...binding, parent: ineligibleParent })).toEqual([]);
+    }
+
+    await expect(nestedTools.get("spawn_agent")!.execute("write-tier", {
+      name: "writer-child",
+      prompt: "do not admit",
+      model_slot: "write-feature",
+    })).rejects.toThrow("requires a canonical read-* model_slot");
+    await expect(nestedTools.get("spawn_agent")!.execute("legacy-read-tier", {
+      name: "legacy-child",
+      prompt: "do not admit",
+      model_slot: "reading-fast",
+    })).rejects.toThrow("requires a canonical read-* model_slot");
+    await expect(nestedTools.get("spawn_agent")!.execute("cwd-override", {
+      name: "escaped-child",
+      prompt: "do not admit",
+      model_slot: "read-review",
+      cwd: path.join(root, "elsewhere"),
+    })).rejects.toThrow("accepts only name, prompt, model_slot");
+    await expect(nestedTools.get("spawn_swarm_agents")!.execute("invalid-swarm", {
+      defaults: { model_slot: "read-review" },
+      agents: [
+        { name: "valid", prompt: "would be valid" },
+        { name: "invalid", prompt: "must reject whole request", model_slot: "write-critical" },
+      ],
+    })).rejects.toThrow("requires a canonical read-* model_slot");
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+
+    harness.runningReadAgents.get("session-test-session:writer")!.runId = "replacement-run";
+    await expect(nestedTools.get("spawn_agent")!.execute("stale-parent", {
+      name: "stale-child",
+      prompt: "do not admit",
+      model_slot: "read-collect",
+    })).rejects.toThrow("bound parent lifecycle is not active");
+  });
+
+  it("admits single and swarm children with forced parent provenance and never replaces a duplicate", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 8, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const outerCtx = makeCtx();
+    const nestedTools = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx,
+    }).map((tool: any) => [tool.name, tool]));
+
+    const single = await nestedTools.get("spawn_agent")!.execute("single", {
+      name: "child-one",
+      prompt: "inspect one",
+      model_slot: "read-critical",
+    });
+    expect(single.details).toMatchObject({ name: "child-one", role: "read", queued: false, modelSlot: "read-critical" });
+    expect(harness.runReadAgentInProcess).toHaveBeenLastCalledWith(
+      "session-test-session",
+      expect.objectContaining({
+        name: "child-one",
+        role: "read",
+        cwd: root,
+        modelSlot: "read-critical",
+        delegationDepth: 1,
+        allowNestedReadAgents: false,
+        parentAgentName: "writer",
+        parentLifecycleRunId: parent.lifecycleRunId,
+        requestedBy: "writer",
+        helperKind: "read_helper",
+      }),
+      "inspect one",
+      outerCtx,
+      expect.any(Object),
+    );
+
+    await expect(nestedTools.get("spawn_agent")!.execute("duplicate", {
+      name: "child-one",
+      prompt: "replace one",
+      model_slot: "read-review",
+    })).rejects.toThrow("nested delegation cannot replace an existing run");
+    expect(harness.shutdownTeammate).not.toHaveBeenCalled();
+
+    const swarm = await nestedTools.get("spawn_swarm_agents")!.execute("swarm", {
+      defaults: { model_slot: "read-collect" },
+      agents: [
+        { name: "child-two", prompt: "inspect two" },
+        { name: "child-three", prompt: "inspect three", model_slot: "read-analyze" },
+        { name: "child-four", prompt: "inspect four", model_slot: "read-review" },
+      ],
+    });
+    expect(swarm.details.failed).toEqual([]);
+    expect(swarm.details.spawned).toHaveLength(3);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(4);
+
+    const childCalls = harness.runReadAgentInProcess.mock.calls.map((call) => call[1]);
+    expect(childCalls.map((child) => child.name)).toEqual(["child-one", "child-two", "child-three", "child-four"]);
+    expect(childCalls.map((child) => child.modelSlot)).toEqual(["read-critical", "read-collect", "read-analyze", "read-review"]);
+    expect(childCalls.every((child) => child.delegationDepth === 1
+      && child.parentAgentName === "writer"
+      && child.parentLifecycleRunId === parent.lifecycleRunId
+      && child.cwd === root)).toBe(true);
+  });
+
+  it("denies nested spawning immediately when the live parent recipient closes", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const nestedTools = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: makeCtx(),
+    }).map((tool: any) => [tool.name, tool]));
+    const parentState = harness.runningReadAgents.get("session-test-session:writer")!;
+    const spawn = nestedTools.get("spawn_agent")!;
+
+    parentState.messageDeliveryClosed = true;
+    await expect(spawn.execute("closed-delivery", {
+      name: "closed-delivery-child",
+      prompt: "must not start after delivery closes",
+      model_slot: "read-review",
+    })).rejects.toThrow("bound parent lifecycle is not active");
+    parentState.messageDeliveryClosed = false;
+
+    parentState.persistedRecipientClosed = true;
+    await expect(spawn.execute("closed-recipient", {
+      name: "closed-recipient-child",
+      prompt: "must not start after recipient closes",
+      model_slot: "read-review",
+    })).rejects.toThrow("bound parent lifecycle is not active");
+
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+  });
+
+  it("denies and removes a queued nested child when recipient closure precedes capacity drain", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold read capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedTools = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool]));
+    const queued = await nestedTools.get("spawn_agent")!.execute("queued-child", {
+      name: "queued-child",
+      prompt: "wait for admission",
+      model_slot: "read-collect",
+    });
+    expect(queued.details).toMatchObject({ name: "queued-child", queued: true, role: "read" });
+
+    harness.runningReadAgents.get("session-test-session:writer")!.persistedRecipientClosed = true;
+    harness.completions.get("capacity-blocker")!();
+
+    await vi.waitFor(() => {
+      const respond = vi.fn();
+      harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+      expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 1, queued: 0 });
+    });
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect((await teams.readConfig("session-test-session")).members.some((member) => member.name === "queued-child")).toBe(false);
+  });
+
+  it("rechecks parent authorization at queued lead admission and hard-stops delegation", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold read capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedTools = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool]));
+    const queued = await nestedTools.get("spawn_agent")!.execute("queued-child", {
+      name: "queued-child",
+      prompt: "wait for admission",
+      model_slot: "read-collect",
+    });
+    expect(queued.details).toMatchObject({ name: "queued-child", queued: true, role: "read" });
+    await expect(nestedTools.get("spawn_agent")!.execute("queued-duplicate", {
+      name: "queued-child",
+      prompt: "must not replace queued work",
+      model_slot: "read-review",
+    })).rejects.toThrow("nested delegation cannot replace an existing run");
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+
+    const parentState = harness.runningReadAgents.get("session-test-session:writer")!;
+    parentState.stopRequested = true;
+    parentState.teardownState = "stopping";
+    harness.completions.get("capacity-blocker")!();
+
+    await vi.waitFor(() => {
+      const respond = vi.fn();
+      harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+      expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 1, queued: 0 });
+    });
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect((await teams.readConfig("session-test-session")).members.some((member) => member.name === "queued-child")).toBe(false);
+    await expect(nestedTools.get("spawn_agent")!.execute("after-stop", {
+      name: "after-stop",
+      prompt: "must not start",
+      model_slot: "read-review",
+    })).rejects.toThrow("bound parent lifecycle is not active");
+  });
+
+  it("rolls back only a deferred direct child admission when parent closure starts during add", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 8, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: makeCtx(),
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+    const originalAddMember = teams.addMember;
+    let markAddStarted!: () => void;
+    const addStarted = new Promise<void>((resolve) => { markAddStarted = resolve; });
+    let releaseAdd!: () => void;
+    const addGate = new Promise<void>((resolve) => { releaseAdd = resolve; });
+    vi.spyOn(teams, "addMember").mockImplementation(async (teamName, member) => {
+      if (member.name === "racing-child") {
+        markAddStarted();
+        await addGate;
+      }
+      return originalAddMember(teamName, member);
+    });
+
+    const spawning = nestedSpawn.execute("racing-child", {
+      name: "racing-child",
+      prompt: "must lose to parent closure",
+      model_slot: "read-review",
+    });
+    await addStarted;
+    harness.runningReadAgents.get("session-test-session:writer")!.messageDeliveryClosed = true;
+    const closing = closePersistedRecipient(
+      "session-test-session",
+      "writer",
+      parent.lifecycleRunId!,
+      { role: "write", removeOnFailure: true }
+    );
+    releaseAdd();
+
+    await expect(spawning).rejects.toThrow("bound parent lifecycle is not active");
+    await closing;
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+    expect((await teams.readConfig("session-test-session")).members.some((member) => member.name === "racing-child")).toBe(false);
+  });
+
+  it("rejects a queued request when parent closure wins during model precommit", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+    let markModelLookupStarted!: () => void;
+    const modelLookupStarted = new Promise<void>((resolve) => { markModelLookupStarted = resolve; });
+    let releaseModels!: (models: any[]) => void;
+    ctx.modelRegistry.getAvailable.mockImplementation(() => {
+      markModelLookupStarted();
+      return new Promise<any[]>((resolve) => { releaseModels = resolve; });
+    });
+
+    const spawning = nestedSpawn.execute("precommit-child", {
+      name: "precommit-child",
+      prompt: "must not enter the queue",
+      model_slot: "read-collect",
+    });
+    await modelLookupStarted;
+    harness.runningReadAgents.get("session-test-session:writer")!.messageDeliveryClosed = true;
+    await closePersistedRecipient(
+      "session-test-session",
+      "writer",
+      parent.lifecycleRunId!,
+      { role: "write", removeOnFailure: true }
+    );
+    releaseModels([{ provider: "provider", id: "model" }]);
+
+    await expect(spawning).rejects.toThrow("bound parent lifecycle is not active");
+    const respond = vi.fn();
+    harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+    expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 2, queued: 0 });
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+  });
+
+  it("rolls back a queued child when parent closure starts during drain admission", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+    await nestedSpawn.execute("drain-child", {
+      name: "drain-child",
+      prompt: "wait for drain",
+      model_slot: "read-collect",
+    });
+
+    const originalAddMember = teams.addMember;
+    let markAddStarted!: () => void;
+    const addStarted = new Promise<void>((resolve) => { markAddStarted = resolve; });
+    let releaseAdd!: () => void;
+    const addGate = new Promise<void>((resolve) => { releaseAdd = resolve; });
+    vi.spyOn(teams, "addMember").mockImplementation(async (teamName, member) => {
+      if (member.name === "drain-child") {
+        markAddStarted();
+        await addGate;
+      }
+      return originalAddMember(teamName, member);
+    });
+
+    harness.completions.get("capacity-blocker")!();
+    await addStarted;
+    harness.runningReadAgents.get("session-test-session:writer")!.messageDeliveryClosed = true;
+    const closing = closePersistedRecipient(
+      "session-test-session",
+      "writer",
+      parent.lifecycleRunId!,
+      { role: "write", removeOnFailure: true }
+    );
+    releaseAdd();
+    await closing;
+
+    await vi.waitFor(() => {
+      const respond = vi.fn();
+      harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+      expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 1, queued: 0 });
+    });
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect((await teams.readConfig("session-test-session")).members.some((member) => member.name === "drain-child")).toBe(false);
+  });
+
+  it("admits exactly one same-name request at capacity and launches it once", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+
+    const settled = await Promise.allSettled([
+      nestedSpawn.execute("same-name-a", { name: "same-name", prompt: "first", model_slot: "read-review" }),
+      nestedSpawn.execute("same-name-b", { name: "same-name", prompt: "second", model_slot: "read-review" }),
+    ]);
+    expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(settled.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect((settled.find((result) => result.status === "fulfilled") as PromiseFulfilledResult<any>).value.details)
+      .toMatchObject({ name: "same-name", queued: true });
+    expect((settled.find((result) => result.status === "rejected") as PromiseRejectedResult).reason.message)
+      .toContain("nested delegation cannot replace an existing run");
+
+    harness.completions.get("capacity-blocker")!();
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    expect(harness.runReadAgentInProcess.mock.calls.filter((call) => call[1].name === "same-name")).toHaveLength(1);
+  });
+
+  it("rejects a stale same-name queue request after a direct winner releases its reservation", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+
+    const originalFindQueuedWriteSpawn = writeQueue.findQueuedWriteSpawn;
+    let lookupCount = 0;
+    let markWinnerLookupReached!: () => void;
+    const winnerLookupReached = new Promise<void>((resolve) => { markWinnerLookupReached = resolve; });
+    let markLoserLookupReached!: () => void;
+    const loserLookupReached = new Promise<void>((resolve) => { markLoserLookupReached = resolve; });
+    let releaseLoserLookup!: () => void;
+    const loserLookupGate = new Promise<void>((resolve) => { releaseLoserLookup = resolve; });
+    vi.spyOn(writeQueue, "findQueuedWriteSpawn").mockImplementation(async (...args) => {
+      const result = await originalFindQueuedWriteSpawn(...args);
+      lookupCount += 1;
+      if (lookupCount === 1) {
+        markWinnerLookupReached();
+        await loserLookupReached;
+      } else if (lookupCount === 2) {
+        markLoserLookupReached();
+        await loserLookupGate;
+      }
+      return result;
+    });
+
+    const winnerPromise = nestedSpawn.execute("same-name-direct", {
+      name: "same-name-transfer",
+      prompt: "start directly",
+      model_slot: "read-review",
+    });
+    await winnerLookupReached;
+    const loserPromise = nestedSpawn.execute("same-name-stale", {
+      name: "same-name-transfer",
+      prompt: "must not queue from a stale roster",
+      model_slot: "read-review",
+    });
+    await loserLookupReached;
+
+    const settled = await Promise.allSettled([
+      winnerPromise.finally(releaseLoserLookup),
+      loserPromise,
+    ]);
+    expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(settled.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect((settled.find((result) => result.status === "fulfilled") as PromiseFulfilledResult<any>).value.details)
+      .toMatchObject({ name: "same-name-transfer", queued: false });
+    expect((settled.find((result) => result.status === "rejected") as PromiseRejectedResult).reason.message)
+      .toContain("nested delegation cannot replace an existing run");
+
+    const activeRespond = vi.fn();
+    harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond: activeRespond });
+    expect(activeRespond).toHaveBeenCalledWith({ sessionId: "test-session", running: 2, queued: 0 });
+    expect(harness.runReadAgentInProcess.mock.calls.filter((call) => call[1].name === "same-name-transfer")).toHaveLength(1);
+
+    harness.completions.get("same-name-transfer")!();
+    await vi.waitFor(() => {
+      const completedRespond = vi.fn();
+      harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond: completedRespond });
+      expect(completedRespond).toHaveBeenCalledWith({ sessionId: "test-session", running: 1, queued: 0 });
+    });
+    expect(harness.runReadAgentInProcess.mock.calls.filter((call) => call[1].name === "same-name-transfer")).toHaveLength(1);
+  });
+
+  it("preserves a concurrent enqueue while the current queue head is draining", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+    await nestedSpawn.execute("queued-one", { name: "queued-one", prompt: "first", model_slot: "read-review" });
+
+    const originalAddMember = teams.addMember;
+    let markAddStarted!: () => void;
+    const addStarted = new Promise<void>((resolve) => { markAddStarted = resolve; });
+    let releaseAdd!: () => void;
+    const addGate = new Promise<void>((resolve) => { releaseAdd = resolve; });
+    vi.spyOn(teams, "addMember").mockImplementation(async (teamName, member) => {
+      if (member.name === "queued-one") {
+        markAddStarted();
+        await addGate;
+      }
+      return originalAddMember(teamName, member);
+    });
+
+    harness.completions.get("capacity-blocker")!();
+    await addStarted;
+    const queuedTwo = await harness.tools.get("spawn_agent")!.execute("queued-two", {
+      name: "queued-two",
+      prompt: "second",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    expect(queuedTwo.details).toMatchObject({ queued: true, queuePosition: 2 });
+    releaseAdd();
+
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    const respond = vi.fn();
+    harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+    expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 2, queued: 1 });
+
+    harness.completions.get("queued-one")!();
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(3));
+    expect(harness.runReadAgentInProcess.mock.calls[2][1].name).toBe("queued-two");
+  });
+
+  it("releases a queued nested-name reservation when the item is dropped", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent,
+      parentRunId: parent.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+    await nestedSpawn.execute("reserved-child", {
+      name: "reserved-child",
+      prompt: "queued request",
+      model_slot: "read-review",
+    });
+    const duplicate: Member = {
+      agentId: "reserved-child@session-test-session",
+      name: "reserved-child",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "xhigh",
+      modelSlot: "read-review",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    };
+    await teams.addMember("session-test-session", duplicate);
+
+    harness.completions.get("capacity-blocker")!();
+    await vi.waitFor(() => {
+      const respond = vi.fn();
+      harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+      expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 1, queued: 0 });
+    });
+    await teams.removeMemberMatchingRun("session-test-session", duplicate.name, duplicate.lifecycleRunId!);
+
+    await expect(nestedSpawn.execute("reserved-child-retry", {
+      name: "reserved-child",
+      prompt: "reservation must be reusable",
+      model_slot: "read-review",
+    })).resolves.toMatchObject({ details: { name: "reserved-child", queued: false } });
+    expect(harness.runReadAgentInProcess.mock.calls.filter((call) => call[1].name === "reserved-child")).toHaveLength(1);
   });
 });

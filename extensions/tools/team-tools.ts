@@ -15,7 +15,13 @@ import type { Member } from "../../src/utils/models";
 import type { RunningReadAgent } from "../runtime/types";
 import type { ReadAgentTeardownResult } from "../agents/read-agent-session-lifecycle";
 import type { ShutdownTeammateOptions } from "../team/lifecycle";
-import { onLifecycleTombstoneCleared, readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
+import {
+  onLifecycleTombstoneCleared,
+  readLifecycleTombstone,
+  withLifecycleTombstoneLock,
+  type LifecycleTombstoneLock,
+} from "../../src/utils/lifecycle-tombstone";
+import { isEligibleNestedReadParent, NESTED_READ_MODEL_SLOTS, type NestedReadModelSlot } from "../runtime/nested-read-agents";
 
 export const CHILD_AGENT_LIFECYCLE_PROBE = "pi-extended-teams:child-agent-lifecycle-probe";
 
@@ -43,6 +49,28 @@ export interface TeamToolsOptions {
   setSessionCtx?(ctx: any): void;
 }
 
+export interface NestedReadAgentToolBinding {
+  teamName: string;
+  parent: Member;
+  parentRunId: string;
+  outerCtx: any;
+}
+
+export interface TeamToolsRuntime {
+  createNestedReadAgentTools(binding: NestedReadAgentToolBinding): any[];
+}
+
+interface SpawnTeammateOptions {
+  once?: boolean;
+  nestedParent?: {
+    teamName: string;
+    name: string;
+    lifecycleRunId: string;
+    cwd: string;
+  };
+  allowNestedReadAgents?: boolean;
+}
+
 interface QueuedReadSpawn {
   id: string;
   teamName: string;
@@ -52,10 +80,13 @@ interface QueuedReadSpawn {
   resolved: ReturnType<typeof resolveModel>;
   ctx: any;
   requestedAt: number;
+  nameReservationId?: string;
 }
 
-export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
-  if (options.isTeammate) return;
+export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamToolsRuntime {
+  if (options.isTeammate) {
+    return { createNestedReadAgentTools: () => [] };
+  }
 
   function emitOrchestrationResponse(requestId: string | undefined, type: string, payload: Record<string, any>): void {
     if (!requestId) return;
@@ -96,6 +127,21 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     const slot = requireSpawnLevel(params, context);
     const settings = loadSettings({ projectDir: params.cwd || ctx.cwd });
     return requireFavoriteModelLevel(settings, slot).model;
+  }
+
+  function requireNestedReadSpawnLevel(params: any, context: string): NestedReadModelSlot {
+    rejectDirectModelSelection(params, context);
+    if (!NESTED_READ_MODEL_SLOTS.includes(params?.model_slot)) {
+      throw new Error(`${context} requires a canonical read-* model_slot: ${NESTED_READ_MODEL_SLOTS.join(", ")}.`);
+    }
+    return params.model_slot;
+  }
+
+  function rejectUnexpectedNestedParams(params: any, allowed: readonly string[], context: string): void {
+    const unexpected = Object.keys(params || {}).filter((key) => !allowed.includes(key));
+    if (unexpected.length > 0) {
+      throw new Error(`${context} accepts only ${allowed.join(", ")}; do not pass ${unexpected.join(", ")}.`);
+    }
   }
 
   function mergeSwarmAgentParams(defaults: any = {}, agent: any = {}): any {
@@ -159,6 +205,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
   const queuedReadSpawnsByTeam = new Map<string, QueuedReadSpawn[]>();
   const readQueueDrainingTeams = new Set<string>();
   const readAdmissionReservationsByTeam = new Map<string, Map<string, number>>();
+  const nestedReadNameReservationsByTeam = new Map<string, Map<string, string>>();
 
   function activeAgentCount(teamName: string, role?: string): number {
     let count = 0;
@@ -191,6 +238,25 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     if (count > 1) reservations.set(key, count - 1);
     else reservations.delete(key);
     if (reservations.size === 0) readAdmissionReservationsByTeam.delete(teamName);
+  }
+
+  function reserveNestedReadName(teamName: string, name: string): string {
+    const reservations = nestedReadNameReservationsByTeam.get(teamName) ?? new Map<string, string>();
+    if (reservations.has(name)) {
+      throw new Error(`Nested read agent ${name} is already active or queued; nested delegation cannot replace an existing run.`);
+    }
+    const reservationId = crypto.randomUUID();
+    reservations.set(name, reservationId);
+    nestedReadNameReservationsByTeam.set(teamName, reservations);
+    return reservationId;
+  }
+
+  function releaseNestedReadName(teamName: string, name: string, reservationId?: string): void {
+    if (!reservationId) return;
+    const reservations = nestedReadNameReservationsByTeam.get(teamName);
+    if (reservations?.get(name) !== reservationId) return;
+    reservations.delete(name);
+    if (reservations.size === 0) nestedReadNameReservationsByTeam.delete(teamName);
   }
 
   function readQueue(teamName: string): QueuedReadSpawn[] {
@@ -228,11 +294,23 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     return readQueue(teamName).find((queued) => queued.member.name === params.name || memberMatchesOperation(queued.member, params));
   }
 
+  function removeQueuedReadSpawnById(teamName: string, id: string): QueuedReadSpawn | undefined {
+    const queue = readQueue(teamName);
+    const removed = queue.find((queued) => queued.id === id);
+    if (!removed) return undefined;
+    setReadQueue(teamName, queue.filter((queued) => queued.id !== id));
+    releaseNestedReadName(teamName, removed.member.name, removed.nameReservationId);
+    return removed;
+  }
+
   function removeQueuedReadSpawnsByName(teamName: string, name: string): QueuedReadSpawn[] {
     const queue = readQueue(teamName);
     const removed = queue.filter((queued) => queued.member.name === name);
     if (removed.length === 0) return [];
     setReadQueue(teamName, queue.filter((queued) => queued.member.name !== name));
+    for (const queued of removed) {
+      releaseNestedReadName(teamName, queued.member.name, queued.nameReservationId);
+    }
     return removed;
   }
 
@@ -246,12 +324,151 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     });
   }
 
-  async function startReadAgentMember(teamName: string, member: Member, prompt: string, ctx: any): Promise<void> {
+  function assertNestedParentRuntimeActive(
+    teamName: string,
+    parentName: string,
+    parentLifecycleRunId: string
+  ): RunningReadAgent {
+    const parentStateKey = options.readAgentKey(teamName, parentName);
+    const parentState = options.runningReadAgents.get(parentStateKey);
+    const closingTeardownStates = new Set(["stopping", "quarantined", "persistence_failed", "finalized"]);
+    if (!parentState
+      || !options.isCurrentReadAgentRun(parentStateKey, parentState)
+      || parentState.runId !== parentLifecycleRunId
+      || parentState.messageDeliveryClosed === true
+      || parentState.persistedRecipientClosed === true
+      || parentState.status === "finishing"
+      || parentState.stopRequested
+      || (parentState.teardownState !== undefined && closingTeardownStates.has(parentState.teardownState))) {
+      throw new Error(`Nested read spawning is no longer authorized for ${parentName}: the bound parent lifecycle is not active.`);
+    }
+    return parentState;
+  }
+
+  async function assertNestedParentAuthorized(
+    teamName: string,
+    parentName: string,
+    parentLifecycleRunId: string,
+    parentCwd: string,
+    lifecycleLock?: LifecycleTombstoneLock
+  ): Promise<Member> {
+    const initialFence = lifecycleLock?.read() ?? await readLifecycleTombstone(teamName, parentName);
+    if (initialFence.status !== "absent") {
+      throw new Error(`Nested read spawning is no longer authorized for ${parentName}: the bound parent lifecycle is not active.`);
+    }
+    const initialParentState = assertNestedParentRuntimeActive(teamName, parentName, parentLifecycleRunId);
+
+    const config = await teams.readConfig(teamName);
+    const persistedParent = config.members.find((candidate) => candidate.name === parentName);
+    const finalFence = lifecycleLock?.read() ?? await readLifecycleTombstone(teamName, parentName);
+    const finalParentState = assertNestedParentRuntimeActive(teamName, parentName, parentLifecycleRunId);
+    if (finalFence.status !== "absent" || finalParentState !== initialParentState) {
+      throw new Error(`Nested read spawning is no longer authorized for ${parentName}: the bound parent lifecycle is not active.`);
+    }
+    if (!persistedParent
+      || persistedParent.lifecycleRunId !== parentLifecycleRunId
+      || persistedParent.cwd !== parentCwd
+      || persistedParent.isActive === false
+      || !isEligibleNestedReadParent(persistedParent)) {
+      throw new Error(`Nested read spawning is not authorized for ${parentName}: the persisted parent policy or provenance does not match.`);
+    }
+    return persistedParent;
+  }
+
+  async function assertNestedChildAdmission(
+    teamName: string,
+    child: Member,
+    lifecycleLock?: LifecycleTombstoneLock
+  ): Promise<void> {
+    if (child.role !== "read"
+      || child.delegationDepth !== 1
+      || child.helperKind !== "read_helper"
+      || child.allowNestedReadAgents !== false
+      || !child.parentAgentName
+      || !child.parentLifecycleRunId
+      || child.requestedBy !== child.parentAgentName
+      || !NESTED_READ_MODEL_SLOTS.includes(child.modelSlot as NestedReadModelSlot)) {
+      throw new Error(`Nested read agent ${child.name} is missing runtime-owned read-only policy or parent provenance.`);
+    }
+    await assertNestedParentAuthorized(
+      teamName,
+      child.parentAgentName,
+      child.parentLifecycleRunId,
+      child.cwd,
+      lifecycleLock
+    );
+  }
+
+  async function rollbackNestedChildAdmission(teamName: string, member: Member, cause: unknown): Promise<never> {
+    const runId = member.lifecycleRunId;
+    if (!runId) throw cause;
+    try {
+      const removed = await teams.removeMemberMatchingRun(teamName, member.name, runId);
+      if (!removed) throw new Error(`matching child run ${runId} was not present`);
+    } catch (rollbackError) {
+      const causeMessage = cause instanceof Error ? cause.message : String(cause);
+      const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+      throw new Error(`${causeMessage} Exact-run rollback for nested read agent ${member.name} failed: ${rollbackMessage}`);
+    }
+    throw cause;
+  }
+
+  async function admitAndLaunchReadAgentMember(
+    teamName: string,
+    member: Member,
+    prompt: string,
+    ctx: any
+  ): Promise<{ launch: Promise<void> | void }> {
+    const addValidateAndLaunch = async (parentLifecycleLock?: LifecycleTombstoneLock): Promise<{ launch: Promise<void> | void }> => {
+      if (member.delegationDepth === 1) {
+        await assertNestedChildAdmission(teamName, member, parentLifecycleLock);
+      }
+      await teams.addMember(teamName, member);
+      if (member.delegationDepth === 1) {
+        try {
+          await assertNestedChildAdmission(teamName, member, parentLifecycleLock);
+        } catch (error) {
+          return rollbackNestedChildAdmission(teamName, member, error);
+        }
+      }
+
+      try {
+        return {
+          launch: options.runReadAgentInProcess(teamName, member, prompt, ctx, options.readAgentOptions()),
+        };
+      } catch (error) {
+        if (member.delegationDepth === 1) {
+          return rollbackNestedChildAdmission(teamName, member, error);
+        }
+        throw error;
+      }
+    };
+
+    if (member.delegationDepth !== 1 || !member.parentAgentName) {
+      return addValidateAndLaunch();
+    }
+    return withLifecycleTombstoneLock(teamName, member.parentAgentName, async parentLifecycleLock => {
+      return addValidateAndLaunch(parentLifecycleLock);
+    });
+  }
+
+  async function startReadAgentMember(
+    teamName: string,
+    member: Member,
+    prompt: string,
+    ctx: any,
+    nameReservationId?: string,
+    releaseNameOnFailure = true
+  ): Promise<void> {
     const key = options.readAgentKey(teamName, member.name);
     const reservesReadCapacity = (member.role || "read") === "read";
     if (reservesReadCapacity) reserveReadAdmission(teamName, key);
 
+    const releaseNameReservation = () => {
+      releaseNestedReadName(teamName, member.name, nameReservationId);
+    };
     const releaseReservationAndDrain = () => {
+      if (releaseNameOnFailure) releaseNameReservation();
       if (reservesReadCapacity) releaseReadAdmission(teamName, key);
       void drainQueuedReadSpawns(teamName);
     };
@@ -271,34 +488,53 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     };
 
     try {
-      await teams.addMember(teamName, member);
-    } catch (error) {
-      releaseReservationAndDrain();
-      throw error;
-    }
-
-    try {
-      const result = options.runReadAgentInProcess(teamName, member, prompt, ctx, options.readAgentOptions());
-      void Promise.resolve(result).then(drainAfterRun, drainAfterRun);
+      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx);
+      releaseNameReservation();
+      void Promise.resolve(admitted.launch).then(drainAfterRun, drainAfterRun);
     } catch (error) {
       releaseReservationAndDrain();
       throw error;
     }
   }
 
-  function enqueueReadSpawn(teamName: string, member: Member, prompt: string, params: any, resolved: ReturnType<typeof resolveModel>, ctx: any): QueuedReadSpawn {
-    const queued: QueuedReadSpawn = {
-      id: crypto.randomUUID(),
-      teamName,
-      member,
-      prompt,
-      params,
-      resolved,
-      ctx,
-      requestedAt: Date.now(),
+  async function enqueueReadSpawn(
+    teamName: string,
+    member: Member,
+    prompt: string,
+    params: any,
+    resolved: ReturnType<typeof resolveModel>,
+    ctx: any,
+    nameReservationId?: string
+  ): Promise<QueuedReadSpawn> {
+    const append = (): QueuedReadSpawn => {
+      const queue = readQueue(teamName);
+      if (queue.some((queued) => queued.member.name === member.name)) {
+        throw new Error(`Nested read agent ${member.name} is already active or queued; nested delegation cannot replace an existing run.`);
+      }
+      const queued: QueuedReadSpawn = {
+        id: crypto.randomUUID(),
+        teamName,
+        member,
+        prompt,
+        params,
+        resolved,
+        ctx,
+        requestedAt: Date.now(),
+        nameReservationId,
+      };
+      setReadQueue(teamName, [...queue, queued]);
+      return queued;
     };
-    setReadQueue(teamName, [...readQueue(teamName), queued]);
-    return queued;
+
+    if (member.delegationDepth !== 1 || !member.parentAgentName) return append();
+    return withLifecycleTombstoneLock(teamName, member.parentAgentName, async parentLifecycleLock => {
+      await assertNestedChildAdmission(teamName, member, parentLifecycleLock);
+      const currentConfig = await teams.readConfig(teamName);
+      if (currentConfig.members.some((candidate) => candidate.name === member.name)) {
+        throw new Error(`Nested read agent ${member.name} is already active or queued; nested delegation cannot replace an existing run.`);
+      }
+      return append();
+    });
   }
 
   async function drainQueuedReadSpawns(teamName: string): Promise<void> {
@@ -311,20 +547,26 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
         const settings = loadSettings({ projectDir: next.member.cwd });
         if (activeReadCount(teamName) >= settings.readAgents.maxConcurrent) return;
 
-        const queue = readQueue(teamName);
-        const queued = queue[0];
+        const queued = readQueue(teamName)[0];
         if (!queued) return;
         const fence = await readLifecycleTombstone(teamName, queued.member.name);
         if (fence.status !== "absent") return;
         try {
           const config = await teams.readConfig(teamName);
           if (config.members.some((member) => member.name === queued.member.name)) {
-            setReadQueue(teamName, queue.slice(1));
+            removeQueuedReadSpawnById(teamName, queued.id);
             continue;
           }
           queued.member.joinedAt = Date.now();
-          await startReadAgentMember(teamName, queued.member, queued.prompt, queued.ctx);
-          setReadQueue(teamName, queue.slice(1));
+          await startReadAgentMember(
+            teamName,
+            queued.member,
+            queued.prompt,
+            queued.ctx,
+            queued.nameReservationId,
+            false
+          );
+          removeQueuedReadSpawnById(teamName, queued.id);
         } catch (error) {
           const latestFence = await readLifecycleTombstone(teamName, queued.member.name);
           if (latestFence.status !== "absent") {
@@ -339,7 +581,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
             return;
           }
           // Invalid non-lifecycle requests may be dropped so later work can run.
-          setReadQueue(teamName, queue.slice(1));
+          removeQueuedReadSpawnById(teamName, queued.id);
         }
       }
     } finally {
@@ -367,12 +609,40 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     return sessionName;
   }
 
-  async function spawnTeammate(params: any, ctx: any, spawnOptions: { once?: boolean } = {}): Promise<{ content: any[]; details: any }> {
+  async function spawnTeammate(params: any, ctx: any, spawnOptions: SpawnTeammateOptions = {}): Promise<{ content: any[]; details: any }> {
     const safeName = paths.sanitizeName(params.name);
     const safeTeamName = paths.sanitizeName(params.team_name);
     const cwd = params.cwd || ctx.cwd;
     const teamConfig = await teams.readConfig(safeTeamName);
+    let nestedNameReservationId: string | undefined;
+    let nestedNameReservationTransferred = false;
 
+    if (spawnOptions.nestedParent) {
+      rejectUnexpectedNestedParams(params, ["name", "prompt", "model_slot", "team_name", "cwd"], `Nested read agent ${safeName}`);
+      requireNestedReadSpawnLevel(params, `Nested read agent ${safeName}`);
+      if (safeTeamName !== spawnOptions.nestedParent.teamName || params.team_name !== spawnOptions.nestedParent.teamName) {
+        throw new Error("Nested read agents must remain in the bound parent team.");
+      }
+      if (cwd !== spawnOptions.nestedParent.cwd || params.cwd !== spawnOptions.nestedParent.cwd) {
+        throw new Error("Nested read agents must use the bound parent cwd.");
+      }
+      await assertNestedParentAuthorized(
+        safeTeamName,
+        spawnOptions.nestedParent.name,
+        spawnOptions.nestedParent.lifecycleRunId,
+        spawnOptions.nestedParent.cwd
+      );
+
+      const activeDuplicate = teamConfig.members.find((candidate) => candidate.name === safeName);
+      const queuedReadDuplicate = findQueuedReadSpawn(safeTeamName, { name: safeName });
+      const queuedWriteDuplicate = await writeQueue.findQueuedWriteSpawn(safeTeamName, { name: safeName });
+      if (activeDuplicate || queuedReadDuplicate || queuedWriteDuplicate) {
+        throw new Error(`Nested read agent ${safeName} is already active or queued; nested delegation cannot replace an existing run.`);
+      }
+      nestedNameReservationId = reserveNestedReadName(safeTeamName, safeName);
+    }
+
+    try {
     if (spawnOptions.once) {
       const existingOnceMember = teamConfig.members.find(m => m.agentType === "teammate" && (m.name === safeName || memberMatchesOperation(m, params)));
       if (existingOnceMember) {
@@ -438,7 +708,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     }
 
     const settings = loadSettings({ projectDir: cwd });
-    const modelSlot = requireSpawnLevel(params, `Agent ${safeName}`);
+    const modelSlot = spawnOptions.nestedParent
+      ? requireNestedReadSpawnLevel(params, `Nested read agent ${safeName}`)
+      : requireSpawnLevel(params, `Agent ${safeName}`);
     const role: AgentRole = roleForFavoriteModelSlot(modelSlot);
     const requestedLevel = requireFavoriteModelLevel(settings, modelSlot);
     const requestedFavoriteModel = requestedLevel.model;
@@ -479,16 +751,31 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       thinking: chosenThinking,
       planModeRequired: params.plan_mode_required,
       metadata: operationMetadataFromParams(params),
+      delegationDepth: spawnOptions.nestedParent ? 1 : 0,
+      allowNestedReadAgents: !spawnOptions.nestedParent && spawnOptions.allowNestedReadAgents === true,
+      parentAgentName: spawnOptions.nestedParent?.name,
+      parentLifecycleRunId: spawnOptions.nestedParent?.lifecycleRunId,
+      requestedBy: spawnOptions.nestedParent?.name,
+      helperKind: spawnOptions.nestedParent ? "read_helper" : undefined,
     };
 
     if (role === "read") {
-      removeQueuedReadSpawnsByName(safeTeamName, safeName);
+      if (!spawnOptions.nestedParent) removeQueuedReadSpawnsByName(safeTeamName, safeName);
       const currentReadCount = activeReadCount(safeTeamName);
       if (currentReadCount >= settings.readAgents.maxConcurrent) {
         if (!settings.readAgents.queueOverflow) {
           throw new Error(`Read-agent capacity reached (${currentReadCount}/${settings.readAgents.maxConcurrent}) and queueOverflow is disabled.`);
         }
-        const queued = enqueueReadSpawn(safeTeamName, member, params.prompt, params, resolved, ctx);
+        const queued = await enqueueReadSpawn(
+          safeTeamName,
+          member,
+          params.prompt,
+          params,
+          resolved,
+          ctx,
+          nestedNameReservationId
+        );
+        nestedNameReservationTransferred = !!nestedNameReservationId;
         const queuePosition = readQueue(safeTeamName).findIndex((item) => item.id === queued.id) + 1;
         return {
           content: [{ type: "text", text: `Read teammate ${params.name} queued at position ${queuePosition}; capacity is ${currentReadCount}/${settings.readAgents.maxConcurrent}.` }],
@@ -496,7 +783,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
         };
       }
 
-      await startReadAgentMember(safeTeamName, member, params.prompt, ctx);
+      await startReadAgentMember(safeTeamName, member, params.prompt, ctx, nestedNameReservationId);
       return {
         content: [{ type: "text", text: `Read teammate ${params.name} started in-process.` }],
         details: spawnResolutionDetails(member, params, resolved, { mode: "in-process", terminalId: null, queued: false }),
@@ -547,6 +834,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       content: [{ type: "text", text: `Edit agent ${params.name} started in-process and is followable from Pi.${debugSuffix}` }],
       details: spawnResolutionDetails(member, params, resolved, { mode: "in-process", terminalId: null, queued: false, debugLogPath }),
     };
+    } finally {
+      if (!nestedNameReservationTransferred) {
+        releaseNestedReadName(safeTeamName, safeName, nestedNameReservationId);
+      }
+    }
   }
 
   pi.events?.on?.("pi-extended-teams:orchestration-request", async (payload: any) => {
@@ -611,6 +903,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     prompt: Type.String({ description: "The agent's assignment and report shape." }),
     cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead session cwd." })),
     metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
+    allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Opt in eligible depth-0 write-feature/write-critical agents to restricted read-only child spawning.", default: false })),
   };
   const publicAgentParams = {
     ...publicAgentBaseParams,
@@ -637,12 +930,115 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
       ...params,
       name,
       team_name: sessionName,
-    }, ctx);
+    }, ctx, { allowNestedReadAgents: params.allow_nested_read_agents === true });
 
     return {
       content: [{ type: "text", text: `Agent ${name} started (${result.details.role}, ${result.details.mode || "in-process"}).` }],
       details: { ...result.details, name, session: sessionName },
     };
+  }
+
+  const nestedReadAgentParams = {
+    name: Type.Optional(Type.String({ description: "Stable child name. Defaults to a generated name." })),
+    prompt: Type.String({ description: "Read-only assignment and required report shape." }),
+    model_slot: StringEnum(NESTED_READ_MODEL_SLOTS, { description: "Required canonical read-* intent tier." }),
+  };
+  const nestedSwarmAgentParams = {
+    name: Type.Optional(Type.String({ description: "Stable child name. Defaults to a generated name." })),
+    prompt: Type.String({ description: "Read-only assignment and required report shape." }),
+    model_slot: Type.Optional(StringEnum(NESTED_READ_MODEL_SLOTS, { description: "Canonical read-* tier, or inherit defaults.model_slot." })),
+  };
+
+  async function spawnNestedReadAgent(
+    params: any,
+    binding: NestedReadAgentToolBinding,
+    context = "spawn_agent"
+  ): Promise<{ content: any[]; details: any }> {
+    rejectUnexpectedNestedParams(params, ["name", "prompt", "model_slot"], context);
+    requireNestedReadSpawnLevel(params, context);
+    await assertNestedParentAuthorized(binding.teamName, binding.parent.name, binding.parentRunId, binding.parent.cwd);
+    const name = params.name || generatedAgentName();
+    const result = await spawnTeammate({
+      name,
+      prompt: params.prompt,
+      model_slot: params.model_slot,
+      team_name: binding.teamName,
+      cwd: binding.parent.cwd,
+    }, binding.outerCtx, {
+      nestedParent: {
+        teamName: binding.teamName,
+        name: binding.parent.name,
+        lifecycleRunId: binding.parentRunId,
+        cwd: binding.parent.cwd,
+      },
+    });
+    return {
+      content: result.content,
+      details: { ...result.details, name, session: binding.teamName },
+    };
+  }
+
+  function createNestedReadAgentTools(binding: NestedReadAgentToolBinding): any[] {
+    if (!isEligibleNestedReadParent(binding.parent)
+      || binding.parent.lifecycleRunId !== binding.parentRunId
+      || binding.parent.delegationDepth !== 0) {
+      return [];
+    }
+
+    return [
+      {
+        name: "spawn_agent",
+        label: "Spawn Read Agent",
+        description: "Spawn one depth-1 read-only child in this writer's team and cwd. Only canonical read-* model_slot values are accepted. The child reports back to this writer and cannot delegate.",
+        parameters: Type.Object(nestedReadAgentParams),
+        async execute(_toolCallId: string, params: any) {
+          return spawnNestedReadAgent(params, binding);
+        },
+      },
+      {
+        name: "spawn_swarm_agents",
+        label: "Spawn Read Swarm Agents",
+        description: "Spawn any number of depth-1 read-only children in this writer's team and cwd, subject to the team's global read capacity and queue. Children report back to this writer and cannot delegate.",
+        parameters: Type.Object({
+          defaults: Type.Optional(Type.Object({
+            model_slot: Type.Optional(StringEnum(NESTED_READ_MODEL_SLOTS, { description: "Shared canonical read-* tier." })),
+          })),
+          agents: Type.Array(Type.Object(nestedSwarmAgentParams), { description: "Read-only child assignments." }),
+        }),
+        async execute(_toolCallId: string, params: any) {
+          rejectUnexpectedNestedParams(params, ["defaults", "agents"], "spawn_swarm_agents");
+          rejectUnexpectedNestedParams(params.defaults || {}, ["model_slot"], "spawn_swarm_agents defaults");
+          if (!Array.isArray(params.agents) || params.agents.length === 0) {
+            throw new Error("spawn_swarm_agents requires at least one read-only child.");
+          }
+          const mergedAgents = params.agents.map((agent: any, index: number) => {
+            rejectUnexpectedNestedParams(agent, ["name", "prompt", "model_slot"], `spawn_swarm_agents agent ${index + 1}`);
+            const merged = mergeSwarmAgentParams(params.defaults || {}, agent);
+            requireNestedReadSpawnLevel(merged, `spawn_swarm_agents agent ${merged.name || index + 1}`);
+            return merged;
+          });
+          await assertNestedParentAuthorized(binding.teamName, binding.parent.name, binding.parentRunId, binding.parent.cwd);
+
+          const spawned: any[] = [];
+          const failed: Array<{ name: string; error: string }> = [];
+          for (let index = 0; index < mergedAgents.length; index += 1) {
+            const merged = mergedAgents[index];
+            const name = merged.name || generatedAgentName(index);
+            try {
+              const result = await spawnNestedReadAgent({ ...merged, name }, binding, `spawn_swarm_agents agent ${name}`);
+              spawned.push({ ...result.details, name });
+            } catch (error) {
+              failed.push({ name, error: error instanceof Error ? error.message : String(error) });
+            }
+          }
+
+          const lines = [`Spawned ${spawned.length}/${params.agents.length} nested read agents.`];
+          for (const item of spawned) lines.push(`- ${item.name}: ${item.queued ? "queued" : "started"}`);
+          for (const item of failed) lines.push(`- ${item.name}: failed — ${item.error}`);
+          return { content: [{ type: "text", text: lines.join("\n") }], details: { session: binding.teamName, spawned, failed } };
+        },
+      },
+    ];
   }
 
   pi.registerTool({
@@ -664,6 +1060,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
         cwd: Type.Optional(Type.String()),
         model_slot: Type.Optional(StringEnum(ACCEPTED_FAVORITE_MODEL_SLOTS, { description: levelDescription })),
         metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
+        allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Shared opt-in for eligible depth-0 write-feature/write-critical agents.", default: false })),
       })),
       agents: Type.Array(Type.Object(publicSwarmAgentParams), { description: "Agents to spawn as one batch. Each one must have model_slot directly or inherit it from defaults." }),
     }),
@@ -689,7 +1086,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
             ...merged,
             name,
             team_name: sessionName,
-          }, ctx);
+          }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true });
           spawned.push({ ...result.details, name });
         } catch (error) {
           failed.push({ name, error: error instanceof Error ? error.message : String(error) });
@@ -703,4 +1100,5 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): void {
     },
   });
 
+  return { createNestedReadAgentTools };
 }

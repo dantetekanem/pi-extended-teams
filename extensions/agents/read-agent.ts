@@ -19,6 +19,8 @@ import {
   type SpawnResourcePlan,
 } from "../resources/spawn-resource-plan";
 import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
+import { isEligibleNestedReadParent, NESTED_DELEGATION_TOOL_NAMES } from "../runtime/nested-read-agents";
+import type { NestedReadAgentToolBinding } from "../tools/team-tools";
 import {
   closeReadAgentMessageDelivery,
   enqueueReadAgentMessageDelivery,
@@ -52,6 +54,7 @@ export interface RunReadAgentOptions {
   deliverMessageToActiveAgent?(teamName: string, recipient: string, content: string): Promise<boolean>;
   createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
   extensionInstanceId?: string;
+  createNestedReadAgentTools?(binding: NestedReadAgentToolBinding): any[];
 }
 
 function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
@@ -604,6 +607,15 @@ export async function runReadAgentInProcess(
     const childSettingsManager = createSettingsManager(member.cwd, agentDir, {
       projectTrusted: resourcePlan.trust.projectTrusted,
     });
+    const nestedReadAgentTools = isEligibleNestedReadParent(member)
+      ? options.createNestedReadAgentTools?.({
+          teamName: readTeamName,
+          parent: member,
+          parentRunId: state.runId,
+          outerCtx: ctx,
+        }) ?? []
+      : [];
+    const nestedReadDelegationEnabled = nestedReadAgentTools.length > 0;
     const loader = new DefaultResourceLoader({
       cwd: member.cwd,
       agentDir,
@@ -621,9 +633,15 @@ export async function runReadAgentInProcess(
           : "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
         "Use send_message for direct communication and read_inbox only when you were told a reply is waiting. Do not coordinate a peer-agent society; the lead controls orchestration.",
         "Progress reporting is required, not optional UI polish. Call report_progress before your first work tool with a concise phrase describing what you are starting. Call it again whenever you change phase or evidence source, hit a blocker, or begin synthesis; never make more than 3 work-tool calls without a fresh progress update. Use a new phrase describing what you are doing now. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.",
-        member.requestedBy
-          ? `You are a read helper requested by '${member.requestedBy}'. When finished, send your concise report to the lead and stop.`
-          : "You cannot spawn or create other agents. If another agent is needed, use send_message to ask team-lead; only the lead decides and performs the spawn.",
+        ...(member.requestedBy
+          ? [`You are a depth-1 read helper requested by '${member.requestedBy}'. Your report_and_exit deliverable goes to that requesting writer; the lead receives only a classified completion notice. You cannot delegate.`]
+          : nestedReadDelegationEnabled
+            ? [
+                "This opted-in depth-0 write-feature/write-critical run may use restricted spawn_agent or spawn_swarm_agents for depth-1 read-only helpers. Choose any canonical read-* tier and any helper count, subject to the team's global read capacity and queue. Children report to you and cannot delegate.",
+                "Use spawn_agent with only name (optional), prompt, and model_slot. Use spawn_swarm_agents with optional defaults.model_slot plus agents using only name (optional), prompt, and model_slot.",
+                "Do not request write tiers, cwd/team overrides, metadata, replacement of an active/queued name, or delegation outside your assigned scope.",
+              ]
+            : ["You cannot spawn or create other agents. If another agent is needed, use send_message to ask team-lead; only the lead decides and performs the spawn."]),
         "NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.",
         "When finished, use report_and_exit with the complete required deliverable in content and only a short label in summary, then stop. Never replace required output with a summary. Do not wait for the lead to kill you — report and exit cleanly.",
       ],
@@ -666,9 +684,11 @@ export async function runReadAgentInProcess(
     });
     const communicationToolNames = communicationTools.map(tool => tool.name);
     const communicationToolNameSet = new Set(communicationToolNames);
+    const delegationToolNameSet = new Set<string>(NESTED_DELEGATION_TOOL_NAMES);
     const extensionToolNames = loader.getExtensions().extensions.flatMap(extension => {
-      return Array.from(extension.tools.keys()).filter(name => !communicationToolNameSet.has(name));
+      return Array.from(extension.tools.keys()).filter(name => !communicationToolNameSet.has(name) && !delegationToolNameSet.has(name));
     });
+    const nestedReadAgentToolNames = nestedReadAgentTools.map(tool => tool.name);
     const activeToolNames = Array.from(new Set([
       "read",
       "bash",
@@ -679,6 +699,7 @@ export async function runReadAgentInProcess(
       "ls",
       ...extensionToolNames,
       ...communicationToolNames,
+      ...nestedReadAgentToolNames,
     ]));
 
     const { session } = await createAgentSession({
@@ -687,7 +708,7 @@ export async function runReadAgentInProcess(
       thinkingLevel: member.thinking as any,
       modelRegistry: ctx.modelRegistry,
       tools: activeToolNames,
-      customTools: communicationTools,
+      customTools: [...communicationTools, ...nestedReadAgentTools],
       resourceLoader: loader,
       settingsManager: childSettingsManager,
       sessionManager: SessionManager.inMemory(member.cwd),
@@ -736,6 +757,9 @@ export async function runReadAgentInProcess(
       ?? `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
     await deliverCompletion(report, completionSummary);
   } catch (e) {
+    const lastError = runtime.createRuntimeError(e);
+    state.lastError = lastError;
+    options.renderReadAgentStatus();
     settleSessionCreation(state.session);
     await closeRecipient();
     if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
@@ -800,7 +824,7 @@ export async function runReadAgentInProcess(
       try {
         await runtime.writeRuntimeStatus(readTeamName, member.name, state.runId, {
           lastHeartbeatAt: Date.now(),
-          lastError: runtime.createRuntimeError(e),
+          lastError,
         });
       } catch {
         // Ignore runtime cleanup races.

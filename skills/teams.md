@@ -20,6 +20,7 @@ If agents would otherwise be useful, stop and ask the user to turn off or finish
 - **The lead owns the result.** The lead retains integration, cross-lane decisions, scope tradeoffs, verification synthesis, and final acceptance. If only one substantive execution lane exists, the lead executes it.
 - **Read agents multiply genuine independent coverage.** Use them for bounded investigation, review, testing, audits, and second opinions only when each lane returns distinct useful evidence.
 - **Edit agents are optional and rare.** A writer owns exactly one isolated sub-outcome with non-overlapping files. Use `write-system` for normal complex implementation, integration, or refactoring inside that lane; reserve `write-critical` for rare high-risk security, concurrency, recovery, migration, or data-integrity work. Neither tier allows broad cross-stack ownership. Edit agents must claim files before writing and report every changed path.
+- **Nested read helpers require explicit opt-in.** Only a depth-0 `write-feature` or `write-critical` spawn with `allow_nested_read_agents: true` receives restricted read-only spawn tools. It may use any canonical `read-*` tier and any helper count subject to global capacity; children report to that writer and cannot delegate. Read agents, depth-1 children, `write-patch`, and `write-system` remain denied.
 
 ## Mandatory outcome-to-lane gate
 
@@ -78,6 +79,17 @@ spawn_agent({
 })
 ```
 
+For a bounded feature or critical writer that genuinely needs independent read evidence, the lead may explicitly opt in restricted nested helpers:
+
+```text
+spawn_agent({
+  name: "parser-feature",
+  model_slot: "write-feature",
+  allow_nested_read_agents: true,
+  prompt: "Implement the bounded parser change; delegate only independent read-only evidence lanes."
+})
+```
+
 ## Hot-word trigger: "agents"
 
 When the user says "agents", "use agents", "spawn agents", "send agents", "agents to investigate/review/test", or any phrase meaning "delegate to helpers", immediately run intake and map the requested outcomes to candidate lanes. Do not wait for the user to explain the extension mechanics, but do not invent a 2–3-agent swarm. Spawn only the genuine independent lanes the map supports. The whole request cannot be assigned as one lane, and a plan where one teammate owns every unfinished substantive outcome is invalid. If the map contains only one substantive execution lane, the lead executes it instead of spawning a replacement writer; use an agent only for a separate read-only question or review that adds distinct value. Exception: if the autoresearch conflict guard is active, spawn nothing and explain that agent delegation is disabled until autoresearch is off.
@@ -109,7 +121,7 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 Default lead tools:
 
 - `spawn_agent` — start one read or edit-allowed agent in the current Pi session using required `model_slot` level.
-- `spawn_swarm_agents` — start a batch of agents with optional shared `model_slot` defaults.
+- `spawn_swarm_agents` — start a batch of agents with optional shared `model_slot` and `allow_nested_read_agents` defaults.
 - `stop_teammate` — explicitly stop one active agent when cancellation is requested.
 - `check_teammate` — inspect one agent's health when needed.
 - `send_message` — send a direct message in the current session.
@@ -149,6 +161,7 @@ Claim docs/guide.md, update only stale public tool names, run the focused docs r
 - Start by reading your initial instructions.
 - Use `send_message` for direct communication and `read_inbox` when the extension wakes you or you expect a reply.
 - Never sleep, busy-wait, or poll.
-- You cannot spawn other agents. If another agent is needed, ask the lead with `send_message`.
+- Unless you are an explicitly opted-in depth-0 `write-feature` / `write-critical` writer, you cannot spawn other agents; ask the lead with `send_message`.
+- If opted in, use only the restricted spawn tools for depth-1 read helpers within your lane. Any canonical `read-*` tier and helper count is allowed subject to global capacity; children report to you and cannot delegate.
 - Read agents: investigate, report, and stop.
 - Edit agents: claim files before editing, release claims when done, and call `report_and_exit` with your final report.

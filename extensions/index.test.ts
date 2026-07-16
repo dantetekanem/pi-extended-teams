@@ -728,6 +728,288 @@ describe("extension integration", () => {
     }
   });
 
+  it("adds active depth-1 read helper counts to writer rows without changing global counts", async () => {
+    const setup = await setupExtension();
+    try {
+      const runtime = await import("../src/utils/runtime.js");
+      let writerState: any;
+      let activeHelperState: any;
+      let runningAgents!: Map<string, any>;
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        runningAgents = options.runningReadAgents;
+        const state = {
+          runId: member.lifecycleRunId,
+          name: member.name,
+          teamName,
+          startedAt: Date.now() - 1_000,
+          tokensUsed: 25,
+          status: "working",
+          recentEvents: [],
+          lastActivityAt: Date.now(),
+          role: member.role,
+          model: member.model,
+          thinking: member.thinking,
+          modelSlot: member.modelSlot,
+          latestProgress: "Implementing parent work",
+          session: { getSessionStats: () => ({ tokens: { total: 25 } }) },
+        };
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), state);
+        if (member.name === "writer") writerState = state;
+      });
+
+      const ctx = makeCtx(setup.root, "nested-helper-activity-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "writer",
+        prompt: "Implement a bounded feature",
+        cwd: setup.root,
+        model_slot: "write-critical",
+        allow_nested_read_agents: true,
+      }, new AbortController().signal, undefined, ctx);
+
+      const teamName = "session-nested-helper-activity-session";
+      const writer = (await setup.teams.readConfig(teamName)).members.find((member: any) => member.name === "writer")!;
+      const helperBase = {
+        agentType: "teammate",
+        role: "read" as const,
+        model: "provider/model",
+        thinking: "high" as const,
+        modelSlot: "read-review",
+        joinedAt: Date.now() - 500,
+        tmuxPaneId: "",
+        cwd: setup.root,
+        subscriptions: [],
+        delegationDepth: 1,
+        allowNestedReadAgents: false,
+        parentAgentName: "writer",
+        parentLifecycleRunId: writer.lifecycleRunId,
+        requestedBy: "writer",
+        helperKind: "read_helper" as const,
+      };
+      const activeHelper: any = { ...helperBase, agentId: "active-helper@team", name: "active-helper" };
+      const runtimeHelper: any = { ...helperBase, agentId: "runtime-helper@team", name: "runtime-helper" };
+      const completedHelper: any = { ...helperBase, agentId: "completed-helper@team", name: "completed-helper", isActive: false };
+      await setup.teams.addMember(teamName, activeHelper);
+      await setup.teams.addMember(teamName, runtimeHelper);
+      await setup.teams.addMember(teamName, completedHelper);
+
+      activeHelperState = {
+        runId: activeHelper.lifecycleRunId,
+        name: activeHelper.name,
+        teamName,
+        startedAt: Date.now() - 500,
+        tokensUsed: 5,
+        status: "working",
+        recentEvents: [],
+        lastActivityAt: Date.now(),
+        role: "read",
+        model: activeHelper.model,
+        thinking: activeHelper.thinking,
+        modelSlot: activeHelper.modelSlot,
+        session: { getSessionStats: () => ({ tokens: { total: 5 } }) },
+      };
+      runningAgents.set(`${teamName}:${activeHelper.name}`, activeHelperState);
+      await runtime.writeRuntimeStatus(teamName, runtimeHelper.name, runtimeHelper.lifecycleRunId!, {
+        ready: true,
+        startedAt: Date.now() - 500,
+        lastHeartbeatAt: Date.now(),
+        currentAction: "working",
+        tokensUsed: 7,
+      });
+
+      await vi.advanceTimersByTimeAsync(1_200);
+      const widgetCall = [...ctx.ui.setWidget.mock.calls]
+        .reverse()
+        .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      const widget = widgetCall![1]({ requestRender: vi.fn() });
+      const activeRendered = widget.render(180).join("\n");
+      expect(activeRendered).toContain("3 active · 2 read · 1 write");
+      expect(activeRendered).toMatch(/\(writer\) model\/xhigh · \+2 · write-critical · .* · 25 tok · Implementing parent work\.{1,3}/);
+      expect(activeRendered).not.toContain("completed-helper");
+
+      // Failed helpers remain in their live runner/runtime records until async
+      // teardown, but must stop contributing to the parent's helper suffix.
+      activeHelperState.lastError = { message: "local helper failed", timestamp: Date.now() };
+      await runtime.writeRuntimeStatus(teamName, runtimeHelper.name, runtimeHelper.lifecycleRunId!, {
+        lastHeartbeatAt: Date.now(),
+        lastError: { message: "runtime helper failed", timestamp: Date.now() },
+      });
+      await vi.advanceTimersByTimeAsync(1_200);
+      const failedRendered = widget.render(180).join("\n");
+      expect(failedRendered).toContain("3 active · 2 read · 1 write");
+      expect(failedRendered).not.toContain("(writer) model/xhigh · +");
+
+      activeHelperState.teardownState = "finalized";
+      await runtime.writeRuntimeStatus(teamName, runtimeHelper.name, runtimeHelper.lifecycleRunId!, {
+        lastHeartbeatAt: Date.now() - runtime.HEARTBEAT_STALE_MS - 1,
+      });
+      writerState.latestProgress = undefined;
+      await vi.advanceTimersByTimeAsync(1_200);
+
+      const finishedRendered = widget.render(180).join("\n");
+      expect(finishedRendered).toContain("1 active · 1 write");
+      expect(finishedRendered).not.toContain(" read");
+      expect(finishedRendered).not.toContain("(writer) +");
+      expect(finishedRendered).not.toContain("active-helper");
+      expect(finishedRendered).not.toContain("runtime-helper");
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("removes a failed helper suffix while a real rejected-prompt run remains live for delivery", async () => {
+    const setup = await setupExtension();
+    try {
+      let writerState: any;
+      let runningAgents!: Map<string, any>;
+      let readAgentOptions: any;
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        runningAgents = options.runningReadAgents;
+        readAgentOptions = options;
+        writerState = {
+          runId: member.lifecycleRunId,
+          name: member.name,
+          teamName,
+          startedAt: Date.now() - 1_000,
+          tokensUsed: 25,
+          status: "working",
+          recentEvents: [],
+          lastActivityAt: Date.now(),
+          role: member.role,
+          model: member.model,
+          thinking: member.thinking,
+          modelSlot: member.modelSlot,
+          latestProgress: "Implementing parent work",
+          session: { getSessionStats: () => ({ tokens: { total: 25 } }) },
+        };
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), writerState);
+      });
+
+      const ctx = makeCtx(setup.root, "real-helper-failure-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "writer",
+        prompt: "Implement a bounded feature",
+        cwd: setup.root,
+        model_slot: "write-critical",
+        allow_nested_read_agents: true,
+      }, new AbortController().signal, undefined, ctx);
+
+      const teamName = "session-real-helper-failure-session";
+      const writer = (await setup.teams.readConfig(teamName)).members.find((member: any) => member.name === "writer")!;
+      const helper: any = {
+        agentId: `failing-helper@${teamName}`,
+        name: "failing-helper",
+        agentType: "teammate",
+        role: "read",
+        model: "provider/model",
+        thinking: "high",
+        modelSlot: "read-review",
+        joinedAt: Date.now(),
+        tmuxPaneId: "",
+        cwd: setup.root,
+        subscriptions: [],
+        delegationDepth: 1,
+        allowNestedReadAgents: false,
+        parentAgentName: "writer",
+        parentLifecycleRunId: writer.lifecycleRunId,
+        requestedBy: "writer",
+        helperKind: "read_helper",
+      };
+      await setup.teams.addMember(teamName, helper);
+
+      let markPromptStarted!: () => void;
+      const promptStarted = new Promise<void>((resolve) => { markPromptStarted = resolve; });
+      let rejectPrompt!: (error: Error) => void;
+      const promptGate = new Promise<void>((_resolve, reject) => { rejectPrompt = reject; });
+      const session = {
+        messages: [],
+        getSessionStats: vi.fn(() => ({ tokens: { total: 5 }, cost: 0 })),
+        subscribe: vi.fn(),
+        prompt: vi.fn(() => {
+          markPromptStarted();
+          return promptGate;
+        }),
+        bindExtensions: vi.fn(async () => {}),
+        sendUserMessage: vi.fn(async () => {}),
+        isStreaming: true,
+        hasExtensionHandlers: vi.fn(() => false),
+        extensionRunner: { emit: vi.fn(async () => {}) },
+        clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
+        abort: vi.fn(async () => {}),
+        dispose: vi.fn(),
+      };
+      vi.doMock("./internal/pi-runtime-api.js", () => ({
+        loadPiRuntimeApi: async () => ({
+          createAgentSession: vi.fn(async () => ({ session })),
+          DefaultResourceLoader: class {
+            async reload() {}
+            getExtensions() { return { extensions: [], errors: [], runtime: {} }; }
+          },
+          getAgentDir: () => "/mock-agent-dir",
+          SettingsManager: {
+            create: vi.fn(() => ({
+              getGlobalSettings: () => ({}),
+              getProjectSettings: () => ({}),
+            })),
+          },
+          SessionManager: { inMemory: vi.fn(() => ({})) },
+        }),
+      }));
+      const actualReadAgent = await vi.importActual<typeof import("./agents/read-agent.js")>("./agents/read-agent.js");
+      let markFailureDeliveryStarted!: () => void;
+      const failureDeliveryStarted = new Promise<void>((resolve) => { markFailureDeliveryStarted = resolve; });
+      let releaseFailureDelivery!: () => void;
+      const failureDeliveryGate = new Promise<void>((resolve) => { releaseFailureDelivery = resolve; });
+      const helperOptions = {
+        ...readAgentOptions,
+        deliverMessageToActiveAgent: vi.fn(async () => {
+          markFailureDeliveryStarted();
+          await failureDeliveryGate;
+          return true;
+        }),
+        renderLeadInboxStatus: vi.fn(async () => {}),
+        notifyLeadOfInboxReports: vi.fn(async () => {}),
+        createResourcePlan: vi.fn(async () => ({
+          selectionMode: "default" as const,
+          extensionPaths: [],
+          extensions: [],
+          diagnostics: [],
+          skills: "all" as const,
+          trust: { cwd: setup.root, projectTrusted: true },
+        })),
+      };
+
+      const run = actualReadAgent.runReadAgentInProcess(teamName, helper, "fail after starting", ctx, helperOptions);
+      await promptStarted;
+      await vi.advanceTimersByTimeAsync(1_200);
+      const widgetCall = [...ctx.ui.setWidget.mock.calls]
+        .reverse()
+        .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      const widget = widgetCall![1]({ requestRender: vi.fn() });
+      expect(widget.render(180).join("\n")).toMatch(/\(writer\) model\/xhigh · \+1 · write-critical/);
+
+      rejectPrompt(new Error("provider rejected prompt"));
+      await failureDeliveryStarted;
+      await vi.advanceTimersByTimeAsync(1_200);
+      const liveFailureState = runningAgents.get(`${teamName}:failing-helper`);
+      expect(liveFailureState?.lastError).toMatchObject({ message: "provider rejected prompt" });
+      expect(runningAgents.get(`${teamName}:failing-helper`)).toBe(liveFailureState);
+      const failedRendered = widget.render(180).join("\n");
+      expect(failedRendered).toContain("2 active · 1 read · 1 write");
+      expect(failedRendered).not.toMatch(/\(writer\) model\/xhigh · \+/);
+
+      releaseFailureDelivery();
+      await run;
+      expect(runningAgents.has(`${teamName}:failing-helper`)).toBe(false);
+      expect(writerState.latestProgress).toBe("Implementing parent work");
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("quarantines a parent-shutdown delivery timeout and defers child cleanup", async () => {
     const setup = await setupExtension();
     try {

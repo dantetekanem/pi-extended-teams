@@ -92,6 +92,8 @@ function writeFavoriteLevels() {
       "reading-default": { model: "provider/model", thinking: "high" },
       "writing-basic": { model: "provider/model", thinking: "high" },
       "writing-hard": { model: "provider/model", thinking: "xhigh" },
+      "write-feature": { model: "provider/model", thinking: "medium" },
+      "write-critical": { model: "provider/model", thinking: "xhigh" },
     },
   }));
 }
@@ -400,6 +402,8 @@ describe("in-process read agent tool wiring", () => {
       tools: new Map([
         ["selected_extension_tool", { definition: { name: "selected_extension_tool" } }],
         ["send_message", { definition: { name: "send_message", description: "untrusted override" } }],
+        ["spawn_agent", { definition: { name: "spawn_agent", description: "untrusted external spawn" } }],
+        ["spawn_swarm_agents", { definition: { name: "spawn_swarm_agents", description: "untrusted external swarm" } }],
       ]),
     });
     const createResourcePlan = vi.fn(async (input: { cwd: string; projectTrusted: boolean }) => Object.freeze({
@@ -453,7 +457,10 @@ describe("in-process read agent tool wiring", () => {
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
     expect(sessionOptions.tools).toContain("selected_extension_tool");
     expect(sessionOptions.tools.filter((name: string) => name === "send_message")).toHaveLength(1);
+    expect(sessionOptions.tools).not.toContain("spawn_agent");
+    expect(sessionOptions.tools).not.toContain("spawn_swarm_agents");
     expect(sessionOptions.customTools.find((tool: any) => tool.name === "send_message")?.description).not.toBe("untrusted override");
+    expect(sessionOptions.customTools.some((tool: any) => tool.name === "spawn_agent" || tool.name === "spawn_swarm_agents")).toBe(false);
     expect(piMocks.settingsManagers.at(-1)?.isProjectTrusted()).toBe(true);
     expect(session.bindExtensions.mock.invocationCallOrder[0]).toBeLessThan(session.prompt.mock.invocationCallOrder[0]);
     expect(session.extensionRunner.emit).toHaveBeenCalledOnce();
@@ -461,6 +468,151 @@ describe("in-process read agent tool wiring", () => {
     expect(session.extensionRunner.emit.mock.invocationCallOrder[0]).toBeLessThan(session.clearQueue.mock.invocationCallOrder[0]);
     expect(session.clearQueue.mock.invocationCallOrder[0]).toBeLessThan(session.abort.mock.invocationCallOrder[0]);
     expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(session.dispose.mock.invocationCallOrder[0]);
+  });
+
+  it("replaces filtered external spawn collisions with restricted tools only for an opted-in write-feature parent", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    piMocks.loaderExtensions.push({
+      tools: new Map([
+        ["spawn_agent", { definition: { name: "spawn_agent", description: "untrusted external spawn" } }],
+        ["spawn_swarm_agents", { definition: { name: "spawn_swarm_agents", description: "untrusted external swarm" } }],
+      ]),
+    });
+    const restrictedTools = [
+      { name: "spawn_agent", description: "restricted single", execute: vi.fn() },
+      { name: "spawn_swarm_agents", description: "restricted swarm", execute: vi.fn() },
+    ];
+    const createNestedReadAgentTools = vi.fn(() => restrictedTools);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const member: Member = {
+      agentId: "feature-writer@team",
+      name: "feature-writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      thinking: "medium",
+      modelSlot: "write-feature",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "implement a bounded feature",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+    };
+    writeTeamConfig("team", member);
+    const outerCtx = {
+      cwd: root,
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    };
+
+    await runReadAgentInProcess("team", member, "implement a bounded feature", outerCtx, {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      createNestedReadAgentTools,
+    });
+
+    expect(createNestedReadAgentTools).toHaveBeenCalledOnce();
+    expect(createNestedReadAgentTools).toHaveBeenCalledWith({
+      teamName: "team",
+      parent: member,
+      parentRunId: member.lifecycleRunId,
+      outerCtx,
+    });
+    const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+    expect(sessionOptions.tools.filter((name: string) => name === "spawn_agent")).toEqual(["spawn_agent"]);
+    expect(sessionOptions.tools.filter((name: string) => name === "spawn_swarm_agents")).toEqual(["spawn_swarm_agents"]);
+    expect(sessionOptions.customTools).toEqual(expect.arrayContaining(restrictedTools));
+    expect(sessionOptions.customTools.find((tool: any) => tool.name === "spawn_agent")?.description).toBe("restricted single");
+    expect(sessionOptions.customTools.find((tool: any) => tool.name === "spawn_swarm_agents")?.description).toBe("restricted swarm");
+    const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
+    expect(promptText).toContain("opted-in depth-0 write-feature/write-critical run");
+    expect(promptText).toContain("restricted spawn_agent or spawn_swarm_agents");
+    expect(promptText).toContain("any canonical read-* tier and any helper count");
+    expect(promptText).toContain("global read capacity and queue");
+    expect(promptText).toContain("Children report to you and cannot delegate");
+  });
+
+  it.each([
+    { label: "non-opted-in write-feature", role: "write" as const, modelSlot: "write-feature", thinking: "medium" as const, delegationDepth: 0, allowNestedReadAgents: false },
+    { label: "opted-in write-patch", role: "write" as const, modelSlot: "write-patch", thinking: "high" as const, delegationDepth: 0, allowNestedReadAgents: true },
+    { label: "opted-in write-system", role: "write" as const, modelSlot: "write-system", thinking: "xhigh" as const, delegationDepth: 0, allowNestedReadAgents: true },
+    { label: "depth-1 read child", role: "read" as const, modelSlot: "read-review", thinking: "high" as const, delegationDepth: 1, allowNestedReadAgents: true },
+  ])("does not assign delegation tools to $label sessions", async ({ label, role, modelSlot, thinking, delegationDepth, allowNestedReadAgents }) => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    piMocks.loaderExtensions.push({
+      tools: new Map([
+        ["spawn_agent", { definition: { name: "spawn_agent", description: "untrusted external spawn" } }],
+        ["spawn_swarm_agents", { definition: { name: "spawn_swarm_agents", description: "untrusted external swarm" } }],
+      ]),
+    });
+    const createNestedReadAgentTools = vi.fn(() => [
+      { name: "spawn_agent", execute: vi.fn() },
+      { name: "spawn_swarm_agents", execute: vi.fn() },
+    ]);
+    const member: Member = {
+      agentId: `${label}@team`,
+      name: label.replaceAll(" ", "-"),
+      agentType: "teammate",
+      role,
+      model: "provider/model",
+      thinking,
+      modelSlot,
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "bounded assignment",
+      delegationDepth,
+      allowNestedReadAgents,
+      parentAgentName: delegationDepth === 1 ? "writer" : undefined,
+      parentLifecycleRunId: delegationDepth === 1 ? "writer-run" : undefined,
+      requestedBy: delegationDepth === 1 ? "writer" : undefined,
+      helperKind: delegationDepth === 1 ? "read_helper" : undefined,
+    };
+    writeTeamConfig("team", member);
+
+    await runReadAgentInProcess("team", member, "bounded assignment", {
+      cwd: root,
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents: new Map<string, RunningReadAgent>(),
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: () => true,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      createNestedReadAgentTools,
+    });
+
+    expect(createNestedReadAgentTools).not.toHaveBeenCalled();
+    const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+    expect(sessionOptions.tools).not.toContain("spawn_agent");
+    expect(sessionOptions.tools).not.toContain("spawn_swarm_agents");
+    expect(sessionOptions.customTools.some((tool: any) => tool.name === "spawn_agent" || tool.name === "spawn_swarm_agents")).toBe(false);
+    const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
+    expect(promptText).not.toContain("opted-in depth-0 write-feature/write-critical run");
+    if (delegationDepth === 1) {
+      expect(promptText).toContain(`depth-1 read helper requested by 'writer'`);
+      expect(promptText).toContain("report_and_exit deliverable goes to that requesting writer");
+      expect(promptText).toContain("lead receives only a classified completion notice");
+      expect(promptText).toContain("You cannot delegate");
+      expect(promptText).not.toContain("send your concise report to the lead");
+    }
   });
 
   it("injects the complete writer coordination surface into nested write-agent sessions", async () => {
@@ -1438,8 +1590,10 @@ describe("in-process read agent tool wiring", () => {
     expect(options.notifyLeadOfInboxReports).toHaveBeenCalledWith("team");
 
     const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
-    expect(promptText).toContain("You are a read helper requested by 'writer'");
-    expect(promptText).toContain("send your concise report to the lead and stop");
+    expect(promptText).toContain("depth-1 read helper requested by 'writer'");
+    expect(promptText).toContain("report_and_exit deliverable goes to that requesting writer");
+    expect(promptText).toContain("lead receives only a classified completion notice");
+    expect(promptText).not.toContain("send your concise report to the lead and stop");
   });
 
   it("uses a fallback delivery if a read helper exits without sending its required report", async () => {
@@ -1624,7 +1778,7 @@ describe("in-process read agent tool wiring", () => {
     expect(new Set(requesterReports.map(message => message.metadata?.runId)).size).toBe(2);
   });
 
-  it("immediately emits one classified lead wake when a running read helper fails", async () => {
+  it("publishes a rejected prompt failure while the helper remains live during deferred delivery", async () => {
     const helper: Member = {
       agentId: "failing-helper@team",
       name: "failing-helper",
@@ -1658,6 +1812,11 @@ describe("in-process read agent tool wiring", () => {
     session.prompt.mockRejectedValue(new Error("source unavailable"));
     piMocks.createAgentSession.mockResolvedValue({ session });
     const runningReadAgents = new Map<string, RunningReadAgent>();
+    const liveFailureRenders: RunningReadAgent[] = [];
+    let markFailureDeliveryStarted!: () => void;
+    const failureDeliveryStarted = new Promise<void>((resolve) => { markFailureDeliveryStarted = resolve; });
+    let releaseFailureDelivery!: () => void;
+    const failureDeliveryGate = new Promise<void>((resolve) => { releaseFailureDelivery = resolve; });
     const options = {
       isTeammate: false,
       agentName: "team-lead",
@@ -1666,22 +1825,40 @@ describe("in-process read agent tool wiring", () => {
       readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
       isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
       ensureReadAgentStatusTicker: vi.fn(),
-      renderReadAgentStatus: vi.fn(),
+      renderReadAgentStatus: vi.fn(() => {
+        const state = runningReadAgents.get("team:failing-helper");
+        if (state?.lastError) liveFailureRenders.push(state);
+      }),
       rememberCompletedAgentReport: vi.fn(),
       emitAgentReport: vi.fn(),
       releaseAllClaimsForAgent: vi.fn(async () => []),
       quietTrigger: vi.fn(),
       renderLeadInboxStatus: vi.fn(async () => {}),
       notifyLeadOfInboxReports: vi.fn(async () => {}),
-      deliverMessageToActiveAgent: vi.fn(async () => true),
+      deliverMessageToActiveAgent: vi.fn(async () => {
+        markFailureDeliveryStarted();
+        await failureDeliveryGate;
+        return true;
+      }),
     };
 
-    await runReadAgentInProcess("team", helper, "investigate", {
+    const run = runReadAgentInProcess("team", helper, "investigate", {
       modelRegistry: {
         find: vi.fn(() => ({ provider: "provider", id: "model" })),
       },
     }, options);
+    await failureDeliveryStarted;
 
+    const liveFailureState = runningReadAgents.get("team:failing-helper");
+    expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
+    expect(liveFailureState?.lastError).toMatchObject({ message: "source unavailable" });
+    expect(liveFailureState?.lastError?.timestamp).toEqual(expect.any(Number));
+    expect(liveFailureRenders).toContain(liveFailureState);
+    expect(runningReadAgents.get("team:failing-helper")).toBe(liveFailureState);
+
+    releaseFailureDelivery();
+    await run;
+    expect(runningReadAgents.has("team:failing-helper")).toBe(false);
     expect(options.deliverMessageToActiveAgent).toHaveBeenCalledWith(
       "team",
       "writer",

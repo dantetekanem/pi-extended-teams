@@ -23,6 +23,14 @@ export interface Member {
   metadata?: Record<string, any>;
   /** Authoritative identity for one admitted lifecycle run. Never stored in user metadata. */
   lifecycleRunId?: string;
+  /** Runtime-owned delegation depth. Public lead spawns are depth 0; restricted children are depth 1. */
+  delegationDepth?: number;
+  /** Lead-approved opt-in for restricted nested read delegation. */
+  allowNestedReadAgents?: boolean;
+  /** Runtime-owned parent identity for a restricted nested read child. */
+  parentAgentName?: string;
+  /** Runtime-owned parent lifecycle identity for a restricted nested read child. */
+  parentLifecycleRunId?: string;
   /** "read" agents run in-process (no pane); "write" agents spawn in tmux. */
   role?: "read" | "write";
   /** Optional category preset name from settings.json. */

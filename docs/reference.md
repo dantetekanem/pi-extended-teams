@@ -27,6 +27,7 @@ Spawn one agent in the current Pi session by configured intent tier only.
 - `cwd` (optional): Working directory. Defaults to the lead session cwd.
 - `model_slot` (required): One of the eight canonical tiers: `read-collect`, `read-review`, `read-analyze`, `read-critical`, `write-patch`, `write-feature`, `write-system`, or `write-critical`. The schema recommends `read-review` as the normal default. The tier selects read/write behavior, model, and thinking from `/agents-favorite-models`.
 - `metadata` (optional): Extra structured metadata for runtime/orchestration use.
+- `allow_nested_read_agents` (optional, default `false`): Opt in a depth-0 `write-feature` or `write-critical` agent to restricted read-only child spawning.
 
 Do not pass `role`, `model`, or `thinking` directly. Spawn calls reject them; see `TIPS.md` for examples.
 
@@ -56,7 +57,7 @@ Spawn a batch of agents in the current Pi session. Use `defaults` for shared int
 
 **Parameters**
 
-- `defaults` (optional): Shared `cwd`, `model_slot`, and `metadata` values.
+- `defaults` (optional): Shared `cwd`, `model_slot`, `metadata`, and `allow_nested_read_agents` values.
 - `agents` (required): Array of agent specs. Each agent accepts the same fields as `spawn_agent`, except `model_slot` may be inherited from `defaults`.
 
 **Example**
@@ -213,7 +214,7 @@ report_and_exit({
 
 ## UI
 
-Active agents appear in the below-editor activity card. From an empty editor, press Down to open the live follow view, Down/Up to navigate agents/main, `x` to stop the selected agent, and Escape to return. Completed reports are pushed into the lead session automatically.
+Active agents appear in the below-editor activity card. A writer row shows `+N` when N attributed depth-1 read helpers are currently active. From an empty editor, press Down to open the live follow view, Down/Up to navigate agents/main, `x` to stop the selected agent, and Escape to return. Completed reports are pushed into the lead session automatically.
 
 ### `/agents-favorite-models`
 
@@ -294,7 +295,7 @@ Spawn calls use `model_slot` only. They reject raw `model`, direct `thinking`, a
 
 ## Behavior notes
 
-- The lead controls orchestration. Spawned agents should not create other agents.
+- Nested read delegation requires `allow_nested_read_agents: true` and is available only to depth-0 `write-feature` / `write-critical` agents. Their restricted tools accept any canonical `read-*` tier and any helper count subject to global read capacity and queueing; children report to the writer and cannot delegate. Read agents, depth-1 children, `write-patch`, and `write-system` remain denied and ask the lead for help.
 - Agents run in-process and are followable from Pi.
 - Read agents should not edit files or make mutating changes.
 - Use `read-review` as the normal default, `read-collect` for bounded evidence gathering, `read-analyze` for connected explanation, and `read-critical` only for irreducible high-stakes reasoning. See `TIPS.md` for tier-selection examples.

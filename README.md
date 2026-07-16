@@ -55,7 +55,7 @@ spawn_agent({
 - **Implicit current-session workflow**: no public team setup step is required.
 - **Read agents as the default multiplier**: in-process, parallel, full read/test/search tool access, directed to report without editing.
 - **Optional edit agents**: in-process and followable from Pi; use them only for isolated, non-overlapping edits.
-- **Live activity card**: active agent progress, intent tier, elapsed time, and token usage stay visible below the editor.
+- **Live activity card**: active agent progress, intent tier, elapsed time, and token usage stay visible below the editor; an active writer shows `+N` for its currently active nested read helpers.
 - **Auto-delivered reports**: new agent messages queue a lead follow-up even during an active turn, without manual polling.
 - **Down-key live navigation**: inspect active transcripts, models, thinking levels, elapsed time, tokens, and grouped tool activity; expand large logs with `l`, message the selected agent with `m`, or stop it with `x`.
 - **Built-in orchestration guidance**: the extension teaches intent-tier selection, delegated-lane ownership, report-first synthesis, and literal waiting without polling.
@@ -103,8 +103,9 @@ Avoid:
 
 - Treating edit agents as the default implementation path.
 - Spawning multiple edit agents for the same files.
-- Having agents create more agents; they should ask the lead with `send_message`.
 - Polling for completion with sleeps or loops; the extension wakes the lead.
+
+Nested read delegation is explicit and restricted. Only a depth-0 `write-feature` or `write-critical` agent spawned with `allow_nested_read_agents: true` receives restricted `spawn_agent` / `spawn_swarm_agents` tools. It may request any number of helpers at any canonical `read-*` tier, subject to global read capacity and queueing. Children cannot delegate. Read agents, depth-1 children, `write-patch`, and `write-system` remain denied and must ask the lead with `send_message`.
 
 ## Favorite model slots
 

@@ -21,6 +21,7 @@ import {
 import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
 import { isEligibleNestedReadParent, NESTED_DELEGATION_TOOL_NAMES } from "../runtime/nested-read-agents";
 import type { NestedReadAgentToolBinding } from "../tools/team-tools";
+import type { ParentRunIdentity, PendingChildController } from "../runtime/pending-child-controller";
 import {
   closeReadAgentMessageDelivery,
   enqueueReadAgentMessageDelivery,
@@ -30,6 +31,8 @@ import {
 } from "./read-agent-session-lifecycle";
 
 export { closeReadAgentMessageDelivery } from "./read-agent-session-lifecycle";
+
+const pendingParentWakeSignals = new WeakMap<RunningReadAgent, () => void>();
 
 export interface RunReadAgentOptions {
   isTeammate: boolean;
@@ -51,10 +54,16 @@ export interface RunReadAgentOptions {
   agentName?: string;
   renderLeadInboxStatus?(): Promise<void>;
   notifyLeadOfInboxReports?(teamName: string): Promise<void>;
-  deliverMessageToActiveAgent?(teamName: string, recipient: string, content: string): Promise<boolean>;
+  deliverMessageToActiveAgent?(
+    teamName: string,
+    recipient: string,
+    content: string,
+    expectedRecipientRunId?: string
+  ): Promise<boolean>;
   createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
   extensionInstanceId?: string;
   createNestedReadAgentTools?(binding: NestedReadAgentToolBinding): any[];
+  pendingChildController?: PendingChildController;
 }
 
 function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
@@ -241,11 +250,13 @@ export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | un
 
   const session = agent.session;
   const delivery = session.isStreaming ? { deliverAs: "steer" as const } : undefined;
-  await enqueueReadAgentMessageDelivery(
+  const deliveryResult = enqueueReadAgentMessageDelivery(
     agent,
     agent.name,
     () => session.sendUserMessage(content, delivery)
   );
+  pendingParentWakeSignals.get(agent)?.();
+  await deliveryResult;
   markReadAgentActivity(agent, "received lead message", "thinking");
   return true;
 }
@@ -344,9 +355,14 @@ async function ensureReadHelperCompletionMessages(
 ): Promise<void> {
   if (!member.requestedBy) return;
 
+  const expectedRequesterRunId = member.parentAgentName === member.requestedBy
+    ? member.parentLifecycleRunId
+    : undefined;
   let requesterReceivedReport = false;
   try {
-    const deliveredDirectly = await deliverMessageToActiveAgent?.(teamName, member.requestedBy, report) === true;
+    const deliveredDirectly = expectedRequesterRunId
+      ? await deliverMessageToActiveAgent?.(teamName, member.requestedBy, report, expectedRequesterRunId) === true
+      : await deliverMessageToActiveAgent?.(teamName, member.requestedBy, report) === true;
     if (deliveredDirectly) {
       requesterReceivedReport = true;
     } else {
@@ -365,7 +381,10 @@ async function ensureReadHelperCompletionMessages(
           report,
           outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
           color,
-          { metadata: { helperReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy } }
+          {
+            metadata: { helperReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy },
+            ...(expectedRequesterRunId ? { expectedRecipientRunId: expectedRequesterRunId } : {}),
+          }
         );
         requesterReceivedReport = true;
       }
@@ -482,8 +501,26 @@ export async function runReadAgentInProcess(
 
   let submittedFinalReport: SubmittedAgentReport | undefined;
   let finalReportSubmissionInProgress = false;
+  const pendingChildController = options.pendingChildController;
+  const pendingChildParent: ParentRunIdentity | undefined = isEligibleNestedReadParent(member)
+    ? {
+        teamName: readTeamName,
+        parentName: member.name,
+        parentRunId: state.runId,
+      }
+    : undefined;
+  let pendingChildGeneration: number | undefined;
+  if (pendingChildController && pendingChildParent) {
+    const snapshot = pendingChildController.observeParent(pendingChildParent);
+    pendingChildGeneration = snapshot.generation;
+    if (snapshot.cancelled) state.stopRequested = true;
+    pendingParentWakeSignals.set(state, () => {
+      pendingChildController.signalParentChange(pendingChildParent);
+    });
+  }
 
   const closeRecipient = async (): Promise<ReadAgentDeliveryCloseResult> => {
+    if (pendingChildParent) pendingChildController?.cancelParent(pendingChildParent);
     const deliveryClose = closeReadAgentMessageDelivery(state);
     if (!state.recipientClosurePromise) {
       state.recipientClosurePromise = closePersistedRecipient(
@@ -560,6 +597,9 @@ export async function runReadAgentInProcess(
   };
 
   try {
+    if (pendingChildParent && !pendingChildController) {
+      throw new Error(`Eligible nested read parent ${member.name} requires a pending child controller.`);
+    }
     const [provider, modelId] = (member.model || "").split("/", 2);
     const model = provider && modelId ? ctx.modelRegistry.find(provider, modelId) : undefined;
     if (!model) {
@@ -739,6 +779,30 @@ export async function runReadAgentInProcess(
     state.acceptingMessages = true;
     try {
       await session.prompt(prompt, { source: "extension" as any });
+      if (pendingChildController && pendingChildParent) {
+        while (!submittedFinalReport && !state.stopRequested) {
+          const snapshot = pendingChildController.observeParent(pendingChildParent);
+          if (snapshot.cancelled) break;
+
+          let change;
+          if (snapshot.generation !== pendingChildGeneration) {
+            change = { status: "changed" as const, generation: snapshot.generation };
+          } else {
+            change = await pendingChildController.waitForChangeOrCancelled(
+              pendingChildParent,
+              snapshot.generation
+            );
+          }
+          pendingChildGeneration = change.generation;
+          if (change.status === "cancelled" || submittedFinalReport || state.stopRequested) break;
+
+          // Every direct delivery and exact child transition advances the parent
+          // generation. Drain the current delivery, then observe again because
+          // its continuation may accept or settle another child wave.
+          const deliveryTail = state.messageDeliveryTail;
+          if (deliveryTail) await deliveryTail.catch(() => {});
+        }
+      }
     } finally {
       state.acceptingMessages = false;
     }
@@ -750,6 +814,7 @@ export async function runReadAgentInProcess(
     options.renderReadAgentStatus();
 
     if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) return;
+    if (pendingChildParent && !submittedFinalReport) return;
 
     const report = submittedFinalReport?.content
       ?? (getLastAssistantText(session.messages) || "Read agent completed, but produced no assistant text.");
@@ -831,8 +896,12 @@ export async function runReadAgentInProcess(
       }
     }
   } finally {
+    pendingParentWakeSignals.delete(state);
     settleSessionCreation(state.session);
     const teardown = await shutdownTeammate(readTeamName, member, { reason: "quit" });
+    if (teardown.finalized && pendingChildController && pendingChildParent) {
+      pendingChildController.forgetParent(pendingChildParent);
+    }
     if (!teardown.finalized) options.renderReadAgentStatus();
   }
 }

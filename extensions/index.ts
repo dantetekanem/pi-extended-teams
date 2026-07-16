@@ -20,6 +20,7 @@ import { registerTeamTools, type TeamToolsRuntime } from "./tools/team-tools.js"
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
 import { formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
+import { createPendingChildController } from "./runtime/pending-child-controller.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
 import * as messaging from "../src/utils/messaging";
 import * as teams from "../src/utils/teams";
@@ -82,6 +83,7 @@ export default function (pi: ExtensionAPI) {
     return createSpawnResourcePlan({ ...input, pi });
   };
   let teamToolsRuntime: TeamToolsRuntime | undefined;
+  const pendingChildController = createPendingChildController();
   const { startWriteAgent, drainWriteQueue } = createWriteAgentRuntime({
     terminal,
     getProjectTrusted: (cwd) => parentProjectTrustForSpawn(sessionCtx, cwd),
@@ -101,6 +103,31 @@ export default function (pi: ExtensionAPI) {
     getTeamName: () => teamName,
     extensionInstanceId,
     onWriterInactive: (targetTeamName, member) => removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId }),
+    onTeammateClosing: (targetTeamName, member) => {
+      if (!member.lifecycleRunId) return;
+      pendingChildController.cancelParent({
+        teamName: targetTeamName,
+        parentName: member.name,
+        parentRunId: member.lifecycleRunId,
+      });
+    },
+    onTeammateSettled: (targetTeamName, member) => {
+      if (!member.lifecycleRunId) return;
+      if (member.parentAgentName && member.parentLifecycleRunId) {
+        pendingChildController.settleChildRun({
+          teamName: targetTeamName,
+          parentName: member.parentAgentName,
+          parentRunId: member.parentLifecycleRunId,
+          childName: member.name,
+          childRunId: member.lifecycleRunId,
+        });
+      }
+      pendingChildController.forgetParent({
+        teamName: targetTeamName,
+        parentName: member.name,
+        parentRunId: member.lifecycleRunId,
+      });
+    },
   });
 
   function readAgentKey(targetTeamName: string, targetAgentName: string): string {
@@ -113,11 +140,15 @@ export default function (pi: ExtensionAPI) {
     void Promise.resolve(launch).catch(() => {});
   }
 
-  async function deliverMessageToActiveAgent(targetTeamName: string, targetAgentName: string, content: string): Promise<boolean> {
-    const delivered = await sendMessageToRunningReadAgent(
-      runningReadAgents.get(readAgentKey(targetTeamName, targetAgentName)),
-      content
-    );
+  async function deliverMessageToActiveAgent(
+    targetTeamName: string,
+    targetAgentName: string,
+    content: string,
+    expectedRecipientRunId?: string
+  ): Promise<boolean> {
+    const target = runningReadAgents.get(readAgentKey(targetTeamName, targetAgentName));
+    if (expectedRecipientRunId !== undefined && target?.runId !== expectedRecipientRunId) return false;
+    const delivered = await sendMessageToRunningReadAgent(target, content);
     if (delivered) renderReadAgentStatus();
     return delivered;
   }
@@ -1091,6 +1122,7 @@ export default function (pi: ExtensionAPI) {
       createNestedReadAgentTools: (binding: Parameters<TeamToolsRuntime["createNestedReadAgentTools"]>[0]) => {
         return teamToolsRuntime?.createNestedReadAgentTools(binding) ?? [];
       },
+      pendingChildController,
     };
   }
 
@@ -1111,6 +1143,7 @@ export default function (pi: ExtensionAPI) {
     getTeamName: () => teamName,
     getSessionCtx: () => sessionCtx,
     setSessionCtx,
+    pendingChildController,
   });
 
   if (isTeammate) {

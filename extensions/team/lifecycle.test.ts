@@ -13,6 +13,7 @@ import type { RunningReadAgent } from "../runtime/types.js";
 import { enqueueReadAgentMessageDelivery, NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "../agents/read-agent-session-lifecycle.js";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 import { registerTaskRuntimeTools } from "../tools/task-runtime-tools.js";
+import { createPendingChildController } from "../runtime/pending-child-controller.js";
 
 let root: string;
 let teamsRoot: string;
@@ -124,6 +125,10 @@ describe("team lifecycle performance", () => {
       notifyReleaseStarted();
       return new Promise<string[]>((resolve) => { finishRelease = () => resolve([]); });
     });
+    const pendingChildController = createPendingChildController();
+    const exactParent = { teamName: "stop-team", parentName: "reader", parentRunId: "run-1" };
+    const onTeammateClosing = vi.fn(() => { pendingChildController.cancelParent(exactParent); });
+    const onTeammateSettled = vi.fn(() => { pendingChildController.forgetParent(exactParent); });
     const lifecycle = createLifecycleRuntime({
       isTeammate: false,
       terminal: null,
@@ -135,11 +140,21 @@ describe("team lifecycle performance", () => {
       drainWriteQueue: vi.fn(async () => {}),
       getSessionCwd: () => root,
       getTeamName: () => "stop-team",
+      onTeammateClosing,
+      onTeammateSettled,
     });
 
     const stopping = lifecycle.shutdownTeammate("stop-team", reader);
     await releaseStarted;
 
+    expect(onTeammateClosing).toHaveBeenCalledOnce();
+    expect(onTeammateClosing).toHaveBeenCalledWith("stop-team", expect.objectContaining({
+      name: "reader",
+      lifecycleRunId: "run-1",
+    }));
+    expect(onTeammateSettled).not.toHaveBeenCalled();
+    expect(pendingChildController.observeParent(exactParent).cancelled).toBe(true);
+    expect(pendingChildController.trackedParentCount()).toBe(1);
     expect(state.stopRequested).toBe(true);
     expect(state.acceptingMessages).toBe(false);
     const stoppingMember = (await teams.readConfig("stop-team")).members.find(item => item.name === "reader");
@@ -157,6 +172,12 @@ describe("team lifecycle performance", () => {
       releasedClaims: [],
     });
     await rejectedRecipient;
+    expect(onTeammateSettled).toHaveBeenCalledOnce();
+    expect(onTeammateSettled).toHaveBeenCalledWith("stop-team", expect.objectContaining({
+      name: "reader",
+      lifecycleRunId: "run-1",
+    }));
+    expect(pendingChildController.trackedParentCount()).toBe(0);
     expect(runningReadAgents.has("stop-team:reader")).toBe(false);
     expect((await teams.readConfig("stop-team")).members.map(item => item.name)).toEqual(["team-lead"]);
   });
@@ -566,6 +587,12 @@ describe("team lifecycle performance", () => {
       } as any,
     };
     const runningReadAgents = new Map([["dispose-failure-team:dispose-failure", state]]);
+    const pendingChildController = createPendingChildController();
+    const exactParent = {
+      teamName: "dispose-failure-team",
+      parentName: reader.name,
+      parentRunId: "dispose-run",
+    };
     const lifecycle = createLifecycleRuntime({
       isTeammate: false,
       terminal: null,
@@ -577,6 +604,8 @@ describe("team lifecycle performance", () => {
       drainWriteQueue: vi.fn(async () => {}),
       getSessionCwd: () => root,
       getTeamName: () => "dispose-failure-team",
+      onTeammateClosing: () => { pendingChildController.cancelParent(exactParent); },
+      onTeammateSettled: () => { pendingChildController.forgetParent(exactParent); },
     });
 
     await expect(lifecycle.shutdownTeammate("dispose-failure-team", reader)).resolves.toMatchObject({
@@ -590,6 +619,8 @@ describe("team lifecycle performance", () => {
       tombstone: { runId: "dispose-run", phase: "cleanup_failed" },
     });
     expect(runningReadAgents.get("dispose-failure-team:dispose-failure")).toBe(state);
+    expect(pendingChildController.observeParent(exactParent).cancelled).toBe(true);
+    expect(pendingChildController.trackedParentCount()).toBe(1);
   });
 
   it("classifies claim-release and member-removal failures without claiming finalization", async () => {

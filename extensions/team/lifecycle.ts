@@ -35,6 +35,8 @@ export interface LifecycleRuntimeOptions {
   getSessionCwd(): string | undefined;
   getTeamName(): string | null | undefined;
   onWriterInactive?(teamName: string, member: Member): void;
+  onTeammateClosing?(teamName: string, member: Member): void;
+  onTeammateSettled?(teamName: string, member: Member): void;
   extensionInstanceId?: string;
 }
 
@@ -147,6 +149,12 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
         expectedRunId = expectedState.runId;
       }
       member.lifecycleRunId = expectedRunId;
+    }
+    try {
+      options.onTeammateClosing?.(teamName, { ...member, lifecycleRunId: expectedRunId });
+    } catch {
+      // Lifecycle cancellation hooks are in-memory notifications only. Persisted
+      // teardown ownership remains authoritative if an observer fails.
     }
 
     const persistedRuntime = await runtime.readRuntimeStatus(teamName, member.name).catch(() => null);
@@ -296,6 +304,12 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
 
       if (drainQueue && (member.role ?? "write") === "write") {
         void options.drainWriteQueue(teamName).catch(() => {});
+      }
+      try {
+        options.onTeammateSettled?.(teamName, { ...member, lifecycleRunId: expectedRunId });
+      } catch {
+        // Exact child settlement is idempotent and must not change persisted
+        // lifecycle finalization or quarantine ownership.
       }
       return { finalized: true, removedMember, releasedClaims };
     };

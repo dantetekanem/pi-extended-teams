@@ -319,6 +319,41 @@ describe("extension integration", () => {
     }
   });
 
+  it("rejects direct delivery when the active same-name agent has a different lifecycle run", async () => {
+    const setup = await setupExtension();
+    try {
+      writeFavoriteLevels(setup.root);
+      let capturedOptions: any;
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        capturedOptions = options;
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), {
+          runId: "writer-run-B",
+          name: member.name,
+          teamName,
+        });
+      });
+      const ctx = makeCtx(setup.root, "replacement-run-delivery-session");
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "writer",
+        prompt: "Run the replacement assignment",
+        cwd: setup.root,
+        model_slot: "write-critical",
+      }, new AbortController().signal, undefined, ctx);
+
+      const delivered = await capturedOptions.deliverMessageToActiveAgent(
+        "session-replacement-run-delivery-session",
+        "writer",
+        "stale child report",
+        "writer-run-A"
+      );
+
+      expect(delivered).toBe(false);
+      expect(setup.readAgentMock.sendMessageToRunningReadAgent).not.toHaveBeenCalled();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("captures public lead extension sourceInfo when the child resource plan is requested", async () => {
     const setup = await setupExtension();
     try {

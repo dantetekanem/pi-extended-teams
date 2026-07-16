@@ -22,6 +22,13 @@ import {
   type LifecycleTombstoneLock,
 } from "../../src/utils/lifecycle-tombstone";
 import { isEligibleNestedReadParent, NESTED_READ_MODEL_SLOTS, type NestedReadModelSlot } from "../runtime/nested-read-agents";
+import {
+  createPendingChildController,
+  type ParentRunIdentity,
+  type PendingChildAcceptance,
+  type PendingChildController,
+  type PendingChildRun,
+} from "../runtime/pending-child-controller";
 
 export const CHILD_AGENT_LIFECYCLE_PROBE = "pi-extended-teams:child-agent-lifecycle-probe";
 
@@ -47,6 +54,7 @@ export interface TeamToolsOptions {
   getTeamName(): string | null | undefined;
   getSessionCtx?(): any;
   setSessionCtx?(ctx: any): void;
+  pendingChildController?: PendingChildController;
 }
 
 export interface NestedReadAgentToolBinding {
@@ -81,6 +89,7 @@ interface QueuedReadSpawn {
   ctx: any;
   requestedAt: number;
   nameReservationId?: string;
+  pendingChildAcceptance?: PendingChildAcceptance;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamToolsRuntime {
@@ -202,6 +211,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     };
   }
 
+  const pendingChildController = options.pendingChildController ?? createPendingChildController();
   const queuedReadSpawnsByTeam = new Map<string, QueuedReadSpawn[]>();
   const readQueueDrainingTeams = new Set<string>();
   const readAdmissionReservationsByTeam = new Map<string, Map<string, number>>();
@@ -278,10 +288,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     });
   });
   let lifecycleProbeCleanedUp = false;
+  let pendingChildCancelUnsubscribe = (): void => {};
   pi.on?.("session_shutdown", () => {
     if (lifecycleProbeCleanedUp) return;
     lifecycleProbeCleanedUp = true;
     if (typeof lifecycleProbeUnsubscribe === "function") lifecycleProbeUnsubscribe();
+    pendingChildCancelUnsubscribe();
     lifecycleFenceUnsubscribe();
   });
 
@@ -294,12 +306,28 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     return readQueue(teamName).find((queued) => queued.member.name === params.name || memberMatchesOperation(queued.member, params));
   }
 
-  function removeQueuedReadSpawnById(teamName: string, id: string): QueuedReadSpawn | undefined {
+  function pendingParentForMember(teamName: string, member: Member): ParentRunIdentity | undefined {
+    if (member.delegationDepth !== 1 || !member.parentAgentName || !member.parentLifecycleRunId) return undefined;
+    return {
+      teamName,
+      parentName: member.parentAgentName,
+      parentRunId: member.parentLifecycleRunId,
+    };
+  }
+
+  function removeQueuedReadSpawnById(
+    teamName: string,
+    id: string,
+    settlePendingAcceptance = true
+  ): QueuedReadSpawn | undefined {
     const queue = readQueue(teamName);
     const removed = queue.find((queued) => queued.id === id);
     if (!removed) return undefined;
     setReadQueue(teamName, queue.filter((queued) => queued.id !== id));
     releaseNestedReadName(teamName, removed.member.name, removed.nameReservationId);
+    if (settlePendingAcceptance && removed.pendingChildAcceptance) {
+      pendingChildController.settleAcceptance(removed.pendingChildAcceptance);
+    }
     return removed;
   }
 
@@ -310,9 +338,21 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     setReadQueue(teamName, queue.filter((queued) => queued.member.name !== name));
     for (const queued of removed) {
       releaseNestedReadName(teamName, queued.member.name, queued.nameReservationId);
+      if (queued.pendingChildAcceptance) pendingChildController.settleAcceptance(queued.pendingChildAcceptance);
     }
     return removed;
   }
+
+  pendingChildCancelUnsubscribe = pendingChildController.onParentCancelled((parent) => {
+    const queue = readQueue(parent.teamName);
+    for (const queued of queue) {
+      const queuedParent = pendingParentForMember(parent.teamName, queued.member);
+      if (!queuedParent
+        || queuedParent.parentName !== parent.parentName
+        || queuedParent.parentRunId !== parent.parentRunId) continue;
+      removeQueuedReadSpawnById(parent.teamName, queued.id);
+    }
+  });
 
   function queuedReadResolutionDetails(queued: QueuedReadSpawn, params: any, extras: Record<string, any> = {}): Record<string, any> {
     return spawnResolutionDetails(queued.member, params, queued.resolved, {
@@ -399,9 +439,23 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     );
   }
 
-  async function rollbackNestedChildAdmission(teamName: string, member: Member, cause: unknown): Promise<never> {
+  function settlePendingChild(identity: PendingChildAcceptance | PendingChildRun | undefined): void {
+    if (!identity) return;
+    if ("childRunId" in identity) pendingChildController.settleChildRun(identity);
+    else pendingChildController.settleAcceptance(identity);
+  }
+
+  async function rollbackNestedChildAdmission(
+    teamName: string,
+    member: Member,
+    cause: unknown,
+    pendingChild: PendingChildAcceptance | PendingChildRun | undefined
+  ): Promise<never> {
     const runId = member.lifecycleRunId;
-    if (!runId) throw cause;
+    if (!runId) {
+      settlePendingChild(pendingChild);
+      throw cause;
+    }
     try {
       const removed = await teams.removeMemberMatchingRun(teamName, member.name, runId);
       if (!removed) throw new Error(`matching child run ${runId} was not present`);
@@ -409,36 +463,76 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       const causeMessage = cause instanceof Error ? cause.message : String(cause);
       const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
       throw new Error(`${causeMessage} Exact-run rollback for nested read agent ${member.name} failed: ${rollbackMessage}`);
+    } finally {
+      settlePendingChild(pendingChild);
     }
     throw cause;
+  }
+
+  interface AdmittedReadAgentLaunch {
+    launch: Promise<void> | void;
+    pendingChildRun?: PendingChildRun;
   }
 
   async function admitAndLaunchReadAgentMember(
     teamName: string,
     member: Member,
     prompt: string,
-    ctx: any
-  ): Promise<{ launch: Promise<void> | void }> {
-    const addValidateAndLaunch = async (parentLifecycleLock?: LifecycleTombstoneLock): Promise<{ launch: Promise<void> | void }> => {
+    ctx: any,
+    queuedAcceptance?: PendingChildAcceptance
+  ): Promise<AdmittedReadAgentLaunch> {
+    const addValidateAndLaunch = async (parentLifecycleLock?: LifecycleTombstoneLock): Promise<AdmittedReadAgentLaunch> => {
+      let pendingAcceptance = queuedAcceptance;
       if (member.delegationDepth === 1) {
         await assertNestedChildAdmission(teamName, member, parentLifecycleLock);
+        const parent = pendingParentForMember(teamName, member);
+        if (!parent) throw new Error(`Nested read agent ${member.name} is missing exact parent identity.`);
+        pendingAcceptance ??= pendingChildController.acceptChild(parent, member.name);
       }
-      await teams.addMember(teamName, member);
+
+      try {
+        await teams.addMember(teamName, member);
+      } catch (error) {
+        settlePendingChild(pendingAcceptance);
+        throw error;
+      }
+
+      let pendingChildRun: PendingChildRun | undefined;
       if (member.delegationDepth === 1) {
+        const runId = member.lifecycleRunId;
+        if (!pendingAcceptance || !runId) {
+          return rollbackNestedChildAdmission(
+            teamName,
+            member,
+            new Error(`Nested read agent ${member.name} did not receive an exact lifecycle run identity.`),
+            pendingAcceptance
+          );
+        }
+        pendingChildRun = pendingChildController.bindAcceptedChild(pendingAcceptance, member.name, runId);
+        if (!pendingChildRun) {
+          return rollbackNestedChildAdmission(
+            teamName,
+            member,
+            new Error(`Nested read agent ${member.name} lost its parent acceptance before launch.`),
+            pendingAcceptance
+          );
+        }
+
         try {
           await assertNestedChildAdmission(teamName, member, parentLifecycleLock);
         } catch (error) {
-          return rollbackNestedChildAdmission(teamName, member, error);
+          return rollbackNestedChildAdmission(teamName, member, error, pendingChildRun);
         }
       }
 
       try {
         return {
           launch: options.runReadAgentInProcess(teamName, member, prompt, ctx, options.readAgentOptions()),
+          pendingChildRun,
         };
       } catch (error) {
         if (member.delegationDepth === 1) {
-          return rollbackNestedChildAdmission(teamName, member, error);
+          return rollbackNestedChildAdmission(teamName, member, error, pendingChildRun);
         }
         throw error;
       }
@@ -458,7 +552,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     prompt: string,
     ctx: any,
     nameReservationId?: string,
-    releaseNameOnFailure = true
+    releaseNameOnFailure = true,
+    queuedAcceptance?: PendingChildAcceptance
   ): Promise<void> {
     const key = options.readAgentKey(teamName, member.name);
     const reservesReadCapacity = (member.role || "read") === "read";
@@ -472,26 +567,35 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       if (reservesReadCapacity) releaseReadAdmission(teamName, key);
       void drainQueuedReadSpawns(teamName);
     };
-    const drainAfterRun = () => {
+    const finishRun = (pendingChildRun: PendingChildRun | undefined) => {
+      settlePendingChild(pendingChildRun);
       if (reservesReadCapacity) releaseReadAdmission(teamName, key);
+      void drainQueuedReadSpawns(teamName);
+    };
+    const drainAfterRun = (pendingChildRun: PendingChildRun | undefined) => {
       const currentState = options.runningReadAgents.get(key);
       if (currentState?.teardownFinalizationPromise) {
         // A completing runner can resolve before lifecycle finalization releases
-        // capacity. Attach one observer and let that finalization own the drain.
+        // capacity or exact child ownership. Attach one observer; finalization
+        // remains authoritative while the run is quarantined.
         void Promise.resolve(currentState.teardownFinalizationPromise).then(
-          () => { void drainQueuedReadSpawns(teamName); },
-          () => { void drainQueuedReadSpawns(teamName); },
+          () => finishRun(pendingChildRun),
+          () => finishRun(pendingChildRun),
         );
         return;
       }
-      void drainQueuedReadSpawns(teamName);
+      finishRun(pendingChildRun);
     };
 
     try {
-      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx);
+      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance);
       releaseNameReservation();
-      void Promise.resolve(admitted.launch).then(drainAfterRun, drainAfterRun);
+      void Promise.resolve(admitted.launch).then(
+        () => drainAfterRun(admitted.pendingChildRun),
+        () => drainAfterRun(admitted.pendingChildRun)
+      );
     } catch (error) {
+      settlePendingChild(queuedAcceptance);
       releaseReservationAndDrain();
       throw error;
     }
@@ -506,7 +610,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     ctx: any,
     nameReservationId?: string
   ): Promise<QueuedReadSpawn> {
-    const append = (): QueuedReadSpawn => {
+    const append = (pendingChildAcceptance?: PendingChildAcceptance): QueuedReadSpawn => {
       const queue = readQueue(teamName);
       if (queue.some((queued) => queued.member.name === member.name)) {
         throw new Error(`Nested read agent ${member.name} is already active or queued; nested delegation cannot replace an existing run.`);
@@ -521,6 +625,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         ctx,
         requestedAt: Date.now(),
         nameReservationId,
+        pendingChildAcceptance,
       };
       setReadQueue(teamName, [...queue, queued]);
       return queued;
@@ -533,7 +638,15 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       if (currentConfig.members.some((candidate) => candidate.name === member.name)) {
         throw new Error(`Nested read agent ${member.name} is already active or queued; nested delegation cannot replace an existing run.`);
       }
-      return append();
+      const parent = pendingParentForMember(teamName, member);
+      if (!parent) throw new Error(`Nested read agent ${member.name} is missing exact parent identity.`);
+      const pendingChildAcceptance = pendingChildController.acceptChild(parent, member.name);
+      try {
+        return append(pendingChildAcceptance);
+      } catch (error) {
+        pendingChildController.settleAcceptance(pendingChildAcceptance);
+        throw error;
+      }
     });
   }
 
@@ -564,9 +677,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
             queued.prompt,
             queued.ctx,
             queued.nameReservationId,
-            false
+            false,
+            queued.pendingChildAcceptance
           );
-          removeQueuedReadSpawnById(teamName, queued.id);
+          removeQueuedReadSpawnById(teamName, queued.id, false);
         } catch (error) {
           const latestFence = await readLifecycleTombstone(teamName, queued.member.name);
           if (latestFence.status !== "absent") {

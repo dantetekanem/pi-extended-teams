@@ -61,6 +61,7 @@ import { createLifecycleRuntime } from "../team/lifecycle.js";
 import { sanitizeTuiLine } from "../ui/renderers.js";
 import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "./read-agent-session-lifecycle.js";
 import type { RunningReadAgent } from "../runtime/types.js";
+import { createPendingChildController, type PendingChildRun } from "../runtime/pending-child-controller.js";
 
 let root: string;
 
@@ -136,6 +137,16 @@ function fixtureMember(name: string, role: "read" | "write" = "read", modelSlot?
     tmuxPaneId: "",
     cwd: root,
     subscriptions: [],
+  };
+}
+
+function eligibleNestedParent(name = "feature-writer"): Member {
+  return {
+    ...fixtureMember(name, "write", "write-feature"),
+    thinking: "medium",
+    prompt: "implement a bounded feature",
+    delegationDepth: 0,
+    allowNestedReadAgents: true,
   };
 }
 
@@ -472,6 +483,11 @@ describe("in-process read agent tool wiring", () => {
 
   it("replaces filtered external spawn collisions with restricted tools only for an opted-in write-feature parent", async () => {
     const session = makeSession();
+    session.prompt.mockImplementation(async () => {
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const report = sessionOptions.customTools.find((tool: any) => tool.name === "report_and_exit");
+      await report.execute("report", { content: "tool wiring verified", summary: "Done" });
+    });
     piMocks.createAgentSession.mockResolvedValue({ session });
     piMocks.loaderExtensions.push({
       tools: new Map([
@@ -485,6 +501,7 @@ describe("in-process read agent tool wiring", () => {
     ];
     const createNestedReadAgentTools = vi.fn(() => restrictedTools);
     const runningReadAgents = new Map<string, RunningReadAgent>();
+    const pendingChildController = createPendingChildController();
     const member: Member = {
       agentId: "feature-writer@team",
       name: "feature-writer",
@@ -519,6 +536,7 @@ describe("in-process read agent tool wiring", () => {
       emitAgentReport: vi.fn(),
       releaseAllClaimsForAgent: vi.fn(async () => []),
       createNestedReadAgentTools,
+      pendingChildController,
     });
 
     expect(createNestedReadAgentTools).toHaveBeenCalledOnce();
@@ -540,6 +558,400 @@ describe("in-process read agent tool wiring", () => {
     expect(promptText).toContain("any canonical read-* tier and any helper count");
     expect(promptText).toContain("global read capacity and queue");
     expect(promptText).toContain("Children report to you and cannot delegate");
+  });
+
+  it("keeps an opted-in writer live for an exact child report and lets the idle continuation submit the sole final report", async () => {
+    const session = makeSession();
+    session.messages = [{ role: "assistant", content: "initial turn ended without a final report" }];
+    const pendingChildController = createPendingChildController();
+    let exactChildRun: PendingChildRun | undefined;
+    let sessionOptions: any;
+    let continuationReportResult: any;
+    const createNestedReadAgentTools = vi.fn((binding: any) => [{
+      name: "spawn_agent",
+      async execute() {
+        const acceptance = pendingChildController.acceptChild({
+          teamName: binding.teamName,
+          parentName: binding.parent.name,
+          parentRunId: binding.parentRunId,
+        }, "child");
+        exactChildRun = pendingChildController.bindAcceptedChild(acceptance, "child", "child-run");
+        return { content: [{ type: "text", text: "child started" }] };
+      },
+    }]);
+    session.prompt.mockImplementation(async () => {
+      sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const spawn = sessionOptions.customTools.find((tool: any) => tool.name === "spawn_agent");
+      await spawn.execute("spawn-child", {});
+    });
+    session.sendUserMessage.mockImplementation(async (...args: any[]) => {
+      expect(args[0]).toBe("Exact child report");
+      const report = sessionOptions.customTools.find((tool: any) => tool.name === "report_and_exit");
+      continuationReportResult = await report.execute("parent-report", {
+        content: "Authoritative parent report",
+        summary: "Parent done",
+      });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+
+    const writer: Member = {
+      agentId: "feature-writer@team",
+      name: "feature-writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      thinking: "medium",
+      modelSlot: "write-feature",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "implement a bounded feature",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+    };
+    writeTeamConfig("team", writer);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "different-team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      createNestedReadAgentTools,
+      pendingChildController,
+    };
+
+    let runSettled = false;
+    const run = runReadAgentInProcess("team", writer, writer.prompt!, {
+      cwd: root,
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options).then(() => { runSettled = true; });
+
+    await vi.waitFor(() => {
+      expect(exactChildRun).toBeDefined();
+      expect(pendingChildController.pendingCount({
+        teamName: "team",
+        parentName: "feature-writer",
+        parentRunId: writer.lifecycleRunId!,
+      })).toBe(1);
+    });
+    const liveParent = runningReadAgents.get("team:feature-writer")!;
+    expect(liveParent.acceptingMessages).toBe(true);
+    expect(liveParent.persistedRecipientClosed).not.toBe(true);
+    expect(runSettled).toBe(false);
+    expect(rememberCompletedAgentReport).not.toHaveBeenCalled();
+    expect((await teams.readConfig("team")).members.find(member => member.name === writer.name)?.isActive).not.toBe(false);
+
+    const delivery = sendMessageToRunningReadAgent(liveParent, "Exact child report").catch((error: Error) => error);
+    await expect(delivery).resolves.toEqual(expect.objectContaining({ message: expect.stringContaining("was cancelled") }));
+    expect(pendingChildController.settleChildRun(exactChildRun!)).toBe(false);
+    await run;
+
+    expect(pendingChildController.trackedParentCount()).toBe(0);
+    expect(session.sendUserMessage).toHaveBeenCalledOnce();
+    expect(continuationReportResult).toMatchObject({ details: { accepted: true } });
+    expect(rememberCompletedAgentReport).toHaveBeenCalledOnce();
+    expect(rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      report: "Authoritative parent report",
+      summary: "Parent done",
+    }));
+    expect(JSON.stringify(rememberCompletedAgentReport.mock.calls)).not.toContain("initial turn ended without a final report");
+  });
+
+  it("keeps an eligible zero-child parent idle until a direct message submits the first authoritative report", async () => {
+    const session = makeSession();
+    session.messages = [{ role: "assistant", content: "non-authoritative initial assistant text" }];
+    const pendingChildController = createPendingChildController();
+    let firstReportResult: any;
+    let duplicateReportResult: any;
+    session.sendUserMessage.mockImplementation(async (...args: any[]) => {
+      expect(args[0]).toBe("submit final report");
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const report = sessionOptions.customTools.find((tool: any) => tool.name === "report_and_exit");
+      firstReportResult = await report.execute("first", {
+        content: "sole authoritative report",
+        summary: "Authoritative",
+      });
+      duplicateReportResult = await report.execute("duplicate", {
+        content: "must be ignored",
+        summary: "Duplicate",
+      });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+
+    const writer = eligibleNestedParent("zero-idle-writer");
+    writeTeamConfig("team", writer);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "different-team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      createNestedReadAgentTools: vi.fn(() => [{ name: "spawn_agent", execute: vi.fn() }]),
+      pendingChildController,
+    };
+
+    let runSettled = false;
+    const run = runReadAgentInProcess("team", writer, writer.prompt!, {
+      cwd: root,
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options).then(() => { runSettled = true; });
+
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledOnce();
+      expect(runningReadAgents.get("team:zero-idle-writer")?.acceptingMessages).toBe(true);
+    });
+    expect(runSettled).toBe(false);
+    expect(rememberCompletedAgentReport).not.toHaveBeenCalled();
+    expect(pendingChildController.pendingCount({
+      teamName: "team",
+      parentName: writer.name,
+      parentRunId: writer.lifecycleRunId!,
+    })).toBe(0);
+
+    const delivery = sendMessageToRunningReadAgent(
+      runningReadAgents.get("team:zero-idle-writer"),
+      "submit final report"
+    ).catch((error: Error) => error);
+    await expect(delivery).resolves.toEqual(expect.objectContaining({ message: expect.stringContaining("was cancelled") }));
+    await run;
+
+    expect(firstReportResult).toMatchObject({ details: { accepted: true } });
+    expect(duplicateReportResult).toMatchObject({ details: { accepted: false } });
+    expect(rememberCompletedAgentReport).toHaveBeenCalledOnce();
+    expect(rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      report: "sole authoritative report",
+      summary: "Authoritative",
+    }));
+    expect(JSON.stringify(rememberCompletedAgentReport.mock.calls)).not.toContain("non-authoritative initial assistant text");
+    expect(JSON.stringify(rememberCompletedAgentReport.mock.calls)).not.toContain("must be ignored");
+    expect(pendingChildController.trackedParentCount()).toBe(0);
+  });
+
+  it("keeps a parent live when a child-report continuation returns without a report, then accepts a later direct report", async () => {
+    const session = makeSession();
+    const pendingChildController = createPendingChildController();
+    let childRun: PendingChildRun | undefined;
+    session.prompt.mockImplementation(async () => {
+      const identity = {
+        teamName: "team",
+        parentName: "continuation-writer",
+        parentRunId: writer.lifecycleRunId!,
+      };
+      const acceptance = pendingChildController.acceptChild(identity, "child");
+      childRun = pendingChildController.bindAcceptedChild(acceptance, "child", "child-run");
+    });
+    session.sendUserMessage.mockImplementation(async (...args: any[]) => {
+      const content = args[0];
+      if (content === "child report without parent final") return;
+      expect(content).toBe("later direct report");
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const report = sessionOptions.customTools.find((tool: any) => tool.name === "report_and_exit");
+      await report.execute("final", { content: "later authoritative report", summary: "Done later" });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+
+    const writer = eligibleNestedParent("continuation-writer");
+    writeTeamConfig("team", writer);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "different-team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      createNestedReadAgentTools: vi.fn(() => [{ name: "spawn_agent", execute: vi.fn() }]),
+      pendingChildController,
+    };
+    let runSettled = false;
+    const run = runReadAgentInProcess("team", writer, writer.prompt!, {
+      cwd: root,
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options).then(() => { runSettled = true; });
+
+    await vi.waitFor(() => expect(childRun).toBeDefined());
+    const liveParent = runningReadAgents.get("team:continuation-writer")!;
+    expect(pendingChildController.settleChildRun(childRun!)).toBe(true);
+    await expect(sendMessageToRunningReadAgent(liveParent, "child report without parent final")).resolves.toBe(true);
+    expect(runSettled).toBe(false);
+    expect(liveParent.acceptingMessages).toBe(true);
+    expect(rememberCompletedAgentReport).not.toHaveBeenCalled();
+
+    const finalDelivery = sendMessageToRunningReadAgent(liveParent, "later direct report").catch((error: Error) => error);
+    await expect(finalDelivery).resolves.toEqual(expect.objectContaining({ message: expect.stringContaining("was cancelled") }));
+    await run;
+    expect(rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      report: "later authoritative report",
+      summary: "Done later",
+    }));
+    expect(pendingChildController.trackedParentCount()).toBe(0);
+  });
+
+  it("rearms across child waves when child B is accepted during child A's continuation", async () => {
+    const session = makeSession();
+    const pendingChildController = createPendingChildController();
+    let childA: PendingChildRun | undefined;
+    let childB: PendingChildRun | undefined;
+    const writer = eligibleNestedParent("wave-writer");
+    session.prompt.mockImplementation(async () => {
+      const identity = { teamName: "team", parentName: writer.name, parentRunId: writer.lifecycleRunId! };
+      const acceptance = pendingChildController.acceptChild(identity, "child-a");
+      childA = pendingChildController.bindAcceptedChild(acceptance, "child-a", "child-a-run");
+    });
+    session.sendUserMessage.mockImplementation(async (...args: any[]) => {
+      const content = args[0];
+      const identity = { teamName: "team", parentName: writer.name, parentRunId: writer.lifecycleRunId! };
+      if (content === "child A report") {
+        const acceptance = pendingChildController.acceptChild(identity, "child-b");
+        childB = pendingChildController.bindAcceptedChild(acceptance, "child-b", "child-b-run");
+        return;
+      }
+      expect(content).toBe("child B report");
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const report = sessionOptions.customTools.find((tool: any) => tool.name === "report_and_exit");
+      await report.execute("waves-complete", { content: "all child waves integrated", summary: "Waves done" });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+
+    writeTeamConfig("team", writer);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "different-team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      createNestedReadAgentTools: vi.fn(() => [{ name: "spawn_agent", execute: vi.fn() }]),
+      pendingChildController,
+    };
+    let runSettled = false;
+    const run = runReadAgentInProcess("team", writer, writer.prompt!, {
+      cwd: root,
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options).then(() => { runSettled = true; });
+
+    await vi.waitFor(() => expect(childA).toBeDefined());
+    const liveParent = runningReadAgents.get("team:wave-writer")!;
+    expect(pendingChildController.settleChildRun(childA!)).toBe(true);
+    await expect(sendMessageToRunningReadAgent(liveParent, "child A report")).resolves.toBe(true);
+    expect(childB).toBeDefined();
+    expect(pendingChildController.pendingCount({
+      teamName: "team",
+      parentName: writer.name,
+      parentRunId: writer.lifecycleRunId!,
+    })).toBe(1);
+    expect(runSettled).toBe(false);
+
+    expect(pendingChildController.settleChildRun(childB!)).toBe(true);
+    const finalDelivery = sendMessageToRunningReadAgent(liveParent, "child B report").catch((error: Error) => error);
+    await expect(finalDelivery).resolves.toEqual(expect.objectContaining({ message: expect.stringContaining("was cancelled") }));
+    await run;
+    expect(rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      report: "all child waves integrated",
+      summary: "Waves done",
+    }));
+    expect(pendingChildController.trackedParentCount()).toBe(0);
+  });
+
+  it("unblocks an eligible zero-child idle parent immediately on explicit stop without fallback completion", async () => {
+    const session = makeSession();
+    session.messages = [{ role: "assistant", content: "must never become a completion report" }];
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const writer = eligibleNestedParent("stopped-idle-writer");
+    writeTeamConfig("team", writer);
+    const pendingChildController = createPendingChildController();
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const readAgentKey = (teamName: string, agentName: string) => `${teamName}:${agentName}`;
+    const isCurrentReadAgentRun = (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state;
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents,
+      readAgentKey,
+      isCurrentReadAgentRun,
+      renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => "team",
+      onTeammateClosing: (teamName, member) => {
+        pendingChildController.cancelParent({
+          teamName,
+          parentName: member.name,
+          parentRunId: member.lifecycleRunId!,
+        });
+      },
+      onTeammateSettled: (teamName, member) => {
+        pendingChildController.forgetParent({
+          teamName,
+          parentName: member.name,
+          parentRunId: member.lifecycleRunId!,
+        });
+      },
+    });
+    const options = {
+      isTeammate: false,
+      getTeamName: () => "different-team",
+      runningReadAgents,
+      readAgentKey,
+      isCurrentReadAgentRun,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      createNestedReadAgentTools: vi.fn(() => [{ name: "spawn_agent", execute: vi.fn() }]),
+      pendingChildController,
+      shutdownTeammate: lifecycle.shutdownTeammate,
+    };
+    const run = runReadAgentInProcess("team", writer, writer.prompt!, {
+      cwd: root,
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+
+    await vi.waitFor(() => {
+      expect(session.prompt).toHaveBeenCalledOnce();
+      expect(runningReadAgents.get("team:stopped-idle-writer")?.acceptingMessages).toBe(true);
+    });
+    await expect(lifecycle.shutdownTeammate("team", writer, { reason: "reload" })).resolves.toMatchObject({
+      status: "settled",
+      finalized: true,
+      removedMember: true,
+    });
+    await run;
+
+    expect(rememberCompletedAgentReport).not.toHaveBeenCalled();
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(runningReadAgents.size).toBe(0);
+    expect(pendingChildController.trackedParentCount()).toBe(0);
   });
 
   it.each([
@@ -581,6 +993,7 @@ describe("in-process read agent tool wiring", () => {
       helperKind: delegationDepth === 1 ? "read_helper" : undefined,
     };
     writeTeamConfig("team", member);
+    const rememberCompletedAgentReport = vi.fn();
 
     await runReadAgentInProcess("team", member, "bounded assignment", {
       cwd: root,
@@ -593,13 +1006,16 @@ describe("in-process read agent tool wiring", () => {
       isCurrentReadAgentRun: () => true,
       ensureReadAgentStatusTicker: vi.fn(),
       renderReadAgentStatus: vi.fn(),
-      rememberCompletedAgentReport: vi.fn(),
+      rememberCompletedAgentReport,
       emitAgentReport: vi.fn(),
       releaseAllClaimsForAgent: vi.fn(async () => []),
       createNestedReadAgentTools,
     });
 
     expect(createNestedReadAgentTools).not.toHaveBeenCalled();
+    expect(rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      report: "final report",
+    }));
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
     expect(sessionOptions.tools).not.toContain("spawn_agent");
     expect(sessionOptions.tools).not.toContain("spawn_swarm_agents");
@@ -1594,6 +2010,87 @@ describe("in-process read agent tool wiring", () => {
     expect(promptText).toContain("report_and_exit deliverable goes to that requesting writer");
     expect(promptText).toContain("lead receives only a classified completion notice");
     expect(promptText).not.toContain("send your concise report to the lead and stop");
+  });
+
+  it("retains an old child report instead of delivering it to a replacement parent run", async () => {
+    const helper: Member = {
+      agentId: "stale-child@team",
+      name: "stale-child",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "high",
+      modelSlot: "read-review",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      prompt: "inspect the old parent assignment",
+      requestedBy: "writer",
+      helperKind: "read_helper",
+      delegationDepth: 1,
+      parentAgentName: "writer",
+      parentLifecycleRunId: "writer-run-A",
+    };
+    const replacementParent: Member = {
+      agentId: "writer@team",
+      name: "writer",
+      agentType: "teammate",
+      role: "write",
+      model: "provider/model",
+      thinking: "medium",
+      modelSlot: "write-feature",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+      lifecycleRunId: "writer-run-B",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+      isActive: true,
+    };
+    writeTeamConfig("team", helper, [replacementParent]);
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = {
+      isTeammate: false,
+      agentName: "team-lead",
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      renderLeadInboxStatus: vi.fn(async () => {}),
+      notifyLeadOfInboxReports: vi.fn(async () => {}),
+      deliverMessageToActiveAgent: vi.fn(async () => false),
+    };
+
+    await runReadAgentInProcess("team", helper, helper.prompt!, {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+
+    expect(options.deliverMessageToActiveAgent).toHaveBeenCalledWith(
+      "team",
+      "writer",
+      "final report",
+      "writer-run-A"
+    );
+    expect(await readInbox("team", "writer", false, false)).toEqual([]);
+    expect((await listTeamReportEvents("team")).filter(event => event.agentName === "stale-child"))
+      .toEqual([expect.objectContaining({ status: "completed", report: "final report" })]);
+    const leadInbox = await readInbox("team", "team-lead", false, false);
+    expect(leadInbox).toHaveLength(1);
+    expect(leadInbox[0].metadata).toMatchObject({
+      finalReport: true,
+      helperCompletion: true,
+      requestedBy: "writer",
+    });
+    expect(leadInbox[0].text).toContain("writer is no longer running; the report is retained here");
   });
 
   it("uses a fallback delivery if a read helper exits without sending its required report", async () => {

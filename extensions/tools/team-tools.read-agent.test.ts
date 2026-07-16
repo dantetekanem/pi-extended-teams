@@ -14,6 +14,7 @@ import { ACCEPTED_FAVORITE_MODEL_SLOTS, FAVORITE_MODEL_SLOTS } from "../../src/u
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 import { NESTED_READ_MODEL_SLOTS } from "../runtime/nested-read-agents.js";
 import { closePersistedRecipient } from "../team/recipient-closure.js";
+import { createPendingChildController } from "../runtime/pending-child-controller.js";
 
 type RegisteredTool = {
   name: string;
@@ -128,6 +129,7 @@ function registerTools() {
   });
 
   const sessionCtx = makeCtx();
+  const pendingChildController = createPendingChildController();
   const teamToolsRuntime = registerTeamTools({
     registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
     on: vi.fn((name: string, handler: (event: any) => void | Promise<void>) => {
@@ -160,6 +162,7 @@ function registerTools() {
     agentName: "team-lead",
     getTeamName: () => "session-test-session",
     getSessionCtx: () => sessionCtx,
+    pendingChildController,
   });
 
   const emit = (name: string, payload: any) => {
@@ -171,7 +174,7 @@ function registerTools() {
   const shutdown = async (reason = "reload") => {
     for (const handler of sessionHandlers.get("session_shutdown") ?? []) await handler({ reason });
   };
-  return { tools, teamToolsRuntime, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes };
+  return { tools, teamToolsRuntime, pendingChildController, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes };
 }
 
 async function admitNestedReadParent(
@@ -1013,6 +1016,37 @@ describe("public agent spawn tools", () => {
       && child.cwd === root)).toBe(true);
   });
 
+  it("registers an immediate child before launch so a fast completion cannot be lost", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 8, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const identity = {
+      teamName: "session-test-session",
+      parentName: parent.name,
+      parentRunId: parent.lifecycleRunId!,
+    };
+    harness.runReadAgentInProcess.mockImplementationOnce(() => Promise.resolve());
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: identity.teamName,
+      parent,
+      parentRunId: identity.parentRunId,
+      outerCtx: makeCtx(),
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+
+    await nestedSpawn.execute("fast", {
+      name: "fast-child",
+      prompt: "finish immediately",
+      model_slot: "read-collect",
+    });
+
+    await vi.waitFor(() => expect(harness.pendingChildController.pendingCount(identity)).toBe(0));
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledOnce();
+    expect(harness.pendingChildController.trackedParentCount()).toBe(1);
+    expect(harness.pendingChildController.forgetParent(identity)).toBe(true);
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
+  });
+
   it("denies nested spawning immediately when the live parent recipient closes", async () => {
     writeFavoriteLevels();
     const harness = registerTools();
@@ -1083,6 +1117,129 @@ describe("public agent spawn tools", () => {
     expect((await teams.readConfig("session-test-session")).members.some((member) => member.name === "queued-child")).toBe(false);
   });
 
+  it("drops a queued child immediately when its exact parent run closes", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    const identity = {
+      teamName: "session-test-session",
+      parentName: parent.name,
+      parentRunId: parent.lifecycleRunId!,
+    };
+
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold read capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: identity.teamName,
+      parent,
+      parentRunId: identity.parentRunId,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+    await nestedSpawn.execute("queued", {
+      name: "drop-on-close",
+      prompt: "must never promote",
+      model_slot: "read-collect",
+    });
+    expect(harness.pendingChildController.pendingCount(identity)).toBe(1);
+
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents: harness.runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key, state) => harness.runningReadAgents.get(key) === state,
+      renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => identity.teamName,
+      onTeammateClosing: (teamName, member) => {
+        harness.pendingChildController.cancelParent({
+          teamName,
+          parentName: member.name,
+          parentRunId: member.lifecycleRunId!,
+        });
+      },
+      onTeammateSettled: (teamName, member) => {
+        harness.pendingChildController.forgetParent({
+          teamName,
+          parentName: member.name,
+          parentRunId: member.lifecycleRunId!,
+        });
+      },
+    });
+    await expect(lifecycle.shutdownTeammate(identity.teamName, parent)).resolves.toMatchObject({
+      status: "settled",
+      finalized: true,
+      removedMember: true,
+    });
+
+    const respond = vi.fn();
+    harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+    expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 1, queued: 0 });
+    expect(harness.pendingChildController.pendingCount(identity)).toBe(0);
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
+    expect(harness.runReadAgentInProcess.mock.calls.some(call => call[1].name === "drop-on-close")).toBe(false);
+  });
+
+  it("keeps a queued acceptance across capacity promotion and rekeys it to the assigned exact run", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const abort = new AbortController().signal;
+    const identity = {
+      teamName: "session-test-session",
+      parentName: parent.name,
+      parentRunId: parent.lifecycleRunId!,
+    };
+
+    await harness.tools.get("spawn_agent")!.execute("blocker", {
+      name: "capacity-blocker",
+      prompt: "hold read capacity",
+      cwd: root,
+      model_slot: "read-review",
+    }, abort, undefined, ctx);
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: identity.teamName,
+      parent,
+      parentRunId: identity.parentRunId,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+    await nestedSpawn.execute("queued", {
+      name: "promoted-child",
+      prompt: "wait then run",
+      model_slot: "read-collect",
+    });
+    expect(harness.pendingChildController.pendingCount(identity)).toBe(1);
+
+    harness.completions.get("capacity-blocker")!();
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    const promoted = (await teams.readConfig(identity.teamName)).members.find(member => member.name === "promoted-child")!;
+    expect(promoted.lifecycleRunId).toBeTruthy();
+    expect(harness.pendingChildController.pendingCount(identity)).toBe(1);
+    expect(harness.pendingChildController.settleChildRun({
+      ...identity,
+      childName: promoted.name,
+      childRunId: "stale-run",
+    })).toBe(false);
+    expect(harness.pendingChildController.pendingCount(identity)).toBe(1);
+
+    harness.completions.get("promoted-child")!();
+    await vi.waitFor(() => expect(harness.pendingChildController.pendingCount(identity)).toBe(0));
+    expect(harness.pendingChildController.trackedParentCount()).toBe(1);
+    expect(harness.pendingChildController.forgetParent(identity)).toBe(true);
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
+  });
+
   it("rechecks parent authorization at queued lead admission and hard-stops delegation", async () => {
     writeFavoriteLevels();
     writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
@@ -1090,6 +1247,11 @@ describe("public agent spawn tools", () => {
     const parent = await admitNestedReadParent(harness);
     const ctx = makeCtx();
     const abort = new AbortController().signal;
+    const identity = {
+      teamName: "session-test-session",
+      parentName: parent.name,
+      parentRunId: parent.lifecycleRunId!,
+    };
 
     await harness.tools.get("spawn_agent")!.execute("blocker", {
       name: "capacity-blocker",
@@ -1115,6 +1277,7 @@ describe("public agent spawn tools", () => {
       model_slot: "read-review",
     })).rejects.toThrow("nested delegation cannot replace an existing run");
     expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect(harness.pendingChildController.pendingCount(identity)).toBe(1);
 
     const parentState = harness.runningReadAgents.get("session-test-session:writer")!;
     parentState.stopRequested = true;
@@ -1128,6 +1291,7 @@ describe("public agent spawn tools", () => {
     });
     expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
     expect((await teams.readConfig("session-test-session")).members.some((member) => member.name === "queued-child")).toBe(false);
+    expect(harness.pendingChildController.pendingCount(identity)).toBe(0);
     await expect(nestedTools.get("spawn_agent")!.execute("after-stop", {
       name: "after-stop",
       prompt: "must not start",
@@ -1180,13 +1344,82 @@ describe("public agent spawn tools", () => {
     expect((await teams.readConfig("session-test-session")).members.some((member) => member.name === "racing-child")).toBe(false);
   });
 
-  it("rejects a queued request when parent closure wins during model precommit", async () => {
+  it("blocks immediate admission when successful parent stop wins before the first acceptance without leaking resources", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 8, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const ctx = makeCtx();
+    const identity = {
+      teamName: "session-test-session",
+      parentName: parent.name,
+      parentRunId: parent.lifecycleRunId!,
+    };
+    const nestedSpawn = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: identity.teamName,
+      parent,
+      parentRunId: identity.parentRunId,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool])).get("spawn_agent")!;
+    let markModelLookupStarted!: () => void;
+    const modelLookupStarted = new Promise<void>((resolve) => { markModelLookupStarted = resolve; });
+    let releaseModels!: (models: any[]) => void;
+    ctx.modelRegistry.getAvailable.mockImplementation(() => {
+      markModelLookupStarted();
+      return new Promise<any[]>((resolve) => { releaseModels = resolve; });
+    });
+
+    const spawning = nestedSpawn.execute("preaccept-direct", {
+      name: "preaccept-direct",
+      prompt: "must never be admitted",
+      model_slot: "read-collect",
+    });
+    await modelLookupStarted;
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
+
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents: harness.runningReadAgents,
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key, state) => harness.runningReadAgents.get(key) === state,
+      renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => identity.teamName,
+      onTeammateClosing: () => { harness.pendingChildController.cancelParent(identity); },
+      onTeammateSettled: () => { harness.pendingChildController.forgetParent(identity); },
+    });
+    await expect(lifecycle.shutdownTeammate(identity.teamName, parent)).resolves.toMatchObject({
+      status: "settled",
+      finalized: true,
+      removedMember: true,
+    });
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
+
+    releaseModels([{ provider: "provider", id: "model" }]);
+    await expect(spawning).rejects.toThrow("bound parent lifecycle is not active");
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+    expect((await teams.readConfig(identity.teamName)).members.some(member => member.name === "preaccept-direct")).toBe(false);
+    const respond = vi.fn();
+    harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
+    expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 0, queued: 0 });
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
+  });
+
+  it("rejects a queued request when successful parent stop wins before the first acceptance", async () => {
     writeFavoriteLevels();
     writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
     const harness = registerTools();
     const parent = await admitNestedReadParent(harness);
     const ctx = makeCtx();
     const abort = new AbortController().signal;
+    const identity = {
+      teamName: "session-test-session",
+      parentName: parent.name,
+      parentRunId: parent.lifecycleRunId!,
+    };
     await harness.tools.get("spawn_agent")!.execute("blocker", {
       name: "capacity-blocker",
       prompt: "hold capacity",
@@ -1213,20 +1446,36 @@ describe("public agent spawn tools", () => {
       model_slot: "read-collect",
     });
     await modelLookupStarted;
-    harness.runningReadAgents.get("session-test-session:writer")!.messageDeliveryClosed = true;
-    await closePersistedRecipient(
-      "session-test-session",
-      "writer",
-      parent.lifecycleRunId!,
-      { role: "write", removeOnFailure: true }
-    );
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents: harness.runningReadAgents,
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key, state) => harness.runningReadAgents.get(key) === state,
+      renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => identity.teamName,
+      onTeammateClosing: () => { harness.pendingChildController.cancelParent(identity); },
+      onTeammateSettled: () => { harness.pendingChildController.forgetParent(identity); },
+    });
+    await expect(lifecycle.shutdownTeammate(identity.teamName, parent)).resolves.toMatchObject({
+      status: "settled",
+      finalized: true,
+      removedMember: true,
+    });
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
     releaseModels([{ provider: "provider", id: "model" }]);
 
     await expect(spawning).rejects.toThrow("bound parent lifecycle is not active");
     const respond = vi.fn();
     harness.emit(CHILD_AGENT_LIFECYCLE_PROBE, { sessionId: "test-session", respond });
-    expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 2, queued: 0 });
+    expect(respond).toHaveBeenCalledWith({ sessionId: "test-session", running: 1, queued: 0 });
     expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect((await teams.readConfig(identity.teamName)).members.some(member => member.name === "precommit-child")).toBe(false);
+    expect(harness.pendingChildController.trackedParentCount()).toBe(0);
   });
 
   it("rolls back a queued child when parent closure starts during drain admission", async () => {

@@ -1,7 +1,7 @@
 import { Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import type { RunningReadAgent } from "../runtime/types";
 import { dimAnsi, pink, purple } from "./ansi";
-import { framePanel } from "./frame";
+import { createFramePanelRowRenderer, framePanel } from "./frame";
 import { extractTextParts, formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount, sanitizePlainTuiLine, sanitizeTuiLine, sanitizeTuiText } from "./renderers";
 
 const REFRESH_INTERVAL_MS = 250;
@@ -329,7 +329,75 @@ export function createAgentFollowComponent(
   let focused = false;
   const messageInput = new Input();
   const stoppingAgents = new Set<string>();
-  const refreshTimer = setInterval(() => tui.requestRender(), REFRESH_INTERVAL_MS);
+  let transcriptAgent: RunningReadAgent | undefined;
+  let transcriptMessages: unknown[] | undefined;
+  let transcriptMessageCount = -1;
+  let transcriptLastMessage: unknown;
+  let transcriptWidth = -1;
+  let transcriptExpanded = false;
+  let cachedTranscriptLines: string[] = [];
+  let cachedFrameWidth = -1;
+  let cachedFrameRowRenderer: ((line: string) => string) | undefined;
+  let cachedFrameContent: string[] | null = null;
+  let cachedFrameLines: string[] | null = null;
+  let fastFrameKey = "";
+  let fastFrameMessages: unknown[] | undefined;
+  let fastFrameMessageCount = -1;
+  let fastFrameLastMessage: unknown;
+  let refreshStateKey = "";
+  let refreshMessages: unknown[] | undefined;
+  let refreshMessageCount = -1;
+  let refreshLastMessage: unknown;
+  const refreshTimer = setInterval(() => {
+    const agents = options.getAgents().slice().sort((a, b) => a.name.localeCompare(b.name));
+    const agent = currentAgent(agents, selectedName);
+    if (!agent) {
+      const emptyKey = agents.map((item) => item.name).join("\0");
+      if (emptyKey !== refreshStateKey) {
+        refreshStateKey = emptyKey;
+        tui.requestRender();
+      }
+      return;
+    }
+
+    try {
+      const total = agent.session?.getSessionStats().tokens.total;
+      if (typeof total === "number") agent.tokensUsed = total;
+    } catch {
+      // The nested session may be shutting down while this view refreshes.
+    }
+    const messages = agent.session?.messages || [];
+    const lastMessage = messages[messages.length - 1];
+    const stateKey = [
+      Math.floor(Date.now() / 1000),
+      agents.map((item) => item.name).join(","),
+      agent.name,
+      agent.model,
+      agent.thinking,
+      agent.modelSlot,
+      agent.startedAt,
+      agent.tokensUsed,
+      agent.status,
+      agent.latestProgress,
+      stoppingAgents.has(agent.name),
+      expandLargeToolResults,
+      offsetFromBottom,
+      composingMessage,
+      messageStatus,
+      tui.terminal?.rows ?? 24,
+    ].join("\0");
+    if (stateKey === refreshStateKey
+      && refreshMessages === messages
+      && refreshMessageCount === messages.length
+      && refreshLastMessage === lastMessage) {
+      return;
+    }
+    refreshStateKey = stateKey;
+    refreshMessages = messages;
+    refreshMessageCount = messages.length;
+    refreshLastMessage = lastMessage;
+    tui.requestRender();
+  }, REFRESH_INTERVAL_MS);
 
   const syncInputFocus = () => {
     messageInput.focused = focused && composingMessage;
@@ -436,9 +504,9 @@ export function createAgentFollowComponent(
         purple("─".repeat(innerWidth)),
         composingMessage ? pink(`message ${agent.name}`) : dimAnsi(`message ${agent.name}`),
         ...(composingMessage ? messageInput.render(innerWidth) : [dimAnsi("> Press m to start typing")]),
-        messageStatus
-          ? dimAnsi(messageStatus)
-          : dimAnsi(composingMessage ? "enter send · esc cancel" : "m message selected agent"),
+        ...(messageStatus
+          ? [dimAnsi(messageStatus)]
+          : composingMessage ? [dimAnsi("enter send · esc cancel")] : []),
       ] : [];
       const bodyHeight = Math.max(4, terminalRows - navigationLines.length - 6 - messageLines.length);
       lastBodyHeight = bodyHeight;
@@ -451,11 +519,41 @@ export function createAgentFollowComponent(
         // The nested session may be shutting down while this view renders.
       }
 
+      const currentMessages = agent.session?.messages || [];
+      const lastMessage = currentMessages[currentMessages.length - 1];
       const renderNow = Date.now();
+      const isStopping = stoppingAgents.has(agent.name);
+      const currentFastFrameKey = composingMessage ? "" : [
+        innerWidth,
+        terminalRows,
+        Math.floor(renderNow / 1000),
+        agents.map((item) => item.name).join(","),
+        selectedName,
+        agent.model,
+        agent.thinking,
+        agent.modelSlot,
+        agent.startedAt,
+        agent.tokensUsed,
+        agent.status,
+        agent.latestProgress,
+        isStopping,
+        expandLargeToolResults,
+        offsetFromBottom,
+        messageStatus,
+        options.sendMessage ? 1 : 0,
+      ].join("\0");
+      if (currentFastFrameKey
+        && currentFastFrameKey === fastFrameKey
+        && fastFrameMessages === currentMessages
+        && fastFrameMessageCount === currentMessages.length
+        && fastFrameLastMessage === lastMessage
+        && cachedFrameLines) {
+        return cachedFrameLines.slice();
+      }
       const model = formatModelLabel(agent.model, agent.thinking).replace(" · ", "/");
       const slot = agent.modelSlot || "level inherited";
       const elapsed = formatElapsed(renderNow - agent.startedAt);
-      const activity = stoppingAgents.has(agent.name)
+      const activity = isStopping
         ? "stopping"
         : agent.latestProgress
           ? formatAnimatedProgress(agent.latestProgress, renderNow)
@@ -469,11 +567,25 @@ export function createAgentFollowComponent(
           ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction} · x stop · pgup/pgdn scroll · esc main`
           : `↑/esc main · ${logAction}${messageAction} · x stop · pgup/pgdn scroll · end follow`;
 
-      const transcriptWidth = Math.max(20, innerWidth);
-      const transcriptLines = formatAgentFollowTranscript(agent.session?.messages || [], {
-        expandLargeToolResults,
-        width: transcriptWidth,
-      }).flatMap(line => wrapTextWithAnsi(line, transcriptWidth));
+      const currentTranscriptWidth = Math.max(20, innerWidth);
+      if (transcriptAgent !== agent
+        || transcriptMessages !== currentMessages
+        || transcriptMessageCount !== currentMessages.length
+        || transcriptLastMessage !== lastMessage
+        || transcriptWidth !== currentTranscriptWidth
+        || transcriptExpanded !== expandLargeToolResults) {
+        transcriptAgent = agent;
+        transcriptMessages = currentMessages;
+        transcriptMessageCount = currentMessages.length;
+        transcriptLastMessage = lastMessage;
+        transcriptWidth = currentTranscriptWidth;
+        transcriptExpanded = expandLargeToolResults;
+        cachedTranscriptLines = formatAgentFollowTranscript(currentMessages, {
+          expandLargeToolResults,
+          width: currentTranscriptWidth,
+        }).flatMap(line => wrapTextWithAnsi(line, currentTranscriptWidth));
+      }
+      const transcriptLines = cachedTranscriptLines;
       lastTranscriptRows = transcriptLines.length;
       const maxOffset = Math.max(0, transcriptLines.length - bodyHeight);
       offsetFromBottom = Math.min(offsetFromBottom, maxOffset);
@@ -481,15 +593,66 @@ export function createAgentFollowComponent(
       const visible = transcriptLines.slice(start, start + bodyHeight);
       while (visible.length < bodyHeight) visible.push("");
 
-      return framePanel([
+      const frameContent = [
         ...navigationLines,
         purple("─".repeat(innerWidth)),
-        truncateToWidth(headline, innerWidth, "…", true),
+        headline,
         dimAnsi(help),
         purple("─".repeat(innerWidth)),
         ...visible,
         ...messageLines,
-      ], innerWidth, AGENT_FOLLOW_BACKGROUND);
+      ];
+      let renderedFrame: string[] | undefined;
+      if (cachedFrameWidth === innerWidth
+        && cachedFrameContent
+        && cachedFrameContent.length === frameContent.length
+        && cachedFrameLines) {
+        let changedCount = 0;
+        let changed0 = -1;
+        let changed1 = -1;
+        let changed2 = -1;
+        let changed3 = -1;
+        for (let index = 0; index < frameContent.length; index++) {
+          if (frameContent[index] === cachedFrameContent[index]) continue;
+          if (changedCount === 0) changed0 = index;
+          else if (changedCount === 1) changed1 = index;
+          else if (changedCount === 2) changed2 = index;
+          else if (changedCount === 3) changed3 = index;
+          changedCount++;
+          if (changedCount > 4) break;
+        }
+        if (changedCount === 0) {
+          fastFrameKey = currentFastFrameKey;
+          fastFrameMessages = currentMessages;
+          fastFrameMessageCount = currentMessages.length;
+          fastFrameLastMessage = lastMessage;
+          return cachedFrameLines.slice();
+        }
+        if (changedCount <= 4) {
+          const renderFrameRow = cachedFrameRowRenderer!;
+          renderedFrame = cachedFrameLines.slice();
+          renderedFrame[changed0 + 1] = renderFrameRow(frameContent[changed0]);
+          if (changedCount > 1) {
+            renderedFrame[changed1 + 1] = renderFrameRow(frameContent[changed1]);
+            if (changedCount > 2) {
+              renderedFrame[changed2 + 1] = renderFrameRow(frameContent[changed2]);
+              if (changedCount > 3) renderedFrame[changed3 + 1] = renderFrameRow(frameContent[changed3]);
+            }
+          }
+        }
+      }
+      if (!renderedFrame) {
+        renderedFrame = framePanel(frameContent, innerWidth, AGENT_FOLLOW_BACKGROUND);
+        cachedFrameRowRenderer = createFramePanelRowRenderer(innerWidth, AGENT_FOLLOW_BACKGROUND);
+      }
+      cachedFrameWidth = innerWidth;
+      cachedFrameContent = frameContent;
+      cachedFrameLines = renderedFrame;
+      fastFrameKey = currentFastFrameKey;
+      fastFrameMessages = currentMessages;
+      fastFrameMessageCount = currentMessages.length;
+      fastFrameLastMessage = lastMessage;
+      return renderedFrame;
     },
     invalidate() {
       messageInput.invalidate();

@@ -72,30 +72,162 @@ function markReadAgentActivity(
   pushReadAgentEvent(agent, text);
 }
 
-function refreshReadAgentStats(agent: RunningReadAgent, session: AgentSession): void {
+function refreshReadAgentStats(agent: RunningReadAgent, session: AgentSession, activityAlreadyMarked = false): void {
   const tokensUsed = session.getSessionStats().tokens.total;
-  if (tokensUsed !== agent.tokensUsed) {
+  if (tokensUsed !== agent.tokensUsed && !activityAlreadyMarked) {
     agent.lastActivityAt = Date.now();
     agent.idleNudgeLevel = undefined;
   }
   agent.tokensUsed = tokensUsed;
 }
 
-function assistantProgressSnippet(message: any): string | undefined {
-  if (message?.role !== "assistant") return undefined;
-  const text = sanitizeTuiLine(extractTextParts(message.content)).trim();
-  if (!text) return undefined;
-  return text.length > 180 ? `…${text.slice(-179)}` : text;
+const MAX_ASSISTANT_PROGRESS_SNIPPET_CHARS = 180;
+const MAX_ASSISTANT_PROGRESS_TAIL_CHARS = 384;
+
+function clipAssistantProgressText(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > MAX_ASSISTANT_PROGRESS_SNIPPET_CHARS
+    ? `…${trimmed.slice(-(MAX_ASSISTANT_PROGRESS_SNIPPET_CHARS - 1))}`
+    : trimmed;
 }
 
-function updateAssistantProgress(agent: RunningReadAgent, message: any, recordEvent: boolean): boolean {
-  const snippet = assistantProgressSnippet(message);
+function assistantProgressSnippetFromRawText(rawText: string): string | undefined {
+  return clipAssistantProgressText(sanitizeTuiLine(rawText));
+}
+
+function assistantProgressSnippetFromSafeTail(normalizedText: string): string | undefined {
+  return clipAssistantProgressText(normalizedText);
+}
+
+function normalizeIncrementalAssistantDelta(delta: string): string | null {
+  let normalized: string | undefined;
+  let segmentStart = 0;
+  for (let index = 0; index < delta.length; index++) {
+    const code = delta.charCodeAt(index);
+    if ((code <= 8) || (code >= 11 && code <= 31) || (code >= 127 && code <= 159)) return null;
+    if (code !== 9 && code !== 10) continue;
+    normalized = `${normalized || ""}${delta.slice(segmentStart, index)}${code === 9 ? "   " : " "}`;
+    segmentStart = index + 1;
+  }
+  return normalized === undefined ? delta : `${normalized}${delta.slice(segmentStart)}`;
+}
+
+function assistantProgressSnippet(message: any): string | undefined {
+  if (message?.role !== "assistant") return undefined;
+  return assistantProgressSnippetFromRawText(extractTextParts(message.content));
+}
+
+function applyAssistantProgressSnippet(agent: RunningReadAgent, snippet: string | undefined, recordEvent: boolean): boolean {
   if (!snippet || snippet === agent.latestAssistantSnippet) return false;
   agent.latestAssistantSnippet = snippet;
   agent.lastActivityAt = Date.now();
   agent.idleNudgeLevel = undefined;
   if (recordEvent) pushReadAgentEvent(agent, `assistant: ${snippet}`);
   return true;
+}
+
+function updateAssistantProgress(agent: RunningReadAgent, message: any, recordEvent: boolean): boolean {
+  return applyAssistantProgressSnippet(agent, assistantProgressSnippet(message), recordEvent);
+}
+
+function resetIncrementalAssistantProgress(agent: RunningReadAgent): void {
+  agent.assistantProgressNormalizedTail = "";
+  agent.assistantProgressTailTruncated = false;
+  agent.assistantProgressContentIndex = undefined;
+  agent.assistantProgressNeedsSeparator = false;
+  agent.assistantProgressIncrementalUnsafe = false;
+}
+
+function updateAssistantProgressFromEvent(agent: RunningReadAgent, event: any): boolean {
+  const update = event.assistantMessageEvent;
+  if (!update || typeof update.type !== "string") {
+    return updateAssistantProgress(agent, event.message, false);
+  }
+
+  if (update.type === "text_start") {
+    agent.assistantProgressNeedsSeparator = agent.assistantProgressContentIndex !== undefined
+      && agent.assistantProgressContentIndex !== update.contentIndex;
+    agent.assistantProgressContentIndex = update.contentIndex;
+    return false;
+  }
+
+  if (update.type !== "text_delta") {
+    return update.type === "text_end"
+      ? updateAssistantProgress(agent, event.message, false)
+      : false;
+  }
+
+  const delta = String(update.delta || "");
+  if (agent.assistantProgressIncrementalUnsafe) return updateAssistantProgress(agent, event.message, false);
+  const normalizedDelta = normalizeIncrementalAssistantDelta(delta);
+  if (normalizedDelta === null) {
+    agent.assistantProgressIncrementalUnsafe = true;
+    return updateAssistantProgress(agent, event.message, false);
+  }
+
+  const needsSeparator = agent.assistantProgressNeedsSeparator
+    || (agent.assistantProgressContentIndex !== undefined && agent.assistantProgressContentIndex !== update.contentIndex);
+  agent.assistantProgressContentIndex = update.contentIndex;
+  agent.assistantProgressNeedsSeparator = false;
+  let normalizedTail = `${agent.assistantProgressNormalizedTail || ""}${needsSeparator ? " " : ""}${normalizedDelta}`;
+  if (normalizedTail.length > MAX_ASSISTANT_PROGRESS_TAIL_CHARS) {
+    normalizedTail = normalizedTail.slice(-MAX_ASSISTANT_PROGRESS_TAIL_CHARS);
+    agent.assistantProgressTailTruncated = true;
+  }
+  agent.assistantProgressNormalizedTail = normalizedTail;
+
+  const snippet = assistantProgressSnippetFromSafeTail(normalizedTail);
+  if (agent.assistantProgressTailTruncated && (!snippet || snippet.length < MAX_ASSISTANT_PROGRESS_SNIPPET_CHARS)) {
+    return updateAssistantProgress(agent, event.message, false);
+  }
+  return applyAssistantProgressSnippet(agent, snippet, false);
+}
+
+export function handleReadAgentSessionEvent(
+  state: RunningReadAgent,
+  session: AgentSession,
+  event: any,
+  renderReadAgentStatus: () => void
+): void {
+  const eventType = event.type;
+  if (eventType === "agent_start" || eventType === "turn_start") {
+    markReadAgentActivity(state, "thinking", "thinking");
+  }
+  if (eventType === "message_start" && event.message?.role === "assistant") {
+    resetIncrementalAssistantProgress(state);
+    markReadAgentActivity(state, "thinking", "thinking");
+  }
+  let assistantActivityMarked = false;
+  if (eventType === "message_update") {
+    assistantActivityMarked = updateAssistantProgressFromEvent(state, event);
+    if (assistantActivityMarked) {
+      state.status = "thinking";
+      state.activeToolName = undefined;
+    }
+  }
+  if (eventType === "message_end" && event.message?.role === "assistant") {
+    assistantActivityMarked = updateAssistantProgress(state, event.message, true);
+    resetIncrementalAssistantProgress(state);
+  }
+  if (eventType === "tool_execution_start") {
+    markReadAgentActivity(state, `working: ${event.toolName}`, "working", event.toolName);
+  }
+  if (eventType === "tool_execution_update") {
+    markReadAgentActivity(state, `working: ${event.toolName}`, "working", event.toolName);
+  }
+  if (eventType === "tool_execution_end") {
+    markReadAgentActivity(state, "thinking", "thinking");
+  }
+  if (eventType === "agent_end") pushReadAgentEvent(state, "agent complete");
+  if (eventType === "message_update" || eventType === "message_end" || eventType === "turn_end" || eventType === "agent_end") {
+    try {
+      refreshReadAgentStats(state, session, assistantActivityMarked);
+      renderReadAgentStatus();
+    } catch {
+      // Ignore stats races while the nested session is shutting down.
+    }
+  }
 }
 
 export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | undefined, content: string): Promise<boolean> {
@@ -580,37 +712,7 @@ export async function runReadAgentInProcess(
     options.renderReadAgentStatus();
 
     session.subscribe((event: any) => {
-      if (event.type === "agent_start" || event.type === "turn_start") {
-        markReadAgentActivity(state, "thinking", "thinking");
-      }
-      if (event.type === "message_start" && event.message?.role === "assistant") {
-        markReadAgentActivity(state, "thinking", "thinking");
-      }
-      if (event.type === "message_update" && updateAssistantProgress(state, event.message, false)) {
-        state.status = "thinking";
-        state.activeToolName = undefined;
-      }
-      if (event.type === "message_end" && event.message?.role === "assistant") {
-        updateAssistantProgress(state, event.message, true);
-      }
-      if (event.type === "tool_execution_start") {
-        markReadAgentActivity(state, `working: ${event.toolName}`, "working", event.toolName);
-      }
-      if (event.type === "tool_execution_update") {
-        markReadAgentActivity(state, `working: ${event.toolName}`, "working", event.toolName);
-      }
-      if (event.type === "tool_execution_end") {
-        markReadAgentActivity(state, "thinking", "thinking");
-      }
-      if (event.type === "agent_end") pushReadAgentEvent(state, "agent complete");
-      if (event.type === "message_update" || event.type === "message_end" || event.type === "turn_end" || event.type === "agent_end") {
-        try {
-          refreshReadAgentStats(state, session);
-          options.renderReadAgentStatus();
-        } catch {
-          // Ignore stats races while the nested session is shutting down.
-        }
-      }
+      handleReadAgentSessionEvent(state, session, event, options.renderReadAgentStatus);
     });
 
     state.acceptingMessages = true;

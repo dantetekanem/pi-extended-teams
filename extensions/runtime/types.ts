@@ -17,6 +17,11 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   thinking?: string;
   modelSlot?: string;
   latestAssistantSnippet?: string;
+  assistantProgressNormalizedTail?: string;
+  assistantProgressTailTruncated?: boolean;
+  assistantProgressContentIndex?: number;
+  assistantProgressNeedsSeparator?: boolean;
+  assistantProgressIncrementalUnsafe?: boolean;
   latestProgress?: string;
   progressUpdatedAt?: number;
   session?: AgentSession;

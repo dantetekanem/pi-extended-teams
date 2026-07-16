@@ -56,8 +56,9 @@ vi.mock("../internal/pi-runtime-api", () => ({
   loadPiRuntimeApi: async () => mockedPiRuntimeApi(),
 }));
 
-import { closeReadAgentMessageDelivery, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./read-agent.js";
+import { closeReadAgentMessageDelivery, handleReadAgentSessionEvent, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./read-agent.js";
 import { createLifecycleRuntime } from "../team/lifecycle.js";
+import { sanitizeTuiLine } from "../ui/renderers.js";
 import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "./read-agent-session-lifecycle.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 
@@ -1012,6 +1013,107 @@ describe("in-process read agent tool wiring", () => {
       metadata: { initialPrompt: "edit an isolated file", modelSlot: "write-system" },
     });
     expect(JSON.stringify({ state: options.rememberCompletedAgentReport.mock.calls, leadInbox, reports })).not.toContain("writing-hard");
+  });
+
+  it("preserves the full per-update assistant snippet while processing text deltas incrementally", () => {
+    const state = {
+      runId: "run-reader",
+      name: "reader",
+      teamName: "team",
+      startedAt: 0,
+      tokensUsed: 0,
+      status: "thinking",
+      recentEvents: [],
+      lastActivityAt: 0,
+    } as RunningReadAgent;
+    const session = { getSessionStats: () => ({ tokens: { total: 42 } }) } as any;
+    const renderReadAgentStatus = vi.fn();
+    const expectedSnippet = (text: string) => {
+      const sanitized = sanitizeTuiLine(text).trim();
+      return sanitized.length > 180 ? `…${sanitized.slice(-179)}` : sanitized;
+    };
+
+    let firstPart = "";
+    handleReadAgentSessionEvent(state, session, {
+      type: "message_start",
+      message: { role: "assistant", content: [{ type: "text", text: firstPart }] },
+    }, renderReadAgentStatus);
+
+    for (const delta of ["Alpha\t", "beta\n", "gamma ", "x".repeat(2_500)]) {
+      firstPart += delta;
+      const message = { role: "assistant", content: [{ type: "text", text: firstPart }] };
+      handleReadAgentSessionEvent(state, session, {
+        type: "message_update",
+        message,
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta, partial: message },
+      }, renderReadAgentStatus);
+      expect(state.latestAssistantSnippet).toBe(expectedSnippet(firstPart));
+    }
+
+    let secondPart = "";
+    let message = {
+      role: "assistant",
+      content: [{ type: "text", text: firstPart }, { type: "text", text: secondPart }],
+    };
+    handleReadAgentSessionEvent(state, session, {
+      type: "message_update",
+      message,
+      assistantMessageEvent: { type: "text_start", contentIndex: 1, partial: message },
+    }, renderReadAgentStatus);
+    secondPart = "second part";
+    message = {
+      role: "assistant",
+      content: [{ type: "text", text: firstPart }, { type: "text", text: secondPart }],
+    };
+    handleReadAgentSessionEvent(state, session, {
+      type: "message_update",
+      message,
+      assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: secondPart, partial: message },
+    }, renderReadAgentStatus);
+    expect(state.latestAssistantSnippet).toBe(expectedSnippet(`${firstPart}\n${secondPart}`));
+
+    secondPart += "\x1b[2K\runsafe tail";
+    message = {
+      role: "assistant",
+      content: [{ type: "text", text: firstPart }, { type: "text", text: secondPart }],
+    };
+    handleReadAgentSessionEvent(state, session, {
+      type: "message_update",
+      message,
+      assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "\x1b[2K\runsafe tail", partial: message },
+    }, renderReadAgentStatus);
+    expect(state.latestAssistantSnippet).toBe(expectedSnippet(`${firstPart}\n${secondPart}`));
+    expect(state.tokensUsed).toBe(42);
+    expect(renderReadAgentStatus).toHaveBeenCalledTimes(7);
+  });
+
+  it("refreshes exact session stats on every update even when message history is unchanged", () => {
+    const state = {
+      runId: "run-reader",
+      name: "reader",
+      teamName: "team",
+      startedAt: 0,
+      tokensUsed: 0,
+      status: "thinking",
+      recentEvents: [],
+      lastActivityAt: 0,
+    } as RunningReadAgent;
+    let tokensUsed = 42;
+    const session = {
+      messages: [{ role: "user", content: "prompt" }],
+      getSessionStats: vi.fn(() => ({ tokens: { total: tokensUsed } })),
+    } as any;
+    const renderReadAgentStatus = vi.fn();
+    const update = { type: "message_update", message: { role: "toolResult", content: "partial" } };
+
+    handleReadAgentSessionEvent(state, session, update, renderReadAgentStatus);
+    expect(state.tokensUsed).toBe(42);
+    tokensUsed = 43;
+    handleReadAgentSessionEvent(state, session, update, renderReadAgentStatus);
+
+    expect(session.getSessionStats).toHaveBeenCalledTimes(2);
+    expect(state.tokensUsed).toBe(43);
+    expect(renderReadAgentStatus).toHaveBeenCalledTimes(2);
   });
 
   it("emits normalized progress without resetting tool-working status for non-assistant message updates", async () => {

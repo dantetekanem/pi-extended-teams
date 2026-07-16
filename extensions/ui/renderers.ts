@@ -4,6 +4,7 @@ import { dimAnsi, pink, purple } from "./ansi";
 
 const ANSI_ESCAPE_SEQUENCE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|_[^\x07\x1b]*(?:\x07|\x1b\\)|[PX^][^\x1b]*(?:\x1b\\|\x07)|[@-Z\\-_])/g;
 const SAFE_SGR_SEQUENCE = /^\x1b\[[0-9;]*m$/;
+const ANIMATED_PROGRESS_DOTS = [".", "..", "..."] as const;
 
 export function sanitizeTuiText(text: string): string {
   return text
@@ -30,7 +31,8 @@ export function formatModelLabel(model?: string, thinking?: string): string {
 
 export function formatAnimatedProgress(text: string, now: number): string {
   const base = sanitizePlainTuiLine(text).replace(/\.+$/, "");
-  return `${base}${".".repeat((Math.floor(now / 1000) % 3) + 1)}`;
+  const phase = Math.floor(now / 1000) % ANIMATED_PROGRESS_DOTS.length;
+  return `${base}${phase === 0 ? ANIMATED_PROGRESS_DOTS[0] : phase === 1 ? ANIMATED_PROGRESS_DOTS[1] : ANIMATED_PROGRESS_DOTS[2]}`;
 }
 
 export function formatElapsed(ms: number): string {

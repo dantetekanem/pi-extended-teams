@@ -5,7 +5,7 @@ description: Multiply a coding session with genuine independent read-only lanes 
 
 # pi-extended-teams
 
-Spawn helper agents inside the current Pi session. The lead stays in charge, keeps the main context, and synthesizes agent reports for the user. Agents are followable from Pi and do not require a separate team setup step.
+Spawn helper agents inside the current Pi session. The lead stays in charge, keeps the main context, and synthesizes agent reports for the user. Agent sessions are isolated: they do not inherit the lead or parent conversation, so the mission prompt is the reliable context handoff. Agents are followable from Pi and do not require a separate team setup step.
 
 ## Autoresearch conflict guard
 
@@ -43,11 +43,25 @@ spawn_swarm_agents({
   agents: [
     {
       name: "git-check",
-      prompt: "Inspect branch/status, recent commits, and diffs. Report what changed and any risks."
+      prompt: `Mode: READ-ONLY
+Question: Does this branch contain changes outside accepted commits 1a2b3c4 and 5d6e7f8?
+Expected delta: Exact unexpected commits or paths, or an evidence-backed clean verdict.
+Known: [verified] source: command "git status --short" -> no output; [decision] source: user request -> only 1a2b3c4 and 5d6e7f8 belong to this change.
+Inspected: working-tree status only, using the command above.
+Do not rediscover: working-tree cleanliness; reuse the supplied command result.
+Dependencies consumed: baseline commit IDs 1a2b3c4 and 5d6e7f8 plus the supplied status result.
+Inspect branch/log/diff boundaries and report commands, unexpected changes, uncertainty, and the next bounded question. Do not edit.`
     },
     {
       name: "test-gaps",
-      prompt: "Find missing or weak test coverage for the current changes. List concrete gaps."
+      prompt: `Mode: READ-ONLY
+Question: Which replay or concurrency behavior in src/auth/token-service.ts remains untested?
+Expected delta: Concrete missing cases tied to file:line, or evidence coverage is sufficient.
+Known: [verified] source: command "pnpm exec vitest run test/auth/token-service.test.ts" -> 18/18 passed; [decision] source: user acceptance criterion -> rotation must invalidate the predecessor token.
+Inspected: source: lead inspection of src/auth/token-service.ts:42-71 and test/auth/token-service.test.ts:10-88 -> rotate() plus happy-path and single-request replay coverage.
+Do not rediscover: changed paths or rerun the passing command; reuse the supplied paths and result.
+Dependencies consumed: exact paths/lines and focused-test command/result above.
+Inspect only the concurrent rotation path and focused tests. Report gaps, coverage boundary, and next test question. Do not edit.`
     }
   ]
 })
@@ -65,7 +79,14 @@ Spawn one more focused helper when needed:
 spawn_agent({
   name: "docs-review",
   model_slot: "read-review",
-  prompt: "Review README.md and docs/guide.md for stale agent-tool references. Report exact lines and replacements."
+  prompt: `Mode: READ-ONLY
+Question: Does docs/guide.md still use retired agent-tool names?
+Expected delta: Exact stale lines and replacements, or a bounded clean verdict.
+Known: [verified] source: README.md#public-tools and extensions/tools/team-tools.ts public schemas -> current spawn tools are spawn_agent and spawn_swarm_agents.
+Inspected: README.md#public-tools against those two schema names.
+Do not rediscover: README.md; reuse the supplied section and exact tool list.
+Dependencies consumed: README.md#public-tools and the two current schema names above.
+Inspect docs/guide.md only for retired alternatives and report searched terms, lines, uncertainty, and next action. Do not edit.`
 })
 ```
 
@@ -75,7 +96,14 @@ Spawn an edit agent only for isolated work:
 spawn_agent({
   name: "docs-fix",
   model_slot: "write-patch",
-  prompt: "Fix only stale tool names in docs/guide.md. Claim the file first, keep the diff small, then call report_and_exit."
+  prompt: `Mode: EDIT-ALLOWED
+Question: Can docs/guide.md be corrected to use only spawn_agent and spawn_swarm_agents?
+Expected delta: A minimal docs-only patch replacing the retired names team_create and task_assign.
+Known: [verified] source: docs-review report R-17 -> retired names occur at docs/guide.md:42 and :58; [decision] source: docs/reference.md#agent-tools -> replacements are spawn_agent and spawn_swarm_agents.
+Inspected: docs-review report R-17 searched docs/guide.md for all four names.
+Do not rediscover: tool-name inventory; use report R-17 and reopen only if the file conflicts.
+Dependencies consumed: docs-review report R-17 and docs/reference.md#agent-tools.
+Claim docs/guide.md only, make the two replacements, run the focused docs reference check, then report changed paths, command/result, conflicts, and next action via report_and_exit.`
 })
 ```
 
@@ -86,7 +114,14 @@ spawn_agent({
   name: "parser-feature",
   model_slot: "write-feature",
   allow_nested_read_agents: true,
-  prompt: "Implement the bounded parser change; delegate only independent read-only evidence lanes."
+  prompt: `Mode: EDIT-ALLOWED
+Question: Can parseConfig reject duplicate keys while preserving existing valid inputs?
+Expected delta: A bounded parser implementation plus focused regression tests.
+Known: [verified] source: issue #214 reproduction with duplicate lines "a=1" then "a=2" -> last value currently wins; [decision] source: issue #214 acceptance criteria -> reject the second key with its line number.
+Inspected: source: lead inspection of src/parser/config.ts:20-64 and test/parser/config.test.ts -> parsing is isolated there and current tests cover valid unique keys.
+Do not rediscover: reproduction, acceptance behavior, or parser ownership; reuse the supplied issue evidence and paths.
+Dependencies consumed: issue #214 reproduction/acceptance criteria and the inspected paths above.
+Claim only src/parser/config.ts and test/parser/config.test.ts, implement and run the focused parser test. If you spawn an independent read-only evidence lane, give the child the same Context handoff contract; it does not inherit this conversation. Report changed paths, command/result, remaining uncertainty, and next action via report_and_exit.`
 })
 ```
 
@@ -102,7 +137,7 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 - Keep implementation in the lead when there is only one substantive execution lane. Otherwise, a writer may own only one isolated sub-outcome.
 - Never sleep, busy-wait, or poll. The extension wakes the lead when reports arrive.
 - Trust quiet agents. Do not ping, message, or check an agent just because it has been quiet for less than several minutes; active status remains visible in the activity card and Down-key live view.
-- When requirements or evidence change while an agent is still active, use `send_message` to update that owner instead of replacing or stopping it. Active in-process read agents receive the message as a steering turn and can continue intelligently; active tmux writers wake through their inbox.
+- When new, changed, or previously omitted evidence affects an active owner, use `send_message` with an **Evidence delta** as defined below instead of replacing or stopping it. Active in-process read agents receive the message as a steering turn and can continue intelligently; active tmux writers wake through their inbox.
 - Once a final report is accepted, new message admission is closed and the agent is self-exiting; teardown may still be finishing. Do not call `stop_teammate` after normal completion. If genuinely new work appears after the report, spawn a fresh bounded `read-collect` lane rather than trying to revive that closing session.
 - Do not wake the lead just to ping idle agents.
 - Use `check_teammate` only when a specific agent appears stalled or unhealthy after several minutes, not immediately after sending a message.
@@ -134,27 +169,56 @@ Edit-agent coordination tools:
 - `list_file_claims` — inspect active claims.
 - `report_and_exit` — send the final report, release claims, and shut down.
 
+## Context handoff contract
+
+Agents start in isolated sessions and know only what their mission tells them. Before spawning, decide how the lane should use existing evidence:
+
+- **Augment/reuse (default):** pass accepted evidence and ask for the next information delta.
+- **Corroborate:** pass the claim and its evidence, then ask for confirmation or refutation.
+- **Blind re-derive (exception):** withhold only conclusions or persuasive evidence that could anchor an independent check. State why the confidence gain justifies duplicate work, what is blinded, and require comparison after the agent records its result. Never blind user constraints, safety boundaries, acceptance criteria, changed surfaces, or the exact question.
+
+Give the lane a compact handoff card containing only context that changes its work; cite long reports rather than pasting transcripts:
+
+- **Question:** one exact unresolved lane question.
+- **Expected delta:** the new evidence, decision, verdict, explanation, or bounded artifact the lead needs.
+- **Known:** relevant facts, binding decisions, prior attempts, and results, each with a source. Label claims `[verified]`, `[reported]`, `[hypothesis]`, `[open]`, or `[conflict]`; label binding choices `[decision]`.
+- **Inspected:** files, symbols, commands, tests, and boundaries already covered.
+- **Do not rediscover:** accepted facts or coverage to reuse. Reopen them only when new conflicting evidence appears.
+- **Dependencies consumed:** accepted reports, decisions, interfaces, or checks on which the lane relies.
+
+Duplicate work only when independent verification changes confidence enough to justify its time and token cost. Do not use blind duplication for inventories, ordinary file discovery, or routine test-gap review.
+
+When relevant evidence arrives after spawning, send each affected owner an **Evidence delta**: its source and label, what changed or was previously omitted, which premise/dependency/do-not-rediscover boundary it affects, and the requested next action. Do not forward a transcript or send a vague “consider this” message.
+
+Require every final report to answer its expected delta, cite evidence, list inspected or searched boundaries, label new facts and uncertainty, identify conflicts and dependencies consumed, preserve negative results, and state what the next lane must not repeat plus its next bounded question. Writers also report changed paths and checks.
+
 ## Writing good agent missions
 
 Give every agent:
 
 - one bounded independent sub-outcome or question (never the whole User request),
-- relevant files or directories,
+- the compact context handoff card above,
+- relevant files, symbols, or search boundaries,
 - the right `model_slot` tier (`read-*` for read-only, `write-*` for edit-allowed),
-- the report shape you want,
+- the reusable report shape you want,
 - and verification expectations.
 
 Good read mission:
 
 ```text
-Review the auth changes in src/auth/* for security issues. Report concrete findings with file:line, severity, and suggested fix. Do not edit files.
+Mode: READ-ONLY
+Question: Can concurrent refresh requests replay a predecessor token?
+Expected delta: A confirmed finding or evidence-backed “not reproducible” verdict.
+Known: [reported] source: CI job #1842 concurrent-refresh case -> token reuse assertion failed once; [decision] source: auth acceptance criterion AC-3 -> rotation must invalidate the predecessor.
+Prior result: [verified] source: command "pnpm exec vitest run test/auth/token-service.test.ts -t replay" -> 1/1 passed, but it issued no concurrent requests.
+Inspected: source: auth-contract report reports/auth-contract.md#rotation -> src/auth/token-service.ts:rotate() and happy-path tests.
+Do not rediscover: token format or single-request invalidation; reuse AC-3, the command result, and the cited report section.
+Dependencies consumed: reports/auth-contract.md#rotation, CI job #1842, AC-3, and the exact replay command/result above.
+Uncertainty: [open] whether invalidation and replacement are atomic.
+Inspect only the persistence/transaction path and focused concurrency tests. Report the verdict, file:line or command evidence, searched boundary, remaining uncertainty, and the next bounded fix/test question. Do not edit.
 ```
 
-Good edit mission:
-
-```text
-Claim docs/guide.md, update only stale public tool names, run the focused docs reference check, then call report_and_exit with changed paths and verification.
-```
+Good edit missions use the same card. The complete `docs-fix` and `parser-feature` prompts above are the copyable edit patterns; do not shorten them to a bare file-and-command instruction.
 
 ## When you are spawned as an agent
 
@@ -162,6 +226,6 @@ Claim docs/guide.md, update only stale public tool names, run the focused docs r
 - Use `send_message` for direct communication and `read_inbox` when the extension wakes you or you expect a reply.
 - Never sleep, busy-wait, or poll.
 - Unless you are an explicitly opted-in depth-0 `write-feature` / `write-critical` writer, you cannot spawn other agents; ask the lead with `send_message`.
-- If opted in, use only the restricted spawn tools for depth-1 read helpers within your lane. Any canonical `read-*` tier and helper count is allowed subject to global capacity; children report to you and cannot delegate.
+- If opted in, use only the restricted spawn tools for depth-1 read helpers within your lane. Any canonical `read-*` tier and helper count is allowed subject to global capacity; children report to you and cannot delegate. Give each child the same Context handoff contract because it does not inherit your conversation or implementation context.
 - Read agents: investigate, report, and stop.
 - Edit agents: claim files before editing, release claims when done, and call `report_and_exit` with your final report.

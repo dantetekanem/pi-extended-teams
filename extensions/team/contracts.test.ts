@@ -63,4 +63,60 @@ describe("persisted team behavior contracts", () => {
     expect(reference).toContain("`allow_nested_read_agents` (optional, default `false`)");
     expect(reference).toContain("any canonical `read-*` tier and any helper count");
   });
+
+  it("requires context-rich missions for isolated agent sessions", () => {
+    const skill = fs.readFileSync(path.resolve(process.cwd(), "skills/teams.md"), "utf-8");
+
+    expect(skill).toContain("they do not inherit the lead or parent conversation");
+    expect(skill).toContain("## Context handoff contract");
+    expect(skill).toContain("**Augment/reuse (default):**");
+    expect(skill).toContain("**Corroborate:**");
+    expect(skill).toContain("**Blind re-derive (exception):**");
+    for (const field of [
+      "**Question:**",
+      "**Expected delta:**",
+      "**Known:**",
+      "**Inspected:**",
+      "**Do not rediscover:**",
+      "**Dependencies consumed:**",
+    ]) {
+      expect(skill).toContain(field);
+    }
+    for (const label of ["`[verified]`", "`[reported]`", "`[hypothesis]`", "`[open]`", "`[conflict]`", "`[decision]`"]) {
+      expect(skill).toContain(label);
+    }
+    expect(skill).toContain("an **Evidence delta**");
+    expect(skill).toContain("what the next lane must not repeat plus its next bounded question");
+    expect(skill).toContain("Give each child the same Context handoff contract");
+
+    const exampleSlice = (name: string, endMarker: string) => {
+      const start = skill.indexOf(`name: "${name}"`);
+      const end = skill.indexOf(endMarker, start);
+      expect(start, `${name} example start`).toBeGreaterThan(-1);
+      expect(end, `${name} example end`).toBeGreaterThan(start);
+      return skill.slice(start, end);
+    };
+    const writerExamples = [
+      exampleSlice("docs-fix", "For a bounded feature or critical writer"),
+      exampleSlice("parser-feature", "## Hot-word trigger"),
+    ];
+    for (const example of writerExamples) {
+      expect(example).toContain("Mode: EDIT-ALLOWED");
+      for (const field of ["Question:", "Expected delta:", "Known:", "Inspected:", "Do not rediscover:", "Dependencies consumed:"]) {
+        expect(example).toContain(field);
+      }
+    }
+    expect(writerExamples[1]).toContain("same Context handoff contract");
+
+    const knownExampleLines = skill.split("\n").filter((line) => line.startsWith("Known:"));
+    expect(knownExampleLines.length).toBeGreaterThanOrEqual(5);
+    for (const line of knownExampleLines) {
+      const claims = line.match(/\[(?:verified|reported|decision)\]/g) ?? [];
+      const sources = line.match(/source:/g) ?? [];
+      expect(claims.length, line).toBeGreaterThan(0);
+      expect(sources.length, line).toBe(claims.length);
+    }
+    expect(skill).toMatch(/Prior result: \[verified\] source:/);
+    expect(skill).toContain("The complete `docs-fix` and `parser-feature` prompts above are the copyable edit patterns");
+  });
 });

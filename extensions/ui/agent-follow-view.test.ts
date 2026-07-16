@@ -135,7 +135,7 @@ describe("agent follow transcript", () => {
       },
     ], { width: 100 });
 
-    expect(successful.map(stripAnsi)).toEqual(["edit · src/app.ts · +2 −1 · worked"]);
+    expect(successful.map(stripAnsi)).toEqual(["edit · src/app.ts · +2 −1 · ✓"]);
     expect(successful.join("\n")).not.toContain("private old source");
     expect(successful.join("\n")).not.toContain("Successfully replaced");
 
@@ -152,7 +152,7 @@ describe("agent follow transcript", () => {
       },
     ], { width: 100 });
 
-    expect(failed.map(stripAnsi)).toEqual(["edit · src/missing.ts · failed"]);
+    expect(failed.map(stripAnsi)).toEqual(["edit · src/missing.ts · ✗"]);
     expect(failed.join("\n")).not.toContain("Could not find");
     expect(failed.join("\n")).not.toContain("secret");
   });
@@ -175,7 +175,7 @@ describe("agent follow transcript", () => {
     ], { width: 100 });
 
     expect(lines.map(stripAnsi)).toEqual([
-      "write · src/generated.ts · worked",
+      "write · src/generated.ts · ✓",
       "final report · duplicate",
     ]);
     expect(lines.join("\n")).not.toContain("large generated file contents");
@@ -188,7 +188,7 @@ describe("agent follow transcript", () => {
         { type: "thinking", thinking: "Neutral thinking prose" },
         { type: "text", text: "Neutral assistant prose" },
         { type: "toolCall", id: "read-pending", name: "read", arguments: { path: "src/pending.ts" } },
-        { type: "toolCall", id: "edit-success", name: "edit", arguments: { path: "src/worked.ts", edits: [] } },
+        { type: "toolCall", id: "edit-success", name: "edit", arguments: { path: "src/succeeded.ts", edits: [] } },
         { type: "toolCall", id: "edit-failure", name: "edit", arguments: { path: "src/failed.ts", edits: [] } },
         { type: "toolCall", id: "bash-raw", name: "bash", arguments: { command: "printf output" } },
       ] },
@@ -206,7 +206,7 @@ describe("agent follow transcript", () => {
 
     const pendingHeader = lines.find((line) => stripAnsi(line).startsWith("╭─ read")) || "";
     const pendingState = lines.find((line) => stripAnsi(line).includes("waiting for result")) || "";
-    const successfulEdit = lines.find((line) => stripAnsi(line).includes("src/worked.ts")) || "";
+    const successfulEdit = lines.find((line) => stripAnsi(line).includes("src/succeeded.ts")) || "";
     const failedEdit = lines.find((line) => stripAnsi(line).includes("src/failed.ts")) || "";
     const rawOutput = lines.find((line) => stripAnsi(line) === "│ neutral shell output") || "";
 
@@ -215,8 +215,8 @@ describe("agent follow transcript", () => {
     expect(pendingState).toContain("\x1b[38;5;222mwaiting for result…\x1b[39m");
     expect(successfulEdit).toContain("\x1b[38;5;114m+2\x1b[39m");
     expect(successfulEdit).toContain("\x1b[38;5;210m−1\x1b[39m");
-    expect(successfulEdit).toContain("\x1b[38;5;114mworked\x1b[39m");
-    expect(failedEdit).toContain("\x1b[38;5;210mfailed\x1b[39m");
+    expect(successfulEdit).toContain("\x1b[38;5;114m✓\x1b[39m");
+    expect(failedEdit).toContain("\x1b[38;5;210m✗\x1b[39m");
     expect(rawOutput).toBe("\x1b[38;5;141m│\x1b[39m neutral shell output");
     expect(lines).toContain("Neutral thinking prose");
     expect(lines).toContain("Neutral assistant prose");
@@ -247,12 +247,12 @@ describe("agent follow transcript", () => {
     ], { width: 80 });
 
     expect(lines.map(stripAnsi)).toEqual([
-      "claim · src/a.ts, src/b.ts · worked",
-      "release · src/a.ts · worked",
+      "claim · src/a.ts, src/b.ts · ✓",
+      "release · src/a.ts · ✓",
     ]);
     expect(lines[0]).toContain("\x1b[38;5;117mclaim\x1b[39m");
     expect(lines[0]).toContain("\x1b[38;5;213msrc/a.ts, src/b.ts\x1b[39m");
-    expect(lines[1]).toContain("\x1b[38;5;114mworked\x1b[39m");
+    expect(lines[1]).toContain("\x1b[38;5;114m✓\x1b[39m");
   });
 
   it.each([

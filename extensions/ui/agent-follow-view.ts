@@ -153,8 +153,13 @@ function renderState(state: string): string {
 }
 
 function renderActionPathState(action: string, path: string, state: string, width?: number): string {
+  const renderedState = state === "failed"
+    ? failureAnsi("✗")
+    : state === "succeeded"
+      ? successAnsi("✓")
+      : renderState(state);
   return boundTranscriptLine(
-    `${actionAnsi(action)}${mutedAnsi(" · ")}${pathAnsi(path)}${mutedAnsi(" · ")}${renderState(state)}`,
+    `${actionAnsi(action)}${mutedAnsi(" · ")}${pathAnsi(path)}${mutedAnsi(" · ")}${renderedState}`,
     width,
   );
 }
@@ -178,13 +183,13 @@ function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }
     const added = counts ? `+${counts.added}` : "+?";
     const removed = counts ? `−${counts.removed}` : "−?";
     return [boundTranscriptLine(
-      `${actionAnsi("edit")}${mutedAnsi(" · ")}${pathAnsi(path)}${mutedAnsi(" · ")}${successAnsi(added)} ${failureAnsi(removed)}${mutedAnsi(" · ")}${successAnsi("worked")}`,
+      `${actionAnsi("edit")}${mutedAnsi(" · ")}${pathAnsi(path)}${mutedAnsi(" · ")}${successAnsi(added)} ${failureAnsi(removed)}${mutedAnsi(" · ")}${successAnsi("✓")}`,
       width,
     )];
   }
 
   if (block.name === "write") {
-    const state = block.result === undefined ? "working" : block.isError ? "failed" : "worked";
+    const state = block.result === undefined ? "working" : block.isError ? "failed" : "succeeded";
     return [renderActionPathState("write", toolPath(block.args), state, width)];
   }
 
@@ -195,7 +200,7 @@ function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }
       ? "working"
       : block.isError || conflicts.length > 0
         ? "failed"
-        : "worked";
+        : "succeeded";
     const action = block.name === "claim_file" ? "claim" : "release";
     return [renderActionPathState(action, toolPaths(block.args), state, width)];
   }

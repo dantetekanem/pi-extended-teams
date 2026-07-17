@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.4] - 2026-07-16
+
+### Changed
+- Double the live agent progress animation frame rate for smoother message transitions.
+
 ## [2.1.3] - 2026-07-14
 
 ### Changed

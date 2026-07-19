@@ -122,6 +122,24 @@ describe("extension teammate inbox wake", () => {
     expect(output).not.toContain("ctrl+o");
   });
 
+  it("globally cleans stale session references at lead startup and shutdown without an adopted team", async () => {
+    const cleanupStaleSessionContextReferences = vi.fn(() => 2);
+    const { handlers, ctx } = setupEvents(() => true, {
+      isTeammate: false,
+      agentName: "team-lead",
+      getTeamName: () => null,
+      cleanupStaleSessionContextReferences,
+    });
+
+    for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+    expect(cleanupStaleSessionContextReferences).toHaveBeenCalledOnce();
+    expect(cleanupStaleSessionContextReferences).toHaveBeenLastCalledWith();
+
+    for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
+    expect(cleanupStaleSessionContextReferences).toHaveBeenCalledTimes(2);
+    expect(cleanupStaleSessionContextReferences).toHaveBeenLastCalledWith();
+  });
+
   it("injects level selection and literal-wait rules into every lead prompt", async () => {
     const handlers = new Map<string, Function[]>();
     registerExtensionEvents({

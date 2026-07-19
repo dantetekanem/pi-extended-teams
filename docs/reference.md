@@ -23,8 +23,9 @@ Spawn one agent in the current Pi session by configured intent tier only.
 **Parameters**
 
 - `name` (optional): Stable display name. If omitted, pi-extended-teams generates a unique name.
-- `prompt` (required): Assignment and expected report shape.
+- `prompt` (required): Assignment, relevant prior context/evidence, constraints, and expected report shape.
 - `cwd` (optional): Working directory. Defaults to the lead session cwd.
+- `session_context` (optional, default `"none"`): Set to `"lazy"` to give the agent an on-demand path to a filtered snapshot frozen from the lead's active branch at admission. Snapshot content is not injected into the prompt; use this only when omitted history may materially affect the lane. Spawn result details report the requested mode as `sessionContext` and actual creation as `sessionContextAvailable` (`null` while queued). Exact-run settlement removes the reference; safe lead startup/shutdown sweeps remove allowlisted leftovers from dead runs while preserving active references.
 - `model_slot` (required): One of the eight canonical tiers: `read-collect`, `read-review`, `read-analyze`, `read-critical`, `write-patch`, `write-feature`, `write-system`, or `write-critical`. The schema recommends `read-review` as the normal default. The tier selects read/write behavior, model, and thinking from `/agents-favorite-models`.
 - `metadata` (optional): Extra structured metadata for runtime/orchestration use.
 - `allow_nested_read_agents` (optional, default `false`): Opt in a depth-0 `write-feature` or `write-critical` agent to restricted read-only child spawning.
@@ -57,7 +58,7 @@ Spawn a batch of agents in the current Pi session. Use `defaults` for shared int
 
 **Parameters**
 
-- `defaults` (optional): Shared `cwd`, `model_slot`, `metadata`, and `allow_nested_read_agents` values.
+- `defaults` (optional): Shared `cwd`, `model_slot`, `metadata`, `session_context`, and `allow_nested_read_agents` values.
 - `agents` (required): Array of agent specs. Each agent accepts the same fields as `spawn_agent`, except `model_slot` may be inherited from `defaults`.
 
 **Example**

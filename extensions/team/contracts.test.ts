@@ -69,6 +69,12 @@ describe("persisted team behavior contracts", () => {
 
     expect(skill).toContain("they do not inherit the lead or parent conversation");
     expect(skill).toContain("## Context handoff contract");
+    expect(skill).toContain("make a context-selection pass");
+    expect(skill).toContain("### Lazy session reference");
+    expect(skill).toContain("session_context: \"lazy\"");
+    expect(skill).toContain("Do not enable it by default or use it as an excuse for a weak mission");
+    expect(skill).toContain("The child should not open it by default");
+    expect(skill).toContain("excludes thinking, images, raw tool arguments, and raw tool-result bodies");
     expect(skill).toContain("**Augment/reuse (default):**");
     expect(skill).toContain("**Corroborate:**");
     expect(skill).toContain("**Blind re-derive (exception):**");

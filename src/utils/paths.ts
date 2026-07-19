@@ -36,6 +36,14 @@ export function runtimeStatusPath(teamName: string, agentName: string) {
   return path.join(teamDir(teamName), "runtime", `${sanitizeName(agentName)}.json`);
 }
 
+export function sessionContextReferencePath(teamName: string, agentName: string, lifecycleRunId: string) {
+  return path.join(
+    teamDir(teamName),
+    "session-context",
+    `${sanitizeName(agentName)}--${sanitizeName(lifecycleRunId)}.md`,
+  );
+}
+
 export function lifecycleTombstonePath(teamName: string, agentName: string) {
   return path.join(teamDir(teamName), "lifecycle", "quarantine", `${sanitizeName(agentName)}.json`);
 }

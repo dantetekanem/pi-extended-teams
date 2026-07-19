@@ -4,6 +4,7 @@ import { StringEnum } from "../internal/schema";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
 import { getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
 import { getPiSessionId } from "../internal/session-files";
+import { createSessionContextReference, removeSessionContextReference } from "../internal/session-context-reference";
 import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
@@ -123,6 +124,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   function requireSpawnLevel(params: any, context: string): CanonicalFavoriteModelSlot {
     rejectDirectModelSelection(params, context);
+    if (params?.session_context !== undefined && params.session_context !== "none" && params.session_context !== "lazy") {
+      throw new Error(`${context} session_context must be none or lazy.`);
+    }
     const slot = normalizeFavoriteModelSlot(params?.model_slot);
     if (!slot) {
       throw new Error(
@@ -178,6 +182,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       resolvedCategory: category,
       requestedModelSlot: canonicalPersistedModelSlot(params.model_slot) ?? null,
       modelSlot: canonicalPersistedModelSlot(member.modelSlot) ?? null,
+      sessionContext: member.sessionContext ?? "none",
+      sessionContextAvailable: null,
       model: member.model ?? null,
       thinking: member.thinking ?? null,
       ...extras,
@@ -472,6 +478,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   interface AdmittedReadAgentLaunch {
     launch: Promise<void> | void;
     pendingChildRun?: PendingChildRun;
+    sessionContextAvailable: boolean;
   }
 
   async function admitAndLaunchReadAgentMember(
@@ -525,12 +532,42 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         }
       }
 
+      let sessionContextReference: ReturnType<typeof createSessionContextReference> = null;
+      if (member.sessionContext === "lazy" && member.lifecycleRunId) {
+        try {
+          sessionContextReference = createSessionContextReference({
+            teamName,
+            agentName: member.name,
+            lifecycleRunId: member.lifecycleRunId,
+            sessionManager: ctx?.sessionManager,
+          });
+        } catch {
+          // Context fallback is optional and must never block an otherwise valid spawn.
+          sessionContextReference = null;
+        }
+      }
+      const launchPrompt = sessionContextReference
+        ? `${prompt}${sessionContextReference.promptSuffix}`
+        : prompt;
+      const removeReference = () => {
+        try {
+          removeSessionContextReference(sessionContextReference);
+        } catch {
+          // Exact-run teardown remains authoritative; stale reference cleanup is best effort.
+        }
+      };
+
       try {
+        const launch = options.runReadAgentInProcess(teamName, member, launchPrompt, ctx, options.readAgentOptions());
         return {
-          launch: options.runReadAgentInProcess(teamName, member, prompt, ctx, options.readAgentOptions()),
+          launch: sessionContextReference
+            ? Promise.resolve(launch).finally(removeReference)
+            : launch,
           pendingChildRun,
+          sessionContextAvailable: !!sessionContextReference,
         };
       } catch (error) {
+        removeReference();
         if (member.delegationDepth === 1) {
           return rollbackNestedChildAdmission(teamName, member, error, pendingChildRun);
         }
@@ -554,7 +591,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     nameReservationId?: string,
     releaseNameOnFailure = true,
     queuedAcceptance?: PendingChildAcceptance
-  ): Promise<void> {
+  ): Promise<boolean> {
     const key = options.readAgentKey(teamName, member.name);
     const reservesReadCapacity = (member.role || "read") === "read";
     if (reservesReadCapacity) reserveReadAdmission(teamName, key);
@@ -594,6 +631,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         () => drainAfterRun(admitted.pendingChildRun),
         () => drainAfterRun(admitted.pendingChildRun)
       );
+      return admitted.sessionContextAvailable;
     } catch (error) {
       settlePendingChild(queuedAcceptance);
       releaseReservationAndDrain();
@@ -867,6 +905,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       metadata: operationMetadataFromParams(params),
       delegationDepth: spawnOptions.nestedParent ? 1 : 0,
       allowNestedReadAgents: !spawnOptions.nestedParent && spawnOptions.allowNestedReadAgents === true,
+      sessionContext: !spawnOptions.nestedParent && params.session_context === "lazy" ? "lazy" : undefined,
       parentAgentName: spawnOptions.nestedParent?.name,
       parentLifecycleRunId: spawnOptions.nestedParent?.lifecycleRunId,
       requestedBy: spawnOptions.nestedParent?.name,
@@ -897,10 +936,15 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         };
       }
 
-      await startReadAgentMember(safeTeamName, member, params.prompt, ctx, nestedNameReservationId);
+      const sessionContextAvailable = await startReadAgentMember(safeTeamName, member, params.prompt, ctx, nestedNameReservationId);
       return {
         content: [{ type: "text", text: `Read teammate ${params.name} started in-process.` }],
-        details: spawnResolutionDetails(member, params, resolved, { mode: "in-process", terminalId: null, queued: false }),
+        details: spawnResolutionDetails(member, params, resolved, {
+          mode: "in-process",
+          terminalId: null,
+          queued: false,
+          sessionContextAvailable,
+        }),
       };
     }
 
@@ -941,12 +985,18 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       mode: "in-process",
       debugLogPath: debugLogPath ?? null,
     }, settings);
-    await startReadAgentMember(safeTeamName, member, params.prompt, ctx);
+    const sessionContextAvailable = await startReadAgentMember(safeTeamName, member, params.prompt, ctx);
     options.renderReadAgentStatus();
     const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
     return {
       content: [{ type: "text", text: `Edit agent ${params.name} started in-process and is followable from Pi.${debugSuffix}` }],
-      details: spawnResolutionDetails(member, params, resolved, { mode: "in-process", terminalId: null, queued: false, debugLogPath }),
+      details: spawnResolutionDetails(member, params, resolved, {
+        mode: "in-process",
+        terminalId: null,
+        queued: false,
+        debugLogPath,
+        sessionContextAvailable,
+      }),
     };
     } finally {
       if (!nestedNameReservationTransferred) {
@@ -1014,8 +1064,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   const levelDescription = "Required configured intent tier. Read tiers: read-collect gathers bounded facts without owning the conclusion; read-review is the normal default for focused review, verification, and bounded synthesis; read-analyze explains behavior or root cause across connected evidence; read-critical is only for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning. Write tiers: write-patch makes a narrow localized change; write-feature implements a bounded feature with a known design; write-system owns a cross-cutting integration or refactor within explicitly claimed files; write-critical is only for high-risk security, concurrency, recovery, migration, or data-integrity changes. Prefer canonical tiers; legacy reading-*/writing-* aliases remain accepted for this minor release. Do not pass role, model, or thinking directly; see TIPS.md.";
   const publicAgentBaseParams = {
     name: Type.Optional(Type.String({ description: "Stable display name. Defaults to a generated agent name." })),
-    prompt: Type.String({ description: "The agent's assignment and report shape." }),
+    prompt: Type.String({ description: "The agent's assignment, relevant prior context, evidence already gathered, constraints, and report shape." }),
     cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead session cwd." })),
+    session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Optional filtered snapshot of the lead's active session branch. Use lazy only when omitted session history may materially affect the lane; the child reads it on demand rather than receiving transcript content in its prompt.", default: "none" })),
     metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
     allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Opt in eligible depth-0 write-feature/write-critical agents to restricted read-only child spawning.", default: false })),
   };
@@ -1158,7 +1209,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   pi.registerTool({
     name: "spawn_agent",
     label: "Spawn Agent",
-    description: "Spawn one agent by configured intent tier only. read-review is the normal read default; use read-collect for bounded fact gathering, read-analyze for connected explanation/root cause, and read-critical only for irreducible high-stakes reasoning. For edits, choose write-patch, write-feature, write-system, or the rare high-risk write-critical by scope and risk. After spawning, do not duplicate or take over its lane; work only on unrelated work, then wait literally idle for the automatic report—never sleep, poll, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
+    description: "Spawn one agent by configured intent tier only. Give it the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta rather than a context-free task. Use session_context=lazy only as an on-demand fallback when omitted session history may materially matter; it never replaces a good mission prompt. read-review is the normal read default; use read-collect for bounded fact gathering, read-analyze for connected explanation/root cause, and read-critical only for irreducible high-stakes reasoning. For edits, choose write-patch, write-feature, write-system, or the rare high-risk write-critical by scope and risk. After spawning, do not duplicate or take over its lane; work only on unrelated work, then wait literally idle for the automatic report—never sleep, poll, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
     parameters: Type.Object(publicAgentParams),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       return spawnPublicAgent(params, ctx);
@@ -1168,12 +1219,13 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   pi.registerTool({
     name: "spawn_swarm_agents",
     label: "Spawn Swarm Agents",
-    description: "Spawn a batch by configured intent tiers only. Use read-review as the normal default, read-collect for bounded collection lanes, read-analyze for connected explanation, and read-critical only for irreducible high-stakes reasoning; choose write-patch/feature/system/critical by edit scope and risk. Each spawned lane is delegation-locked: do not duplicate/take it over, and after unrelated work is done wait literally idle for automatic reports without sleep, polling, repeated inbox/status reads, or premature intervention. Synthesize only after actual reports; intervene only on blocker/error, actual failure, or explicit cancellation. Each agent gets model_slot directly or from defaults; do not pass role, model, or thinking directly.",
+    description: "Spawn a batch by configured intent tiers only. Give each lane the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta. Use session_context=lazy selectively as an on-demand fallback, never instead of a good mission prompt. Use read-review as the normal default, read-collect for bounded collection lanes, read-analyze for connected explanation, and read-critical only for irreducible high-stakes reasoning; choose write-patch/feature/system/critical by edit scope and risk. Each spawned lane is delegation-locked: do not duplicate/take it over, and after unrelated work is done wait literally idle for automatic reports without sleep, polling, repeated inbox/status reads, or premature intervention. Synthesize only after actual reports; intervene only on blocker/error, actual failure, or explicit cancellation. Each agent gets model_slot directly or from defaults; do not pass role, model, or thinking directly.",
     parameters: Type.Object({
       defaults: Type.Optional(Type.Object({
         cwd: Type.Optional(Type.String()),
         model_slot: Type.Optional(StringEnum(ACCEPTED_FAVORITE_MODEL_SLOTS, { description: levelDescription })),
         metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
+        session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Shared lazy session-reference policy.", default: "none" })),
         allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Shared opt-in for eligible depth-0 write-feature/write-critical agents.", default: false })),
       })),
       agents: Type.Array(Type.Object(publicSwarmAgentParams), { description: "Agents to spawn as one batch. Each one must have model_slot directly or inherit it from defaults." }),

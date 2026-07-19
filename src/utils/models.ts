@@ -27,6 +27,8 @@ export interface Member {
   delegationDepth?: number;
   /** Lead-approved opt-in for restricted nested read delegation. */
   allowNestedReadAgents?: boolean;
+  /** Lead-approved lazy access to a filtered active-branch session snapshot. */
+  sessionContext?: "lazy";
   /** Runtime-owned parent identity for a restricted nested read child. */
   parentAgentName?: string;
   /** Runtime-owned parent lifecycle identity for a restricted nested read child. */

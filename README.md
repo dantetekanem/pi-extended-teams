@@ -58,6 +58,7 @@ spawn_agent({
 - **Live activity card**: active agent progress, intent tier, elapsed time, and token usage stay visible below the editor; an active writer shows `+N` for its currently active nested read helpers.
 - **Auto-delivered reports**: new agent messages queue a lead follow-up even during an active turn, without manual polling.
 - **Down-key live navigation**: inspect active transcripts, models, thinking levels, elapsed time, tokens, and grouped tool activity; expand large logs with `l`, message the selected agent with `m`, or stop it with `x`.
+- **Context-aware handoff**: lead missions carry relevant goals, decisions, prior attempts, evidence, and constraints; optional `session_context: "lazy"` gives a child targeted on-demand access to a filtered active-branch snapshot without injecting the transcript.
 - **Built-in orchestration guidance**: the extension teaches intent-tier selection, delegated-lane ownership, report-first synthesis, and literal waiting without polling.
 - **Advisory file claims**: edit agents coordinate file ownership with `claim_file`, `release_file`, and `list_file_claims`.
 - **Direct messaging**: agents and the lead can coordinate with `send_message` and `read_inbox`.

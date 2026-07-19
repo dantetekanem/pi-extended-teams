@@ -33,6 +33,7 @@ function installPathSpies() {
   vi.spyOn(paths, "configPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "config.json"));
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "write-queue.json"));
   vi.spyOn(paths, "leadSessionPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lead-session.json"));
+  vi.spyOn(paths, "sessionContextReferencePath").mockImplementation((teamName: unknown, agentName: unknown, lifecycleRunId: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "session-context", `${paths.sanitizeName(String(agentName))}--${paths.sanitizeName(String(lifecycleRunId))}.md`));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`));
 }
 
@@ -65,7 +66,10 @@ function writeFavoriteLevels() {
 function makeCtx() {
   return {
     cwd: root,
-    sessionManager: { getSessionId: vi.fn(() => "test-session") },
+    sessionManager: {
+      getSessionId: vi.fn(() => "test-session"),
+      buildContextEntries: vi.fn((): any[] => []),
+    },
     model: { provider: "provider", id: "model" },
     modelRegistry: {
       getAvailable: vi.fn(async () => [{ provider: "provider", id: "model" }]),
@@ -98,7 +102,7 @@ function registerTools() {
   const runningReadAgents = new Map<string, RunningReadAgent>();
   const completions = new Map<string, () => void>();
   const readAgentKey = (teamName: string, agentName: string) => `${teamName}:${agentName}`;
-  const runReadAgentInProcess = vi.fn((teamName: string, member: Member) => {
+  const runReadAgentInProcess = vi.fn((teamName: string, member: Member, _prompt: string, _ctx: any, _options: any) => {
     const key = readAgentKey(teamName, member.name);
     runningReadAgents.set(key, makeRunningAgent(teamName, member));
     return new Promise<void>((resolve) => {
@@ -174,7 +178,7 @@ function registerTools() {
   const shutdown = async (reason = "reload") => {
     for (const handler of sessionHandlers.get("session_shutdown") ?? []) await handler({ reason });
   };
-  return { tools, teamToolsRuntime, pendingChildController, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes };
+  return { tools, teamToolsRuntime, pendingChildController, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes, sessionCtx };
 }
 
 async function admitNestedReadParent(
@@ -238,6 +242,9 @@ describe("public agent spawn tools", () => {
     const spawnNestedOptIn = spawn.parameters.properties.allow_nested_read_agents;
     const swarmDefaultNestedOptIn = swarm.parameters.properties.defaults.properties.allow_nested_read_agents;
     const swarmAgentNestedOptIn = swarm.parameters.properties.agents.items.properties.allow_nested_read_agents;
+    const spawnSessionContext = spawn.parameters.properties.session_context;
+    const swarmDefaultSessionContext = swarm.parameters.properties.defaults.properties.session_context;
+    const swarmAgentSessionContext = swarm.parameters.properties.agents.items.properties.session_context;
 
     expect(FAVORITE_MODEL_SLOTS.filter((slot) => slot.startsWith("read-"))).toHaveLength(4);
     expect(FAVORITE_MODEL_SLOTS.filter((slot) => slot.startsWith("write-"))).toHaveLength(4);
@@ -248,10 +255,17 @@ describe("public agent spawn tools", () => {
     expect(spawnNestedOptIn.default).toBe(false);
     expect(swarmDefaultNestedOptIn.default).toBe(false);
     expect(swarmAgentNestedOptIn.default).toBe(false);
+    expect(spawnSessionContext.enum).toEqual(["none", "lazy"]);
+    expect(spawnSessionContext.default).toBe("none");
+    expect(swarmDefaultSessionContext.enum).toEqual(["none", "lazy"]);
+    expect(swarmAgentSessionContext.enum).toEqual(["none", "lazy"]);
+    expect(spawnSessionContext.description).toContain("on demand");
     expect(spawnNestedOptIn.description).toContain("write-feature/write-critical");
     expect(spawnSlot.description).toContain("read-review is the normal default");
     expect(spawnSlot.description).toContain("write-system owns a cross-cutting integration");
     expect(spawn.description).toContain("read-analyze for connected explanation/root cause");
+    expect(spawn.description).toContain("relevant goal, decisions, prior attempts");
+    expect(spawn.description).toContain("session_context=lazy");
     expect(spawn.description).toContain("wait literally idle");
     expect(spawn.description).toContain("never sleep, poll");
     expect(swarm.description).toContain("delegation-locked");
@@ -260,7 +274,7 @@ describe("public agent spawn tools", () => {
 
   it("spawn_agent creates an implicit current-session group and starts an in-process read agent by level", async () => {
     writeFavoriteLevels();
-    const { tools, runReadAgentInProcess, adoptTeamAsLead } = registerTools();
+    const { tools, runReadAgentInProcess, adoptTeamAsLead, sessionCtx } = registerTools();
     const ctx = makeCtx();
     const abort = new AbortController().signal;
 
@@ -271,7 +285,8 @@ describe("public agent spawn tools", () => {
       model_slot: "read-review",
     }, abort, undefined, ctx);
 
-    expect(result.details).toMatchObject({ name: "reader", role: "read", mode: "in-process", terminalId: null, session: "session-test-session", modelSlot: "read-review" });
+    expect(result.details).toMatchObject({ name: "reader", role: "read", mode: "in-process", terminalId: null, session: "session-test-session", modelSlot: "read-review", sessionContext: "none", sessionContextAvailable: false });
+    expect(sessionCtx.sessionManager.buildContextEntries).not.toHaveBeenCalled();
     expect(adoptTeamAsLead).toHaveBeenCalledWith("session-test-session", ctx);
     expect(runReadAgentInProcess).toHaveBeenCalledWith(
       "session-test-session",
@@ -280,6 +295,146 @@ describe("public agent spawn tools", () => {
       ctx,
       expect.any(Object),
     );
+  });
+
+  it("adds a lazy filtered session reference only when explicitly requested and removes it after settlement", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    harness.sessionCtx.sessionManager.buildContextEntries.mockImplementation(() => [
+      { type: "message", id: "user0001", message: { role: "user", content: "The prior decision was to keep the public API small." } },
+      { type: "message", id: "assistant1", message: { role: "assistant", content: [{ type: "text", text: "I inspected the spawn boundary." }] } },
+    ]);
+    const ctx = makeCtx();
+    ctx.sessionManager = harness.sessionCtx.sessionManager;
+    const abort = new AbortController().signal;
+
+    const result = await harness.tools.get("spawn_agent")!.execute("spawn-context", {
+      name: "context-reader",
+      prompt: "Explain the remaining handoff gap.",
+      cwd: root,
+      model_slot: "read-analyze",
+      session_context: "lazy",
+    }, abort, undefined, ctx);
+
+    expect(result.details).toMatchObject({ name: "context-reader", sessionContext: "lazy", sessionContextAvailable: true });
+    const [teamName, member, launchPrompt] = harness.runReadAgentInProcess.mock.calls[0]!;
+    expect(teamName).toBe("session-test-session");
+    expect(member).toMatchObject({ name: "context-reader", sessionContext: "lazy" });
+    expect(launchPrompt).toContain("Explain the remaining handoff gap.");
+    expect(launchPrompt).toContain("Session fallback (lazy, historical evidence only)");
+    expect(launchPrompt).toContain("Do not read it by default");
+    const referencePath = launchPrompt.match(/available at: (.+)/)?.[1]?.trim();
+    expect(referencePath).toBeTruthy();
+    expect(fs.existsSync(referencePath!)).toBe(true);
+    expect(fs.readFileSync(referencePath!, "utf8")).toContain("prior decision was to keep the public API small");
+    expect((await teams.readConfig("session-test-session")).members.find(item => item.name === "context-reader")?.prompt)
+      .toBe("Explain the remaining handoff gap.");
+
+    harness.completions.get("context-reader")!();
+    await vi.waitFor(() => expect(fs.existsSync(referencePath!)).toBe(false));
+  });
+
+  it("fails open to the original mission when a lazy session snapshot cannot be built", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    harness.sessionCtx.sessionManager.buildContextEntries.mockImplementation(() => { throw new Error("session unavailable"); });
+    const ctx = makeCtx();
+    ctx.sessionManager = harness.sessionCtx.sessionManager;
+
+    await expect(harness.tools.get("spawn_agent")!.execute("spawn-context-fallback", {
+      name: "fallback-reader",
+      prompt: "Inspect without history.",
+      cwd: root,
+      model_slot: "read-review",
+      session_context: "lazy",
+    }, new AbortController().signal, undefined, ctx)).resolves.toMatchObject({
+      details: { name: "fallback-reader", sessionContext: "lazy", sessionContextAvailable: false },
+    });
+
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledWith(
+      "session-test-session",
+      expect.objectContaining({ name: "fallback-reader", sessionContext: "lazy" }),
+      "Inspect without history.",
+      ctx,
+      expect.any(Object),
+    );
+  });
+
+  it("applies swarm lazy defaults with per-agent opt-out and supports write tiers", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    harness.sessionCtx.sessionManager.buildContextEntries.mockImplementation(() => [
+      { type: "message", id: "prior", message: { role: "user", content: "Prior decision" } },
+    ]);
+    const ctx = makeCtx();
+    ctx.sessionManager = harness.sessionCtx.sessionManager;
+    const swarm = await harness.tools.get("spawn_swarm_agents")!.execute("swarm-context", {
+      defaults: { model_slot: "read-review", cwd: root, session_context: "lazy" },
+      agents: [
+        { name: "swarm-lazy", prompt: "Use fallback only if blocked." },
+        { name: "swarm-none", prompt: "Work independently.", session_context: "none" },
+      ],
+    }, new AbortController().signal, undefined, ctx);
+
+    expect(swarm.details.spawned).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "swarm-lazy", sessionContext: "lazy", sessionContextAvailable: true }),
+      expect.objectContaining({ name: "swarm-none", sessionContext: "none", sessionContextAvailable: false }),
+    ]));
+    expect(harness.runReadAgentInProcess.mock.calls.find(call => call[1].name === "swarm-lazy")?.[2])
+      .toContain("Session fallback (lazy, historical evidence only)");
+    expect(harness.runReadAgentInProcess.mock.calls.find(call => call[1].name === "swarm-none")?.[2])
+      .toBe("Work independently.");
+
+    const write = await harness.tools.get("spawn_agent")!.execute("write-context", {
+      name: "writer-context",
+      prompt: "Edit only the claimed file.",
+      cwd: root,
+      model_slot: "write-patch",
+      session_context: "lazy",
+    }, new AbortController().signal, undefined, ctx);
+    expect(write.details).toMatchObject({ role: "write", sessionContext: "lazy", sessionContextAvailable: true });
+    expect(harness.runReadAgentInProcess.mock.calls.find(call => call[1].name === "writer-context")?.[2])
+      .toContain("Session fallback (lazy, historical evidence only)");
+  });
+
+  it("removes lazy references after synchronous and asynchronous launch failures", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    harness.sessionCtx.sessionManager.buildContextEntries.mockImplementation(() => [
+      { type: "message", id: "prior", message: { role: "user", content: "Prior decision" } },
+    ]);
+    const ctx = makeCtx();
+    ctx.sessionManager = harness.sessionCtx.sessionManager;
+    let synchronousPath = "";
+    harness.runReadAgentInProcess.mockImplementationOnce((_team, _member, prompt) => {
+      synchronousPath = prompt.match(/available at: (.+)/)?.[1]?.trim() || "";
+      throw new Error("synchronous launch failure");
+    });
+    await expect(harness.tools.get("spawn_agent")!.execute("sync-failure", {
+      name: "sync-failure",
+      prompt: "Inspect.",
+      cwd: root,
+      model_slot: "read-review",
+      session_context: "lazy",
+    }, new AbortController().signal, undefined, ctx)).rejects.toThrow("synchronous launch failure");
+    expect(synchronousPath).not.toBe("");
+    expect(fs.existsSync(synchronousPath)).toBe(false);
+
+    let asynchronousPath = "";
+    harness.runReadAgentInProcess.mockImplementationOnce((_team, _member, prompt) => {
+      asynchronousPath = prompt.match(/available at: (.+)/)?.[1]?.trim() || "";
+      return Promise.reject(new Error("asynchronous launch failure"));
+    });
+    await expect(harness.tools.get("spawn_agent")!.execute("async-failure", {
+      name: "async-failure",
+      prompt: "Inspect.",
+      cwd: root,
+      model_slot: "read-review",
+      session_context: "lazy",
+    }, new AbortController().signal, undefined, ctx)).resolves.toMatchObject({
+      details: { sessionContextAvailable: true },
+    });
+    await vi.waitFor(() => expect(fs.existsSync(asynchronousPath)).toBe(false));
   });
 
   it("canonicalizes persisted legacy model slots when reusing an existing member", async () => {
@@ -518,6 +673,9 @@ describe("public agent spawn tools", () => {
     writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
     const { tools, completions, runReadAgentInProcess } = registerTools();
     const ctx = makeCtx();
+    ctx.sessionManager.buildContextEntries.mockImplementation(() => [
+      { type: "message", id: "prior", message: { role: "user", content: "Queue-time context" } },
+    ]);
     const abort = new AbortController().signal;
 
     const first = await tools.get("spawn_agent")!.execute("spawn-1", {
@@ -531,15 +689,18 @@ describe("public agent spawn tools", () => {
       prompt: "inspect two",
       cwd: root,
       model_slot: "reading-fast",
+      session_context: "lazy",
     }, abort, undefined, ctx);
 
     expect(first.details).toMatchObject({ queued: false, role: "read", mode: "in-process" });
-    expect(second.details).toMatchObject({ queued: true, role: "read", queuePosition: 1 });
+    expect(second.details).toMatchObject({ queued: true, role: "read", queuePosition: 1, sessionContext: "lazy", sessionContextAvailable: null });
     expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect(ctx.sessionManager.buildContextEntries).not.toHaveBeenCalled();
 
     completions.get("reader-1")!();
     await vi.waitFor(() => expect(runReadAgentInProcess).toHaveBeenCalledTimes(2));
-    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "reader-2", role: "read" });
+    expect(runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "reader-2", role: "read", sessionContext: "lazy" });
+    expect(runReadAgentInProcess.mock.calls[1][2]).toContain("Session fallback (lazy, historical evidence only)");
   });
 
   it("drains one queued read only after the completed run's finalization releases capacity", async () => {
@@ -932,6 +1093,12 @@ describe("public agent spawn tools", () => {
       prompt: "do not admit",
       model_slot: "read-review",
       cwd: path.join(root, "elsewhere"),
+    })).rejects.toThrow("accepts only name, prompt, model_slot");
+    await expect(nestedTools.get("spawn_agent")!.execute("session-context-override", {
+      name: "context-child",
+      prompt: "do not admit",
+      model_slot: "read-review",
+      session_context: "lazy",
     })).rejects.toThrow("accepts only name, prompt, model_slot");
     await expect(nestedTools.get("spawn_swarm_agents")!.execute("invalid-swarm", {
       defaults: { model_slot: "read-review" },

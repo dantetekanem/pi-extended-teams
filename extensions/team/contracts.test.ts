@@ -48,7 +48,7 @@ describe("persisted team behavior contracts", () => {
   });
 
   it("documents the public nested read opt-in and denial boundary consistently", () => {
-    for (const documentPath of ["README.md", "TIPS.md", "docs/reference.md", "docs/guide.md", "skills/teams.md"]) {
+    for (const documentPath of ["README.md", "TIPS.md", "skills/teams.md"]) {
       const document = fs.readFileSync(path.resolve(process.cwd(), documentPath), "utf-8");
       expect(document, documentPath).toContain("allow_nested_read_agents");
       expect(document, documentPath).toContain("write-feature");
@@ -59,9 +59,9 @@ describe("persisted team behavior contracts", () => {
       expect(document, documentPath).toMatch(/children[^.]*cannot delegate/i);
     }
 
-    const reference = fs.readFileSync(path.resolve(process.cwd(), "docs/reference.md"), "utf-8");
-    expect(reference).toContain("`allow_nested_read_agents` (optional, default `false`)");
-    expect(reference).toContain("any canonical `read-*` tier and any helper count");
+    const readme = fs.readFileSync(path.resolve(process.cwd(), "README.md"), "utf-8");
+    expect(readme).toContain("spawned with `allow_nested_read_agents: true`");
+    expect(readme).toContain("any number of helpers at any canonical `read-*` tier");
   });
 
   it("requires context-rich missions for isolated agent sessions", () => {
@@ -123,6 +123,6 @@ describe("persisted team behavior contracts", () => {
       expect(sources.length, line).toBe(claims.length);
     }
     expect(skill).toMatch(/Prior result: \[verified\] source:/);
-    expect(skill).toContain("The complete `docs-fix` and `parser-feature` prompts above are the copyable edit patterns");
+    expect(skill).toContain("replace illustrative placeholders with real evidence before using the `docs-fix` template");
   });
 });

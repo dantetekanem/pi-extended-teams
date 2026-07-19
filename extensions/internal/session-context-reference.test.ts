@@ -90,6 +90,44 @@ describe("session context reference", () => {
     expect(fs.existsSync(reference!.path)).toBe(false);
   });
 
+  it("redacts complete quoted and provider-prefixed labeled secrets", async () => {
+    const subject = await loadSubject();
+    const reference = subject.createSessionContextReference({
+      teamName: "session-secrets",
+      agentName: "researcher",
+      lifecycleRunId: "run-secrets",
+      sessionManager: {
+        buildContextEntries: () => [{
+          type: "message",
+          id: "secrets",
+          message: {
+            role: "user",
+            content: [
+              'password="correct horse battery staple"',
+              "client_secret: 'alpha beta'",
+              "OPENAI_API_KEY=sk-live-secret",
+              '"SERVICE_AUTH_TOKEN": "gamma delta"',
+              "after=visible",
+            ].join("\n"),
+          },
+        }],
+      },
+    });
+
+    const content = fs.readFileSync(reference!.path, "utf8");
+    expect(content).toContain([
+      "password=[redacted]",
+      "client_secret: [redacted]",
+      "OPENAI_API_KEY=[redacted]",
+      '"SERVICE_AUTH_TOKEN": [redacted]',
+      "after=visible",
+    ].join("\n"));
+    expect(content).not.toContain("correct horse battery staple");
+    expect(content).not.toContain("alpha beta");
+    expect(content).not.toContain("sk-live-secret");
+    expect(content).not.toContain("gamma delta");
+  });
+
   it("keeps the newest bounded history and repairs malformed Unicode", async () => {
     const subject = await loadSubject();
     const entries = Array.from({ length: 40 }, (_, index) => ({

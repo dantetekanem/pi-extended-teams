@@ -214,7 +214,7 @@ describe("extension integration", () => {
   });
 
   it("keeps public compatibility tables aligned with runtime aliases", () => {
-    for (const documentPath of ["README.md", "TIPS.md", "docs/reference.md"]) {
+    for (const documentPath of ["README.md", "TIPS.md"]) {
       const document = fs.readFileSync(path.resolve(documentPath), "utf-8");
       for (const [legacy, canonical] of Object.entries(LEGACY_FAVORITE_MODEL_SLOT_ALIASES)) {
         expect(document).toContain(`| \`${legacy}\` | \`${canonical}\` |`);

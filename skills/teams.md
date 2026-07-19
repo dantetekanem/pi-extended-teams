@@ -73,20 +73,20 @@ Then:
 2. The lead synthesizes the reports for the user.
 3. Finished agents leave the active status list; completed reports remain available in the session UI.
 
-Spawn one more focused helper when needed:
+Spawn one more focused helper when needed. The next read/edit pair is a generic handoff template: replace `<docs-file>`, `<line-a>`, `<line-b>`, `<authoritative-tool-reference>`, and report `R-17` with real evidence before use.
 
 ```text
 spawn_agent({
   name: "docs-review",
   model_slot: "read-review",
   prompt: `Mode: READ-ONLY
-Question: Does docs/guide.md still use retired agent-tool names?
+Question: Does <docs-file> still use retired agent-tool names?
 Expected delta: Exact stale lines and replacements, or a bounded clean verdict.
-Known: [verified] source: README.md#public-tools and extensions/tools/team-tools.ts public schemas -> current spawn tools are spawn_agent and spawn_swarm_agents.
-Inspected: README.md#public-tools against those two schema names.
-Do not rediscover: README.md; reuse the supplied section and exact tool list.
-Dependencies consumed: README.md#public-tools and the two current schema names above.
-Inspect docs/guide.md only for retired alternatives and report searched terms, lines, uncertainty, and next action. Do not edit.`
+Known: [verified] source: <authoritative-tool-reference> and extensions/tools/team-tools.ts public schemas -> current spawn tools are spawn_agent and spawn_swarm_agents.
+Inspected: <authoritative-tool-reference> against those two schema names.
+Do not rediscover: <authoritative-tool-reference>; reuse the supplied section and exact tool list.
+Dependencies consumed: <authoritative-tool-reference> and the two current schema names above.
+Inspect <docs-file> only for retired alternatives and report searched terms, lines, uncertainty, and next action. Do not edit.`
 })
 ```
 
@@ -97,13 +97,13 @@ spawn_agent({
   name: "docs-fix",
   model_slot: "write-patch",
   prompt: `Mode: EDIT-ALLOWED
-Question: Can docs/guide.md be corrected to use only spawn_agent and spawn_swarm_agents?
+Question: Can <docs-file> be corrected to use only spawn_agent and spawn_swarm_agents?
 Expected delta: A minimal docs-only patch replacing the retired names team_create and task_assign.
-Known: [verified] source: docs-review report R-17 -> retired names occur at docs/guide.md:42 and :58; [decision] source: docs/reference.md#agent-tools -> replacements are spawn_agent and spawn_swarm_agents.
-Inspected: docs-review report R-17 searched docs/guide.md for all four names.
+Known: [verified] source: docs-review report R-17 -> retired names occur at <docs-file>:<line-a> and :<line-b>; [decision] source: <authoritative-tool-reference> -> replacements are spawn_agent and spawn_swarm_agents.
+Inspected: docs-review report R-17 searched <docs-file> for all four names.
 Do not rediscover: tool-name inventory; use report R-17 and reopen only if the file conflicts.
-Dependencies consumed: docs-review report R-17 and docs/reference.md#agent-tools.
-Claim docs/guide.md only, make the two replacements, run the focused docs reference check, then report changed paths, command/result, conflicts, and next action via report_and_exit.`
+Dependencies consumed: docs-review report R-17 and <authoritative-tool-reference>.
+Claim <docs-file> only, make the two replacements, run the focused docs contract check, then report changed paths, command/result, conflicts, and next action via report_and_exit.`
 })
 ```
 
@@ -243,7 +243,7 @@ Uncertainty: [open] whether invalidation and replacement are atomic.
 Inspect only the persistence/transaction path and focused concurrency tests. Report the verdict, file:line or command evidence, searched boundary, remaining uncertainty, and the next bounded fix/test question. Do not edit.
 ```
 
-Good edit missions use the same card. The complete `docs-fix` and `parser-feature` prompts above are the copyable edit patterns; do not shorten them to a bare file-and-command instruction.
+Good edit missions use the same card. The complete `docs-fix` and `parser-feature` prompts above show the handoff pattern; replace illustrative placeholders with real evidence before using the `docs-fix` template, and do not shorten either prompt to a bare file-and-command instruction.
 
 ## When you are spawned as an agent
 

@@ -46,7 +46,7 @@ Spawn an edit-allowed agent only when the work is isolated and safe to run in pa
 spawn_agent({
   name: "docs-fix",
   model_slot: "write-patch",
-  prompt: "Claim docs/guide.md, fix only stale public tool names, verify, then call report_and_exit."
+  prompt: "Claim TIPS.md, fix only stale public tool names, verify, then call report_and_exit."
 })
 ```
 
@@ -242,8 +242,8 @@ The current source layout keeps TypeScript files under 500 lines where practical
 
 ## Learn more
 
-- [Usage Guide](docs/guide.md)
-- [Tool Reference](docs/reference.md)
+- [Workflow and tier examples](TIPS.md)
+- [Agent workflow skill](skills/teams.md)
 
 ## Credits & attribution
 

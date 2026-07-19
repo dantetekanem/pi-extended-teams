@@ -172,7 +172,10 @@ function redactHighConfidenceSecrets(value: string): string {
   return value
     .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/gi, "[redacted private key]")
     .replace(/\b(authorization\s*:\s*bearer)\s+[^\s]+/gi, "$1 [redacted]")
-    .replace(/\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password)\b(\s*[:=]\s*)["']?[^\s,"']+/gi, "$1$2[redacted]");
+    .replace(
+      /(["']?)\b([A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password))\b\1(\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,"']+)/gi,
+      "$1$2$1$3[redacted]",
+    );
 }
 
 function textContent(content: unknown): string {

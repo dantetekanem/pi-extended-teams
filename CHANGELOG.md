@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.5] - 2026-07-19
+
+### Added
+- Add opt-in lazy references to filtered, bounded snapshots of the lead's active Pi session branch.
+
+### Changed
+- Require context-rich agent missions and report effective lazy snapshot availability across read, write, swarm, and queued spawns.
+
+### Security
+- Bind snapshot creation and cleanup to validated identities, non-symlink paths, exact run directories, and allowlisted stale artifacts.
+
+### Removed
+- Remove the obsolete direct npm publishing script.
+
 ## [2.1.4] - 2026-07-16
 
 ### Changed

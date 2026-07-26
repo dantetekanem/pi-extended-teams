@@ -68,9 +68,25 @@ describe("agent follow transcript", () => {
     expect(plain).toContain("Inspect the project");
     expect(plain).toContain("I should inspect the files.");
     expect(plain).toContain("I will inspect it.");
-    expect(plain).toContain("╭─ read · README.md");
+    expect(plain.split("\n")).toContain("read · README.md");
+    expect(plain).not.toContain("╭─ read");
     expect(plain).toContain("│ Line one\n│ Line two");
     expect(plain).toContain("╰─ 2 lines");
+  });
+
+  it("keeps thinking multiline while removing Markdown bold markers", () => {
+    const lines = formatAgentFollowTranscript([
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "**Planning RNG test isolation**\n\n**Designing deterministic tests**" },
+      ] },
+    ]).map(stripAnsi);
+
+    expect(lines).toEqual([
+      "thinking",
+      "Planning RNG test isolation\n\nDesigning deterministic tests",
+      "",
+    ]);
+    expect(lines.join("\n")).not.toContain("**");
   });
 
   it("collapses large tool results with head and tail context and can expand them", () => {
@@ -81,7 +97,8 @@ describe("agent follow transcript", () => {
     ];
 
     const collapsed = stripAnsi(formatAgentFollowTranscript(messages).join("\n"));
-    expect(collapsed).toContain("╭─ bash · $ rg TODO src");
+    expect(collapsed.split("\n")).toContain("bash · $ rg TODO src");
+    expect(collapsed).not.toContain("╭─ bash");
     expect(collapsed).toContain("9 lines hidden · press l to expand logs");
     expect(collapsed).not.toContain("│ line 10");
     expect(collapsed).toContain("│ line 20");
@@ -113,6 +130,29 @@ describe("agent follow transcript", () => {
     expect(plain.join("\n")).not.toContain("report_progress");
     expect(lines[0]).not.toContain("\x1b[");
     expect(lines.join("\n")).not.toContain("\x1b[48;2;31;33;47m");
+  });
+
+  it("places the spacer after progress and immediately before a block tool", () => {
+    const lines = formatAgentFollowTranscript([
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "**Planning the read**" },
+        { type: "toolCall", id: "progress-1", name: "report_progress", arguments: { status: "Reading the requested line" } },
+      ] },
+      { role: "toolResult", toolCallId: "progress-1", toolName: "report_progress", content: "Progress updated", isError: false },
+      { role: "assistant", content: [
+        { type: "toolCall", id: "read-1", name: "read", arguments: { path: "README.md" } },
+      ] },
+      { role: "toolResult", toolCallId: "read-1", toolName: "read", content: "# pi-extended-teams", isError: false },
+    ]).map(stripAnsi);
+    const progressIndex = lines.indexOf("Reading the requested line");
+    const readIndex = lines.indexOf("read · README.md");
+
+    expect(lines.slice(0, progressIndex)).toEqual(["thinking", "Planning the read", ""]);
+    expect(lines.slice(progressIndex, readIndex + 1)).toEqual([
+      "Reading the requested line",
+      "",
+      "read · README.md",
+    ]);
   });
 
   it("renders successful and failed edits without source or result noise", () => {
@@ -204,7 +244,7 @@ describe("agent follow transcript", () => {
       { role: "toolResult", toolCallId: "bash-raw", toolName: "bash", content: "neutral shell output", isError: false },
     ], { width: 80 });
 
-    const pendingHeader = lines.find((line) => stripAnsi(line).startsWith("╭─ read")) || "";
+    const pendingHeader = lines.find((line) => stripAnsi(line).startsWith("read")) || "";
     const pendingState = lines.find((line) => stripAnsi(line).includes("waiting for result")) || "";
     const successfulEdit = lines.find((line) => stripAnsi(line).includes("src/succeeded.ts")) || "";
     const failedEdit = lines.find((line) => stripAnsi(line).includes("src/failed.ts")) || "";

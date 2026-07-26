@@ -172,7 +172,7 @@ function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }
     const rawStatus = details?.status ?? args?.status ?? resultStatus ?? "updating";
     const status = compactTranscriptLine(String(rawStatus)) || "updating";
     const failureSuffix = block.isError ? " (failed)" : "";
-    return [boundTranscriptLine(`${status}${failureSuffix}`, width)];
+    return [boundTranscriptLine(`${status}${failureSuffix}`, width), ""];
   }
 
   if (block.name === "edit") {
@@ -222,10 +222,10 @@ function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }
 
 function renderToolHeader(block: Extract<TranscriptBlock, { kind: "tool" }>): string {
   const detail = compactToolArgs(block.name, block.args);
-  if (!detail) return `${structuralAnsi("╭─")} ${actionAnsi(block.name)}`;
+  if (!detail) return actionAnsi(block.name);
   const isPath = typeof asRecord(block.args)?.path === "string";
   const renderedDetail = isPath ? pathAnsi(detail) : bodyAnsi(`${block.name === "bash" ? "$ " : ""}${detail}`);
-  return `${structuralAnsi("╭─")} ${actionAnsi(block.name)}${mutedAnsi(" · ")}${renderedDetail}`;
+  return `${actionAnsi(block.name)}${mutedAnsi(" · ")}${renderedDetail}`;
 }
 
 function renderToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, expandLargeToolResults: boolean, width?: number): string[] {
@@ -308,9 +308,15 @@ export function formatAgentFollowTranscript(messages: any[], options: AgentFollo
     }
   }
 
-  const lines = blocks.flatMap(block => block.kind === "section"
-    ? [block.label === "user" ? pink(block.label) : purple(block.label), block.text, ""]
-    : renderToolBlock(block, options.expandLargeToolResults === true, options.width));
+  const lines = blocks.flatMap(block => {
+    if (block.kind === "tool") {
+      return renderToolBlock(block, options.expandLargeToolResults === true, options.width);
+    }
+    if (block.label === "thinking") {
+      return [purple(block.label), block.text.replace(/\*\*/g, ""), ""];
+    }
+    return [block.label === "user" ? pink(block.label) : purple(block.label), block.text, ""];
+  });
   return lines.length > 0 ? lines : [dimAnsi("Waiting for the agent's first transcript event…")];
 }
 

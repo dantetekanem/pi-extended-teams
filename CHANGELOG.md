@@ -4,7 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [2.1.7] - 2026-07-25
+## [2.1.9] - 2026-07-26
+
+### Changed
+- Align verbose tool headers at the left while preserving their piped output and result summaries.
+- Preserve multiline thinking output without Markdown bold delimiters and place progress spacing directly before following block tools.
+
+## [2.1.8] - 2026-07-26
+
+### Added
+- Keep macOS systems awake while agents are active with one idle-sleep assertion, without preventing display sleep, and release it after the last agent settles or the lead exits.
+
+## [2.1.7] - 2026-07-26
 
 ### Fixed
 - Persist spawned-agent sessions, recover accepted final content before teardown, fail with actionable session pointers instead of empty successful reports, and let the lead's `check_teammate` retrieve reports after roster cleanup.

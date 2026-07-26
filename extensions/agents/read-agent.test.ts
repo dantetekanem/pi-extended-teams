@@ -14,7 +14,10 @@ const piMocks = vi.hoisted(() => ({
   loaderOptions: [] as any[],
   loaderExtensions: [] as any[],
   settingsManagers: [] as any[],
-  sessionManagerInMemory: vi.fn((cwd: string) => ({ cwd })),
+  sessionManagerCreate: vi.fn(),
+  sessionManagerOpen: vi.fn(),
+  persistedSessionEntries: new Map<string, any[]>(),
+  sessionManagerCounter: 0,
 }));
 
 function mockedPiRuntimeApi() {
@@ -46,7 +49,8 @@ function mockedPiRuntimeApi() {
     }),
   },
   SessionManager: {
-    inMemory: piMocks.sessionManagerInMemory,
+    create: piMocks.sessionManagerCreate,
+    open: piMocks.sessionManagerOpen,
   },
   };
 }
@@ -174,7 +178,22 @@ describe("in-process read agent tool wiring", () => {
     piMocks.loaderExtensions.length = 0;
     piMocks.settingsManagers.length = 0;
     piMocks.createAgentSession.mockReset();
-    piMocks.sessionManagerInMemory.mockClear();
+    piMocks.sessionManagerCreate.mockReset();
+    piMocks.sessionManagerOpen.mockReset();
+    piMocks.persistedSessionEntries.clear();
+    piMocks.sessionManagerCounter = 0;
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string) => {
+      const id = `child-session-${++piMocks.sessionManagerCounter}`;
+      const sessionFile = path.join(root, "child-sessions", `${id}.jsonl`);
+      return {
+        cwd,
+        getSessionId: () => id,
+        getSessionFile: () => sessionFile,
+      };
+    });
+    piMocks.sessionManagerOpen.mockImplementation((sessionFile: string) => ({
+      getEntries: () => piMocks.persistedSessionEntries.get(sessionFile) ?? [],
+    }));
     vi.spyOn(os, "homedir").mockReturnValue(root);
     installPathSpies();
     writeFavoriteLevels();
@@ -383,6 +402,8 @@ describe("in-process read agent tool wiring", () => {
     expect(piMocks.loaderOptions[0].noPromptTemplates).toBeUndefined();
     expect(piMocks.loaderOptions[0].noThemes).toBeUndefined();
     expect(sessionOptions.settingsManager).toBe(piMocks.loaderOptions[0].settingsManager);
+    expect(piMocks.sessionManagerCreate).toHaveBeenCalledWith(root);
+    expect(sessionOptions.sessionManager).toBe(piMocks.sessionManagerCreate.mock.results[0].value);
     const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
     expect(promptText).toContain("Use send_message for direct communication and read_inbox only when you were told a reply is waiting");
     expect(promptText).toContain("If another agent is needed, use send_message to ask team-lead");
@@ -403,6 +424,236 @@ describe("in-process read agent tool wiring", () => {
     expect(await readInbox("team", "team-lead", false, false)).toEqual([]);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader");
     expect(runningReadAgents.size).toBe(0);
+  });
+
+  it("requests one report-only recovery turn when the first turn has no usable output", async () => {
+    const session = makeSession();
+    session.messages = [];
+    session.prompt.mockImplementation(async () => {
+      if (session.prompt.mock.calls.length === 1) return;
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const reportTool = sessionOptions.customTools.find((tool: any) => tool.name === "report_and_exit");
+      await reportTool.execute("recovered-report", {
+        content: "Recovered on the report-only turn",
+        summary: "Recovered",
+      });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const member = { ...fixtureMember("reader"), prompt: "investigate" };
+    writeTeamConfig("team", member);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const emitAgentReport = vi.fn();
+
+    await runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key, state) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport,
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect((session.prompt.mock.calls as any[][])[1][0]).toContain("previous turn ended without a usable final report");
+    expect(rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      status: "completed",
+      report: "Recovered on the report-only turn",
+      summary: "Recovered",
+      reportSource: "report_and_exit",
+      recoveryAttempted: true,
+      recoverySessionId: "child-session-1",
+      recoverySessionFile: expect.stringContaining("child-session-1.jsonl"),
+    }));
+    expect(emitAgentReport).toHaveBeenCalledWith(
+      "team", "reader", expect.any(Number), 42, "Recovered on the report-only turn", true,
+    );
+  });
+
+  it("recovers an accepted report_and_exit payload from the durable child session", async () => {
+    const session = makeSession();
+    session.messages = [];
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const sessionFile = path.join(root, "child-sessions", "durable-child.jsonl");
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(sessionFile, "durable fixture\n");
+    piMocks.sessionManagerCreate.mockImplementationOnce(() => ({
+      getSessionId: () => "durable-child",
+      getSessionFile: () => sessionFile,
+    }));
+    piMocks.persistedSessionEntries.set(sessionFile, [
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "accepted-report-call",
+            name: "report_and_exit",
+            arguments: { content: "Recovered durable report", summary: "Durable" },
+          }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "accepted-report-call",
+          toolName: "report_and_exit",
+          content: [{ type: "text", text: "Final report accepted." }],
+          details: { accepted: true },
+          isError: false,
+        },
+      },
+    ]);
+    const member = { ...fixtureMember("reader"), prompt: "investigate" };
+    writeTeamConfig("team", member);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const emitAgentReport = vi.fn();
+
+    await runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key, state) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport,
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    });
+
+    expect(session.prompt).toHaveBeenCalledOnce();
+    expect(piMocks.sessionManagerOpen).toHaveBeenCalledWith(sessionFile);
+    expect(rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      status: "completed",
+      report: "Recovered durable report",
+      summary: "Durable",
+      reportSource: "persisted-report_and_exit",
+      recoveryAttempted: false,
+      recoverySessionId: "durable-child",
+      recoverySessionFile: sessionFile,
+    }));
+    expect(emitAgentReport).toHaveBeenCalledWith(
+      "team", "reader", expect.any(Number), 42, "Recovered durable report", true,
+    );
+    const reports = await listTeamReportEvents("team");
+    expect(reports.at(-1)).toMatchObject({
+      status: "completed",
+      report: "Recovered durable report",
+      metadata: {
+        reportSource: "persisted-report_and_exit",
+        recoverySessionId: "durable-child",
+        recoverySessionFile: sessionFile,
+      },
+    });
+  });
+
+  it("classifies a terminal provider error without report text as a failed recoverable run", async () => {
+    const session = makeSession();
+    (session as any).messages = [{
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "provider retries exhausted",
+    }];
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const sessionFile = path.join(root, "child-sessions", "provider-error.jsonl");
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(sessionFile, "provider error fixture\n");
+    piMocks.sessionManagerCreate.mockImplementationOnce(() => ({
+      getSessionId: () => "provider-error",
+      getSessionFile: () => sessionFile,
+    }));
+    const member = { ...fixtureMember("reader"), prompt: "investigate" };
+    writeTeamConfig("team", member);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const emitAgentReport = vi.fn();
+
+    await runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key, state) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport,
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    });
+
+    expect(session.prompt).toHaveBeenCalledOnce();
+    expect(rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      status: "failed",
+      report: expect.stringContaining("stopReason=error: provider retries exhausted"),
+      reportSource: "irrecoverable-empty",
+      recoveryAttempted: false,
+      recoverySessionId: "provider-error",
+      recoverySessionFile: sessionFile,
+    }));
+    const failureText = rememberCompletedAgentReport.mock.calls[0][1].report;
+    expect(failureText).toContain(`Recovery pointer: pi-child-session/v1`);
+    expect(failureText).toContain(`sessionFile=${JSON.stringify(sessionFile)}`);
+    expect(failureText).toContain("Retrieve the child transcript with the read tool");
+    expect(failureText).not.toContain("produced no assistant text");
+    expect(emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, failureText, false);
+  });
+
+  it("emits a failed diagnostic and stable pointer when the recovery turn is also empty", async () => {
+    const session = makeSession();
+    session.messages = [];
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const member = { ...fixtureMember("reader"), prompt: "investigate" };
+    writeTeamConfig("team", member);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const rememberCompletedAgentReport = vi.fn();
+    const emitAgentReport = vi.fn();
+
+    await runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key, state) => runningReadAgents.get(key) === state,
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport,
+      emitAgentReport,
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    });
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    const failedReport = rememberCompletedAgentReport.mock.calls[0][1];
+    expect(failedReport).toMatchObject({
+      status: "failed",
+      reportSource: "irrecoverable-empty",
+      recoveryAttempted: true,
+      recoverySessionId: "child-session-1",
+      recoverySessionFile: expect.stringContaining("child-session-1.jsonl"),
+    });
+    expect(failedReport.report).toContain("report-only recovery turn without producing any usable final report");
+    expect(failedReport.report).toContain("durableFile=false");
+    expect(failedReport.report).toContain("lifecycleRunId=");
+    expect(failedReport.report).not.toContain("produced no assistant text");
+    expect(emitAgentReport).toHaveBeenCalledWith(
+      "team", "reader", expect.any(Number), 42, failedReport.report, false,
+    );
   });
 
   it("loads one immutable extension selection, activates its tools, and propagates parent trust", async () => {

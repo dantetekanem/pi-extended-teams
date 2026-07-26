@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.7] - 2026-07-25
+
+### Fixed
+- Persist spawned-agent sessions, recover accepted final content before teardown, fail with actionable session pointers instead of empty successful reports, and let the lead's `check_teammate` retrieve reports after roster cleanup.
+
 ## [2.1.5] - 2026-07-19
 
 ### Added

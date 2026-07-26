@@ -2,6 +2,8 @@ import { Type } from "@sinclair/typebox";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
+import * as reportEvents from "../../src/utils/report-events";
+import * as paths from "../../src/utils/paths";
 import { formatTeammateStatusForModel, renderTeammateStatus } from "../ui/renderers";
 import type { RunningReadAgent } from "../runtime/types";
 import type { Member } from "../../src/utils/models";
@@ -104,7 +106,9 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
   pi.registerTool({
     name: "check_teammate",
     label: "Check Agent",
-    description: "Check one agent's status in the current Pi session only for targeted diagnostics after it has been quiet for several minutes or appears unhealthy. Do not use immediately after sending a message, while waiting for normal work, or after a report has already arrived.",
+    description: options.isTeammate
+      ? "Check one agent's active status in the current Pi session only for targeted diagnostics after it has been quiet for several minutes or appears unhealthy. Do not use immediately after sending a message or while waiting for normal work."
+      : "Check one agent's status in the current Pi session only for targeted diagnostics after it has been quiet for several minutes or appears unhealthy. If the agent already left the roster before its report reached you, this recovers its latest persisted report. Do not use immediately after sending a message, while waiting for normal work, or after a report has already arrived.",
     parameters: Type.Object({ agent_name: Type.String() }),
     async execute(_toolCallId: string, params: any) {
       const teamName = options.getTeamName();
@@ -132,7 +136,40 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
           };
           return { content: [{ type: "text", text: formatTeammateStatusForModel(params.agent_name, details) }], details };
         }
-        throw new Error(`Agent ${params.agent_name} not found`);
+        if (options.isTeammate) throw new Error(`Agent ${params.agent_name} not found`);
+        const latestReport = (await reportEvents.listTeamReportEvents(teamName, {
+          agentName: params.agent_name,
+          limit: 1,
+        })).at(-1);
+        if (latestReport) {
+          const reportPath = paths.reportEventsPath(teamName);
+          const report = String(latestReport.report || "").trim();
+          const recoverySessionFile = typeof latestReport.metadata?.recoverySessionFile === "string"
+            ? latestReport.metadata.recoverySessionFile
+            : undefined;
+          const text = [
+            `Agent ${params.agent_name} is no longer active. Recovered its latest persisted ${latestReport.status} report from ${reportPath}.`,
+            recoverySessionFile
+              ? `Its durable child transcript is available at ${recoverySessionFile}. Use the read tool on that path if the report is incomplete.`
+              : undefined,
+            report || "The persisted report body is empty; inspect the report event file above for metadata and any recovery pointer.",
+          ].filter(Boolean).join("\n\n");
+          const details = {
+            agentName: params.agent_name,
+            alive: false,
+            unreadCount: 0,
+            health: latestReport.status,
+            agentLoopReady: false,
+            hasRecentHeartbeat: false,
+            startupStalled: false,
+            removedMember: true,
+            releasedClaims: [],
+            reportPath,
+            completedReport: latestReport,
+          };
+          return { content: [{ type: "text", text }], details };
+        }
+        throw new Error(`Agent ${params.agent_name} not found and no persisted report is available.`);
       }
 
       const unreadCount = (await messaging.readInbox(teamName, params.agent_name, true, false)).length;

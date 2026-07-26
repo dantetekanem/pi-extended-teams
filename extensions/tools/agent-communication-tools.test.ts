@@ -83,6 +83,21 @@ describe("read-agent communication tools", () => {
     expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" });
   });
 
+  it("rejects blank final reports before closing report admission", async () => {
+    const onReportAndExit = vi.fn(async () => ({ accepted: true }));
+    const tools = new Map<string, Tool>(createAgentCommunicationTools({
+      isTeammate: true, agentName: "reader", role: "read", getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run",
+      authorizeWriteMember: vi.fn(async () => {}), onReportAndExit,
+    }).map((tool: Tool) => [tool.name, tool]));
+
+    await expect(tools.get("report_and_exit")!.execute("blank-report", {
+      content: " \n\t ",
+      summary: "Not usable",
+    })).rejects.toThrow("Final report content must not be empty");
+    expect(onReportAndExit).not.toHaveBeenCalled();
+  });
+
   it("exposes the complete coordination surface to write agents", () => {
     const tools = Array.from(makeTools("session", "writer", "write").keys()).sort();
 

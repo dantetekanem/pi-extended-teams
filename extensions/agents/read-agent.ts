@@ -4,8 +4,8 @@ import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
-import type { CompletedAgentReport, RunningReadAgent } from "../runtime/types";
-import { extractTextParts, getLastAssistantText, sanitizeTuiLine } from "../ui/renderers";
+import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
+import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
 import { requireWriteAgentTeam } from "../team/roster";
 import { isPiPromptPlanningMember, shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
@@ -29,6 +29,16 @@ import {
   type ReadAgentDeliveryCloseResult,
   type ReadAgentTeardownResult,
 } from "./read-agent-session-lifecycle";
+import {
+  EMPTY_REPORT_RECOVERY_PROMPT,
+  ReadAgentReportUnavailableError,
+  nonEmptyReportText,
+  persistedSessionMessages,
+  readAgentRecoveryReference,
+  resolveReadAgentReport,
+  type PersistedReadAgentMessages,
+  type ResolvedReadAgentReport,
+} from "./read-agent-report";
 
 export { closeReadAgentMessageDelivery } from "./read-agent-session-lifecycle";
 
@@ -294,7 +304,8 @@ async function recordReadAgentReportEvent(
   startedAt: number,
   tokensUsed: number,
   costUsd?: number,
-  color?: string
+  color?: string,
+  reportMetadata: Record<string, any> = {}
 ): Promise<void> {
   const operation = operationMetadataFromMember(member);
   const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
@@ -316,7 +327,11 @@ async function recordReadAgentReportEvent(
     source: "read-agent",
     operationId: operation.operationId,
     workflowRunId: operation.workflowRunId,
-    metadata: { ...(member.prompt ? { initialPrompt: member.prompt } : {}), ...(modelSlot ? { modelSlot } : {}) },
+    metadata: {
+      ...(member.prompt ? { initialPrompt: member.prompt } : {}),
+      ...(modelSlot ? { modelSlot } : {}),
+      ...reportMetadata,
+    },
   }).catch(() => {});
 }
 
@@ -501,6 +516,7 @@ export async function runReadAgentInProcess(
 
   let submittedFinalReport: SubmittedAgentReport | undefined;
   let finalReportSubmissionInProgress = false;
+  let childSessionManager: any;
   const pendingChildController = options.pendingChildController;
   const pendingChildParent: ParentRunIdentity | undefined = isEligibleNestedReadParent(member)
     ? {
@@ -534,10 +550,27 @@ export async function runReadAgentInProcess(
     return deliveryClose;
   };
 
-  const deliverCompletion = async (report: string, completionSummary: string): Promise<void> => {
+  const deliverCompletion = async (
+    resolution: ResolvedReadAgentReport,
+    completionSummary: string,
+    recoveryAttempted: boolean,
+    recoveryReference: { sessionId?: string; sessionFile?: string },
+  ): Promise<void> => {
     const session = state.session;
     if (!session) throw new Error(`Agent ${member.name} completed without a nested session.`);
+    const report = resolution.report!;
     const completionStats = session.getSessionStats();
+    const includeRecoveryReference = recoveryAttempted || resolution.source?.startsWith("persisted-");
+    const reportMetadata = {
+      reportSource: resolution.source,
+      recoveryAttempted,
+      ...(includeRecoveryReference && recoveryReference.sessionId
+        ? { recoverySessionId: recoveryReference.sessionId }
+        : {}),
+      ...(includeRecoveryReference && recoveryReference.sessionFile
+        ? { recoverySessionFile: recoveryReference.sessionFile }
+        : {}),
+    };
     options.rememberCompletedAgentReport(readTeamName, {
       name: member.name,
       role,
@@ -555,6 +588,7 @@ export async function runReadAgentInProcess(
       color: member.color,
       requestedBy: member.requestedBy,
       initialPrompt: member.prompt || prompt,
+      ...reportMetadata,
       source: "read-agent",
     });
     const completionMetadata = {
@@ -567,8 +601,20 @@ export async function runReadAgentInProcess(
       thinking: member.thinking,
       modelSlot,
       initialPrompt: member.prompt || prompt,
+      ...reportMetadata,
     };
-    await recordReadAgentReportEvent(readTeamName, member, "completed", report, completionSummary, state.startedAt, state.tokensUsed, completionStats.cost);
+    await recordReadAgentReportEvent(
+      readTeamName,
+      member,
+      "completed",
+      report,
+      completionSummary,
+      state.startedAt,
+      state.tokensUsed,
+      completionStats.cost,
+      undefined,
+      reportMetadata,
+    );
     const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
     if (member.requestedBy) {
       await ensureReadHelperCompletionMessages(
@@ -707,11 +753,16 @@ export async function runReadAgentInProcess(
         options.renderReadAgentStatus();
       },
       onReportAndExit: async report => {
+        const content = nonEmptyReportText(report.content);
+        if (!content) throw new Error("Final report content must not be empty.");
         if (submittedFinalReport || finalReportSubmissionInProgress) return { accepted: false };
         finalReportSubmissionInProgress = true;
         try {
           const deliveryClose = await closeRecipient();
-          submittedFinalReport = report;
+          submittedFinalReport = {
+            content,
+            summary: nonEmptyReportText(report.summary),
+          };
           return {
             accepted: true,
             cancelledDeliveries: deliveryClose.cancelledDeliveries,
@@ -742,6 +793,7 @@ export async function runReadAgentInProcess(
       ...nestedReadAgentToolNames,
     ]));
 
+    childSessionManager = SessionManager.create(member.cwd);
     const { session } = await createAgentSession({
       cwd: member.cwd,
       model,
@@ -751,7 +803,7 @@ export async function runReadAgentInProcess(
       customTools: [...communicationTools, ...nestedReadAgentTools],
       resourceLoader: loader,
       settingsManager: childSettingsManager,
-      sessionManager: SessionManager.inMemory(member.cwd),
+      sessionManager: childSessionManager,
     });
 
     state.session = session;
@@ -776,9 +828,36 @@ export async function runReadAgentInProcess(
       handleReadAgentSessionEvent(state, session, event, options.renderReadAgentStatus);
     });
 
+    let persistedSnapshot: PersistedReadAgentMessages = { messages: [] };
+    let completionResolution: ResolvedReadAgentReport | undefined;
+    let recoveryAttempted = false;
+    const resolveCurrentReport = (): ResolvedReadAgentReport => {
+      persistedSnapshot = persistedSessionMessages(
+        SessionManager,
+        nonEmptyReportText(childSessionManager.getSessionFile?.()),
+      );
+      return resolveReadAgentReport(submittedFinalReport, session.messages, persistedSnapshot.messages);
+    };
+    const unavailableReportError = (reason: string): ReadAgentReportUnavailableError => {
+      const reference = readAgentRecoveryReference(readTeamName, member.name, state.runId, childSessionManager);
+      const message = [
+        reason,
+        persistedSnapshot.error ? `The durable child session could not be read: ${persistedSnapshot.error}` : undefined,
+        `Recovery pointer: ${reference.pointer}`,
+        reference.guidance,
+      ].filter(Boolean).join("\n");
+      return new ReadAgentReportUnavailableError(
+        message,
+        recoveryAttempted,
+        reference.sessionId,
+        reference.sessionFile,
+      );
+    };
+
     state.acceptingMessages = true;
     try {
       await session.prompt(prompt, { source: "extension" as any });
+      refreshReadAgentStats(state, session);
       if (pendingChildController && pendingChildParent) {
         while (!submittedFinalReport && !state.stopRequested) {
           const snapshot = pendingChildController.observeParent(pendingChildParent);
@@ -802,6 +881,34 @@ export async function runReadAgentInProcess(
           const deliveryTail = state.messageDeliveryTail;
           if (deliveryTail) await deliveryTail.catch(() => {});
         }
+      } else if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
+        completionResolution = resolveCurrentReport();
+        if (completionResolution.terminalFailure) {
+          throw unavailableReportError(completionResolution.terminalFailure);
+        }
+        if (!completionResolution.report) {
+          recoveryAttempted = true;
+          markReadAgentActivity(state, "recovering missing report", "thinking");
+          options.renderReadAgentStatus();
+          try {
+            await session.prompt(EMPTY_REPORT_RECOVERY_PROMPT, { source: "extension" as any });
+            refreshReadAgentStats(state, session);
+          } catch (error) {
+            throw unavailableReportError(
+              `The report-only recovery turn failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          completionResolution = resolveCurrentReport();
+          if (completionResolution.terminalFailure) {
+            throw unavailableReportError(completionResolution.terminalFailure);
+          }
+          if (!completionResolution.report) {
+            throw unavailableReportError(
+              completionResolution.recoveryReason
+                ?? "The agent completed a report-only recovery turn without producing any usable final report.",
+            );
+          }
+        }
       }
     } finally {
       state.acceptingMessages = false;
@@ -816,11 +923,19 @@ export async function runReadAgentInProcess(
     if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) return;
     if (pendingChildParent && !submittedFinalReport) return;
 
-    const report = submittedFinalReport?.content
-      ?? (getLastAssistantText(session.messages) || "Read agent completed, but produced no assistant text.");
-    const completionSummary = submittedFinalReport?.summary
+    completionResolution ??= resolveCurrentReport();
+    if (completionResolution.terminalFailure) {
+      throw unavailableReportError(completionResolution.terminalFailure);
+    }
+    if (!completionResolution.report) {
+      throw unavailableReportError(
+        completionResolution.recoveryReason ?? "The agent completed without producing any usable final report.",
+      );
+    }
+    const completionSummary = completionResolution.summary
       ?? `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
-    await deliverCompletion(report, completionSummary);
+    const recoveryReference = readAgentRecoveryReference(readTeamName, member.name, state.runId, childSessionManager);
+    await deliverCompletion(completionResolution, completionSummary, recoveryAttempted, recoveryReference);
   } catch (e) {
     const lastError = runtime.createRuntimeError(e);
     state.lastError = lastError;
@@ -830,6 +945,20 @@ export async function runReadAgentInProcess(
     if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
       const failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
       const failureStats = state.session?.getSessionStats();
+      const reportUnavailable = e instanceof ReadAgentReportUnavailableError ? e : undefined;
+      const failureRecoveryReference = childSessionManager
+        ? readAgentRecoveryReference(readTeamName, member.name, state.runId, childSessionManager)
+        : undefined;
+      const failureReportMetadata = {
+        reportSource: reportUnavailable?.reportSource ?? "runtime-failure" as AgentReportSource,
+        recoveryAttempted: reportUnavailable?.recoveryAttempted ?? false,
+        ...((reportUnavailable?.recoverySessionId ?? failureRecoveryReference?.sessionId)
+          ? { recoverySessionId: reportUnavailable?.recoverySessionId ?? failureRecoveryReference?.sessionId }
+          : {}),
+        ...((reportUnavailable?.recoverySessionFile ?? failureRecoveryReference?.sessionFile)
+          ? { recoverySessionFile: reportUnavailable?.recoverySessionFile ?? failureRecoveryReference?.sessionFile }
+          : {}),
+      };
       options.rememberCompletedAgentReport(readTeamName, {
         name: member.name,
         role,
@@ -847,6 +976,7 @@ export async function runReadAgentInProcess(
         color: "red",
         requestedBy: member.requestedBy,
         initialPrompt: member.prompt || prompt,
+        ...failureReportMetadata,
         source: "read-agent",
       });
       const failureSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`;
@@ -860,8 +990,20 @@ export async function runReadAgentInProcess(
         thinking: member.thinking,
         modelSlot,
         initialPrompt: member.prompt || prompt,
+        ...failureReportMetadata,
       };
-      await recordReadAgentReportEvent(readTeamName, member, "failed", failureReport, failureSummary, state.startedAt, state.tokensUsed, failureStats?.cost, "red");
+      await recordReadAgentReportEvent(
+        readTeamName,
+        member,
+        "failed",
+        failureReport,
+        failureSummary,
+        state.startedAt,
+        state.tokensUsed,
+        failureStats?.cost,
+        "red",
+        failureReportMetadata,
+      );
       const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
       if (member.requestedBy) {
         await ensureReadHelperCompletionMessages(

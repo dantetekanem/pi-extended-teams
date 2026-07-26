@@ -7,6 +7,7 @@ import { registerTaskRuntimeTools } from "./task-runtime-tools.js";
 import * as teams from "../../src/utils/teams.js";
 import * as runtime from "../../src/utils/runtime.js";
 import * as messaging from "../../src/utils/messaging.js";
+import * as reportEvents from "../../src/utils/report-events.js";
 import type { Member } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 
@@ -42,6 +43,9 @@ describe("task runtime tools", () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "task-runtime-tools-"));
     vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName, agentName) => {
       return path.join(root, String(teamName), "lifecycle", "quarantine", `${String(agentName)}.json`);
+    });
+    vi.spyOn(paths, "reportEventsPath").mockImplementation((teamName) => {
+      return path.join(root, String(teamName), "reports.json");
     });
   });
 
@@ -109,6 +113,42 @@ describe("task runtime tools", () => {
     } finally {
       readConfig.mockRestore();
     }
+  });
+
+  it("limits post-roster persisted report recovery to the lead", async () => {
+    const leadTools = registerTools(false);
+    const teammateTools = registerTools(true);
+    vi.spyOn(teams, "readConfig").mockResolvedValue({
+      name: "team", description: "", createdAt: Date.now(), leadAgentId: "lead", leadSessionId: "session", members: [],
+    });
+    await reportEvents.appendTeamReportEvent("team", {
+      agentName: "finished-reader",
+      role: "read",
+      status: "completed",
+      report: "Durable completed report",
+      summary: "Done",
+      createdAt: Date.now(),
+      source: "read-agent",
+      metadata: { reportSource: "persisted-report_and_exit", recoverySessionFile: "/tmp/finished-reader.jsonl" },
+    });
+
+    const result = await leadTools.get("check_teammate").execute("check", { agent_name: "finished-reader" });
+
+    expect(result.content[0].text).toContain("Recovered its latest persisted completed report");
+    expect(result.content[0].text).toContain("Durable completed report");
+    expect(result.content[0].text).toContain("/tmp/finished-reader.jsonl");
+    expect(result.content[0].text).toContain(path.join(root, "team", "reports.json"));
+    expect(result.details).toMatchObject({
+      alive: false,
+      health: "completed",
+      removedMember: true,
+      completedReport: { agentName: "finished-reader", report: "Durable completed report" },
+    });
+
+    const listReports = vi.spyOn(reportEvents, "listTeamReportEvents");
+    await expect(teammateTools.get("check_teammate").execute("check", { agent_name: "finished-reader" }))
+      .rejects.toThrow("Agent finished-reader not found");
+    expect(listReports).not.toHaveBeenCalled();
   });
 
   it("uses lifecycle cleanup proof for a settled dead teammate", async () => {

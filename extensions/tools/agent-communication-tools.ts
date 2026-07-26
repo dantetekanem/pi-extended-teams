@@ -47,6 +47,13 @@ function normalizeProgressStatus(value: unknown): string {
   return status;
 }
 
+function normalizeFinalReportContent(value: unknown): string {
+  if (typeof value !== "string") throw new Error("Final report content must be a string.");
+  const content = value.trim();
+  if (!content) throw new Error("Final report content must not be empty.");
+  return content;
+}
+
 export function createReportProgressTool(options: Pick<AgentCommunicationToolsOptions, "isTeammate" | "agentName" | "getTeamName" | "getLifecycleRunId" | "onProgress">): any {
   return {
     name: "report_progress",
@@ -132,12 +139,14 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
     label: "Report and Exit",
     description: "Submit the complete final report to the lead and finish this nested agent run.",
     parameters: Type.Object({
-      content: Type.String({ description: "Complete final report to send to the lead; do not replace required output with a summary." }),
+      content: Type.String({ minLength: 1, description: "Complete non-empty final report to send to the lead; do not replace required output with a summary." }),
       summary: Type.Optional(Type.String({ description: "Short report summary." })),
     }),
     async execute(_toolCallId: string, params: SubmittedAgentReport) {
       const teamName = requireCurrentSession(options);
-      const result = await options.onReportAndExit({ content: params.content, summary: params.summary });
+      const content = normalizeFinalReportContent(params.content);
+      const summary = typeof params.summary === "string" && params.summary.trim() ? params.summary.trim() : undefined;
+      const result = await options.onReportAndExit({ content, summary });
       const text = result.accepted
         ? "Final report accepted. Finish immediately; the outer runner will release claims and stop this nested session."
         : "A final report was already accepted for this run. This duplicate was ignored; finish immediately.";

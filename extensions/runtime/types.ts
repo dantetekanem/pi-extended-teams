@@ -30,6 +30,14 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   finished?: Promise<void>;
 }
 
+export type AgentReportSource =
+  | "report_and_exit"
+  | "persisted-report_and_exit"
+  | "assistant-text"
+  | "persisted-assistant-text"
+  | "irrecoverable-empty"
+  | "runtime-failure";
+
 export interface CompletedAgentReport {
   name: string;
   role: string;
@@ -47,5 +55,9 @@ export interface CompletedAgentReport {
   color?: string;
   requestedBy?: string;
   initialPrompt?: string;
+  reportSource?: AgentReportSource;
+  recoveryAttempted?: boolean;
+  recoverySessionId?: string;
+  recoverySessionFile?: string;
   source: "read-agent" | "lead-inbox" | "report-event";
 }

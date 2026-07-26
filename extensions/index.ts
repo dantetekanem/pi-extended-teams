@@ -21,6 +21,7 @@ import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } 
 import { formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 import { createPendingChildController } from "./runtime/pending-child-controller.js";
+import { createActiveAgentSleepController, runWithActiveAgentSleepAssertion } from "./runtime/active-agent-sleep.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
 import * as messaging from "../src/utils/messaging";
 import * as teams from "../src/utils/teams";
@@ -84,6 +85,7 @@ export default function (pi: ExtensionAPI) {
   };
   let teamToolsRuntime: TeamToolsRuntime | undefined;
   const pendingChildController = createPendingChildController();
+  const activeAgentSleepController = createActiveAgentSleepController();
   const { startWriteAgent, drainWriteQueue } = createWriteAgentRuntime({
     terminal,
     getProjectTrusted: (cwd) => parentProjectTrustForSpawn(sessionCtx, cwd),
@@ -132,6 +134,14 @@ export default function (pi: ExtensionAPI) {
 
   function readAgentKey(targetTeamName: string, targetAgentName: string): string {
     return `${targetTeamName}:${targetAgentName}`;
+  }
+
+  function runInProcessAgentWithSleepAssertion(
+    ...args: Parameters<typeof runReadAgentInProcess>
+  ): ReturnType<typeof runReadAgentInProcess> {
+    return runWithActiveAgentSleepAssertion(activeAgentSleepController, () => {
+      return runReadAgentInProcess(...args);
+    });
   }
 
   function observeReadAgentLaunch(launch: Promise<void> | void): void {
@@ -785,7 +795,7 @@ export default function (pi: ExtensionAPI) {
 
           await teams.addMember(queued.teamName, member);
           observeReadAgentLaunch(
-            runReadAgentInProcess(queued.teamName, member, helperPrompt, sessionCtx, readAgentOptions())
+            runInProcessAgentWithSleepAssertion(queued.teamName, member, helperPrompt, sessionCtx, readAgentOptions())
           );
           await removeQueuedReadHelperRequest(teamName, queued.id);
         } catch (e) {
@@ -961,7 +971,7 @@ export default function (pi: ExtensionAPI) {
         };
         await teams.addMember(requestedTeamName, member);
         observeReadAgentLaunch(
-          runReadAgentInProcess(requestedTeamName, member, prompt, sessionCtx, readAgentOptions())
+          runInProcessAgentWithSleepAssertion(requestedTeamName, member, prompt, sessionCtx, readAgentOptions())
         );
         pi.events?.emit?.("pi-prompt:prompt-build:progress", { teamName: requestedTeamName, status: "spawned", started: i + 1, total: prompts.length, text: `building prompt — ${i + 1}/${prompts.length} branches started` });
       }
@@ -1030,7 +1040,11 @@ export default function (pi: ExtensionAPI) {
     teamActivityRenderDirty = false;
     settleTeamActivityRenderWaiters();
 
-    await stopRunningAgentsForShutdown(reason);
+    try {
+      await stopRunningAgentsForShutdown(reason);
+    } finally {
+      activeAgentSleepController.dispose();
+    }
 
     teamActivityStatusSnapshot = null;
     teamActivityStatusSnapshotSignature = null;
@@ -1133,7 +1147,7 @@ export default function (pi: ExtensionAPI) {
     isCurrentReadAgentRun,
     renderReadAgentStatus,
     readAgentOptions,
-    runReadAgentInProcess,
+    runReadAgentInProcess: runInProcessAgentWithSleepAssertion,
     startWriteAgent,
     shutdownTeammate,
     adoptTeamAsLead,

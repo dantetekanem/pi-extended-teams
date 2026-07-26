@@ -75,6 +75,28 @@ async function setupExtension(
   };
   vi.doMock("./agents/read-agent.js", () => readAgentMock);
 
+  const sleepAssertionReleases: Array<ReturnType<typeof vi.fn>> = [];
+  const sleepController = {
+    retain: vi.fn(() => {
+      const release = vi.fn();
+      sleepAssertionReleases.push(release);
+      return release;
+    }),
+    dispose: vi.fn(),
+  };
+  vi.doMock("./runtime/active-agent-sleep.js", () => ({
+    createActiveAgentSleepController: vi.fn(() => sleepController),
+    runWithActiveAgentSleepAssertion: (controller: typeof sleepController, launch: () => unknown) => {
+      const release = controller.retain();
+      try {
+        return Promise.resolve(launch()).finally(release);
+      } catch (error) {
+        release();
+        throw error;
+      }
+    },
+  }));
+
   const extensionModule = await import("./index.js") as any;
   const extension = extensionModule.default;
   const paths = await import("../src/utils/paths.js");
@@ -151,6 +173,8 @@ async function setupExtension(
     pi,
     terminal,
     readAgentMock,
+    sleepController,
+    sleepAssertionReleases,
     teams,
     restoreEnv() {
       process.env = originalEnv;
@@ -314,6 +338,66 @@ describe("extension integration", () => {
 
       const config = await setup.teams.readConfig("session-edit-session");
       expect(config.members.map((member: any) => member.name)).toEqual(["team-lead", "editor"]);
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("holds one shared sleep assertion across concurrent in-process agent runs", async () => {
+    const setup = await setupExtension();
+    try {
+      writeFavoriteLevels(setup.root);
+      let resolveFirst!: () => void;
+      let resolveSecond!: () => void;
+      const firstRun = new Promise<void>((resolve) => { resolveFirst = resolve; });
+      const secondRun = new Promise<void>((resolve) => { resolveSecond = resolve; });
+      setup.readAgentMock.runReadAgentInProcess
+        .mockReturnValueOnce(firstRun)
+        .mockReturnValueOnce(secondRun);
+      const ctx = makeCtx(setup.root, "sleep-assertion-session");
+      const signal = new AbortController().signal;
+
+      await setup.tools.get("spawn_agent")!.execute("spawn-first", {
+        name: "first",
+        prompt: "Inspect first",
+        cwd: setup.root,
+        model_slot: "read-review",
+      }, signal, undefined, ctx);
+      await setup.tools.get("spawn_agent")!.execute("spawn-second", {
+        name: "second",
+        prompt: "Inspect second",
+        cwd: setup.root,
+        model_slot: "read-review",
+      }, signal, undefined, ctx);
+
+      expect(setup.sleepController.retain).toHaveBeenCalledTimes(2);
+      expect(setup.sleepAssertionReleases).toHaveLength(2);
+
+      resolveFirst();
+      await firstRun;
+      await Promise.resolve();
+      expect(setup.sleepAssertionReleases[0]).toHaveBeenCalledOnce();
+      expect(setup.sleepAssertionReleases[1]).not.toHaveBeenCalled();
+
+      resolveSecond();
+      await secondRun;
+      await Promise.resolve();
+      expect(setup.sleepAssertionReleases[1]).toHaveBeenCalledOnce();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("disposes the shared sleep assertion during extension shutdown", async () => {
+    const setup = await setupExtension();
+    try {
+      const ctx = makeCtx(setup.root, "sleep-assertion-shutdown-session");
+
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) {
+        await handler({ reason: "quit" }, ctx);
+      }
+
+      expect(setup.sleepController.dispose).toHaveBeenCalledOnce();
     } finally {
       setup.restoreEnv();
     }
@@ -990,7 +1074,12 @@ describe("extension integration", () => {
               getProjectSettings: () => ({}),
             })),
           },
-          SessionManager: { inMemory: vi.fn(() => ({})) },
+          SessionManager: {
+            create: vi.fn(() => ({
+              getSessionFile: vi.fn(() => undefined),
+              getSessionId: vi.fn(() => "failing-helper-session"),
+            })),
+          },
         }),
       }));
       const actualReadAgent = await vi.importActual<typeof import("./agents/read-agent.js")>("./agents/read-agent.js");

@@ -63,6 +63,11 @@ spawn_agent({
 - **Advisory file claims**: edit agents coordinate file ownership with `claim_file`, `release_file`, and `list_file_claims`.
 - **Direct messaging**: agents and the lead can coordinate with `send_message` and `read_inbox`.
 - **Targeted health checks**: use `check_teammate` only when a specific agent appears stalled.
+- **macOS idle-sleep protection**: active agents keep the Mac awake without keeping its display awake.
+
+### macOS sleep behavior
+
+While at least one in-process agent is active, pi-extended-teams holds one `/usr/bin/caffeinate -i` assertion. This prevents idle system sleep so agents can finish, but intentionally allows the display to dim and sleep. The assertion is released after the last agent settles or the lead Pi exits. It does not override lid-close sleep, manual sleep, shutdown, battery exhaustion, or process failure; other platforms and Macs without `caffeinate` use a safe no-op fallback.
 
 ## Public tool surface
 

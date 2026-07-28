@@ -406,17 +406,39 @@ export async function broadcastMessage(
   }
 }
 
+export interface BroadcastMessageOnceRecipientResult {
+  recipient: string;
+  delivered: boolean;
+  message?: InboxMessage;
+  error?: string;
+}
+
 export async function broadcastMessageOnce(
   teamName: string,
   fromName: string,
   text: string,
   summary: string,
   options: SendPlainMessageOptions & { operationId: string }
-): Promise<Array<SendPlainMessageOnceResult & { recipient: string }>> {
+): Promise<BroadcastMessageOnceRecipientResult[]> {
   const config = await readConfig(teamName);
-  const deliveryPromises = config.members
+  const recipients = config.members
     .filter((member) => member.name !== fromName)
-    .map(async (member) => ({ recipient: member.name, ...(await sendPlainMessageOnceIfRunning(teamName, fromName, member.name, text, summary, options)) }));
+    .map((member) => member.name);
+  // One unreachable member must not abort delivery to the rest, and the caller
+  // needs the per-recipient outcome: silently omitting failures would make a
+  // partial broadcast indistinguishable from a smaller team. Retrying stays safe
+  // because operationId dedupes an already-delivered message.
+  const results = await Promise.allSettled(
+    recipients.map((recipient) => sendPlainMessageOnceIfRunning(teamName, fromName, recipient, text, summary, options))
+  );
 
-  return await Promise.all(deliveryPromises);
+  return results.map((result, index) => (
+    result.status === "fulfilled"
+      ? { recipient: recipients[index], ...result.value }
+      : {
+          recipient: recipients[index],
+          delivered: false,
+          error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        }
+  ));
 }

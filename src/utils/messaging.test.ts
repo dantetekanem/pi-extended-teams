@@ -5,6 +5,7 @@ import os from "node:os";
 import {
   appendMessage,
   broadcastMessage,
+  broadcastMessageOnce,
   findInboxMessageByOperation,
   peekInbox,
   readInbox,
@@ -66,6 +67,29 @@ describe("Messaging Utilities", () => {
     expect(writes).not.toContain(inboxFile);
     expect((await readInbox("test-team", "receiver", false, false)).map(message => message.text)).toEqual(["first", "second"]);
     expect(fs.readdirSync(path.dirname(inboxFile)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("broadcasts once to reachable members and reports the unreachable ones", async () => {
+    fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({
+      name: "test-team",
+      members: [
+        { name: "team-lead" },
+        { name: "ghost", isActive: false },
+        { name: "writer", isActive: true },
+      ],
+    }));
+
+    const results = await broadcastMessageOnce("test-team", "team-lead", "ping", "broadcast", { operationId: "op-1" });
+
+    // One unreachable member must not abort delivery to the rest, and the caller
+    // needs to see who missed it rather than inferring it from a short array.
+    expect(results.map(result => result.recipient).sort()).toEqual(["ghost", "writer"]);
+    expect(results.find(result => result.recipient === "writer")?.delivered).toBe(true);
+    expect(results.find(result => result.recipient === "ghost")).toMatchObject({
+      delivered: false,
+      error: expect.stringContaining("not running"),
+    });
+    expect((await readInbox("test-team", "writer", false, false)).length).toBe(1);
   });
 
   it("should append a message successfully", async () => {

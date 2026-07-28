@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildExtensionArgs, buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, isModelListed, resolvePiExtendedTeamsExtensionSource } from "./pi-command";
+import { spawnSync } from "node:child_process";
+import { buildExtensionArgs, buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand, isModelListed, resolvePiExtendedTeamsExtensionSource } from "./pi-command";
 
 const originalExtendedSource = process.env.PI_EXTENDED_TEAMS_EXTENSION_SOURCE;
 const originalLegacySource = process.env.PI_TEAMS_EXTENSION_SOURCE;
@@ -26,6 +27,22 @@ function restoreEnv() {
 describe("pi command helpers", () => {
   afterEach(() => {
     restoreEnv();
+  });
+
+  it("quotes the pi launch command so the shell cannot expand the install path", () => {
+    const originalArgv1 = process.argv[1];
+    try {
+      process.argv[1] = "/tmp/pi $(id -u)/dist/cli.js";
+      const launch = getPiLaunchCommand();
+
+      // buildPiCommand output is handed to `sh -c` by the tmux adapter, so the
+      // interpolated path must survive shell evaluation verbatim.
+      const echoed = spawnSync("sh", ["-c", launch.replace(/^node /, "echo ")], { encoding: "utf-8" });
+      expect(echoed.stdout.trim()).toBe("/tmp/pi $(id -u)/dist/cli.js");
+    } finally {
+      if (originalArgv1 === undefined) delete (process.argv as unknown as Record<number, string>)[1];
+      else process.argv[1] = originalArgv1;
+    }
   });
 
   it("falls back to a nearby checkout from cwd when the installed module path cannot find the extension", () => {

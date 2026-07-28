@@ -21,14 +21,14 @@ export function getPiLaunchCommand(): string {
       || /(?:^|[/\\])dist[/\\]cli\.js$/i.test(argv1);
 
     if (looksLikeScript) {
-      return `node ${JSON.stringify(argv1)}`;
+      return `node ${shellQuote(argv1)}`;
     }
   }
 
   if (execPath) {
     const base = path.basename(execPath).toLowerCase();
     if (base !== "node" && base !== "node.exe" && base !== "bun" && base !== "bun.exe") {
-      return JSON.stringify(execPath);
+      return shellQuote(execPath);
     }
   }
 

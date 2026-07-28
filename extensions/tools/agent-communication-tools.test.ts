@@ -25,13 +25,13 @@ function installPathSpies() {
   });
 }
 
-function makeTools(teamName: string | null = "session", agentName = "reader", role: "read" | "write" = "read") {
+function makeTools(teamName: string | null = "session", agentName = "reader", role: "read" | "write" = "read", lifecycleRunId: string | null = "reader-run") {
   return new Map<string, Tool>(createAgentCommunicationTools({
     isTeammate: true,
     agentName,
     role,
     getTeamName: () => teamName ?? undefined,
-    getLifecycleRunId: () => "reader-run",
+    getLifecycleRunId: () => lifecycleRunId ?? undefined,
     authorizeWriteMember: vi.fn(async () => {}),
     onReportAndExit: vi.fn(async () => ({ accepted: true })),
   } as any).map((tool: Tool) => [tool.name, tool]));
@@ -56,6 +56,15 @@ describe("read-agent communication tools", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("still delivers inbox messages when no lifecycle run id is available", async () => {
+    await sendPlainMessage("session", "team-lead", "reader", "Initial instructions", "assignment");
+    const tools = makeTools("session", "reader", "read", null);
+
+    const result = await tools.get("read_inbox")!.execute("read", { unread_only: true });
+
+    expect(result.content[0].text).toContain("Initial instructions");
   });
 
   it("exposes direct communication and complete final reporting to read agents", () => {

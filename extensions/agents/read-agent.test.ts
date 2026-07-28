@@ -344,6 +344,7 @@ describe("in-process read agent tool wiring", () => {
   it("injects teammate-safe communication tools and guidance into nested read-agent sessions", async () => {
     const session = makeSession();
     piMocks.createAgentSession.mockResolvedValue({ session });
+    const modelRuntime = {};
     const runningReadAgents = new Map<string, RunningReadAgent>();
     const options = {
       isTeammate: false,
@@ -373,12 +374,14 @@ describe("in-process read agent tool wiring", () => {
       prompt: "investigate",
     }, "investigate", {
       modelRegistry: {
+        runtime: modelRuntime,
         find: vi.fn(() => ({ provider: "provider", id: "model" })),
       },
     }, options);
 
     expect(piMocks.createAgentSession).toHaveBeenCalledTimes(1);
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+    expect(sessionOptions.modelRuntime).toBe(modelRuntime);
     const communicationToolNames = ["send_message", "report_progress", "read_inbox", "report_and_exit"];
     expect(sessionOptions.tools).toEqual([
       "read",

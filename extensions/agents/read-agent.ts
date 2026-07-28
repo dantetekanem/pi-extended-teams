@@ -794,17 +794,21 @@ export async function runReadAgentInProcess(
     ]));
 
     childSessionManager = SessionManager.create(member.cwd);
+    const parentModelRuntime: unknown = Reflect.get(ctx.modelRegistry, "runtime");
     const { session } = await createAgentSession({
       cwd: member.cwd,
       model,
       thinkingLevel: member.thinking as any,
+      // Pi 0.82 consumes modelRuntime; reuse the parent's runtime so nested
+      // sessions retain custom providers and runtime-scoped credentials.
+      modelRuntime: parentModelRuntime,
       modelRegistry: ctx.modelRegistry,
       tools: activeToolNames,
       customTools: [...communicationTools, ...nestedReadAgentTools],
       resourceLoader: loader,
       settingsManager: childSettingsManager,
       sessionManager: childSessionManager,
-    });
+    } as Parameters<typeof createAgentSession>[0] & { modelRuntime?: unknown });
 
     state.session = session;
     installReadAgentSessionLifecycle(session);

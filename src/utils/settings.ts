@@ -249,10 +249,7 @@ function favoriteModelConfigFromRaw(
 ): FavoriteModelConfig | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   return {
-    // Store the same canonical form spawn resolves to. Otherwise a hand-edited
-    // value such as "provider/model:high" survives load, gets rewritten during
-    // spawn, and then fails the member.model === level.model assertion after the
-    // agent has already been added to the roster.
+    // Keep configured and spawn-time model identities aligned.
     model: "model" in raw ? normalizeQualifiedModel(String(raw.model ?? "")) : (base?.model ?? null),
     thinking: "thinking" in raw ? normalizeThinking(raw.thinking) : (base?.thinking ?? null),
   };

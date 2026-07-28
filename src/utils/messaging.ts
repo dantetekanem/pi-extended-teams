@@ -424,10 +424,7 @@ export async function broadcastMessageOnce(
   const recipients = config.members
     .filter((member) => member.name !== fromName)
     .map((member) => member.name);
-  // One unreachable member must not abort delivery to the rest, and the caller
-  // needs the per-recipient outcome: silently omitting failures would make a
-  // partial broadcast indistinguishable from a smaller team. Retrying stays safe
-  // because operationId dedupes an already-delivered message.
+  // Report every recipient; operation IDs make retries idempotent.
   const results = await Promise.allSettled(
     recipients.map((recipient) => sendPlainMessageOnceIfRunning(teamName, fromName, recipient, text, summary, options))
   );

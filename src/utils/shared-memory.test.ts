@@ -68,8 +68,6 @@ describe("shared memory utilities", () => {
 
     await writeSharedMemory("team", "bob", "other", "value");
 
-    // readMemoryRaw does not guard JSON.parse, so a zero-byte file left by a
-    // crash mid-write makes every later read and write throw.
     expect(writes).not.toContain(memoryPath);
     expect((await readSharedMemory("team")).map((entry) => entry.key).sort()).toEqual(["decision", "other"]);
     expect(fs.readdirSync(testDir).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);

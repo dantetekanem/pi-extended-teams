@@ -212,8 +212,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             }
           } catch (e) {
             if (!teammateInboxDisposed) {
-              // Best-effort: every caller of this wake is fire-and-forget, so a
-              // second failure here would surface as an unhandled rejection.
+              // Wake callers are fire-and-forget.
               await writeTeammateRuntimeStatus(teamName, {
                 lastHeartbeatAt: Date.now(),
                 lastError: runtime.createRuntimeError(e),

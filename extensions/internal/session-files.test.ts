@@ -112,7 +112,6 @@ describe("session file cleanup", () => {
 
   it("findLeadTeamForSession ignores stray entries that are not valid team names", () => {
     writeTeam("current-session", { leadPid: process.pid, sessionId: "current-session-id" });
-    // macOS Finder drops .DS_Store into any browsed directory; sanitizeName rejects it.
     fs.writeFileSync(path.join(teamsRoot, ".DS_Store"), "stray");
 
     expect(findLeadTeamForSession("current-session-id")).toBe("current-session");

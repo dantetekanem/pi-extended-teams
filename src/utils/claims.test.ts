@@ -117,8 +117,6 @@ describe("crash safety", () => {
 
     await claimFiles("t", "bob", ["src/b.ts"]);
 
-    // A crash between O_TRUNC and write would leave a zero-byte registry, and
-    // readClaims swallows parse errors, so every agent's claim disappears.
     expect(writes).not.toContain(registry);
     expect((await listClaims("t")).map((claim) => claim.path).sort()).toEqual(["src/a.ts", "src/b.ts"]);
     expect(fs.readdirSync(path.dirname(registry)).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);

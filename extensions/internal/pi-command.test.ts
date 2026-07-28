@@ -35,8 +35,7 @@ describe("pi command helpers", () => {
       process.argv[1] = "/tmp/pi $(id -u)/dist/cli.js";
       const launch = getPiLaunchCommand();
 
-      // buildPiCommand output is handed to `sh -c` by the tmux adapter, so the
-      // interpolated path must survive shell evaluation verbatim.
+      // Match the tmux adapter's `sh -c` boundary.
       const echoed = spawnSync("sh", ["-c", launch.replace(/^node /, "echo ")], { encoding: "utf-8" });
       expect(echoed.stdout.trim()).toBe("/tmp/pi $(id -u)/dist/cli.js");
     } finally {

@@ -544,9 +544,7 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
               applyItems(nextItems, refreshOptions.resetLog);
               updateAutoRefresh();
             })
-            // readConfig throws when the team is gone, its config is torn, or the
-            // lock cannot be acquired. This runs from a timer, so an escaping
-            // rejection would take down the Pi process; stop refreshing instead.
+            // Timer refresh failures must not reject or immediately re-arm.
             .catch(() => stopAutoRefresh())
             .finally(() => {
               autoRefreshInFlight = false;

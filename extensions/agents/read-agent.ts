@@ -1044,15 +1044,12 @@ export async function runReadAgentInProcess(
   } finally {
     pendingParentWakeSignals.delete(state);
     settleSessionCreation(state.session);
-    // The run is over even when lifecycle cleanup is refused by a fence, so stop
-    // heartbeating and admitting deliveries before handing teardown off. Both
-    // calls are idempotent: on the happy path closeRecipient already did them.
+    // End run-owned activity even when persisted lifecycle cleanup is refused.
     if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
     state.heartbeatTimer = undefined;
     closeReadAgentMessageDelivery(state);
     const teardown = await shutdownTeammate(readTeamName, member, { reason: "quit" });
     if (pendingChildController && pendingChildParent) {
-      // forgetParent is self-guarding: it is a no-op while children remain.
       pendingChildController.forgetParent(pendingChildParent);
     }
     if (!teardown.finalized) options.renderReadAgentStatus();

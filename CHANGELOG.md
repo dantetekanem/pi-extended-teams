@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.11] - 2026-07-28
+
+### Fixed
+- Keep lead-team adoption resilient to stray filesystem entries and preserve inbox delivery when lifecycle telemetry has no run identity.
+- Quote Pi launch paths safely before `sh -c` evaluation and contain rejected timer-driven background work instead of terminating Pi.
+- Stop refused read-agent teardown from leaking heartbeat timers or message delivery, and treat tombstones unlinked during a concurrent read as absent rather than corrupt.
+- Write claims, shared memory, inboxes, and the read-helper queue through atomic replacement so interrupted writers cannot truncate live shared state.
+- Canonicalize hand-edited favorite-model values at the settings load boundary.
+- Report idempotent broadcast outcomes for every recipient without aborting successful sibling deliveries when one recipient is unavailable.
+
+### Credits
+- All fixes in this release were contributed by Dan Gayle ([@dangayle](https://github.com/dangayle)) through PRs [#6](https://github.com/dantetekanem/pi-extended-teams/pull/6), [#7](https://github.com/dantetekanem/pi-extended-teams/pull/7), [#8](https://github.com/dantetekanem/pi-extended-teams/pull/8), [#9](https://github.com/dantetekanem/pi-extended-teams/pull/9), [#11](https://github.com/dantetekanem/pi-extended-teams/pull/11), [#12](https://github.com/dantetekanem/pi-extended-teams/pull/12), [#14](https://github.com/dantetekanem/pi-extended-teams/pull/14), and [#15](https://github.com/dantetekanem/pi-extended-teams/pull/15).
+
 ## [2.1.10] - 2026-07-28
 
 ### Fixed

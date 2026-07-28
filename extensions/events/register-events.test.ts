@@ -246,13 +246,9 @@ describe("extension teammate inbox wake", () => {
       watchCallback = callback;
       return { close: vi.fn() } as unknown as fs.FSWatcher;
     });
-    // `Could not acquire lock` is an expected production failure under fan-out
-    // contention (see src/utils/lock.ts), and it is not a RuntimeStatusWriteRejectedError,
-    // so writeTeammateRuntimeStatus rethrows it from the wake's own catch block.
     const runtimeWrite = vi.spyOn(runtime, "writeRuntimeStatus").mockImplementation(async (_teamName: any, _agentName: any, _runId: any, updates: any) => {
       const keys = Object.keys(updates ?? {});
-      // Fail only the wake's own two writes; leave the session_start/turn_end
-      // writes working so this test isolates the wake path.
+      // Fail only the two wake-path writes.
       if (keys.length <= 2 && keys.includes("lastHeartbeatAt")) throw new Error("Could not acquire lock");
       return {} as any;
     });

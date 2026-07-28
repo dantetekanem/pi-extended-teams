@@ -171,13 +171,9 @@ describe("loadSettings", () => {
     });
     const s = loadSettings({ homeDir, projectDir });
 
-    // Spawn re-normalizes through requireQualifiedKnownModel and then asserts
-    // member.model === level.model, so a non-canonical stored value desyncs.
     expect(s.favoriteModels["read-review"]?.model).toBe("provider/model");
     expect(s.favoriteModels["read-analyze"]?.model).toBe("provider/model");
     expect(s.favoriteModels["write-patch"]?.model).toBe("provider/model");
-    // Unqualified values cannot be resolved at all; null makes the slot report
-    // "not configured" before an agent is admitted to the roster.
     expect(s.favoriteModels["write-feature"]?.model).toBeNull();
   });
 

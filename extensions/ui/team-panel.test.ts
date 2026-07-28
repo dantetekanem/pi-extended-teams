@@ -108,9 +108,6 @@ describe("team panel items", () => {
   });
 
   it("does not raise an unhandled rejection when the auto-refresh read fails", async () => {
-    // A team with no live members keeps the 1s auto-refresh armed (shouldAutoRefresh
-    // returns true while items is empty), which is exactly the state after the last
-    // agent finishes. readConfig throws by design once the team dir is gone.
     const config = teams.createTeam("team", "session", "lead", "", "provider/model");
     fs.writeFileSync(paths.configPath("team"), JSON.stringify(config, null, 2));
 

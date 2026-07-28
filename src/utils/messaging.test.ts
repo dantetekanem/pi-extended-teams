@@ -62,8 +62,6 @@ describe("Messaging Utilities", () => {
     await appendMessage("test-team", "receiver", { from: "sender", text: "second", timestamp: "now", read: false });
     await readInbox("test-team", "receiver", true, true);
 
-    // Agent pids are SIGKILLed by default, and readInboxRaw does not guard
-    // JSON.parse: a zero-byte inbox makes every later read and send throw.
     expect(writes).not.toContain(inboxFile);
     expect((await readInbox("test-team", "receiver", false, false)).map(message => message.text)).toEqual(["first", "second"]);
     expect(fs.readdirSync(path.dirname(inboxFile)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
@@ -81,8 +79,6 @@ describe("Messaging Utilities", () => {
 
     const results = await broadcastMessageOnce("test-team", "team-lead", "ping", "broadcast", { operationId: "op-1" });
 
-    // One unreachable member must not abort delivery to the rest, and the caller
-    // needs to see who missed it rather than inferring it from a short array.
     expect(results.map(result => result.recipient).sort()).toEqual(["ghost", "writer"]);
     expect(results.find(result => result.recipient === "writer")?.delivered).toBe(true);
     expect(results.find(result => result.recipient === "ghost")).toMatchObject({

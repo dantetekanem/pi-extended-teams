@@ -122,8 +122,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         const unreadOnly = params.unread_only !== false;
         const msgs = await messaging.readInbox(teamName, options.agentName, unreadOnly, markAsRead);
         const lifecycleRunId = options.getLifecycleRunId();
-        // Telemetry is best-effort here: the messages are already marked read,
-        // so failing now would drop them without the agent ever seeing them.
+        // Do not fail after read flags are persisted; telemetry is best-effort.
         if (markAsRead && lifecycleRunId) {
           await runtime.writeRuntimeStatus(teamName, options.agentName, lifecycleRunId, {
             lastHeartbeatAt: Date.now(),

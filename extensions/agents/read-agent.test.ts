@@ -344,8 +344,6 @@ describe("in-process read agent tool wiring", () => {
   it("stops heartbeating when lifecycle teardown is refused by an unreadable fence", async () => {
     const session = makeSession();
     session.prompt.mockImplementation(async () => {
-      // The fence becomes unreadable before the run's finalizer gets to it, so
-      // shutdownTeammate refuses cleanup and never reaches requestReadAgentTeardown.
       const fence = paths.lifecycleTombstonePath("team", "reader");
       fs.mkdirSync(path.dirname(fence), { recursive: true });
       fs.writeFileSync(fence, "{ malformed");

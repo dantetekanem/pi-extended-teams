@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.10] - 2026-07-28
+
+### Fixed
+- Reuse the parent model runtime for nested read-agent sessions so Pi 0.82 custom providers and runtime-scoped credentials remain available.
+
 ## [2.1.9] - 2026-07-26
 
 ### Changed

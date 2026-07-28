@@ -128,6 +128,44 @@ describe("create_predefined_team tiers", () => {
     });
   });
 
+  it("refuses to recreate a team that already has members", async () => {
+    const create = registerTools().get("create_predefined_team")!;
+    const ctx = makeCtx();
+
+    await create.execute("first", {
+      team_name: "live-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, ctx);
+
+    // An agent spawned separately into the same team, e.g. via spawn_agent.
+    await teams.addMember("live-writers", {
+      agentId: "reviewer@live-writers",
+      name: "reviewer",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "high",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    } as Member);
+
+    const before = (await teams.readConfig("live-writers")).members.map(member => member.name);
+    expect(before).toContain("writer");
+    expect(before).toContain("reviewer");
+
+    await expect(create.execute("second", {
+      team_name: "live-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, ctx)).rejects.toThrow(/already exists/);
+
+    const after = (await teams.readConfig("live-writers")).members.map(member => member.name);
+    expect(after).toEqual(before);
+  });
+
   it("rejects direct thinking from a predefined agent definition", async () => {
     fs.writeFileSync(
       path.join(root, ".pi", "agents", "writer.md"),

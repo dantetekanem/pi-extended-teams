@@ -107,6 +107,10 @@ function readUnlocked(teamName: string, agentName: string, tombstonePath: string
     }
     return { status: "occupied", tombstone: parsed };
   } catch (error) {
+    // The owning run may unlink its fence between the existsSync probe above and
+    // this read. A vanished fence is absent, not corrupt; every other read
+    // failure stays fail-closed.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" };
     return { status: "corrupt", error: `Lifecycle tombstone could not be read: ${errorText(error)}` };
   }
 }

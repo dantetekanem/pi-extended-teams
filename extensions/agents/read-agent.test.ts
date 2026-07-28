@@ -341,6 +341,44 @@ describe("in-process read agent tool wiring", () => {
     expect(runningReadAgents.size).toBe(0);
   });
 
+  it("stops heartbeating when lifecycle teardown is refused by an unreadable fence", async () => {
+    const session = makeSession();
+    session.prompt.mockImplementation(async () => {
+      // The fence becomes unreadable before the run's finalizer gets to it, so
+      // shutdownTeammate refuses cleanup and never reaches requestReadAgentTeardown.
+      const fence = paths.lifecycleTombstonePath("team", "reader");
+      fs.mkdirSync(path.dirname(fence), { recursive: true });
+      fs.writeFileSync(fence, "{ malformed");
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const member = { ...fixtureMember("reader"), prompt: "investigate" };
+    writeTeamConfig("team", member);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    let observed: RunningReadAgent | undefined;
+
+    await expect(runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => {
+        observed = state;
+        return runningReadAgents.get(key) === state;
+      },
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    })).rejects.toThrow(/lifecycle-quarantined by a corrupt tombstone/);
+
+    expect(observed).toBeDefined();
+    expect(observed!.heartbeatTimer).toBeUndefined();
+    expect(observed!.messageDeliveryClosed).toBe(true);
+  });
+
   it("injects teammate-safe communication tools and guidance into nested read-agent sessions", async () => {
     const session = makeSession();
     piMocks.createAgentSession.mockResolvedValue({ session });

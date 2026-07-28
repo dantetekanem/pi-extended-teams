@@ -11,6 +11,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { writeJsonAtomic } from "./atomic-json";
 import { withLock } from "./lock";
 import { claimsPath } from "./paths";
 
@@ -64,9 +65,7 @@ function readClaims(p: string): ClaimMap {
 }
 
 function writeClaims(p: string, claims: ClaimMap): void {
-  const dir = path.dirname(p);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(claims, null, 2));
+  writeJsonAtomic(p, claims);
 }
 
 /**

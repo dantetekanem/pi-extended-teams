@@ -48,6 +48,26 @@ describe("Messaging Utilities", () => {
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
   });
 
+  it("never truncates a live inbox in place", async () => {
+    await appendMessage("test-team", "receiver", { from: "sender", text: "first", timestamp: "now", read: false });
+    const inboxFile = path.join(testDir, "inboxes", "receiver.json");
+    const writes: string[] = [];
+    const realWriteFileSync = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((target: any, data: any, options: any) => {
+      writes.push(String(target));
+      return realWriteFileSync(target, data, options);
+    }) as typeof fs.writeFileSync);
+
+    await appendMessage("test-team", "receiver", { from: "sender", text: "second", timestamp: "now", read: false });
+    await readInbox("test-team", "receiver", true, true);
+
+    // Agent pids are SIGKILLed by default, and readInboxRaw does not guard
+    // JSON.parse: a zero-byte inbox makes every later read and send throw.
+    expect(writes).not.toContain(inboxFile);
+    expect((await readInbox("test-team", "receiver", false, false)).map(message => message.text)).toEqual(["first", "second"]);
+    expect(fs.readdirSync(path.dirname(inboxFile)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+  });
+
   it("should append a message successfully", async () => {
     const msg = { from: "sender", text: "hello", timestamp: "now", read: false };
     await appendMessage("test-team", "receiver", msg);

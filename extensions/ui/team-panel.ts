@@ -540,11 +540,17 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             tui.requestRender();
           }
           void buildTeamPanelItems(panelTeamName!, options)
-            .then((nextItems) => applyItems(nextItems, refreshOptions.resetLog))
+            .then((nextItems) => {
+              applyItems(nextItems, refreshOptions.resetLog);
+              updateAutoRefresh();
+            })
+            // readConfig throws when the team is gone, its config is torn, or the
+            // lock cannot be acquired. This runs from a timer, so an escaping
+            // rejection would take down the Pi process; stop refreshing instead.
+            .catch(() => stopAutoRefresh())
             .finally(() => {
               autoRefreshInFlight = false;
               loading = false;
-              updateAutoRefresh();
               tui.requestRender();
             });
         }

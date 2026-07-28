@@ -46,7 +46,7 @@ export function installAgentNavigation(ctx: any, options: AgentNavigationOptions
         initialAgentName: agents.slice().sort((a, b) => a.name.localeCompare(b.name))[0]?.name,
         stopAgent: options.stopAgent,
         sendMessage: options.sendMessage,
-      }).finally(() => { opening = false; });
+      }).catch(() => {}).finally(() => { opening = false; });
       return true;
     });
   };

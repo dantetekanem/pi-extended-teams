@@ -240,6 +240,40 @@ describe("extension teammate inbox wake", () => {
     expect(quietTrigger).toHaveBeenCalledWith("You have 1 new inbox message(s). Read them with read_inbox and act.");
   });
 
+  it("does not reject the inbox wake when runtime status writes keep failing", async () => {
+    let watchCallback: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
+    const watchInboxDirectory = vi.fn((_path: string, callback: any) => {
+      watchCallback = callback;
+      return { close: vi.fn() } as unknown as fs.FSWatcher;
+    });
+    // `Could not acquire lock` is an expected production failure under fan-out
+    // contention (see src/utils/lock.ts), and it is not a RuntimeStatusWriteRejectedError,
+    // so writeTeammateRuntimeStatus rethrows it from the wake's own catch block.
+    const runtimeWrite = vi.spyOn(runtime, "writeRuntimeStatus").mockImplementation(async (_teamName: any, _agentName: any, _runId: any, updates: any) => {
+      const keys = Object.keys(updates ?? {});
+      // Fail only the wake's own two writes; leave the session_start/turn_end
+      // writes working so this test isolates the wake path.
+      if (keys.length <= 2 && keys.includes("lastHeartbeatAt")) throw new Error("Could not acquire lock");
+      return {} as any;
+    });
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+
+    try {
+      const { handlers, ctx } = setupEvents(() => true, { watchInboxDirectory });
+      for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+
+      watchCallback?.("change", "writer.json");
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(runtimeWrite).toHaveBeenCalled();
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
   it("closes teammate inbox handles and prevents work after session shutdown", async () => {
     const close = vi.fn();
     let watchCallback: ((eventType: string, filename: string | Buffer | null) => void) | undefined;

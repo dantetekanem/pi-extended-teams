@@ -57,6 +57,24 @@ describe("shared memory utilities", () => {
     expect(await deleteSharedMemory("team", "decision")).toBeNull();
   });
 
+  it("never truncates the live memory file in place", async () => {
+    await writeSharedMemory("team", "alice", "decision", "keep");
+    const writes: string[] = [];
+    const realWriteFileSync = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((target: any, data: any, options: any) => {
+      writes.push(String(target));
+      return realWriteFileSync(target, data, options);
+    }) as typeof fs.writeFileSync);
+
+    await writeSharedMemory("team", "bob", "other", "value");
+
+    // readMemoryRaw does not guard JSON.parse, so a zero-byte file left by a
+    // crash mid-write makes every later read and write throw.
+    expect(writes).not.toContain(memoryPath);
+    expect((await readSharedMemory("team")).map((entry) => entry.key).sort()).toEqual(["decision", "other"]);
+    expect(fs.readdirSync(testDir).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+  });
+
   it("rejects blank keys", async () => {
     await expect(writeSharedMemory("team", "alice", " ", "value")).rejects.toThrow("must not be empty");
     await expect(deleteSharedMemory("team", " ")).rejects.toThrow("must not be empty");

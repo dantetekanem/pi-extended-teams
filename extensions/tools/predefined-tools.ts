@@ -99,6 +99,12 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
         pi,
       });
 
+      // createTeam overwrites config.json with a lead-only roster, so recreating a
+      // live team silently drops every member spawned into it by other means.
+      if (teams.teamExists(params.team_name)) {
+        throw new Error(`Team "${params.team_name}" already exists. Choose a different team_name, or stop that team first.`);
+      }
+
       const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
       options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
 

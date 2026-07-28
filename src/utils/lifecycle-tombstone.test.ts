@@ -68,6 +68,24 @@ describe("lifecycle tombstone store", () => {
     expect(await readLifecycleTombstone("team", "reader")).toEqual({ status: "absent" });
   });
 
+  it("treats a tombstone unlinked mid-read as absent rather than corrupt", async () => {
+    const file = tombstonePath("team", "reader");
+    await withLifecycleTombstoneLock("team", "reader", async lock => {
+      lock.occupy({
+        team: "team", agent: "reader", runId: "run-1", role: "read", reason: "quit", extensionInstanceId: "extension-a",
+      });
+    });
+
+    // The owning run clears its fence between the existsSync probe and the open.
+    const realReadFileSync = fs.readFileSync;
+    vi.spyOn(fs, "readFileSync").mockImplementationOnce(((target: any, options: any) => {
+      if (target === file) fs.unlinkSync(file);
+      return realReadFileSync(target, options);
+    }) as typeof fs.readFileSync);
+
+    expect(await readLifecycleTombstone("team", "reader")).toEqual({ status: "absent" });
+  });
+
   it("treats corrupt content as occupied and never overwrites or clears it", async () => {
     const file = tombstonePath("team", "reader");
     fs.mkdirSync(path.dirname(file), { recursive: true });

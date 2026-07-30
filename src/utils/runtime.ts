@@ -21,6 +21,16 @@ export interface RuntimeError {
   timestamp: number;
 }
 
+export interface ContextUsageSnapshot {
+  tokens: number | null;
+  contextWindow: number;
+  percent: number | null;
+}
+
+export function initialContextUsage(contextWindow = 0): ContextUsageSnapshot {
+  return { tokens: 0, contextWindow, percent: 0 };
+}
+
 export interface AgentRuntimeStatus {
   teamName: string;
   agentName: string;
@@ -33,6 +43,7 @@ export interface AgentRuntimeStatus {
   currentAction?: "starting" | "thinking" | "working" | "finishing" | "done";
   activeToolName?: string;
   tokensUsed?: number;
+  contextUsage?: ContextUsageSnapshot;
   latestProgress?: string;
   progressUpdatedAt?: number;
   lastError?: RuntimeError;

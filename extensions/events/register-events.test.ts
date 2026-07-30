@@ -364,15 +364,31 @@ describe("extension teammate inbox wake", () => {
       },
     };
     (ctx as any).sessionManager = { getBranch: vi.fn(() => []) };
+    let currentContextUsage = { tokens: 597, contextWindow: 200_000, percent: 0.3 };
+    (ctx as any).getContextUsage = vi.fn(() => currentContextUsage);
 
     for (const handler of handlers.get("session_start") || []) {
       await handler({}, ctx);
     }
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+      contextUsage: { tokens: 0, percent: 0 },
+    });
+    for (const handler of handlers.get("turn_start") || []) {
+      await handler({}, ctx);
+    }
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+      contextUsage: { tokens: 0, percent: 0 },
+    });
+
+    currentContextUsage = { tokens: 46_000, contextWindow: 200_000, percent: 23 };
     for (const handler of handlers.get("message_end") || []) {
       await handler({ message: assistantMessage }, ctx);
     }
 
-    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({ tokensUsed: 175 });
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+      tokensUsed: 175,
+      contextUsage: { tokens: 46_000, contextWindow: 200_000, percent: 23 },
+    });
   });
 
   it("defers the turn_end inbox wake until the writer session becomes idle", async () => {

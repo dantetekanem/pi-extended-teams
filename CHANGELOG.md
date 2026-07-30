@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.12] - 2026-07-30
+
+### Fixed
+- Show each running agent's current context-window usage as tokens and percentage instead of cumulative billed and cache traffic.
+- Start newly spawned agents at `0 tok (0%)` until provider-reported usage is available, while preserving unknown usage after compaction.
+
+### Changed
+- Refresh the README with the current six-agent live activity view.
+
 ## [2.1.11] - 2026-07-28
 
 ### Fixed

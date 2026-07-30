@@ -1945,7 +1945,7 @@ describe("in-process read agent tool wiring", () => {
     expect(renderReadAgentStatus).toHaveBeenCalledTimes(7);
   });
 
-  it("refreshes exact session stats on every update even when message history is unchanged", () => {
+  it("ignores pre-response estimates and adopts provider context usage on the first measured update", () => {
     const state = {
       runId: "run-reader",
       name: "reader",
@@ -1956,21 +1956,30 @@ describe("in-process read agent tool wiring", () => {
       recentEvents: [],
       lastActivityAt: 0,
     } as RunningReadAgent;
-    let tokensUsed = 42;
+    let tokensUsed = 0;
+    let contextTokens = 597;
+    let contextPercent = 0.3;
     const session = {
       messages: [{ role: "user", content: "prompt" }],
-      getSessionStats: vi.fn(() => ({ tokens: { total: tokensUsed } })),
+      getSessionStats: vi.fn(() => ({
+        tokens: { total: tokensUsed },
+        contextUsage: { tokens: contextTokens, contextWindow: 200_000, percent: contextPercent },
+      })),
     } as any;
     const renderReadAgentStatus = vi.fn();
     const update = { type: "message_update", message: { role: "toolResult", content: "partial" } };
 
     handleReadAgentSessionEvent(state, session, update, renderReadAgentStatus);
-    expect(state.tokensUsed).toBe(42);
-    tokensUsed = 43;
+    expect(state.tokensUsed).toBe(0);
+    expect(state.contextUsage).toEqual({ tokens: 0, contextWindow: 200_000, percent: 0 });
+    tokensUsed = 2_300_000;
+    contextTokens = 80_000;
+    contextPercent = 40;
     handleReadAgentSessionEvent(state, session, update, renderReadAgentStatus);
 
     expect(session.getSessionStats).toHaveBeenCalledTimes(2);
-    expect(state.tokensUsed).toBe(43);
+    expect(state.tokensUsed).toBe(2_300_000);
+    expect(state.contextUsage).toEqual({ tokens: 80_000, contextWindow: 200_000, percent: 40 });
     expect(renderReadAgentStatus).toHaveBeenCalledTimes(2);
   });
 

@@ -79,11 +79,28 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     }, delayMs);
   };
 
+  const modelContextWindow = (ctx: any): number => {
+    return typeof ctx?.model?.contextWindow === "number" ? ctx.model.contextWindow : 0;
+  };
+
   const teammateRuntimeUpdates = (ctx: any, updates: Partial<runtime.AgentRuntimeStatus>, currentAssistantMessage?: any) => {
     const usage = summarizeSessionUsage(ctx, currentAssistantMessage);
+    const contextWindow = modelContextWindow(ctx);
+    const hasMeasuredUsage = typeof usage.tokensUsed === "number" && usage.tokensUsed > 0;
+    let contextUsage: runtime.ContextUsageSnapshot = hasMeasuredUsage
+      ? { tokens: null, contextWindow, percent: null }
+      : runtime.initialContextUsage(contextWindow);
+    if (hasMeasuredUsage) {
+      try {
+        contextUsage = ctx?.getContextUsage?.() ?? contextUsage;
+      } catch {
+        // Context telemetry is best-effort while the teammate session is settling.
+      }
+    }
     return {
       ...updates,
       ...(typeof usage.tokensUsed === "number" ? { tokensUsed: usage.tokensUsed } : {}),
+      contextUsage,
     };
   };
 
@@ -164,6 +181,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           ready: false,
           currentAction: "starting",
           activeToolName: undefined,
+          contextUsage: runtime.initialContextUsage(modelContextWindow(ctx)),
           lastError: undefined,
         });
       }

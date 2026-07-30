@@ -757,10 +757,12 @@ describe("extension integration", () => {
     }
   });
 
-  it("renders the compact activity card below the editor without remounting during token updates", async () => {
+  it("renders zero before provider context usage and updates without remounting", async () => {
     const setup = await setupExtension();
     try {
-      let tokenCount = 12;
+      let billedTokenCount = 0;
+      let contextTokenCount = 597;
+      let contextPercent = 0.3;
       let runningState: any;
       const abortAgent = vi.fn(async () => {});
       const disposeAgent = vi.fn();
@@ -787,7 +789,10 @@ describe("extension integration", () => {
           session: {
             abort: abortAgent,
             dispose: disposeAgent,
-            getSessionStats: () => ({ tokens: { total: tokenCount } }),
+            getSessionStats: () => ({
+              tokens: { total: billedTokenCount },
+              contextUsage: { tokens: contextTokenCount, contextWindow: 200_000, percent: contextPercent },
+            }),
           },
         };
         options.runningReadAgents.set(options.readAgentKey(teamName, member.name), runningState);
@@ -813,13 +818,16 @@ describe("extension integration", () => {
       const widget = widgetCall![1]({ requestRender });
       const initialRendered = widget.render(160).join("\n");
       expect(initialRendered).toContain("agent activity");
-      expect(initialRendered).toMatch(/\(reader\) model\/high · read-review · 1s · 12 tok · Reviewing focused test coverage\.{1,3}/);
+      expect(initialRendered).toMatch(/\(reader\) model\/high · read-review · 1s · 0 tok \(0%\) · Reviewing focused test coverage\.{1,3}/);
+      expect(initialRendered).not.toContain("597 tok");
       expect(initialRendered).not.toContain("secret agent thought");
       expect(initialRendered).not.toContain("reader read thinking");
       expect(ctx.ui.setStatus).toHaveBeenCalledWith("01-pi-extended-teams-read", undefined);
 
       const firstWidgetCallIndex = ctx.ui.setWidget.mock.calls.indexOf(widgetCall!);
-      tokenCount = 2_300_000;
+      billedTokenCount = 2_300_000;
+      contextTokenCount = 80_000;
+      contextPercent = 40;
       runningState.latestProgress = "Writing the final report";
       runningState.progressUpdatedAt = Date.now();
       await vi.advanceTimersByTimeAsync(1_000);
@@ -829,7 +837,8 @@ describe("extension integration", () => {
       expect(updatedRendered).not.toContain("Writing the final report");
       await vi.advanceTimersByTimeAsync(1_000);
       updatedRendered = widget.render(160).join("\n");
-      expect(updatedRendered).toMatch(/\(reader\) model\/high · read-review · 3s · 2\.3M tok · Writing the final report\.{1,3}/);
+      expect(updatedRendered).toMatch(/\(reader\) model\/high · read-review · 3s · 80k tok \(40%\) · Writing the final report\.{1,3}/);
+      expect(updatedRendered).not.toContain("2.3M tok");
       expect(requestRender).toHaveBeenCalled();
       expect(ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function")).toHaveLength(1);
       expect(ctx.ui.setWidget.mock.calls.slice(firstWidgetCallIndex + 1).some((call: any[]) => call[0] === "01-pi-extended-teams-readers" && call[1] === undefined)).toBe(false);
@@ -870,7 +879,10 @@ describe("extension integration", () => {
           thinking: member.thinking,
           modelSlot: member.modelSlot,
           latestProgress: "Implementing parent work",
-          session: { getSessionStats: () => ({ tokens: { total: 25 } }) },
+          session: { getSessionStats: () => ({
+            tokens: { total: 25 },
+            contextUsage: { tokens: 25, contextWindow: 200_000, percent: 0.0125 },
+          }) },
         };
         options.runningReadAgents.set(options.readAgentKey(teamName, member.name), state);
         if (member.name === "writer") writerState = state;
@@ -926,7 +938,10 @@ describe("extension integration", () => {
         model: activeHelper.model,
         thinking: activeHelper.thinking,
         modelSlot: activeHelper.modelSlot,
-        session: { getSessionStats: () => ({ tokens: { total: 5 } }) },
+        session: { getSessionStats: () => ({
+          tokens: { total: 5 },
+          contextUsage: { tokens: 5, contextWindow: 200_000, percent: 0.0025 },
+        }) },
       };
       runningAgents.set(`${teamName}:${activeHelper.name}`, activeHelperState);
       await runtime.writeRuntimeStatus(teamName, runtimeHelper.name, runtimeHelper.lifecycleRunId!, {
@@ -935,6 +950,7 @@ describe("extension integration", () => {
         lastHeartbeatAt: Date.now(),
         currentAction: "working",
         tokensUsed: 7,
+        contextUsage: { tokens: 7, contextWindow: 200_000, percent: 0.0035 },
       });
 
       await vi.advanceTimersByTimeAsync(1_200);
@@ -944,7 +960,7 @@ describe("extension integration", () => {
       const widget = widgetCall![1]({ requestRender: vi.fn() });
       const activeRendered = widget.render(180).join("\n");
       expect(activeRendered).toContain("3 active · 2 read · 1 write");
-      expect(activeRendered).toMatch(/\(writer\) model\/xhigh · \+2 · write-critical · .* · 25 tok · Implementing parent work\.{1,3}/);
+      expect(activeRendered).toMatch(/\(writer\) model\/xhigh · \+2 · write-critical · .* · 25 tok \(0%\) · Implementing parent work\.{1,3}/);
       expect(activeRendered).not.toContain("completed-helper");
 
       // Failed helpers remain in their live runner/runtime records until async

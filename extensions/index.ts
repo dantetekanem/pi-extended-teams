@@ -18,7 +18,7 @@ import { createReportProgressTool } from "./tools/agent-communication-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools, type TeamToolsRuntime } from "./tools/team-tools.js";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
-import { formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount } from "./ui/renderers.js";
+import { formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 import { createPendingChildController } from "./runtime/pending-child-controller.js";
 import { createActiveAgentSleepController, runWithActiveAgentSleepAssertion } from "./runtime/active-agent-sleep.js";
@@ -243,13 +243,17 @@ export default function (pi: ExtensionAPI) {
     return runtimeHeartbeatIsRecent(status, now) ? "" : "heartbeat stale";
   }
 
+  function formatRunningContextUsage(usage: runtime.ContextUsageSnapshot | undefined): string {
+    return formatContextUsage(usage ?? runtime.initialContextUsage());
+  }
+
   function formatAgentProgressStatus(
     name: string,
     model: string | undefined,
     thinking: string | undefined,
     modelSlot: string | undefined,
     elapsed: string,
-    tokens: string,
+    contextUsage: string,
     latestProgress: string | undefined,
     now: number,
     activeReadHelperCount = 0
@@ -259,7 +263,26 @@ export default function (pi: ExtensionAPI) {
     const identity = modelAndThinking ? `(${name}) ${modelAndThinking}` : `(${name})`;
     const helperSuffix = activeReadHelperCount > 0 ? `+${activeReadHelperCount}` : undefined;
     const progress = latestProgress ? formatAnimatedProgress(latestProgress, now) : undefined;
-    return [identity, helperSuffix, modelSlot, elapsed, `${tokens} tok`, progress].filter(Boolean).join(" · ");
+    return [identity, helperSuffix, modelSlot, elapsed, contextUsage, progress].filter(Boolean).join(" · ");
+  }
+
+  function refreshInProcessAgentUsage(agent: RunningReadAgent, now: number): void {
+    try {
+      const session = agent.session;
+      const stats = session?.getSessionStats();
+      if (!stats) return;
+      if (stats.tokens.total !== agent.tokensUsed) {
+        agent.tokensUsed = stats.tokens.total;
+        agent.lastActivityAt = now;
+        agent.idleNudgeLevel = undefined;
+      }
+      const contextUsage = stats.contextUsage ?? session?.getContextUsage?.();
+      agent.contextUsage = stats.tokens.total > 0
+        ? contextUsage
+        : runtime.initialContextUsage(contextUsage?.contextWindow);
+    } catch {
+      // Ignore stats races while the nested session is shutting down.
+    }
   }
 
   function currentSessionAgentGroupName(ctx?: any): string | undefined {
@@ -595,27 +618,18 @@ export default function (pi: ExtensionAPI) {
     };
 
     for (const agent of writeAgents) {
-      try {
-        const tokensUsed = agent.session?.getSessionStats().tokens.total;
-        if (typeof tokensUsed === "number" && tokensUsed !== agent.tokensUsed) {
-          agent.tokensUsed = tokensUsed;
-          agent.lastActivityAt = now;
-          agent.idleNudgeLevel = undefined;
-        }
-      } catch {
-        // Ignore stats races while the nested session is shutting down.
-      }
+      refreshInProcessAgentUsage(agent, now);
       const elapsed = formatElapsed(now - agent.startedAt);
       const status = describeReadAgentStatus(agent, now);
       const idleNudgeMessage = getIdleReadAgentNudgeMessage(agent, status);
       if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
       const slotLabel = agent.modelSlot ? `slot:${agent.modelSlot}` : "";
-      const tokenCount = formatTokenCount(agent.tokensUsed);
-      const detail = [modelLabel, slotLabel, elapsed, `${tokenCount} tok`, status.detail].filter(Boolean).join(" · ");
+      const contextUsage = formatRunningContextUsage(agent.contextUsage);
+      const detail = [modelLabel, slotLabel, elapsed, contextUsage, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "write", status: status.label, detail });
-      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, tokenCount, agent.latestProgress, now, activeReadHelperCounts.get(agent.name)));
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now, activeReadHelperCounts.get(agent.name)));
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyWriteMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
@@ -623,15 +637,15 @@ export default function (pi: ExtensionAPI) {
       const modelLabel = formatModelLabel(member.model, member.thinking);
       const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
       const slotLabel = modelSlot ? `slot:${modelSlot}` : "";
-      const tokens = typeof runtimeStatus.tokensUsed === "number" ? `${formatTokenCount(runtimeStatus.tokensUsed)} tok` : "0 tok";
+      const contextUsage = formatRunningContextUsage(runtimeStatus.contextUsage);
       const screen = member.tmuxPaneId ? (member.windowId ? `${member.windowId}/${member.tmuxPaneId}` : member.tmuxPaneId) : "";
       const action = runtimeOnlyActionLabel(runtimeStatus);
       const heartbeat = runtimeOnlyHeartbeatDetail(runtimeStatus, now);
-      const detail = [screen, modelLabel, slotLabel, elapsed, tokens, heartbeat, action].filter(Boolean).join(" · ");
+      const detail = [screen, modelLabel, slotLabel, elapsed, contextUsage, heartbeat, action].filter(Boolean).join(" · ");
       const status = runtimeOnlyStatusLabel(runtimeStatus, now);
       countStatus(status);
       entries.push({ name: member.name, role: "write", status, detail });
-      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus.latestProgress, now, activeReadHelperCounts.get(member.name)));
+      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, contextUsage, runtimeStatus.latestProgress, now, activeReadHelperCounts.get(member.name)));
     }
 
     for (const member of activeWriteMembers.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -645,16 +659,16 @@ export default function (pi: ExtensionAPI) {
       const runtimeStatus = await runtime.readRuntimeStatus(activityTeamName!, member.name).catch(() => null);
       const elapsed = formatElapsed(now - (runtimeStatus?.startedAt || member.joinedAt));
       const modelLabel = formatModelLabel(member.model, member.thinking);
-      const tokens = typeof runtimeStatus?.tokensUsed === "number" ? `${formatTokenCount(runtimeStatus.tokensUsed)} tok` : "0 tok";
+      const contextUsage = formatRunningContextUsage(runtimeStatus?.contextUsage);
       const action = runtimeStatus?.activeToolName
         ? `${runtimeStatus.currentAction || "working"}: ${runtimeStatus.activeToolName}`
         : runtimeStatus?.currentAction || "running";
       const screen = member.windowId ? `${member.windowId}/${member.tmuxPaneId}` : member.tmuxPaneId;
-      const detail = [screen, modelLabel, elapsed, tokens, action].filter(Boolean).join(" · ");
+      const detail = [screen, modelLabel, elapsed, contextUsage, action].filter(Boolean).join(" · ");
       const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
       countStatus("bg");
       entries.push({ name: member.name, role: "write", status: "bg", detail });
-      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus?.latestProgress, now, activeReadHelperCounts.get(member.name)));
+      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, contextUsage, runtimeStatus?.latestProgress, now, activeReadHelperCounts.get(member.name)));
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyReadMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
@@ -662,38 +676,29 @@ export default function (pi: ExtensionAPI) {
       const modelLabel = formatModelLabel(member.model, member.thinking);
       const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
       const slotLabel = modelSlot ? `slot:${modelSlot}` : "";
-      const tokens = typeof runtimeStatus.tokensUsed === "number" ? `${formatTokenCount(runtimeStatus.tokensUsed)} tok` : "0 tok";
+      const contextUsage = formatRunningContextUsage(runtimeStatus.contextUsage);
       const action = runtimeOnlyActionLabel(runtimeStatus);
       const heartbeat = runtimeOnlyHeartbeatDetail(runtimeStatus, now);
-      const detail = [modelLabel, slotLabel, elapsed, tokens, heartbeat, action].filter(Boolean).join(" · ");
+      const detail = [modelLabel, slotLabel, elapsed, contextUsage, heartbeat, action].filter(Boolean).join(" · ");
       const status = runtimeOnlyStatusLabel(runtimeStatus, now);
       countStatus(status);
       entries.push({ name: member.name, role: "read", status, detail });
-      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, tokens.replace(/ tok$/, ""), runtimeStatus.latestProgress, now));
+      footerStatuses.push(formatAgentProgressStatus(member.name, member.model, member.thinking, modelSlot, elapsed, contextUsage, runtimeStatus.latestProgress, now));
     }
 
     for (const agent of readAgents) {
-      try {
-        const tokensUsed = agent.session?.getSessionStats().tokens.total;
-        if (typeof tokensUsed === "number" && tokensUsed !== agent.tokensUsed) {
-          agent.tokensUsed = tokensUsed;
-          agent.lastActivityAt = now;
-          agent.idleNudgeLevel = undefined;
-        }
-      } catch {
-        // Ignore stats races while the nested session is shutting down.
-      }
+      refreshInProcessAgentUsage(agent, now);
       const elapsed = formatElapsed(now - agent.startedAt);
       const status = describeReadAgentStatus(agent, now);
       const idleNudgeMessage = getIdleReadAgentNudgeMessage(agent, status);
       if (idleNudgeMessage) idleNudgeMessages.push(idleNudgeMessage);
       const modelLabel = formatModelLabel(agent.model, agent.thinking);
       const slotLabel = agent.modelSlot ? `slot:${agent.modelSlot}` : "";
-      const tokenCount = formatTokenCount(agent.tokensUsed);
-      const detail = [modelLabel, slotLabel, elapsed, `${tokenCount} tok`, status.detail].filter(Boolean).join(" · ");
+      const contextUsage = formatRunningContextUsage(agent.contextUsage);
+      const detail = [modelLabel, slotLabel, elapsed, contextUsage, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
       entries.push({ name: agent.name, role: "read", status: status.label, detail });
-      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, tokenCount, agent.latestProgress, now));
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now));
     }
 
     for (const { agentName: quarantinedName, result } of activityTombstones) {

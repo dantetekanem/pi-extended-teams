@@ -28,6 +28,7 @@ const MAX_AGGREGATE_STATUS_PARTS = 4;
 const PROGRESS_ANIMATION_FRAME_MS = 60;
 const SINGLE_COLUMN_ASCII = /^[\x20-\x7E]*$/;
 const SINGLE_COLUMN_STATUS_TEXT = /^[\x20-\x7E\u00B7]*$/;
+const CONTEXT_USAGE_STATUS_SUFFIX = /^(?:\?|[\d.]+[kM]?) tok(?: \((?:\?|[\d.]+)%\))?$/;
 
 function formatCountSummary(snapshot: TeamActivityStatusSnapshot): string {
   const parts = [`${snapshot.activeCount} active`];
@@ -118,11 +119,7 @@ function splitProgressDisplay(displayText: string | undefined): { prefix: string
   const delimiterIndex = displayText.lastIndexOf(" · ");
   if (delimiterIndex < 0) return null;
   const displayLength = displayText.length;
-  if (displayLength >= 4
-    && displayText.charCodeAt(displayLength - 1) === 107
-    && displayText.charCodeAt(displayLength - 2) === 111
-    && displayText.charCodeAt(displayLength - 3) === 116
-    && displayText.charCodeAt(displayLength - 4) === 32) return null;
+  if (CONTEXT_USAGE_STATUS_SUFFIX.test(displayText.slice(delimiterIndex + 3))) return null;
   let progressEnd = displayLength;
   while (progressEnd > delimiterIndex + 3 && displayText.charCodeAt(progressEnd - 1) === 46) progressEnd--;
   return {

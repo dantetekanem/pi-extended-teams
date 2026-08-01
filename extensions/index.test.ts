@@ -343,6 +343,54 @@ describe("extension integration", () => {
     }
   });
 
+  it("delivers completed read reports to lead context without rendering their bodies", async () => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    try {
+      writeFavoriteLevels(setup.root);
+      const ctx = makeCtx(setup.root, "hidden-report-session");
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader",
+        prompt: "Inspect the project",
+        cwd: setup.root,
+        model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+
+      const spawnOptions = setup.readAgentMock.runReadAgentInProcess.mock.calls[0]![4];
+      const startedAt = Date.now() - 1_000;
+      spawnOptions.emitAgentReport(
+        "session-hidden-report-session",
+        "reader",
+        startedAt,
+        42,
+        "Full report body for the lead model.",
+        true,
+      );
+
+      expect(setup.pi.events.emit).toHaveBeenCalledWith(
+        "pi-extended-teams:agent-report",
+        expect.objectContaining({
+          teamName: "session-hidden-report-session",
+          name: "reader",
+          report: "Full report body for the lead model.",
+          ok: true,
+        }),
+      );
+      expect(setup.pi.sendMessage).toHaveBeenCalledOnce();
+      expect(setup.pi.sendMessage).toHaveBeenCalledWith(
+        {
+          customType: "pi-extended-teams-report",
+          content: "Full report body for the lead model.",
+          display: false,
+          details: { name: "reader", elapsedMs: 1_000, tokens: 42, ok: true },
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+      expect(setup.pi.sendUserMessage).not.toHaveBeenCalled();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("holds one shared sleep assertion across concurrent in-process agent runs", async () => {
     const setup = await setupExtension();
     try {

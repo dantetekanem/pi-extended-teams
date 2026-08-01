@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.13] - 2026-08-01
+
+### Fixed
+- Keep completed agent reports in the lead model context without rendering their full bodies later in the transcript.
+
 ## [2.1.12] - 2026-07-30
 
 ### Fixed

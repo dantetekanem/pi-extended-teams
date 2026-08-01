@@ -320,11 +320,10 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Deliver a finished agent's report straight into the lead's main window: an
-  // always-open report entry with name, elapsed time, tokens, and the full body.
-  // display:true also feeds the report into the lead's context as a
-  // user turn (see convertToLlm), and triggerTurn makes the lead synthesize it
-  // automatically — no read_inbox, no manual polling.
+  // Deliver a finished agent's report into the lead's context without adding
+  // the full body to the transcript. Hidden custom messages still participate
+  // in LLM context (see convertToLlm), and triggerTurn makes the lead synthesize
+  // the report automatically — no read_inbox, no manual polling.
   function emitAgentReport(reportTeamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection = false): void {
     const api = pi as any;
     const details = { name, elapsedMs: Date.now() - startedAt, tokens, ok };
@@ -338,7 +337,7 @@ export default function (pi: ExtensionAPI) {
 
     if (typeof api.sendMessage === "function") {
       api.sendMessage(
-        { customType: "pi-extended-teams-report", content: report, display: true, details },
+        { customType: "pi-extended-teams-report", content: report, display: false, details },
         { triggerTurn: true, deliverAs: "followUp" }
       );
     } else {

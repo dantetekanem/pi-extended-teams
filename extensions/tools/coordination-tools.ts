@@ -192,10 +192,10 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         initialPrompt: member?.prompt,
       };
 
+      let reportPath = "";
       let releasedClaims: string[] = [];
       try {
-        await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", params.content, params.summary || "Final report", undefined, { metadata: reportMetadata });
-        await reportEvents.appendTeamReportEvent(targetTeamName, {
+        const persistedReport = await reportEvents.appendTeamReportEvent(targetTeamName, {
           agentName: options.agentName,
           role: member?.role || "write",
           status: "completed",
@@ -211,7 +211,10 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
           modelSlot,
           color: member?.color,
           metadata: { ...(member?.prompt ? { initialPrompt: member.prompt } : {}), ...(modelSlot ? { modelSlot } : {}) },
-        }).catch(() => {});
+        });
+        reportPath = persistedReport.reportPath || "";
+        if (!reportPath) throw new Error("The persisted report did not provide its standalone file path.");
+        await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", params.content, params.summary || "Final report", undefined, { metadata: reportMetadata });
         releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);
       } catch (error) {
         pendingWriterFinalization.delete(`${targetTeamName}:${options.agentName}`);
@@ -228,7 +231,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         try { ctx.shutdown(); } catch { process.exit(0); }
       }, 250);
 
-      return { content: [{ type: "text", text: `Final report sent. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { session: targetTeamName, releasedClaims } };
+      return { content: [{ type: "text", text: `Final report sent. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { session: targetTeamName, releasedClaims, reportPath } };
     },
   });
 

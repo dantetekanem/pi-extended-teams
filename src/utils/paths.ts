@@ -72,6 +72,10 @@ export function reportEventsPath(teamName: string) {
   return path.join(teamDir(teamName), "reports.json");
 }
 
+export function reportFilesDir() {
+  return path.join(PI_DIR, "agent", "reports");
+}
+
 export function leadSessionPath(teamName: string) {
   return path.join(teamDir(teamName), "lead-session.json");
 }

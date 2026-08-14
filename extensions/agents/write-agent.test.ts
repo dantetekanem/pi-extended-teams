@@ -13,10 +13,15 @@ const mocks = vi.hoisted(() => ({
   writeRuntimeStatus: vi.fn(async () => ({})),
   deleteRuntimeStatus: vi.fn(async () => true),
   writeTeamsDebugEvent: vi.fn(async (..._args: any[]) => {}),
+  occupyLifecycleTombstone: vi.fn(),
+  updateLifecycleTombstone: vi.fn(),
   withLifecycleTombstoneLock: vi.fn(async (_teamName: string, _agentName: string, fn: Function) => fn({
     read: () => ({ status: "absent" }),
+    occupy: mocks.occupyLifecycleTombstone,
+    updateMatching: mocks.updateLifecycleTombstone,
   })),
   deleteRuntimeStatusUnderLifecycleLock: vi.fn(async () => true),
+  cleanupPrivateAgentSessionDirectory: vi.fn(),
   checkModel: vi.fn((
     _piBinary: string,
     _model: string | undefined,
@@ -36,7 +41,9 @@ const mocks = vi.hoisted(() => ({
     _extensions: readonly string[],
     projectTrusted?: boolean,
     _selfExtensionSource?: string,
-  ) => `pi ${projectTrusted ? "--approve" : "--no-approve"} --no-extensions --extension 'self.ts' --extension '/external/$safe.ts'`),
+    sessionDir?: string,
+  ) => `pi ${projectTrusted ? "--approve" : "--no-approve"} --no-extensions --extension 'self.ts' --extension '/external/$safe.ts'${sessionDir ? ` --session-dir '${sessionDir}'` : ""}`),
+  showInResume: false,
   favoriteLevel: {
     slot: "writing-hard",
     role: "write",
@@ -46,7 +53,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../src/utils/settings", () => ({
-  loadSettings: vi.fn(() => ({ debug: { enabled: false } })),
+  loadSettings: vi.fn(() => ({
+    debug: { enabled: false },
+    agentSessions: { showInResume: mocks.showInResume },
+  })),
   requireFavoriteModelLevel: vi.fn(() => mocks.favoriteLevel),
 }));
 vi.mock("../../src/utils/teams", () => ({
@@ -77,10 +87,17 @@ vi.mock("../internal/pi-command", () => ({
   getPiExtendedTeamsExtensionSource: () => "self.ts",
   getPiLaunchCommand: () => "pi",
 }));
+vi.mock("../internal/agent-session-files", () => ({
+  preparePrivateAgentSessionDirectory: (teamName: string, agentName: string, runId: string) => {
+    return `/private/${teamName}/${agentName}/${runId}`;
+  },
+  cleanupPrivateAgentSessionDirectory: vi.fn((...args: any[]) => mocks.cleanupPrivateAgentSessionDirectory(...args)),
+}));
 vi.mock("../team/roster", () => ({ countWriteMembers: vi.fn(async () => 0) }));
 vi.mock("../../src/utils/lifecycle-tombstone", () => ({
   readLifecycleTombstone: vi.fn(async () => ({ status: "absent" })),
   withLifecycleTombstoneLock: mocks.withLifecycleTombstoneLock,
+  generateExtensionInstanceId: () => "extension-instance",
 }));
 
 import { createWriteAgentRuntime } from "./write-agent";
@@ -106,7 +123,10 @@ describe("legacy tmux writer resource plan", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.readConfig.mockImplementation(async () => ({ members: [] }));
+    mocks.updateMember.mockImplementation(async () => {});
     mocks.writeTeamsDebugEvent.mockImplementation(async () => {});
+    mocks.cleanupPrivateAgentSessionDirectory.mockImplementation(() => {});
+    mocks.showInResume = false;
     mocks.favoriteLevel = {
       slot: "writing-hard",
       role: "write",
@@ -214,6 +234,113 @@ describe("legacy tmux writer resource plan", () => {
     expect(releaseSleepAssertion).toHaveBeenCalledOnce();
   });
 
+  it("stops and verifies a returned R1 pane before diagnostics and leaves an R2 replacement untouched", async () => {
+    const admitted = writer();
+    const replacement = { ...writer(), lifecycleRunId: "replacement-run", tmuxPaneId: "%r2" };
+    let replacementInstalled = false;
+    mocks.updateMember.mockRejectedValueOnce(new Error("update failed"));
+    mocks.writeTeamsDebugEvent.mockImplementation(async (_teamName: string, eventName: string) => {
+      if (eventName === "write-agent.spawn.failure") replacementInstalled = true;
+    });
+    mocks.readConfig.mockImplementation(async () => ({
+      members: replacementInstalled ? [replacement] : [admitted],
+    }));
+    mocks.withLifecycleTombstoneLock.mockImplementationOnce(async (_teamName: string, _agentName: string, fn: Function) => fn({
+      read: () => replacementInstalled
+        ? { status: "occupied", tombstone: { runId: "replacement-run" } }
+        : { status: "absent" },
+      occupy: mocks.occupyLifecycleTombstone,
+      updateMatching: mocks.updateLifecycleTombstone,
+    }));
+    const terminal = {
+      spawn: vi.fn(() => "%r1"),
+      kill: vi.fn(),
+      isAlive: vi.fn(() => false),
+    };
+    const onWriterInactive = vi.fn();
+    const runtime = createWriteAgentRuntime({
+      terminal,
+      onWriterInactive,
+      createResourcePlan: async () => ({
+        selectionMode: "explicit",
+        extensionPaths: [],
+        selfExtensionPath: "self.ts",
+        extensions: [],
+        diagnostics: [],
+        skills: "all",
+        trust: { cwd: "/trusted/project", projectTrusted: true },
+      }),
+    });
+
+    await expect(runtime.startWriteAgent("team", admitted, "implement the task")).rejects.toThrow(
+      "Failed to spawn background tmux screen: Error: update failed",
+    );
+
+    const failureDiagnosticIndex = mocks.writeTeamsDebugEvent.mock.calls.findIndex(call => call[1] === "write-agent.spawn.failure");
+    expect(terminal.kill).toHaveBeenCalledWith("%r1");
+    expect(terminal.isAlive).toHaveBeenCalledWith("%r1");
+    expect(terminal.isAlive.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.writeTeamsDebugEvent.mock.invocationCallOrder[failureDiagnosticIndex]!,
+    );
+    expect(onWriterInactive).not.toHaveBeenCalled();
+    expect(mocks.removeMemberMatchingRun).not.toHaveBeenCalled();
+    expect(mocks.deleteRuntimeStatusUnderLifecycleLock).not.toHaveBeenCalled();
+    expect(mocks.removeInboxMessagesByOperationUnderLifecycleLock).not.toHaveBeenCalled();
+    expect(mocks.cleanupPrivateAgentSessionDirectory).not.toHaveBeenCalled();
+    expect(mocks.occupyLifecycleTombstone).not.toHaveBeenCalled();
+    expect(mocks.updateLifecycleTombstone).not.toHaveBeenCalled();
+  });
+
+  it("does not fence or delete R2 state when R1 pane termination cannot be proven", async () => {
+    const admitted = writer();
+    const replacement = { ...writer(), lifecycleRunId: "replacement-run", tmuxPaneId: "%r2" };
+    let replacementInstalled = false;
+    mocks.updateMember.mockRejectedValueOnce(new Error("update failed"));
+    mocks.writeTeamsDebugEvent.mockImplementation(async (_teamName: string, eventName: string) => {
+      if (eventName === "write-agent.spawn.failure") replacementInstalled = true;
+    });
+    mocks.readConfig.mockImplementation(async () => ({
+      members: replacementInstalled ? [replacement] : [admitted],
+    }));
+    mocks.withLifecycleTombstoneLock.mockImplementationOnce(async (_teamName: string, _agentName: string, fn: Function) => fn({
+      read: () => replacementInstalled
+        ? { status: "occupied", tombstone: { runId: "replacement-run" } }
+        : { status: "absent" },
+      occupy: mocks.occupyLifecycleTombstone,
+      updateMatching: mocks.updateLifecycleTombstone,
+    }));
+    const terminal = {
+      spawn: vi.fn(() => "%r1"),
+      kill: vi.fn(),
+      isAlive: vi.fn(() => true),
+    };
+    const runtime = createWriteAgentRuntime({
+      terminal,
+      createResourcePlan: async () => ({
+        selectionMode: "explicit",
+        extensionPaths: [],
+        selfExtensionPath: "self.ts",
+        extensions: [],
+        diagnostics: [],
+        skills: "all",
+        trust: { cwd: "/trusted/project", projectTrusted: true },
+      }),
+    });
+
+    await expect(runtime.startWriteAgent("team", admitted, "implement the task")).rejects.toThrow(
+      "Failed to spawn background tmux screen: Error: update failed",
+    );
+
+    expect(terminal.kill).toHaveBeenCalledWith("%r1");
+    expect(terminal.isAlive).toHaveBeenCalledWith("%r1");
+    expect(mocks.removeMemberMatchingRun).not.toHaveBeenCalled();
+    expect(mocks.deleteRuntimeStatusUnderLifecycleLock).not.toHaveBeenCalled();
+    expect(mocks.removeInboxMessagesByOperationUnderLifecycleLock).not.toHaveBeenCalled();
+    expect(mocks.cleanupPrivateAgentSessionDirectory).not.toHaveBeenCalled();
+    expect(mocks.occupyLifecycleTombstone).not.toHaveBeenCalled();
+    expect(mocks.updateLifecycleTombstone).not.toHaveBeenCalled();
+  });
+
   it("uses one immutable plan for preflight and spawn and propagates its trust snapshot", async () => {
     const extensionPaths = Object.freeze(["/external/$safe.ts"]);
     const plan = Object.freeze({
@@ -245,10 +372,11 @@ describe("legacy tmux writer resource plan", () => {
     expect(mocks.buildCommand.mock.calls[0]?.[3]).toBe(extensionPaths);
     expect(mocks.buildCommand.mock.calls[0]?.[4]).toBe(true);
     expect(mocks.buildCommand.mock.calls[0]?.[5]).toBe("self.ts");
-    expect(mocks.buildCommand.mock.calls[0]).toHaveLength(6);
+    expect(mocks.buildCommand.mock.calls[0]?.[6]).toBe("/private/team/writer/writer-run");
+    expect(mocks.buildCommand.mock.calls[0]).toHaveLength(7);
     expect(terminal.spawn).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/trusted/project",
-      command: expect.stringContaining("--approve"),
+      command: expect.stringContaining("--session-dir '/private/team/writer/writer-run'"),
     }));
     expect(mocks.addMember).toHaveBeenCalledOnce();
     expect(mocks.sendPlainMessageOnceIfRunning).toHaveBeenCalledWith(
@@ -266,5 +394,120 @@ describe("legacy tmux writer resource plan", () => {
       tmuxPaneId: "%writer",
       windowId: "@writer",
     });
+  });
+
+  it("stops and verifies the exact spawned pane before rolling back an updateMember failure", async () => {
+    const admitted = writer();
+    mocks.readConfig.mockImplementation(async () => ({ members: [admitted] }));
+    mocks.updateMember.mockRejectedValueOnce(new Error("update failed"));
+    const terminal = {
+      spawn: vi.fn(() => "%writer"),
+      kill: vi.fn(),
+      isAlive: vi.fn(() => false),
+    };
+    const onWriterInactive = vi.fn();
+    const runtime = createWriteAgentRuntime({
+      terminal,
+      onWriterInactive,
+      createResourcePlan: async () => ({
+        selectionMode: "explicit",
+        extensionPaths: [],
+        selfExtensionPath: "self.ts",
+        extensions: [],
+        diagnostics: [],
+        skills: "all",
+        trust: { cwd: "/trusted/project", projectTrusted: true },
+      }),
+    });
+
+    await expect(runtime.startWriteAgent("team", admitted, "implement the task")).rejects.toThrow(
+      "Failed to spawn background tmux screen: Error: update failed",
+    );
+
+    expect(terminal.kill).toHaveBeenCalledWith("%writer");
+    expect(terminal.isAlive).toHaveBeenCalledWith("%writer");
+    expect(onWriterInactive).toHaveBeenCalledWith("team", expect.objectContaining({ lifecycleRunId: "writer-run" }));
+    expect(mocks.removeInboxMessagesByOperationUnderLifecycleLock).toHaveBeenCalledWith(
+      "team", "writer", "bootstrap:writer-run:initial-prompt",
+    );
+    expect(mocks.deleteRuntimeStatusUnderLifecycleLock).toHaveBeenCalledWith("team", "writer", "writer-run");
+    expect(terminal.isAlive.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.deleteRuntimeStatusUnderLifecycleLock.mock.invocationCallOrder[0]!,
+    );
+    expect(mocks.removeMemberMatchingRun).toHaveBeenCalledWith("team", "writer", "writer-run");
+    expect(mocks.cleanupPrivateAgentSessionDirectory).toHaveBeenCalledWith("team", "writer", "writer-run");
+    expect(mocks.occupyLifecycleTombstone).not.toHaveBeenCalled();
+  });
+
+  it("fences the exact spawned pane and retains recovery artifacts when termination cannot be proven", async () => {
+    const admitted = writer();
+    mocks.readConfig.mockImplementation(async () => ({ members: [admitted] }));
+    mocks.updateMember.mockRejectedValueOnce(new Error("update failed"));
+    const terminal = {
+      spawn: vi.fn(() => "%writer"),
+      kill: vi.fn(),
+      isAlive: vi.fn(() => true),
+    };
+    const onWriterInactive = vi.fn();
+    const runtime = createWriteAgentRuntime({
+      terminal,
+      onWriterInactive,
+      createResourcePlan: async () => ({
+        selectionMode: "explicit",
+        extensionPaths: [],
+        selfExtensionPath: "self.ts",
+        extensions: [],
+        diagnostics: [],
+        skills: "all",
+        trust: { cwd: "/trusted/project", projectTrusted: true },
+      }),
+    });
+
+    await expect(runtime.startWriteAgent("team", admitted, "implement the task")).rejects.toThrow(
+      "Failed to spawn background tmux screen: Error: update failed",
+    );
+
+    expect(terminal.kill).toHaveBeenCalledWith("%writer");
+    expect(terminal.isAlive).toHaveBeenCalledWith("%writer");
+    expect(mocks.occupyLifecycleTombstone).toHaveBeenCalledWith(expect.objectContaining({
+      team: "team",
+      agent: "writer",
+      runId: "writer-run",
+      role: "write",
+      phase: "cleanup_failed",
+      extensionInstanceId: "extension-instance",
+    }));
+    expect(mocks.updateLifecycleTombstone).toHaveBeenCalledWith("writer-run", expect.objectContaining({
+      phase: "cleanup_failed",
+      error: expect.stringContaining("%writer"),
+    }));
+    expect(onWriterInactive).not.toHaveBeenCalled();
+    expect(mocks.removeInboxMessagesByOperationUnderLifecycleLock).not.toHaveBeenCalled();
+    expect(mocks.deleteRuntimeStatusUnderLifecycleLock).not.toHaveBeenCalled();
+    expect(mocks.removeMemberMatchingRun).not.toHaveBeenCalled();
+    expect(mocks.cleanupPrivateAgentSessionDirectory).not.toHaveBeenCalled();
+  });
+
+  it("uses Pi's resumable session store only after an explicit opt-in", async () => {
+    mocks.showInResume = true;
+    const terminal = { spawn: vi.fn(() => "%writer") };
+    const runtime = createWriteAgentRuntime({
+      terminal,
+      createResourcePlan: async () => ({
+        selectionMode: "explicit",
+        extensionPaths: [],
+        selfExtensionPath: "self.ts",
+        extensions: [],
+        diagnostics: [],
+        skills: "all",
+        trust: { cwd: "/trusted/project", projectTrusted: true },
+      }),
+    });
+
+    await runtime.startWriteAgent("team", writer(), "implement the task");
+
+    expect(mocks.buildCommand.mock.calls[0]?.[6]).toBeUndefined();
+    const spawn = (terminal.spawn.mock.calls as any[][])[0]?.[0];
+    expect(spawn.command).not.toContain("--session-dir");
   });
 });

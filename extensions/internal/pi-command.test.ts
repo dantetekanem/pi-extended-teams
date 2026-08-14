@@ -81,6 +81,21 @@ describe("pi command helpers", () => {
     expect(command).not.toContain("--no-skills");
   });
 
+  it("routes spawned Pi sessions to an explicitly quoted private directory", () => {
+    const command = buildPiCommand(
+      "pi",
+      "provider/model",
+      "high",
+      [],
+      false,
+      undefined,
+      "/tmp/$HOME/private agent sessions",
+    );
+
+    expect(command).toContain("--session-dir '/tmp/$HOME/private agent sessions'");
+    expect(command).toContain("--model 'provider/model:high'");
+  });
+
   it("still honors explicit extension source environment overrides and loads self exactly once", () => {
     process.env.PI_EXTENDED_TEAMS_EXTENSION_SOURCE = "/tmp/custom-extension.ts";
     delete process.env.PI_TEAMS_EXTENSION_SOURCE;

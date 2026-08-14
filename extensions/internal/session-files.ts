@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import * as paths from "../../src/utils/paths";
+import { hasRecentPrivateAgentSessions } from "./agent-session-files";
 
 export function resolveSkillFile(skillName: string, cwd: string): string {
   const safeName = paths.sanitizeName(skillName);
@@ -207,11 +208,27 @@ export function cleanupOrphanedTeams(
       const hasLifecycleFence = fs.existsSync(quarantineDir)
         && fs.readdirSync(quarantineDir).some(file => file.endsWith(".json"));
 
-      // Lifecycle tombstones have no TTL. Even corrupt files are occupied and
-      // must keep the team directory out of orphan cleanup.
-      if (hasLifecycleFence) continue;
+      const shouldCleanOrphan = deadLeadPid || (missingLiveLead && oldEnough);
 
-      if (deadLeadPid || (missingLiveLead && oldEnough)) {
+      // Lifecycle tombstones have no TTL. Even corrupt files are occupied and
+      // must keep the team directory out of orphan cleanup, but they must not
+      // keep child processes alive after their lead is gone.
+      if (hasLifecycleFence) {
+        if (shouldCleanOrphan) {
+          killTeamMemberProcesses(dir, readJsonFile(paths.configPath(dir)), terminal);
+        }
+        continue;
+      }
+
+      if (shouldCleanOrphan) {
+        // Failed and recovery-relevant spawned sessions intentionally outlive
+        // their roster member. Stop orphan processes, but do not let dead-lead
+        // directory cleanup bypass the private transcript TTL.
+        const privateSessionRetention = hasRecentPrivateAgentSessions(teamDirectory, { now, maxAgeMs });
+        if (privateSessionRetention !== "none") {
+          killTeamMemberProcesses(dir, readJsonFile(paths.configPath(dir)), terminal);
+          continue;
+        }
         if (forceCleanupTeam(dir, terminal)) cleaned++;
       }
     } catch {

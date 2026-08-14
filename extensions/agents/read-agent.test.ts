@@ -5,8 +5,11 @@ import path from "node:path";
 import * as paths from "../../src/utils/paths.js";
 import * as claims from "../../src/utils/claims.js";
 import * as teams from "../../src/utils/teams.js";
+import * as runtime from "../../src/utils/runtime.js";
+import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 import { readInbox, requireRunningMessageRecipient, sendPlainMessage, sendPlainMessageIfRunning } from "../../src/utils/messaging.js";
 import { listTeamReportEvents } from "../../src/utils/report-events.js";
+import * as reportEvents from "../../src/utils/report-events.js";
 import type { Member } from "../../src/utils/models.js";
 
 const piMocks = vi.hoisted(() => ({
@@ -172,6 +175,21 @@ function makeSession() {
   };
 }
 
+function makeRunOptions(runningReadAgents = new Map<string, RunningReadAgent>()) {
+  return {
+    isTeammate: false,
+    getTeamName: () => "team",
+    runningReadAgents,
+    readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+    isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => runningReadAgents.get(key) === state,
+    ensureReadAgentStatusTicker: vi.fn(),
+    renderReadAgentStatus: vi.fn(),
+    rememberCompletedAgentReport: vi.fn(),
+    emitAgentReport: vi.fn(),
+    releaseAllClaimsForAgent: vi.fn(async () => []),
+  };
+}
+
 describe("in-process read agent tool wiring", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-read-agent-"));
@@ -183,12 +201,13 @@ describe("in-process read agent tool wiring", () => {
     piMocks.sessionManagerOpen.mockReset();
     piMocks.persistedSessionEntries.clear();
     piMocks.sessionManagerCounter = 0;
-    piMocks.sessionManagerCreate.mockImplementation((cwd: string) => {
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
       const id = `child-session-${++piMocks.sessionManagerCounter}`;
-      const sessionFile = path.join(root, "child-sessions", `${id}.jsonl`);
+      const sessionFile = path.join(sessionDir ?? path.join(root, "child-sessions"), `${id}.jsonl`);
       return {
         cwd,
         getSessionId: () => id,
+        getSessionDir: () => sessionDir,
         getSessionFile: () => sessionFile,
       };
     });
@@ -446,7 +465,11 @@ describe("in-process read agent tool wiring", () => {
     expect(piMocks.loaderOptions[0].noPromptTemplates).toBeUndefined();
     expect(piMocks.loaderOptions[0].noThemes).toBeUndefined();
     expect(sessionOptions.settingsManager).toBe(piMocks.loaderOptions[0].settingsManager);
-    expect(piMocks.sessionManagerCreate).toHaveBeenCalledWith(root);
+    const privateSessionDir = piMocks.sessionManagerCreate.mock.calls[0][1];
+    const expectedAgentRoot = path.join(root, "teams", "team", "agent-sessions", "reader");
+    expect(typeof privateSessionDir).toBe("string");
+    expect(path.dirname(privateSessionDir)).toBe(expectedAgentRoot);
+    expect(privateSessionDir).not.toContain(path.join(".pi", "agent", "sessions"));
     expect(sessionOptions.sessionManager).toBe(piMocks.sessionManagerCreate.mock.results[0].value);
     const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
     expect(promptText).toContain("Use send_message for direct communication and read_inbox only when you were told a reply is waiting");
@@ -468,6 +491,376 @@ describe("in-process read agent tool wiring", () => {
     expect(await readInbox("team", "team-lead", false, false)).toEqual([]);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader");
     expect(runningReadAgents.size).toBe(0);
+  });
+
+  it("uses Pi's resumable session store only after an explicit opt-in", async () => {
+    const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    settings.agentSessions = { showInResume: true };
+    fs.writeFileSync(settingsPath, JSON.stringify(settings));
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+
+    await runReadAgentInProcess(
+      "team",
+      { ...fixtureMember("reader"), prompt: "investigate" },
+      "investigate",
+      { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } },
+      makeRunOptions(),
+    );
+
+    expect(piMocks.sessionManagerCreate).toHaveBeenCalledWith(root);
+  });
+
+  it("removes a normal completed private session only after reporting and teardown", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    let privateSessionDir = "";
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
+      privateSessionDir = sessionDir!;
+      const sessionFile = path.join(privateSessionDir, "child-session.jsonl");
+      fs.writeFileSync(sessionFile, "private transcript\n");
+      return {
+        cwd,
+        getSessionId: () => "child-session",
+        getSessionDir: () => privateSessionDir,
+        getSessionFile: () => sessionFile,
+      };
+    });
+
+    await runReadAgentInProcess(
+      "team",
+      { ...fixtureMember("reader"), prompt: "investigate" },
+      "investigate",
+      { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } },
+      makeRunOptions(),
+    );
+
+    expect(privateSessionDir).not.toBe("");
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(fs.existsSync(privateSessionDir)).toBe(false);
+  });
+
+  it("cleans a private session after completed report emission fails without stale recovery pointers", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    let privateSessionDir = "";
+    session.dispose.mockImplementation(() => {
+      expect(fs.existsSync(privateSessionDir)).toBe(true);
+    });
+    const options = makeRunOptions();
+    options.emitAgentReport.mockImplementation(() => {
+      throw new Error("lead notification failed");
+    });
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
+      privateSessionDir = sessionDir!;
+      const sessionFile = path.join(privateSessionDir, "child-session.jsonl");
+      fs.writeFileSync(sessionFile, "private transcript\n");
+      return {
+        cwd,
+        getSessionId: () => "child-session",
+        getSessionDir: () => privateSessionDir,
+        getSessionFile: () => sessionFile,
+      };
+    });
+
+    await runReadAgentInProcess(
+      "team",
+      { ...fixtureMember("reader"), prompt: "investigate" },
+      "investigate",
+      { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } },
+      options,
+    );
+
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(fs.existsSync(privateSessionDir)).toBe(false);
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledOnce();
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1]).toMatchObject({
+      status: "completed",
+      reportSource: "assistant-text",
+    });
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionId");
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionFile");
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      status: "completed",
+      metadata: { reportSource: "assistant-text", recoveryAttempted: false },
+    });
+    expect(reports[0]?.metadata).not.toHaveProperty("recoverySessionId");
+    expect(reports[0]?.metadata).not.toHaveProperty("recoverySessionFile");
+  });
+
+  it("cleans a private session after report-only recovery without stale recovery pointers", async () => {
+    const session = makeSession();
+    session.messages = [];
+    let privateSessionDir = "";
+    const lifecycleOrder: string[] = [];
+    session.dispose.mockImplementation(() => {
+      lifecycleOrder.push("dispose");
+      expect(fs.existsSync(privateSessionDir)).toBe(true);
+    });
+    session.prompt.mockImplementation(async () => {
+      if (session.prompt.mock.calls.length === 1) return;
+      const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+      const reportTool = sessionOptions.customTools.find((tool: any) => tool.name === "report_and_exit");
+      await reportTool.execute("recovered-report", {
+        content: "Recovered on the report-only turn",
+        summary: "Recovered",
+      });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
+      privateSessionDir = sessionDir!;
+      const sessionFile = path.join(privateSessionDir, "child-session.jsonl");
+      fs.writeFileSync(sessionFile, "private recovery transcript\n");
+      return {
+        cwd,
+        getSessionId: () => "child-session",
+        getSessionDir: () => privateSessionDir,
+        getSessionFile: () => sessionFile,
+      };
+    });
+    const options = makeRunOptions();
+
+    await runReadAgentInProcess(
+      "team",
+      { ...fixtureMember("reader"), prompt: "investigate" },
+      "investigate",
+      { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } },
+      options,
+    );
+
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect(lifecycleOrder).toEqual(["dispose"]);
+    expect(fs.existsSync(privateSessionDir)).toBe(false);
+    const remembered = options.rememberCompletedAgentReport.mock.calls[0][1];
+    expect(remembered).toMatchObject({
+      status: "completed",
+      reportSource: "report_and_exit",
+      recoveryAttempted: true,
+    });
+    expect(remembered).not.toHaveProperty("recoverySessionId");
+    expect(remembered).not.toHaveProperty("recoverySessionFile");
+    const reports = await listTeamReportEvents("team");
+    expect(reports.at(-1)).toMatchObject({
+      status: "completed",
+      metadata: { reportSource: "report_and_exit", recoveryAttempted: true },
+    });
+    expect(reports.at(-1)?.metadata).not.toHaveProperty("recoverySessionId");
+    expect(reports.at(-1)?.metadata).not.toHaveProperty("recoverySessionFile");
+  });
+
+  it("cleans a private session after persisted report recovery without stale recovery pointers", async () => {
+    const session = makeSession();
+    session.messages = [];
+    let privateSessionDir = "";
+    const lifecycleOrder: string[] = [];
+    session.dispose.mockImplementation(() => {
+      lifecycleOrder.push("dispose");
+      expect(fs.existsSync(privateSessionDir)).toBe(true);
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const sessionFile = () => path.join(privateSessionDir, "durable-child.jsonl");
+    const options = makeRunOptions();
+    const member = { ...fixtureMember("reader"), prompt: "investigate" };
+    writeTeamConfig("team", member);
+
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
+      privateSessionDir = sessionDir!;
+      const persistedFile = sessionFile();
+      fs.writeFileSync(persistedFile, "durable private transcript\n");
+      piMocks.persistedSessionEntries.set(persistedFile, [
+        {
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{
+              type: "toolCall",
+              id: "accepted-report-call",
+              name: "report_and_exit",
+              arguments: { content: "Recovered durable report", summary: "Durable" },
+            }],
+          },
+        },
+        {
+          type: "message",
+          message: {
+            role: "toolResult",
+            toolCallId: "accepted-report-call",
+            toolName: "report_and_exit",
+            content: [{ type: "text", text: "Final report accepted." }],
+            details: { accepted: true },
+            isError: false,
+          },
+        },
+      ]);
+      return {
+        cwd,
+        getSessionId: () => "durable-child",
+        getSessionDir: () => privateSessionDir,
+        getSessionFile: () => persistedFile,
+      };
+    });
+
+    await runReadAgentInProcess(
+      "team",
+      member,
+      "investigate",
+      { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } },
+      options,
+    );
+
+    expect(session.prompt).toHaveBeenCalledOnce();
+    expect(lifecycleOrder).toEqual(["dispose"]);
+    expect(fs.existsSync(privateSessionDir)).toBe(false);
+    const remembered = options.rememberCompletedAgentReport.mock.calls[0][1];
+    expect(remembered).toMatchObject({
+      status: "completed",
+      reportSource: "persisted-report_and_exit",
+      recoveryAttempted: false,
+    });
+    expect(remembered).not.toHaveProperty("recoverySessionId");
+    expect(remembered).not.toHaveProperty("recoverySessionFile");
+    const reports = await listTeamReportEvents("team");
+    expect(reports.at(-1)).toMatchObject({
+      status: "completed",
+      metadata: { reportSource: "persisted-report_and_exit", recoveryAttempted: false },
+    });
+    expect(reports.at(-1)?.metadata).not.toHaveProperty("recoverySessionId");
+    expect(reports.at(-1)?.metadata).not.toHaveProperty("recoverySessionFile");
+  });
+
+  it("quarantines every recovery artifact when durable report persistence fails", async () => {
+    vi.spyOn(reportEvents, "appendTeamReportEvent").mockRejectedValue(new Error("report store unavailable"));
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    let privateSessionDir = "";
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
+      privateSessionDir = sessionDir!;
+      const sessionFile = path.join(privateSessionDir, "child-session.jsonl");
+      fs.writeFileSync(sessionFile, "private transcript\n");
+      return {
+        cwd,
+        getSessionId: () => "child-session",
+        getSessionDir: () => privateSessionDir,
+        getSessionFile: () => sessionFile,
+      };
+    });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = makeRunOptions(runningReadAgents);
+
+    await runReadAgentInProcess(
+      "team",
+      { ...fixtureMember("reader"), prompt: "investigate" },
+      "investigate",
+      { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } },
+      options,
+    );
+
+    const retainedMember = (await teams.readConfig("team")).members.find(member => member.name === "reader");
+    expect(retainedMember).toMatchObject({ isActive: false, lifecycleRunId: expect.any(String) });
+    const runId = retainedMember!.lifecycleRunId!;
+    expect(fs.existsSync(privateSessionDir)).toBe(true);
+    await expect(runtime.readRuntimeStatus("team", "reader")).resolves.toMatchObject({ lifecycleRunId: runId });
+    await expect(readLifecycleTombstone("team", "reader")).resolves.toMatchObject({
+      status: "occupied",
+      tombstone: {
+        runId,
+        phase: "cleanup_failed",
+        error: expect.stringContaining("report store unavailable"),
+      },
+    });
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(options.emitAgentReport).toHaveBeenCalledWith(
+      "team",
+      "reader",
+      expect.any(Number),
+      42,
+      expect.stringContaining("Recovery pointer: pi-child-session/v1"),
+      false,
+    );
+    expect(runningReadAgents.size).toBe(1);
+  });
+
+  it("retains a failed private session for bounded recovery", async () => {
+    const session = makeSession();
+    session.prompt.mockRejectedValue(new Error("provider failed"));
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    let privateSessionDir = "";
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
+      privateSessionDir = sessionDir!;
+      const sessionFile = path.join(privateSessionDir, "child-session.jsonl");
+      fs.writeFileSync(sessionFile, "recoverable private transcript\n");
+      return {
+        cwd,
+        getSessionId: () => "child-session",
+        getSessionDir: () => privateSessionDir,
+        getSessionFile: () => sessionFile,
+      };
+    });
+
+    await runReadAgentInProcess(
+      "team",
+      { ...fixtureMember("reader"), prompt: "investigate" },
+      "investigate",
+      { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } },
+      makeRunOptions(),
+    );
+
+    expect(privateSessionDir).not.toBe("");
+    expect(fs.existsSync(privateSessionDir)).toBe(true);
+  });
+
+  it("quarantines a failed run when its failure report cannot be persisted", async () => {
+    vi.spyOn(reportEvents, "appendTeamReportEvent").mockRejectedValue(new Error("failure report store unavailable"));
+    const session = makeSession();
+    session.prompt.mockRejectedValue(new Error("provider failed"));
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    let privateSessionDir = "";
+    piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
+      privateSessionDir = sessionDir!;
+      const sessionFile = path.join(privateSessionDir, "child-session.jsonl");
+      fs.writeFileSync(sessionFile, "recoverable failed transcript\n");
+      return {
+        cwd,
+        getSessionId: () => "child-session",
+        getSessionDir: () => privateSessionDir,
+        getSessionFile: () => sessionFile,
+      };
+    });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = makeRunOptions(runningReadAgents);
+
+    await runReadAgentInProcess(
+      "team",
+      { ...fixtureMember("reader"), prompt: "investigate" },
+      "investigate",
+      { modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) } },
+      options,
+    );
+
+    const retainedMember = (await teams.readConfig("team")).members.find(member => member.name === "reader");
+    expect(retainedMember).toMatchObject({ isActive: false, lifecycleRunId: expect.any(String) });
+    const runId = retainedMember!.lifecycleRunId!;
+    expect(fs.existsSync(privateSessionDir)).toBe(true);
+    await expect(runtime.readRuntimeStatus("team", "reader")).resolves.toMatchObject({ lifecycleRunId: runId });
+    await expect(readLifecycleTombstone("team", "reader")).resolves.toMatchObject({
+      status: "occupied",
+      tombstone: {
+        runId,
+        phase: "cleanup_failed",
+        error: expect.stringContaining("failure report store unavailable"),
+      },
+    });
+    expect(options.emitAgentReport).toHaveBeenCalledWith(
+      "team",
+      "reader",
+      expect.any(Number),
+      expect.any(Number),
+      expect.stringContaining("Recovery pointer: pi-child-session/v1"),
+      false,
+    );
   });
 
   it("requests one report-only recovery turn when the first turn has no usable output", async () => {
@@ -512,9 +905,9 @@ describe("in-process read agent tool wiring", () => {
       summary: "Recovered",
       reportSource: "report_and_exit",
       recoveryAttempted: true,
-      recoverySessionId: "child-session-1",
-      recoverySessionFile: expect.stringContaining("child-session-1.jsonl"),
     }));
+    expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionId");
+    expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionFile");
     expect(emitAgentReport).toHaveBeenCalledWith(
       "team", "reader", expect.any(Number), 42, "Recovered on the report-only turn", true,
     );
@@ -585,9 +978,9 @@ describe("in-process read agent tool wiring", () => {
       summary: "Durable",
       reportSource: "persisted-report_and_exit",
       recoveryAttempted: false,
-      recoverySessionId: "durable-child",
-      recoverySessionFile: sessionFile,
     }));
+    expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionId");
+    expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionFile");
     expect(emitAgentReport).toHaveBeenCalledWith(
       "team", "reader", expect.any(Number), 42, "Recovered durable report", true,
     );
@@ -597,10 +990,11 @@ describe("in-process read agent tool wiring", () => {
       report: "Recovered durable report",
       metadata: {
         reportSource: "persisted-report_and_exit",
-        recoverySessionId: "durable-child",
-        recoverySessionFile: sessionFile,
+        recoveryAttempted: false,
       },
     });
+    expect(reports.at(-1)?.metadata).not.toHaveProperty("recoverySessionId");
+    expect(reports.at(-1)?.metadata).not.toHaveProperty("recoverySessionFile");
   });
 
   it("classifies a terminal provider error without report text as a failed recoverable run", async () => {

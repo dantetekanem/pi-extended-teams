@@ -219,9 +219,14 @@ Example:
   },
   "writeAgents": {
     "maxConcurrent": 1
+  },
+  "agentSessions": {
+    "showInResume": false
   }
 }
 ```
+
+Spawned-agent transcripts default to private per-run storage under `~/.pi/teams/<team>/agent-sessions/`, so they do not appear in Pi's `/resume` picker. Read-agent transcripts are removed immediately only after their nested session has explicitly disposed and teardown finalization succeeds. Tmux/predefined writer transcripts remain private when Pi emits `session_shutdown` before disposal can be proven and are eligible for the existing 24-hour janitor once the run is no longer active. If report persistence or cleanup fails, the transcript remains with its runtime, member, and lifecycle fence for recovery. Set `agentSessions.showInResume` to `true` only when spawned agents should use Pi's normal resumable session store.
 
 Provider-priority sorting for the `/agents-favorite-models` picker also supports `providerPriority` in `~/.pi/pi-extended-teams.json` or `.pi/pi-extended-teams.json`.
 

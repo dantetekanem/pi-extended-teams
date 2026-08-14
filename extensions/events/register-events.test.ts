@@ -5,6 +5,7 @@ import path from "node:path";
 import { isInboxFileWatchEvent, registerExtensionEvents } from "./register-events.js";
 import * as paths from "../../src/utils/paths.js";
 import * as runtime from "../../src/utils/runtime.js";
+import * as settings from "../../src/utils/settings.js";
 import { sendPlainMessage } from "../../src/utils/messaging.js";
 
 let root: string;
@@ -122,22 +123,65 @@ describe("extension teammate inbox wake", () => {
     expect(output).not.toContain("ctrl+o");
   });
 
-  it("globally cleans stale session references at lead startup and shutdown without an adopted team", async () => {
+  it("globally cleans stale session references and private agent sessions without an adopted team", async () => {
     const cleanupStaleSessionContextReferences = vi.fn(() => 2);
+    const cleanupStalePrivateAgentSessions = vi.fn(() => 3);
     const { handlers, ctx } = setupEvents(() => true, {
       isTeammate: false,
       agentName: "team-lead",
       getTeamName: () => null,
       cleanupStaleSessionContextReferences,
+      cleanupStalePrivateAgentSessions,
     });
 
     for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
     expect(cleanupStaleSessionContextReferences).toHaveBeenCalledOnce();
     expect(cleanupStaleSessionContextReferences).toHaveBeenLastCalledWith();
+    expect(cleanupStalePrivateAgentSessions).toHaveBeenCalledOnce();
+    expect(cleanupStalePrivateAgentSessions).toHaveBeenLastCalledWith();
 
     for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
     expect(cleanupStaleSessionContextReferences).toHaveBeenCalledTimes(2);
     expect(cleanupStaleSessionContextReferences).toHaveBeenLastCalledWith();
+    expect(cleanupStalePrivateAgentSessions).toHaveBeenCalledOnce();
+  });
+
+  it("does not run the private-session janitor inside spawned teammate sessions", async () => {
+    const cleanupStalePrivateAgentSessions = vi.fn(() => 0);
+    const { handlers, ctx } = setupEvents(() => true, { cleanupStalePrivateAgentSessions });
+
+    for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+
+    expect(cleanupStalePrivateAgentSessions).not.toHaveBeenCalled();
+  });
+
+  it("continues lead session_start initialization when the private-session janitor fails", async () => {
+    const setSessionCtx = vi.fn();
+    const startLeadInboxPolling = vi.fn();
+    const startLeadWatchdog = vi.fn();
+    const cleanupStalePrivateAgentSessions = vi.fn(() => {
+      throw new Error("simulated janitor failure");
+    });
+    const cleanupStaleSessionContextReferences = vi.fn(() => 0);
+    const loadSettings = vi.spyOn(settings, "loadSettings").mockReturnValue({ favoriteModels: {} } as any);
+    const { handlers, ctx } = setupEvents(() => true, {
+      isTeammate: false,
+      agentName: "team-lead",
+      setSessionCtx,
+      startLeadInboxPolling,
+      startLeadWatchdog,
+      cleanupStalePrivateAgentSessions,
+      cleanupStaleSessionContextReferences,
+    });
+    (ctx as any).cwd = root;
+
+    await expect(Promise.all((handlers.get("session_start") || []).map(handler => handler({}, ctx)))).resolves.toBeDefined();
+
+    expect(setSessionCtx).toHaveBeenCalledWith(ctx);
+    expect(loadSettings).toHaveBeenCalledWith({ projectDir: root });
+    expect(cleanupStaleSessionContextReferences).toHaveBeenCalledOnce();
+    expect(startLeadInboxPolling).toHaveBeenCalledOnce();
+    expect(startLeadWatchdog).toHaveBeenCalledOnce();
   });
 
   it("injects level selection and literal-wait rules into every lead prompt", async () => {

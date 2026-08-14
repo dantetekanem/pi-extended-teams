@@ -19,6 +19,7 @@ import {
   type SpawnResourcePlan,
 } from "../resources/spawn-resource-plan";
 import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
+import { preparePrivateAgentSessionDirectory } from "../internal/agent-session-files";
 import { isEligibleNestedReadParent, NESTED_DELEGATION_TOOL_NAMES } from "../runtime/nested-read-agents";
 import type { NestedReadAgentToolBinding } from "../tools/team-tools";
 import type { ParentRunIdentity, PendingChildController } from "../runtime/pending-child-controller";
@@ -300,6 +301,19 @@ function operationMetadataFromMember(member: Member): { operationId?: string; wo
   };
 }
 
+function reportPersistenceBlockReason(
+  description: string,
+  error: unknown,
+  recoveryReference: ReturnType<typeof readAgentRecoveryReference>,
+): string {
+  const persistenceError = error instanceof Error ? error.message : String(error);
+  return [
+    `${description}: ${persistenceError}`,
+    `Recovery pointer: ${recoveryReference.pointer}`,
+    recoveryReference.guidance,
+  ].join("\n");
+}
+
 async function recordReadAgentReportEvent(
   teamName: string,
   member: Member,
@@ -311,33 +325,38 @@ async function recordReadAgentReportEvent(
   costUsd?: number,
   color?: string,
   reportMetadata: Record<string, any> = {}
-): Promise<void> {
+): Promise<{ persisted: true } | { persisted: false; error: unknown }> {
   const operation = operationMetadataFromMember(member);
   const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
-  await reportEvents.appendTeamReportEvent(teamName, {
-    agentName: member.name,
-    role: member.role || "read",
-    status,
-    report,
-    summary,
-    startedAt,
-    elapsedMs: Date.now() - startedAt,
-    tokensUsed,
-    costUsd,
-    model: member.model,
-    thinking: member.thinking,
-    modelSlot,
-    color: color || member.color,
-    requestedBy: member.requestedBy,
-    source: "read-agent",
-    operationId: operation.operationId,
-    workflowRunId: operation.workflowRunId,
-    metadata: {
-      ...(member.prompt ? { initialPrompt: member.prompt } : {}),
-      ...(modelSlot ? { modelSlot } : {}),
-      ...reportMetadata,
-    },
-  }).catch(() => {});
+  try {
+    await reportEvents.appendTeamReportEvent(teamName, {
+      agentName: member.name,
+      role: member.role || "read",
+      status,
+      report,
+      summary,
+      startedAt,
+      elapsedMs: Date.now() - startedAt,
+      tokensUsed,
+      costUsd,
+      model: member.model,
+      thinking: member.thinking,
+      modelSlot,
+      color: color || member.color,
+      requestedBy: member.requestedBy,
+      source: "read-agent",
+      operationId: operation.operationId,
+      workflowRunId: operation.workflowRunId,
+      metadata: {
+        ...(member.prompt ? { initialPrompt: member.prompt } : {}),
+        ...(modelSlot ? { modelSlot } : {}),
+        ...reportMetadata,
+      },
+    });
+    return { persisted: true };
+  } catch (error) {
+    return { persisted: false, error };
+  }
 }
 
 async function ensureLeadCompletionMessage(
@@ -523,6 +542,8 @@ export async function runReadAgentInProcess(
   let submittedFinalReport: SubmittedAgentReport | undefined;
   let finalReportSubmissionInProgress = false;
   let childSessionManager: any;
+  let privateSessionDirectory: string | undefined;
+  let privateCompletedReportPersisted = false;
   const pendingChildController = options.pendingChildController;
   const pendingChildParent: ParentRunIdentity | undefined = isEligibleNestedReadParent(member)
     ? {
@@ -560,13 +581,16 @@ export async function runReadAgentInProcess(
     resolution: ResolvedReadAgentReport,
     completionSummary: string,
     recoveryAttempted: boolean,
-    recoveryReference: { sessionId?: string; sessionFile?: string },
+    recoveryReference: ReturnType<typeof readAgentRecoveryReference>,
   ): Promise<void> => {
     const session = state.session;
     if (!session) throw new Error(`Agent ${member.name} completed without a nested session.`);
     const report = resolution.report!;
     const completionStats = session.getSessionStats();
-    const includeRecoveryReference = recoveryAttempted || resolution.source?.startsWith("persisted-");
+    // Private child transcripts are deleted after teardown; never publish pointers
+    // that would outlive a successful run's recovery artifact.
+    const includeRecoveryReference = !privateSessionDirectory
+      && (recoveryAttempted || resolution.source?.startsWith("persisted-"));
     const reportMetadata = {
       reportSource: resolution.source,
       recoveryAttempted,
@@ -609,7 +633,7 @@ export async function runReadAgentInProcess(
       initialPrompt: member.prompt || prompt,
       ...reportMetadata,
     };
-    await recordReadAgentReportEvent(
+    const reportEventPersistence = await recordReadAgentReportEvent(
       readTeamName,
       member,
       "completed",
@@ -621,6 +645,20 @@ export async function runReadAgentInProcess(
       undefined,
       reportMetadata,
     );
+    if (!reportEventPersistence.persisted) {
+      state.finalizationBlockedReason = reportPersistenceBlockReason(
+        "Could not durably persist the completed read-agent report",
+        reportEventPersistence.error,
+        recoveryReference,
+      );
+      throw new Error(state.finalizationBlockedReason);
+    }
+    // The lifecycle finalizer consumes this flag only after session disposal and
+    // successful lifecycle finalization, so every successful private run is removed.
+    if (privateSessionDirectory) {
+      state.cleanupPrivateSessionOnFinalize = true;
+      privateCompletedReportPersisted = true;
+    }
     const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
     if (member.requestedBy) {
       await ensureReadHelperCompletionMessages(
@@ -799,7 +837,13 @@ export async function runReadAgentInProcess(
       ...nestedReadAgentToolNames,
     ]));
 
-    childSessionManager = SessionManager.create(member.cwd);
+    const agentSettings = loadSettings({ projectDir: member.cwd });
+    privateSessionDirectory = agentSettings.agentSessions.showInResume
+      ? undefined
+      : preparePrivateAgentSessionDirectory(readTeamName, member.name, state.runId);
+    childSessionManager = privateSessionDirectory
+      ? SessionManager.create(member.cwd, privateSessionDirectory)
+      : SessionManager.create(member.cwd);
     const parentModelRuntime: unknown = Reflect.get(ctx.modelRegistry, "runtime");
     const { session } = await createAgentSession({
       cwd: member.cwd,
@@ -952,8 +996,8 @@ export async function runReadAgentInProcess(
     options.renderReadAgentStatus();
     settleSessionCreation(state.session);
     await closeRecipient();
-    if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
-      const failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
+    if (!state.stopRequested && options.isCurrentReadAgentRun(key, state) && !privateCompletedReportPersisted) {
+      let failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
       const failureStats = state.session?.getSessionStats();
       const reportUnavailable = e instanceof ReadAgentReportUnavailableError ? e : undefined;
       const failureRecoveryReference = childSessionManager
@@ -969,12 +1013,37 @@ export async function runReadAgentInProcess(
           ? { recoverySessionFile: reportUnavailable?.recoverySessionFile ?? failureRecoveryReference?.sessionFile }
           : {}),
       };
+      const failureSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`;
+      const failureEventPersistence = await recordReadAgentReportEvent(
+        readTeamName,
+        member,
+        "failed",
+        failureReport,
+        failureSummary,
+        state.startedAt,
+        state.tokensUsed,
+        failureStats?.cost,
+        "red",
+        failureReportMetadata,
+      );
+      if (!failureEventPersistence.persisted) {
+        const recoveryReference = failureRecoveryReference
+          ?? readAgentRecoveryReference(readTeamName, member.name, state.runId, childSessionManager);
+        state.finalizationBlockedReason ||= reportPersistenceBlockReason(
+          "Could not durably persist the failed read-agent report",
+          failureEventPersistence.error,
+          recoveryReference,
+        );
+        if (!failureReport.includes("Recovery pointer: pi-child-session/v1")) {
+          failureReport = `${failureReport}\n\n${state.finalizationBlockedReason}`;
+        }
+      }
       options.rememberCompletedAgentReport(readTeamName, {
         name: member.name,
         role,
         status: "failed",
         report: failureReport,
-        summary: `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`,
+        summary: failureSummary,
         completedAt: Date.now(),
         startedAt: state.startedAt,
         elapsedMs: Date.now() - state.startedAt,
@@ -989,7 +1058,6 @@ export async function runReadAgentInProcess(
         ...failureReportMetadata,
         source: "read-agent",
       });
-      const failureSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`;
       const failureMetadata = {
         finalReport: true,
         startedAt: state.startedAt,
@@ -1002,18 +1070,6 @@ export async function runReadAgentInProcess(
         initialPrompt: member.prompt || prompt,
         ...failureReportMetadata,
       };
-      await recordReadAgentReportEvent(
-        readTeamName,
-        member,
-        "failed",
-        failureReport,
-        failureSummary,
-        state.startedAt,
-        state.tokensUsed,
-        failureStats?.cost,
-        "red",
-        failureReportMetadata,
-      );
       const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
       if (member.requestedBy) {
         await ensureReadHelperCompletionMessages(

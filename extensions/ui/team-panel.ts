@@ -540,11 +540,15 @@ export function registerTeamCommand(pi: any, options: TeamPanelOptions): void {
             tui.requestRender();
           }
           void buildTeamPanelItems(panelTeamName!, options)
-            .then((nextItems) => applyItems(nextItems, refreshOptions.resetLog))
+            .then((nextItems) => {
+              applyItems(nextItems, refreshOptions.resetLog);
+              updateAutoRefresh();
+            })
+            // Timer refresh failures must not reject or immediately re-arm.
+            .catch(() => stopAutoRefresh())
             .finally(() => {
               autoRefreshInFlight = false;
               loading = false;
-              updateAutoRefresh();
               tui.requestRender();
             });
         }

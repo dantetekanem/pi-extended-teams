@@ -173,7 +173,10 @@ describe("extension teammate inbox wake", () => {
     expect(result.systemPrompt).toContain("wait literally idle");
     expect(result.systemPrompt).toContain("Do not sleep, poll");
     expect(result.systemPrompt).toContain("Wait for the actual report before synthesizing");
-    expect(result.systemPrompt).toContain("confirm it with a separate read-only agent using the intent tier that fits the confirmation");
+    expect(result.systemPrompt).toContain("concrete, reproducible findings with file/line evidence or a focused failing regression may proceed directly to TDD repair");
+    expect(result.systemPrompt).toContain("Use a separate read-only confirmation only when evidence is missing or weak, the claim is disputed, or irreducible high-risk uncertainty remains");
+    expect(result.systemPrompt).toContain("never reconfirm an already confirmed finding");
+    expect(result.systemPrompt).not.toContain("Before implementing a durable bug/security/testing claim sourced from an agent report or backlog, confirm it with a separate read-only agent");
   });
 
   it("wakes teammates with implicit-session inbox instructions", async () => {
@@ -238,6 +241,36 @@ describe("extension teammate inbox wake", () => {
     await vi.advanceTimersByTimeAsync(250);
 
     expect(quietTrigger).toHaveBeenCalledWith("You have 1 new inbox message(s). Read them with read_inbox and act.");
+  });
+
+  it("does not reject the inbox wake when runtime status writes keep failing", async () => {
+    let watchCallback: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
+    const watchInboxDirectory = vi.fn((_path: string, callback: any) => {
+      watchCallback = callback;
+      return { close: vi.fn() } as unknown as fs.FSWatcher;
+    });
+    const runtimeWrite = vi.spyOn(runtime, "writeRuntimeStatus").mockImplementation(async (_teamName: any, _agentName: any, _runId: any, updates: any) => {
+      const keys = Object.keys(updates ?? {});
+      // Fail only the two wake-path writes.
+      if (keys.length <= 2 && keys.includes("lastHeartbeatAt")) throw new Error("Could not acquire lock");
+      return {} as any;
+    });
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+
+    try {
+      const { handlers, ctx } = setupEvents(() => true, { watchInboxDirectory });
+      for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+
+      watchCallback?.("change", "writer.json");
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(runtimeWrite).toHaveBeenCalled();
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
   });
 
   it("closes teammate inbox handles and prevents work after session shutdown", async () => {
@@ -334,15 +367,31 @@ describe("extension teammate inbox wake", () => {
       },
     };
     (ctx as any).sessionManager = { getBranch: vi.fn(() => []) };
+    let currentContextUsage = { tokens: 597, contextWindow: 200_000, percent: 0.3 };
+    (ctx as any).getContextUsage = vi.fn(() => currentContextUsage);
 
     for (const handler of handlers.get("session_start") || []) {
       await handler({}, ctx);
     }
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+      contextUsage: { tokens: 0, percent: 0 },
+    });
+    for (const handler of handlers.get("turn_start") || []) {
+      await handler({}, ctx);
+    }
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+      contextUsage: { tokens: 0, percent: 0 },
+    });
+
+    currentContextUsage = { tokens: 46_000, contextWindow: 200_000, percent: 23 };
     for (const handler of handlers.get("message_end") || []) {
       await handler({ message: assistantMessage }, ctx);
     }
 
-    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({ tokensUsed: 175 });
+    expect(await runtime.readRuntimeStatus("team", "writer")).toMatchObject({
+      tokensUsed: 175,
+      contextUsage: { tokens: 46_000, contextWindow: 200_000, percent: 23 },
+    });
   });
 
   it("defers the turn_end inbox wake until the writer session becomes idle", async () => {

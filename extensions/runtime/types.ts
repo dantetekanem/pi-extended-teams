@@ -1,5 +1,5 @@
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
-import type { RuntimeError } from "../../src/utils/runtime";
+import type { ContextUsageSnapshot, RuntimeError } from "../../src/utils/runtime";
 import type { ManagedReadAgentLifecycleState } from "../agents/read-agent-session-lifecycle";
 
 export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
@@ -8,6 +8,7 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   teamName: string;
   startedAt: number;
   tokensUsed: number;
+  contextUsage?: ContextUsageSnapshot;
   status: "starting" | "thinking" | "working" | "finishing";
   recentEvents: string[];
   lastActivityAt: number;

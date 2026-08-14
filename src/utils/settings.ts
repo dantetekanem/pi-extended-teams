@@ -13,6 +13,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { normalizeQualifiedModel } from "./model-resolution";
 import { THINKING_LEVEL_NAMES, type ThinkingLevelName } from "./thinking-levels";
 
 export { THINKING_LEVEL_NAMES, type ThinkingLevelName } from "./thinking-levels";
@@ -248,7 +249,8 @@ function favoriteModelConfigFromRaw(
 ): FavoriteModelConfig | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   return {
-    model: "model" in raw ? toStringOrNull(raw.model) : (base?.model ?? null),
+    // Keep configured and spawn-time model identities aligned.
+    model: "model" in raw ? normalizeQualifiedModel(String(raw.model ?? "")) : (base?.model ?? null),
     thinking: "thinking" in raw ? normalizeThinking(raw.thinking) : (base?.thinking ?? null),
   };
 }

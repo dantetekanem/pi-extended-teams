@@ -5,6 +5,7 @@ import os from "node:os";
 import {
   appendMessage,
   broadcastMessage,
+  broadcastMessageOnce,
   findInboxMessageByOperation,
   peekInbox,
   readInbox,
@@ -46,6 +47,45 @@ describe("Messaging Utilities", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+  });
+
+  it("never truncates a live inbox in place", async () => {
+    await appendMessage("test-team", "receiver", { from: "sender", text: "first", timestamp: "now", read: false });
+    const inboxFile = path.join(testDir, "inboxes", "receiver.json");
+    const writes: string[] = [];
+    const realWriteFileSync = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((target: any, data: any, options: any) => {
+      writes.push(String(target));
+      return realWriteFileSync(target, data, options);
+    }) as typeof fs.writeFileSync);
+
+    await appendMessage("test-team", "receiver", { from: "sender", text: "second", timestamp: "now", read: false });
+    await readInbox("test-team", "receiver", true, true);
+
+    expect(writes).not.toContain(inboxFile);
+    expect((await readInbox("test-team", "receiver", false, false)).map(message => message.text)).toEqual(["first", "second"]);
+    expect(fs.readdirSync(path.dirname(inboxFile)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("broadcasts once to reachable members and reports the unreachable ones", async () => {
+    fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({
+      name: "test-team",
+      members: [
+        { name: "team-lead" },
+        { name: "ghost", isActive: false },
+        { name: "writer", isActive: true },
+      ],
+    }));
+
+    const results = await broadcastMessageOnce("test-team", "team-lead", "ping", "broadcast", { operationId: "op-1" });
+
+    expect(results.map(result => result.recipient).sort()).toEqual(["ghost", "writer"]);
+    expect(results.find(result => result.recipient === "writer")?.delivered).toBe(true);
+    expect(results.find(result => result.recipient === "ghost")).toMatchObject({
+      delivered: false,
+      error: expect.stringContaining("not running"),
+    });
+    expect((await readInbox("test-team", "writer", false, false)).length).toBe(1);
   });
 
   it("should append a message successfully", async () => {

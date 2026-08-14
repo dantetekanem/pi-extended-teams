@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { writeJsonAtomic } from "./atomic-json";
 import { InboxMessage, TeamConfig } from "./models";
 import { withLock } from "./lock";
 import { configPath, inboxPath } from "./paths";
@@ -55,7 +56,7 @@ async function appendRunningMessage(
         if (existing) return { message: existing, delivered: false };
       }
       messages.push(message);
-      fs.writeFileSync(p, JSON.stringify(messages, null, 2));
+      writeJsonAtomic(p, messages);
       return { message, delivered: true };
     });
   };
@@ -191,7 +192,7 @@ export async function appendMessage(teamName: string, agentName: string, message
   await withLock(p, async () => {
     const msgs = readInboxRaw(p);
     msgs.push(message);
-    fs.writeFileSync(p, JSON.stringify(msgs, null, 2));
+    writeJsonAtomic(p, msgs);
   });
 }
 
@@ -208,7 +209,7 @@ export async function appendMessageOnce(
     if (existing) return { message: existing, delivered: false };
 
     msgs.push(message);
-    fs.writeFileSync(p, JSON.stringify(msgs, null, 2));
+    writeJsonAtomic(p, msgs);
     return { message, delivered: true };
   });
 }
@@ -240,7 +241,7 @@ export async function readInbox(
     const result = selectInboxMessages(allMsgs, unreadOnly);
 
     if (markAsRead && result.length > 0 && markMessagesRead(result)) {
-      fs.writeFileSync(p, JSON.stringify(allMsgs, null, 2));
+      writeJsonAtomic(p, allMsgs);
     }
 
     return cloneInboxMessages(result);
@@ -262,7 +263,7 @@ export async function readInboxTail(
     const result = selectInboxMessages(allMsgs, options.unreadOnly === true, normalizedLimit);
 
     if (options.markAsRead === true && result.length > 0 && markMessagesRead(result)) {
-      fs.writeFileSync(p, JSON.stringify(allMsgs, null, 2));
+      writeJsonAtomic(p, allMsgs);
     }
 
     return cloneInboxMessages(result);
@@ -283,7 +284,7 @@ export async function removeInboxMessagesByOperationUnderLifecycleLock(
     const messages = readInboxRaw(p);
     const remaining = messages.filter((message) => !messageOperationMatches(message, operationId, workflowRunId));
     const removed = messages.length - remaining.length;
-    if (removed > 0) fs.writeFileSync(p, JSON.stringify(remaining, null, 2));
+    if (removed > 0) writeJsonAtomic(p, remaining);
     return removed;
   });
 }
@@ -405,17 +406,36 @@ export async function broadcastMessage(
   }
 }
 
+export interface BroadcastMessageOnceRecipientResult {
+  recipient: string;
+  delivered: boolean;
+  message?: InboxMessage;
+  error?: string;
+}
+
 export async function broadcastMessageOnce(
   teamName: string,
   fromName: string,
   text: string,
   summary: string,
   options: SendPlainMessageOptions & { operationId: string }
-): Promise<Array<SendPlainMessageOnceResult & { recipient: string }>> {
+): Promise<BroadcastMessageOnceRecipientResult[]> {
   const config = await readConfig(teamName);
-  const deliveryPromises = config.members
+  const recipients = config.members
     .filter((member) => member.name !== fromName)
-    .map(async (member) => ({ recipient: member.name, ...(await sendPlainMessageOnceIfRunning(teamName, fromName, member.name, text, summary, options)) }));
+    .map((member) => member.name);
+  // Report every recipient; operation IDs make retries idempotent.
+  const results = await Promise.allSettled(
+    recipients.map((recipient) => sendPlainMessageOnceIfRunning(teamName, fromName, recipient, text, summary, options))
+  );
 
-  return await Promise.all(deliveryPromises);
+  return results.map((result, index) => (
+    result.status === "fulfilled"
+      ? { recipient: recipients[index], ...result.value }
+      : {
+          recipient: recipients[index],
+          delivered: false,
+          error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        }
+  ));
 }

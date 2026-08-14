@@ -1,8 +1,9 @@
 import { Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import type { RunningReadAgent } from "../runtime/types";
+import { initialContextUsage } from "../../src/utils/runtime";
 import { dimAnsi, pink, purple } from "./ansi";
 import { createFramePanelRowRenderer, framePanel } from "./frame";
-import { extractTextParts, formatAnimatedProgress, formatElapsed, formatModelLabel, formatTokenCount, sanitizePlainTuiLine, sanitizeTuiLine, sanitizeTuiText } from "./renderers";
+import { extractTextParts, formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel, sanitizePlainTuiLine, sanitizeTuiLine, sanitizeTuiText } from "./renderers";
 
 const REFRESH_INTERVAL_MS = 250;
 const MAX_NAVIGATION_AGENTS = 6;
@@ -372,8 +373,15 @@ export function createAgentFollowComponent(
     }
 
     try {
-      const total = agent.session?.getSessionStats().tokens.total;
-      if (typeof total === "number") agent.tokensUsed = total;
+      const session = agent.session;
+      const stats = session?.getSessionStats();
+      if (stats) {
+        agent.tokensUsed = stats.tokens.total;
+        const contextUsage = stats.contextUsage ?? session?.getContextUsage?.();
+        agent.contextUsage = stats.tokens.total > 0
+          ? contextUsage
+          : initialContextUsage(contextUsage?.contextWindow);
+      }
     } catch {
       // The nested session may be shutting down while this view refreshes.
     }
@@ -388,6 +396,7 @@ export function createAgentFollowComponent(
       agent.modelSlot,
       agent.startedAt,
       agent.tokensUsed,
+      formatContextUsage(agent.contextUsage),
       agent.status,
       agent.latestProgress,
       stoppingAgents.has(agent.name),
@@ -524,8 +533,15 @@ export function createAgentFollowComponent(
 
       selectedName = agent.name;
       try {
-        const total = agent.session?.getSessionStats().tokens.total;
-        if (typeof total === "number") agent.tokensUsed = total;
+        const session = agent.session;
+        const stats = session?.getSessionStats();
+        if (stats) {
+          agent.tokensUsed = stats.tokens.total;
+          const contextUsage = stats.contextUsage ?? session?.getContextUsage?.();
+          agent.contextUsage = stats.tokens.total > 0
+            ? contextUsage
+            : initialContextUsage(contextUsage?.contextWindow);
+        }
       } catch {
         // The nested session may be shutting down while this view renders.
       }
@@ -545,6 +561,7 @@ export function createAgentFollowComponent(
         agent.modelSlot,
         agent.startedAt,
         agent.tokensUsed,
+        formatContextUsage(agent.contextUsage),
         agent.status,
         agent.latestProgress,
         isStopping,
@@ -569,7 +586,7 @@ export function createAgentFollowComponent(
         : agent.latestProgress
           ? formatAnimatedProgress(agent.latestProgress, renderNow)
           : agent.status;
-      const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatTokenCount(agent.tokensUsed)} tok · ${activity}`;
+      const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatContextUsage(agent.contextUsage)} · ${activity}`;
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";
       const messageAction = options.sendMessage ? " · m message" : "";
       const help = composingMessage

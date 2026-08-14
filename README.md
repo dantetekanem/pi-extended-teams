@@ -2,6 +2,8 @@
 
 **pi-extended-teams** multiplies a single Pi session with helper agents while keeping the main agent in charge. Agents run in-process so Pi can follow, track, and surface their reports without a separate setup ceremony.
 
+[![Six read agents running in Pi's live activity card](pi-extended-teams-in-action.png)](pi-extended-teams-in-action.png)
+
 The preferred workflow is simple: ask for agents, or call `spawn_agent` / `spawn_swarm_agents`. The current Pi session is the implicit agent group.
 
 ## Installation

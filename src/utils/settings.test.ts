@@ -160,6 +160,23 @@ describe("loadSettings", () => {
     expect(s.categories.bad.thinking).toBeNull();
   });
 
+  it("canonicalizes hand-edited favorite model values to the form spawn resolves", () => {
+    writeGlobal({
+      favoriteModels: {
+        "read-review": { model: "provider/model:high", thinking: "high" },
+        "read-analyze": { model: " provider / model ", thinking: "high" },
+        "write-patch": { model: "provider/model", thinking: "high" },
+        "write-feature": { model: "unqualified-model", thinking: "high" },
+      },
+    });
+    const s = loadSettings({ homeDir, projectDir });
+
+    expect(s.favoriteModels["read-review"]?.model).toBe("provider/model");
+    expect(s.favoriteModels["read-analyze"]?.model).toBe("provider/model");
+    expect(s.favoriteModels["write-patch"]?.model).toBe("provider/model");
+    expect(s.favoriteModels["write-feature"]?.model).toBeNull();
+  });
+
   it("normalizes legacy favorite slots and lets canonical values win deterministically", () => {
     writeGlobal({
       favoriteModels: {

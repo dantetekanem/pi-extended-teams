@@ -104,6 +104,25 @@ describe("releaseAllForAgent", () => {
   });
 });
 
+describe("crash safety", () => {
+  it("never truncates the live registry in place", async () => {
+    await claimFiles("t", "alice", ["src/a.ts"]);
+    const registry = paths.claimsPath("t");
+    const writes: string[] = [];
+    const realWriteFileSync = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((target: any, data: any, options: any) => {
+      writes.push(String(target));
+      return realWriteFileSync(target, data, options);
+    }) as typeof fs.writeFileSync);
+
+    await claimFiles("t", "bob", ["src/b.ts"]);
+
+    expect(writes).not.toContain(registry);
+    expect((await listClaims("t")).map((claim) => claim.path).sort()).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(fs.readdirSync(path.dirname(registry)).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+  });
+});
+
 describe("concurrent contention", () => {
   it("never grants the same path to two agents", async () => {
     const results = await Promise.all([

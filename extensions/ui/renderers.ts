@@ -1,5 +1,6 @@
 import { keyText } from "@mariozechner/pi-coding-agent";
 import { Text, truncateToWidth } from "@mariozechner/pi-tui";
+import type { ContextUsageSnapshot } from "../../src/utils/runtime";
 import { dimAnsi, pink, purple } from "./ansi";
 
 const ANSI_ESCAPE_SEQUENCE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|_[^\x07\x1b]*(?:\x07|\x1b\\)|[PX^][^\x1b]*(?:\x1b\\|\x07)|[@-Z\\-_])/g;
@@ -46,6 +47,16 @@ export function formatTokenCount(count: number): string {
   if (count < 1000) return `${count}`;
   if (count < 1000000) return `${(count / 1000).toFixed(count < 10000 ? 1 : 0)}k`;
   return `${(count / 1000000).toFixed(1)}M`;
+}
+
+export function formatContextUsage(usage: ContextUsageSnapshot | undefined): string {
+  if (typeof usage?.tokens !== "number"
+    || !Number.isFinite(usage.tokens)
+    || typeof usage.percent !== "number"
+    || !Number.isFinite(usage.percent)) {
+    return "? tok (?%)";
+  }
+  return `${formatTokenCount(usage.tokens)} tok (${Math.round(usage.percent)}%)`;
 }
 
 export function extractTextParts(content: any): string {

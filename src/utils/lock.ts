@@ -7,7 +7,6 @@ const LOCK_TIMEOUT = 30000; // 30 seconds of retrying under high fan-out content
 const LOCK_RETRY_DELAY_MS = 10;
 const DEFAULT_LOCK_RETRIES = Math.ceil(LOCK_TIMEOUT / LOCK_RETRY_DELAY_MS);
 const STALE_LOCK_TIMEOUT = 30000; // 30 seconds for a lock to be considered stale
-const REAP_GUARD_STALE_MS = 5000; // a reap guard older than this belongs to a crashed reaper
 const LOCK_HEARTBEAT_INTERVAL_MS = Math.max(1000, Math.floor(STALE_LOCK_TIMEOUT / 3));
 
 interface LockOwner {
@@ -20,42 +19,106 @@ function readLockOwner(lockFile: string): LockOwner | null {
   try {
     const raw = fs.readFileSync(lockFile, "utf-8");
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.token === "string") return parsed;
+    if (
+      parsed
+      && Number.isSafeInteger(parsed.pid)
+      && parsed.pid > 0
+      && typeof parsed.token === "string"
+      && typeof parsed.acquiredAt === "number"
+    ) return parsed;
+    if (Number.isSafeInteger(parsed) && parsed > 0) {
+      // PID reuse can delay reclaiming a legacy lock, but the liveness check
+      // below will never revoke it while any process has that PID.
+      return { pid: parsed, token: `legacy-pid:${parsed}`, acquiredAt: 0 };
+    }
   } catch {
-    // Older lock files were just a pid string; treat them as unowned for release safety.
+    // Malformed owner records cannot be reclaimed without positive evidence.
   }
   return null;
 }
 
-function removeStaleLock(lockFile: string): void {
+function errorCode(error: unknown): string | undefined {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as NodeJS.ErrnoException).code)
+    : undefined;
+}
+
+function processIsDefinitelyDead(pid: number): boolean {
   try {
-    const stats = fs.statSync(lockFile);
-    if (Date.now() - stats.mtimeMs <= STALE_LOCK_TIMEOUT) return;
-    // Serialize reaping. Without this, a contender that statted the stale lock
-    // and was then preempted could unlink a fresh lock another contender just
-    // created, letting two holders into the critical section at once.
-    const guard = `${lockFile}.reap`;
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // EPERM means the process exists but cannot be signalled. Only ESRCH is
+    // positive evidence that a local process no longer exists.
+    return errorCode(error) === "ESRCH";
+  }
+}
+
+function publishReapGuard(guardFile: string, owner: LockOwner): boolean {
+  const candidateName = `.candidate-${crypto.createHash("sha256").update(owner.token).digest("hex")}`;
+  const candidate = path.join(path.dirname(guardFile), candidateName);
+
+  try {
     try {
-      fs.writeFileSync(guard, String(process.pid), { flag: "wx" });
+      fs.writeFileSync(candidate, JSON.stringify(owner), { flag: "wx" });
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST" || readLockOwner(candidate)?.token !== owner.token) return false;
+    }
+
+    // The complete candidate is published with a no-clobber hard link. A
+    // process dying before this point leaves no visible epoch; dying after it
+    // leaves a complete owner record that a later epoch can recover from.
+    fs.linkSync(candidate, guardFile);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      if (readLockOwner(candidate)?.token === owner.token) fs.unlinkSync(candidate);
     } catch {
-      // Another contender holds the reap guard, or a crashed reaper left one
-      // behind. Clear crashed guards so reaping cannot wedge permanently.
-      try {
-        if (Date.now() - fs.statSync(guard).mtimeMs > REAP_GUARD_STALE_MS) fs.unlinkSync(guard);
-      } catch {
-        // Guard already gone; the active reaper finished.
-      }
-      return; // Retry on the next acquire iteration.
+      // The candidate is unique to this owner and may already be gone.
     }
-    try {
-      // Re-check under the guard: only unlink if the lock is still stale. A
-      // fresh file here means another contender already reaped and re-acquired.
-      if (Date.now() - fs.statSync(lockFile).mtimeMs > STALE_LOCK_TIMEOUT) {
-        fs.unlinkSync(lockFile);
-      }
-    } finally {
-      fs.unlinkSync(guard);
-    }
+  }
+}
+
+function acquireReapGuard(lockFile: string, staleOwner: LockOwner, reaper: LockOwner): boolean {
+  const guardDir = `${lockFile}.reap`;
+  try {
+    fs.mkdirSync(guardDir, { recursive: true });
+  } catch {
+    return false;
+  }
+
+  const generation = crypto.createHash("sha256").update(staleOwner.token).digest("hex");
+  for (let epoch = 0; ; epoch++) {
+    const guardFile = path.join(guardDir, `${generation}.${epoch}`);
+    if (publishReapGuard(guardFile, reaper)) return true;
+
+    const guardOwner = readLockOwner(guardFile);
+    if (guardOwner?.token === reaper.token) return true;
+    if (!guardOwner || !processIsDefinitelyDead(guardOwner.pid)) return false;
+    // Guard epochs are immutable and never unlinked. After a proven owner
+    // death, contenders race to publish the next epoch instead of replacing
+    // state that another live contender may already own.
+  }
+}
+
+function removeStaleLock(lockFile: string, reaper: LockOwner): void {
+  try {
+    const staleOwner = readLockOwner(lockFile);
+    if (!staleOwner) return;
+    if (Date.now() - fs.statSync(lockFile).mtimeMs <= STALE_LOCK_TIMEOUT) return;
+    if (!processIsDefinitelyDead(staleOwner.pid)) return;
+    if (!acquireReapGuard(lockFile, staleOwner, reaper)) return;
+
+    // Re-check both generation and liveness while holding the generation's
+    // immutable guard. No other live reaper for this generation can reach the
+    // unlink, so the path cannot be replaced between this check and removal.
+    const currentOwner = readLockOwner(lockFile);
+    if (currentOwner?.token !== staleOwner.token) return;
+    if (Date.now() - fs.statSync(lockFile).mtimeMs <= STALE_LOCK_TIMEOUT) return;
+    if (!processIsDefinitelyDead(currentOwner.pid)) return;
+    fs.unlinkSync(lockFile);
   } catch {
     // Ignore: another process may have removed it, or it may not exist yet.
   }
@@ -97,7 +160,7 @@ export async function withLock<T>(lockPath: string, fn: () => Promise<T>, retrie
   let acquired = false;
   while (remainingRetries > 0) {
     try {
-      removeStaleLock(lockFile);
+      removeStaleLock(lockFile, owner);
       fs.writeFileSync(lockFile, JSON.stringify(owner), { flag: "wx" });
       acquired = true;
       break;

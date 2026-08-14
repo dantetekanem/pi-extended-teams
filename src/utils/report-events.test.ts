@@ -29,6 +29,7 @@ describe("report events", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-reports-"));
     vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName))));
+    vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
   });
 
   afterEach(() => {

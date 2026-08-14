@@ -1,25 +1,40 @@
-# Goal: Persist one plain-text file per completed report
+# Goal: Never lose a completed spawned-agent report
 
-## Outcome
+## Goal
 
-Store report text at `~/.pi/agent/reports/<session-or-team-id>/<agent-name>.md`. If the same agent name reports again in that session, use `-v2`, `-v3`, and so on. Keep the existing team `reports.json` as the compatibility index. A successful legacy/write `report_and_exit` must persist the text before delivery or claim release and return the exact file path.
+Ensure a completed spawned read agent always delivers meaningful report content to the lead. If the primary in-memory assistant text is unexpectedly empty, recover the report from durable run/session evidence; if no report text exists anywhere, return a concrete diagnostic and deterministic recovery pointer instead of an opaque empty result.
 
-## Scope
+## Specs
 
-- Extend the existing `TeamReportEvent` append seam; do not create a second reporting protocol.
-- Persist only the report text in each `.md` file and retain its path in the existing team index.
-- Keep existing read-agent persistence and `check_teammate` behavior otherwise unchanged.
-- Do not add obligation/terminal protocols, receipts, lifecycle phases, inbox schema, watchdog behavior, or directory-scanning recovery.
-- Scope budget: the report-event helper/model/path, coordination tool, their focused tests, and this harness; at most 7 files and approximately 180 added lines.
-- Do not add dependencies, commit, push, reload, or run a broad suite.
-- Keep this `goal.md` after completion unless Leo explicitly requests deletion.
+- Fix the read-agent completion/reporting path that currently emits `Read agent completed, but produced no assistant text.`
+- Prefer the canonical final report/assistant text produced by the child.
+- Deliver the report to the lead model as a hidden follow-up message; do not render the full report body in the lead transcript.
+- Handle valid Pi message content shapes and completion ordering without discarding text.
+- Preserve enough durable child-run/session metadata to restore or inspect output after the child settles.
+- Make fallback behavior actionable and specific; never represent an empty extraction as a successful usable report.
+- Add focused regression coverage for the observed empty-output path and recovery behavior.
+- Preserve existing agent lifecycle, recipient closure, cleanup, and report-event behavior.
+- Do not add dependencies, commit, push, publish, or change unrelated orchestration behavior.
+- `goal.md` is the persistent project harness and must remain after completion unless Leo explicitly requests deletion.
 
 ## Acceptance criteria
 
-1. Each appended report event produces one `.md` file beneath `~/.pi/agent/reports/<session-or-team-id>` containing only the exact report text.
-2. The first report uses `<agent-name>.md`; later reports for the same agent name use `<agent-name>-v2.md`, `-v3.md`, and so on, with each exact path retained in the team index.
-3. Legacy/write `report_and_exit` awaits persistence before sending the report or releasing claims and returns the exact per-report path.
-4. If persistence fails, the tool rejects without sending the report or releasing claims.
-5. Existing read-agent and `check_teammate` flows remain otherwise unchanged.
-6. Focused tests, TypeScript type checking, and `git diff --check` pass.
-7. The final diff stays within the stated scope budget and a fresh read-only review finds no material issue.
+1. A normally completed read agent reports its non-empty final assistant text to the lead.
+2. When the immediate completion result contains no extractable assistant text but the child session/run artifact contains it, the lead receives the recovered text.
+3. When no assistant/report text exists in any recoverable source, the lead receives an explicit diagnostic containing a stable child session/run pointer and retrieval guidance; the result is not silently treated as a usable report.
+4. Focused automated tests cover normal extraction, durable recovery, and irrecoverable-empty diagnostics.
+5. After roster removal, the lead can retrieve the latest persisted report through `check_teammate` without exposing it to teammate callers.
+6. Direct report delivery still wakes and supplies the lead model with the full report, but the custom message has `display: false` so the report body is not rendered in the transcript.
+7. Existing focused read-agent/lifecycle/report tests and TypeScript type checking pass.
+8. A fresh read-only non-author review finds no material correctness, lifecycle, cleanup, authorization, or regression issue in the final diff.
+
+## Definition of done
+
+The implementation, focused regression coverage, integration checks, and independent review are complete; every criterion above has concrete passing evidence; no active file claims or unresolved material findings remain.
+
+## Verification plan
+
+- Lead: trace the runtime path from child session completion through extraction, persistence, report emission, cleanup, and lead delivery.
+- Lead: run the narrowest new regression tests plus the existing read-agent-focused test file(s) and `pnpm typecheck`.
+- Lead: run a real spawned read-agent smoke exercise if the harness can deterministically exercise the installed extension without starting an unauthorized service; otherwise document the exact boundary and rely on an integration-level fixture.
+- Fresh read-only agent: review the final diff and test evidence against all acceptance criteria.

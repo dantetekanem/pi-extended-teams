@@ -128,6 +128,136 @@ describe("create_predefined_team tiers", () => {
     });
   });
 
+  it("refuses to recreate a team that already has members", async () => {
+    const create = registerTools().get("create_predefined_team")!;
+    const ctx = makeCtx();
+
+    await create.execute("first", {
+      team_name: "live-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, ctx);
+
+    // An agent spawned separately into the same team, e.g. via spawn_agent.
+    await teams.addMember("live-writers", {
+      agentId: "reviewer@live-writers",
+      name: "reviewer",
+      agentType: "teammate",
+      role: "read",
+      model: "provider/model",
+      thinking: "high",
+      joinedAt: Date.now(),
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    } as Member);
+
+    const before = (await teams.readConfig("live-writers")).members.map(member => member.name);
+    expect(before).toContain("writer");
+    expect(before).toContain("reviewer");
+
+    await expect(create.execute("second", {
+      team_name: "live-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, ctx)).rejects.toThrow(/already exists/);
+
+    const after = (await teams.readConfig("live-writers")).members.map(member => member.name);
+    expect(after).toEqual(before);
+  });
+
+  it("preserves a concurrently created team when exclusive creation loses", async () => {
+    const terminal = { spawn: vi.fn(() => "%writer") };
+    const create = registerTools(terminal).get("create_predefined_team")!;
+    const configFile = paths.configPath("raced-writers");
+    const winnerBytes = JSON.stringify({
+      name: "raced-writers",
+      description: "Concurrent winner",
+      createdAt: 1,
+      leadAgentId: "winner-lead",
+      leadSessionId: "winner-session",
+      members: [
+        {
+          agentId: "winner-lead",
+          name: "team-lead",
+          agentType: "lead",
+          joinedAt: 1,
+          tmuxPaneId: "",
+          cwd: root,
+          subscriptions: [],
+        },
+        {
+          agentId: "winner@raced-writers",
+          name: "winner",
+          agentType: "teammate",
+          joinedAt: 1,
+          tmuxPaneId: "",
+          cwd: root,
+          subscriptions: [],
+        },
+      ],
+    }, null, 2);
+    const writeFileSync = fs.writeFileSync.bind(fs) as any;
+    let winnerCreated = false;
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((file: any, data: any, options?: any) => {
+      if (!winnerCreated && String(file) === configFile) {
+        winnerCreated = true;
+        writeFileSync(configFile, winnerBytes);
+      }
+      return writeFileSync(file, data, options);
+    }) as any);
+
+    await expect(create.execute("loser", {
+      team_name: "raced-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(
+      'Team "raced-writers" already exists. Choose a different team_name, or stop that team first.'
+    );
+
+    expect(winnerCreated).toBe(true);
+    expect(fs.readFileSync(configFile, "utf-8")).toBe(winnerBytes);
+    expect(terminal.spawn).not.toHaveBeenCalled();
+  });
+
+  it("retains createTeam's replacement semantics for existing callers", async () => {
+    teams.createTeam("replaceable", "first-session", "first-lead");
+    await teams.addMember("replaceable", {
+      agentId: "writer@replaceable",
+      name: "writer",
+      agentType: "teammate",
+      joinedAt: 1,
+      tmuxPaneId: "",
+      cwd: root,
+      subscriptions: [],
+    } as Member);
+
+    teams.createTeam("replaceable", "replacement-session", "replacement-lead");
+
+    expect(await teams.readConfig("replaceable")).toMatchObject({
+      leadAgentId: "replacement-lead",
+      leadSessionId: "replacement-session",
+      members: [{ agentId: "replacement-lead", name: "team-lead" }],
+    });
+  });
+
+  it("preserves unexpected config creation failures", async () => {
+    const create = registerTools().get("create_predefined_team")!;
+    const configFile = paths.configPath("unwritable-writers");
+    const failure = Object.assign(new Error("filesystem unavailable"), { code: "EACCES" });
+    const writeFileSync = fs.writeFileSync.bind(fs) as any;
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((file: any, data: any, options?: any) => {
+      if (String(file) === configFile) throw failure;
+      return writeFileSync(file, data, options);
+    }) as any);
+
+    await expect(create.execute("io-failure", {
+      team_name: "unwritable-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, makeCtx())).rejects.toBe(failure);
+  });
+
   it("rejects direct thinking from a predefined agent definition", async () => {
     fs.writeFileSync(
       path.join(root, ".pi", "agents", "writer.md"),

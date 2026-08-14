@@ -13,23 +13,32 @@ export function teamExists(teamName: string) {
   return fs.existsSync(configPath(teamName));
 }
 
-export function createTeam(
-  name: string,
-  sessionId: string,
-  leadAgentId: string,
-  description = "",
-  defaultModel?: string,
-  separateWindows?: boolean,
-  metadata?: Record<string, any>
-): TeamConfig {
-  const dir = teamDir(name);
+export class TeamAlreadyExistsError extends Error {
+  constructor(readonly teamName: string) {
+    super(`Team "${teamName}" already exists.`);
+    this.name = "TeamAlreadyExistsError";
+  }
+}
+
+interface TeamCreationInput {
+  name: string;
+  sessionId: string;
+  leadAgentId: string;
+  description: string;
+  defaultModel?: string;
+  separateWindows?: boolean;
+  metadata?: Record<string, any>;
+}
+
+function createTeamWithMode(input: TeamCreationInput, exclusive: boolean): TeamConfig {
+  const dir = teamDir(input.name);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  const tasksDir = taskDir(name);
+  const tasksDir = taskDir(input.name);
   if (!fs.existsSync(tasksDir)) fs.mkdirSync(tasksDir, { recursive: true });
 
   const leadMember: Member = {
-    agentId: leadAgentId,
+    agentId: input.leadAgentId,
     name: "team-lead",
     agentType: "lead",
     joinedAt: Date.now(),
@@ -39,19 +48,53 @@ export function createTeam(
   };
 
   const config: TeamConfig = {
-    name,
-    description,
+    name: input.name,
+    description: input.description,
     createdAt: Date.now(),
-    leadAgentId,
-    leadSessionId: sessionId,
+    leadAgentId: input.leadAgentId,
+    leadSessionId: input.sessionId,
     members: [leadMember],
-    defaultModel,
-    separateWindows,
-    metadata,
+    defaultModel: input.defaultModel,
+    separateWindows: input.separateWindows,
+    metadata: input.metadata,
   };
 
-  fs.writeFileSync(configPath(name), JSON.stringify(config, null, 2));
+  const serialized = JSON.stringify(config, null, 2);
+  if (exclusive) {
+    try {
+      fs.writeFileSync(configPath(input.name), serialized, { flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+      throw new TeamAlreadyExistsError(input.name);
+    }
+  } else {
+    fs.writeFileSync(configPath(input.name), serialized);
+  }
   return config;
+}
+
+export function createTeam(
+  name: string,
+  sessionId: string,
+  leadAgentId: string,
+  description = "",
+  defaultModel?: string,
+  separateWindows?: boolean,
+  metadata?: Record<string, any>
+): TeamConfig {
+  return createTeamWithMode({ name, sessionId, leadAgentId, description, defaultModel, separateWindows, metadata }, false);
+}
+
+export function createTeamIfAbsent(
+  name: string,
+  sessionId: string,
+  leadAgentId: string,
+  description = "",
+  defaultModel?: string,
+  separateWindows?: boolean,
+  metadata?: Record<string, any>
+): TeamConfig {
+  return createTeamWithMode({ name, sessionId, leadAgentId, description, defaultModel, separateWindows, metadata }, true);
 }
 
 function readConfigRaw(p: string): TeamConfig {

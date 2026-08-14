@@ -99,7 +99,13 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
         pi,
       });
 
-      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
+      let config;
+      try {
+        config = teams.createTeamIfAbsent(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, defaultModel);
+      } catch (error) {
+        if (!(error instanceof teams.TeamAlreadyExistsError)) throw error;
+        throw new Error(`Team "${params.team_name}" already exists. Choose a different team_name, or stop that team first.`);
+      }
       options.adoptTeamAsLead(paths.sanitizeName(params.team_name), ctx);
 
       const agentDefinitions = predefined.getAllAgentDefinitions(projectDir);

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
+import { writeJsonAtomic } from "./atomic-json";
 import { withLock } from "./lock";
 import { readHelperQueuePath } from "./paths";
 import type { FavoriteModelSlot } from "./settings";
@@ -30,7 +31,7 @@ function readQueueRaw(queuePath: string): QueuedReadHelperRequest[] {
 }
 
 function writeQueueRaw(queuePath: string, queue: QueuedReadHelperRequest[]): void {
-  fs.writeFileSync(queuePath, JSON.stringify(queue, null, 2));
+  writeJsonAtomic(queuePath, queue);
 }
 
 export async function listReadHelperQueue(teamName: string): Promise<QueuedReadHelperRequest[]> {

@@ -17,6 +17,7 @@ function makeAgent(overrides: Partial<RunningReadAgent> = {}): RunningReadAgent 
     teamName: "team",
     startedAt: Date.now() - 60_000,
     tokensUsed: 42,
+    contextUsage: { tokens: 42, contextWindow: 200_000, percent: 0.021 },
     status: "thinking",
     recentEvents: [],
     lastActivityAt: Date.now(),
@@ -340,29 +341,58 @@ describe("agent follow component", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("renders live agent state and returns to main with up", () => {
-    let tokens = 42;
+  it("starts at zero instead of showing the pre-response message estimate", () => {
+    const tui = { terminal: { rows: 24 }, requestRender: vi.fn() };
+    const agent = makeAgent({
+      contextUsage: undefined,
+      session: {
+        messages: [{ role: "user", content: [{ type: "text", text: "A substantial agent mission" }] }],
+        getSessionStats: () => ({
+          tokens: { total: 0 },
+          contextUsage: { tokens: 597, contextWindow: 200_000, percent: 0.2985 },
+        }),
+      } as any,
+    });
+    const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [agent] });
+
+    const rendered = stripAnsi(component.render(120).join("\n"));
+    expect(rendered).toContain("0 tok (0%)");
+    expect(rendered).not.toContain("597 tok");
+    component.dispose();
+  });
+
+  it("renders current context usage instead of cumulative billed tokens", () => {
+    let billedTokens = 502_000;
+    let contextTokens = 46_000;
+    let contextPercent = 23;
     const done = vi.fn();
     const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
     const agent = makeAgent({
       session: {
         messages: [{ role: "assistant", content: [{ type: "text", text: "Working now" }] }],
-        getSessionStats: () => ({ tokens: { total: tokens } }),
+        getSessionStats: () => ({
+          tokens: { total: billedTokens },
+          contextUsage: { tokens: contextTokens, contextWindow: 200_000, percent: contextPercent },
+        }),
       } as any,
     });
     const component = createAgentFollowComponent(tui, done, { getAgents: () => [agent] });
 
     const first = component.render(140).join("\n");
-    expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 42 tok · Verifying assumptions\.{1,3}/);
+    expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 46k tok \(23%\) · Verifying assumptions\.{1,3}/);
+    expect(first).not.toContain("502k tok");
     expect(first).toContain("Working now");
     expect(stripAnsi(first)).not.toContain("progress:");
     expect(first).toContain("\x1b[48;2;22;23;32m");
     expect(first).not.toContain("\x1b[48;5;235m");
 
-    tokens = 2_300_000;
+    billedTokens = 2_300_000;
+    contextTokens = 80_000;
+    contextPercent = 40;
     agent.latestProgress = "Writing final report";
     const updated = component.render(140).join("\n");
-    expect(updated).toMatch(/2\.3M tok · Writing final report\.{1,3}/);
+    expect(updated).toMatch(/80k tok \(40%\) · Writing final report\.{1,3}/);
+    expect(updated).not.toContain("2.3M tok");
     expect(stripAnsi(updated)).not.toContain("progress:");
 
     component.handleInput("\x1b[A");
@@ -376,8 +406,21 @@ describe("agent follow component", () => {
     const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [agent] });
 
     const rendered = stripAnsi(component.render(80).join("\n"));
-    expect(rendered).toContain("42 tok · working");
+    expect(rendered).toContain("42 tok (0%) · working");
     expect(rendered).not.toContain("progress:");
+    component.dispose();
+  });
+
+  it("shows context usage as unknown immediately after compaction", () => {
+    const tui = { terminal: { rows: 20 }, requestRender: vi.fn() };
+    const agent = makeAgent({
+      contextUsage: { tokens: null, contextWindow: 200_000, percent: null },
+      latestProgress: undefined,
+      status: "thinking",
+    });
+    const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [agent] });
+
+    expect(stripAnsi(component.render(100).join("\n"))).toContain("? tok (?%) · thinking");
     component.dispose();
   });
 

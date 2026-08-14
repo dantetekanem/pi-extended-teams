@@ -107,6 +107,45 @@ describe("team panel items", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("does not raise an unhandled rejection when the auto-refresh read fails", async () => {
+    const config = teams.createTeam("team", "session", "lead", "", "provider/model");
+    fs.writeFileSync(paths.configPath("team"), JSON.stringify(config, null, 2));
+
+    const pi = {
+      registerCommand: vi.fn((_name: string, command: any) => {
+        pi.command = command;
+      }),
+      command: undefined as any,
+    };
+    registerTeamCommand(pi, panelOptions());
+
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    vi.useFakeTimers();
+
+    try {
+      await pi.command.handler("team", {
+        ui: {
+          notify: vi.fn(),
+          custom: vi.fn(async (factory: any) => {
+            factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, { fg: (_name: string, text: string) => text }, {}, vi.fn());
+          }),
+        },
+      });
+
+      fs.rmSync(paths.teamDir("team"), { recursive: true, force: true });
+      await vi.advanceTimersByTimeAsync(1100);
+      vi.useRealTimers();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(rejections).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
   it("keeps the team activity widget open and bounded for 300 active agents", () => {
     const snapshot = makeActivitySnapshot(300);
     const rendered = teamActivityStatusWidget(() => snapshot, () => false).render(80);

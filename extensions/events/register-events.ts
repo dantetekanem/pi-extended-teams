@@ -13,7 +13,8 @@ import { FAVORITE_MODEL_SLOTS, loadSettings } from "../../src/utils/settings";
 import { generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
 import { cleanupStaleSessionContextReferences } from "../internal/session-context-reference";
 
-export const LEAD_ORCHESTRATION_GUIDANCE = `\n\npi-extended-teams lead orchestration rules:\n- Choose tiers by the agent's intended outcome, not by vague task importance. read-review is the normal default for focused review, verification, and bounded synthesis.\n- Use read-collect when the lane gathers bounded facts without owning the conclusion. Use read-analyze when it must explain behavior or root cause across connected evidence. Reserve read-critical for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning.\n- For edits, use write-patch for a narrow localized change, write-feature for a bounded feature with a known design, write-system for a cross-cutting integration/refactor within explicitly claimed files, and write-critical only for high-risk security, concurrency, recovery, migration, or data-integrity changes.\n- Prefer the canonical read-*/write-* tiers. Legacy reading-*/writing-* names are compatibility aliases for this minor release, not intent guidance.\n- A spawned agent owns its assigned lane until it reports, blocks, fails, or the user cancels it. Do not duplicate, take over, test, edit, or synthesize that same lane in parallel; work only on clearly unrelated lanes.\n- When no unrelated work remains, wait literally idle for the automatic report prompt. Do not sleep, poll, repeatedly call read_inbox/check status, send nudges, do dummy work, or treat healthy silence as failure.\n- Wait for the actual report before synthesizing. Intervene only on a reported blocker/error, actual health failure, explicit user cancellation/change, or a genuinely finished agent that remains active.\n- Before implementing a durable bug/security/testing claim sourced from an agent report or backlog, confirm it with a separate read-only agent using the intent tier that fits the confirmation; importance alone does not justify read-critical.`;
+export const LEAD_ORCHESTRATION_GUIDANCE = `\n\npi-extended-teams lead orchestration rules:\n- Choose tiers by the agent's intended outcome, not by vague task importance. read-review is the normal default for focused review, verification, and bounded synthesis.\n- Use read-collect when the lane gathers bounded facts without owning the conclusion. Use read-analyze when it must explain behavior or root cause across connected evidence. Reserve read-critical for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning.\n- For edits, use write-patch for a narrow localized change, write-feature for a bounded feature with a known design, write-system for a cross-cutting integration/refactor within explicitly claimed files, and write-critical only for high-risk security, concurrency, recovery, migration, or data-integrity changes.\n- Prefer the canonical read-*/write-* tiers. Legacy reading-*/writing-* names are compatibility aliases for this minor release, not intent guidance.\n- A spawned agent owns its assigned lane until it reports, blocks, fails, or the user cancels it. Do not duplicate, take over, test, edit, or synthesize that same lane in parallel; work only on clearly unrelated lanes.\n- When no unrelated work remains, wait literally idle for the automatic report prompt. Do not sleep, poll, repeatedly call read_inbox/check status, send nudges, do dummy work, or treat healthy silence as failure.\n- Wait for the actual report before synthesizing. Intervene only on a reported blocker/error, actual health failure, explicit user cancellation/change, or a genuinely finished agent that remains active.\n- For durable bug, security, or testing claims from an agent report or backlog, concrete, reproducible findings with file/line evidence or a focused failing regression may proceed directly to TDD repair.
+- Use a separate read-only confirmation only when evidence is missing or weak, the claim is disputed, or irreducible high-risk uncertainty remains; never reconfirm an already confirmed finding.`;
 
 export interface RegisterEventsOptions {
   isTeammate: boolean;
@@ -79,11 +80,28 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     }, delayMs);
   };
 
+  const modelContextWindow = (ctx: any): number => {
+    return typeof ctx?.model?.contextWindow === "number" ? ctx.model.contextWindow : 0;
+  };
+
   const teammateRuntimeUpdates = (ctx: any, updates: Partial<runtime.AgentRuntimeStatus>, currentAssistantMessage?: any) => {
     const usage = summarizeSessionUsage(ctx, currentAssistantMessage);
+    const contextWindow = modelContextWindow(ctx);
+    const hasMeasuredUsage = typeof usage.tokensUsed === "number" && usage.tokensUsed > 0;
+    let contextUsage: runtime.ContextUsageSnapshot = hasMeasuredUsage
+      ? { tokens: null, contextWindow, percent: null }
+      : runtime.initialContextUsage(contextWindow);
+    if (hasMeasuredUsage) {
+      try {
+        contextUsage = ctx?.getContextUsage?.() ?? contextUsage;
+      } catch {
+        // Context telemetry is best-effort while the teammate session is settling.
+      }
+    }
     return {
       ...updates,
       ...(typeof usage.tokensUsed === "number" ? { tokensUsed: usage.tokensUsed } : {}),
+      contextUsage,
     };
   };
 
@@ -164,6 +182,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           ready: false,
           currentAction: "starting",
           activeToolName: undefined,
+          contextUsage: runtime.initialContextUsage(modelContextWindow(ctx)),
           lastError: undefined,
         });
       }
@@ -212,10 +231,11 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             }
           } catch (e) {
             if (!teammateInboxDisposed) {
+              // Wake callers are fire-and-forget.
               await writeTeammateRuntimeStatus(teamName, {
                 lastHeartbeatAt: Date.now(),
                 lastError: runtime.createRuntimeError(e),
-              });
+              }).catch(() => {});
             }
           } finally {
             wakeInFlight = false;

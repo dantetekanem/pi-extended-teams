@@ -31,16 +31,15 @@ export function findLeadTeamForSession(sessionId?: string): string | null {
     if (!fs.existsSync(teamsDir)) return null;
 
     for (const teamDir of fs.readdirSync(teamsDir)) {
-      const sessionFile = paths.leadSessionPath(teamDir);
-      if (fs.existsSync(sessionFile)) {
-        try {
-          const session = JSON.parse(fs.readFileSync(sessionFile, "utf-8"));
-          if (session.sessionId === sessionId && session.pid === process.pid) {
-            return teamDir;
-          }
-        } catch {
-          // ignore invalid session files
+      try {
+        const sessionFile = paths.leadSessionPath(teamDir);
+        if (!fs.existsSync(sessionFile)) continue;
+        const session = JSON.parse(fs.readFileSync(sessionFile, "utf-8"));
+        if (session.sessionId === sessionId && session.pid === process.pid) {
+          return teamDir;
         }
+      } catch {
+        // ignore entries that are not valid team names, and invalid session files
       }
     }
   } catch {

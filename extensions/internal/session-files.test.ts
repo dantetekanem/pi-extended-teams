@@ -110,6 +110,13 @@ describe("session file cleanup", () => {
     expect(findLeadTeamForSession("missing-session-id")).toBeNull();
   });
 
+  it("findLeadTeamForSession ignores stray entries that are not valid team names", () => {
+    writeTeam("current-session", { leadPid: process.pid, sessionId: "current-session-id" });
+    fs.writeFileSync(path.join(teamsRoot, ".DS_Store"), "stray");
+
+    expect(findLeadTeamForSession("current-session-id")).toBe("current-session");
+  });
+
   it("findLeadTeamForSession does not attach a matching session owned by another process", () => {
     writeTeam("same-session-other-pid", { leadPid: 99999999, sessionId: "current-session-id" });
 

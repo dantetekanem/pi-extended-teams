@@ -107,6 +107,8 @@ function readUnlocked(teamName: string, agentName: string, tombstonePath: string
     }
     return { status: "occupied", tombstone: parsed };
   } catch (error) {
+    // clearMatching may unlink between the existence probe and this read.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" };
     return { status: "corrupt", error: `Lifecycle tombstone could not be read: ${errorText(error)}` };
   }
 }

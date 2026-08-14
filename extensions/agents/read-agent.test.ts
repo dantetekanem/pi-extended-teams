@@ -341,6 +341,42 @@ describe("in-process read agent tool wiring", () => {
     expect(runningReadAgents.size).toBe(0);
   });
 
+  it("stops heartbeating when lifecycle teardown is refused by an unreadable fence", async () => {
+    const session = makeSession();
+    session.prompt.mockImplementation(async () => {
+      const fence = paths.lifecycleTombstonePath("team", "reader");
+      fs.mkdirSync(path.dirname(fence), { recursive: true });
+      fs.writeFileSync(fence, "{ malformed");
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const member = { ...fixtureMember("reader"), prompt: "investigate" };
+    writeTeamConfig("team", member);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    let observed: RunningReadAgent | undefined;
+
+    await expect(runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, {
+      isTeammate: false,
+      getTeamName: () => "team",
+      runningReadAgents,
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: (key: string, state: RunningReadAgent) => {
+        observed = state;
+        return runningReadAgents.get(key) === state;
+      },
+      ensureReadAgentStatusTicker: vi.fn(),
+      renderReadAgentStatus: vi.fn(),
+      rememberCompletedAgentReport: vi.fn(),
+      emitAgentReport: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+    })).rejects.toThrow(/lifecycle-quarantined by a corrupt tombstone/);
+
+    expect(observed).toBeDefined();
+    expect(observed!.heartbeatTimer).toBeUndefined();
+    expect(observed!.messageDeliveryClosed).toBe(true);
+  });
+
   it("injects teammate-safe communication tools and guidance into nested read-agent sessions", async () => {
     const session = makeSession();
     piMocks.createAgentSession.mockResolvedValue({ session });
@@ -1909,7 +1945,7 @@ describe("in-process read agent tool wiring", () => {
     expect(renderReadAgentStatus).toHaveBeenCalledTimes(7);
   });
 
-  it("refreshes exact session stats on every update even when message history is unchanged", () => {
+  it("ignores pre-response estimates and adopts provider context usage on the first measured update", () => {
     const state = {
       runId: "run-reader",
       name: "reader",
@@ -1920,21 +1956,30 @@ describe("in-process read agent tool wiring", () => {
       recentEvents: [],
       lastActivityAt: 0,
     } as RunningReadAgent;
-    let tokensUsed = 42;
+    let tokensUsed = 0;
+    let contextTokens = 597;
+    let contextPercent = 0.3;
     const session = {
       messages: [{ role: "user", content: "prompt" }],
-      getSessionStats: vi.fn(() => ({ tokens: { total: tokensUsed } })),
+      getSessionStats: vi.fn(() => ({
+        tokens: { total: tokensUsed },
+        contextUsage: { tokens: contextTokens, contextWindow: 200_000, percent: contextPercent },
+      })),
     } as any;
     const renderReadAgentStatus = vi.fn();
     const update = { type: "message_update", message: { role: "toolResult", content: "partial" } };
 
     handleReadAgentSessionEvent(state, session, update, renderReadAgentStatus);
-    expect(state.tokensUsed).toBe(42);
-    tokensUsed = 43;
+    expect(state.tokensUsed).toBe(0);
+    expect(state.contextUsage).toEqual({ tokens: 0, contextWindow: 200_000, percent: 0 });
+    tokensUsed = 2_300_000;
+    contextTokens = 80_000;
+    contextPercent = 40;
     handleReadAgentSessionEvent(state, session, update, renderReadAgentStatus);
 
     expect(session.getSessionStats).toHaveBeenCalledTimes(2);
-    expect(state.tokensUsed).toBe(43);
+    expect(state.tokensUsed).toBe(2_300_000);
+    expect(state.contextUsage).toEqual({ tokens: 80_000, contextWindow: 200_000, percent: 40 });
     expect(renderReadAgentStatus).toHaveBeenCalledTimes(2);
   });
 

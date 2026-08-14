@@ -8,6 +8,7 @@ Ensure a completed spawned read agent always delivers meaningful report content 
 
 - Fix the read-agent completion/reporting path that currently emits `Read agent completed, but produced no assistant text.`
 - Prefer the canonical final report/assistant text produced by the child.
+- Deliver the report to the lead model as a hidden follow-up message; do not render the full report body in the lead transcript.
 - Handle valid Pi message content shapes and completion ordering without discarding text.
 - Preserve enough durable child-run/session metadata to restore or inspect output after the child settles.
 - Make fallback behavior actionable and specific; never represent an empty extraction as a successful usable report.
@@ -23,8 +24,9 @@ Ensure a completed spawned read agent always delivers meaningful report content 
 3. When no assistant/report text exists in any recoverable source, the lead receives an explicit diagnostic containing a stable child session/run pointer and retrieval guidance; the result is not silently treated as a usable report.
 4. Focused automated tests cover normal extraction, durable recovery, and irrecoverable-empty diagnostics.
 5. After roster removal, the lead can retrieve the latest persisted report through `check_teammate` without exposing it to teammate callers.
-6. Existing focused read-agent/lifecycle/report tests and TypeScript type checking pass.
-7. A fresh read-only non-author review finds no material correctness, lifecycle, cleanup, authorization, or regression issue in the final diff.
+6. Direct report delivery still wakes and supplies the lead model with the full report, but the custom message has `display: false` so the report body is not rendered in the transcript.
+7. Existing focused read-agent/lifecycle/report tests and TypeScript type checking pass.
+8. A fresh read-only non-author review finds no material correctness, lifecycle, cleanup, authorization, or regression issue in the final diff.
 
 ## Definition of done
 

@@ -95,12 +95,17 @@ function markReadAgentActivity(
 }
 
 function refreshReadAgentStats(agent: RunningReadAgent, session: AgentSession, activityAlreadyMarked = false): void {
-  const tokensUsed = session.getSessionStats().tokens.total;
+  const stats = session.getSessionStats();
+  const tokensUsed = stats.tokens.total;
   if (tokensUsed !== agent.tokensUsed && !activityAlreadyMarked) {
     agent.lastActivityAt = Date.now();
     agent.idleNudgeLevel = undefined;
   }
   agent.tokensUsed = tokensUsed;
+  const contextUsage = stats.contextUsage ?? session.getContextUsage?.();
+  agent.contextUsage = tokensUsed > 0
+    ? contextUsage
+    : runtime.initialContextUsage(contextUsage?.contextWindow);
 }
 
 const MAX_ASSISTANT_PROGRESS_SNIPPET_CHARS = 180;
@@ -478,6 +483,7 @@ export async function runReadAgentInProcess(
     role,
     startedAt: Date.now(),
     tokensUsed: 0,
+    contextUsage: runtime.initialContextUsage(),
     status: "starting",
     recentEvents: [],
     lastActivityAt: Date.now(),
@@ -1044,8 +1050,12 @@ export async function runReadAgentInProcess(
   } finally {
     pendingParentWakeSignals.delete(state);
     settleSessionCreation(state.session);
+    // End run-owned activity even when persisted lifecycle cleanup is refused.
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = undefined;
+    closeReadAgentMessageDelivery(state);
     const teardown = await shutdownTeammate(readTeamName, member, { reason: "quit" });
-    if (teardown.finalized && pendingChildController && pendingChildParent) {
+    if (pendingChildController && pendingChildParent) {
       pendingChildController.forgetParent(pendingChildParent);
     }
     if (!teardown.finalized) options.renderReadAgentStatus();

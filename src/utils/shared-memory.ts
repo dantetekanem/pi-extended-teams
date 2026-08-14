@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { writeJsonAtomic } from "./atomic-json";
 import { withLock } from "./lock";
 import { sharedMemoryPath } from "./paths";
 
@@ -24,7 +25,7 @@ function readMemoryRaw(p: string): Record<string, SharedMemoryEntry> {
 }
 
 function writeMemoryRaw(p: string, memory: Record<string, SharedMemoryEntry>): void {
-  fs.writeFileSync(p, JSON.stringify(memory, null, 2));
+  writeJsonAtomic(p, memory);
 }
 
 export async function writeSharedMemory(

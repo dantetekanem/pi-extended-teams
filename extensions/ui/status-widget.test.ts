@@ -87,6 +87,36 @@ describe("agent activity status widget", () => {
     }
   });
 
+  it("updates a context-only suffix immediately instead of animating it as progress", () => {
+    let snapshot = makeSnapshot({
+      activeCount: 1,
+      readCount: 1,
+      entries: [{
+        name: "reader",
+        role: "read",
+        displayText: "(reader) model/high · read-review · 1s · 46k tok (23%)",
+      }],
+    });
+    const widget = teamActivityStatusWidget(() => snapshot, () => false);
+
+    expect(widget.render(120).join("\n")).toContain("46k tok (23%)");
+    snapshot = makeSnapshot({
+      activeCount: 1,
+      readCount: 1,
+      updatedAt: snapshot.updatedAt + 1,
+      entries: [{
+        name: "reader",
+        role: "read",
+        displayText: "(reader) model/high · read-review · 2s · 80k tok (40%)",
+      }],
+    });
+    const updated = widget.render(120).join("\n");
+
+    expect(updated).toContain("80k tok (40%)");
+    expect(updated).not.toContain("46k tok (23%)");
+    widget.dispose();
+  });
+
   it("keeps expanded rendering bounded while surfacing the aggregate summary", () => {
     const entries = Array.from({ length: 12 }, (_, index) => ({
       name: `reader-${index}`,

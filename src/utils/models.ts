@@ -97,6 +97,7 @@ export interface TeamReportEvent {
   status: "completed" | "failed";
   report: string;
   summary?: string;
+  reportPath?: string;
   createdAt: number;
   startedAt?: number;
   elapsedMs?: number;

@@ -47,6 +47,7 @@ describe("task runtime tools", () => {
     vi.spyOn(paths, "reportEventsPath").mockImplementation((teamName) => {
       return path.join(root, String(teamName), "reports.json");
     });
+    vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
   });
 
   afterEach(() => {

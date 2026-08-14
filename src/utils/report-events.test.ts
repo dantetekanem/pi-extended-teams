@@ -29,6 +29,7 @@ describe("report events", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-reports-"));
     vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName))));
+    vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
   });
 
   afterEach(() => {
@@ -120,6 +121,27 @@ describe("report events", () => {
     expect(sortSpy).not.toHaveBeenCalled();
     sortSpy.mockRestore();
     await expect(listTeamReportEvents("team")).resolves.toMatchObject([{ id: "one" }, { id: "two" }]);
+  });
+
+  it("writes plain-text reports under the session and versions repeated agent names", async () => {
+    const reportFilesDir = path.join(root, "agent", "reports");
+    const getReportFilesDir = (paths as any).reportFilesDir;
+    if (typeof getReportFilesDir !== "function") throw new Error("reportFilesDir is not implemented");
+    vi.spyOn(paths as any, "reportFilesDir").mockReturnValue(reportFilesDir);
+
+    const first = await appendTeamReportEvent("team", event({ id: "one", createdAt: 100, report: "first report", summary: "First" }));
+    const second = await appendTeamReportEvent("team", event({ id: "two", createdAt: 200, report: "second report", summary: "Second" }));
+    const sessionDir = path.join(reportFilesDir, "team");
+
+    expect(path.dirname((first as any).reportPath)).toBe(sessionDir);
+    expect(path.basename((first as any).reportPath)).toBe("reader.md");
+    expect(path.basename((second as any).reportPath)).toBe("reader-v2.md");
+    expect(fs.readFileSync((first as any).reportPath, "utf-8")).toBe("first report");
+    expect(fs.readFileSync((second as any).reportPath, "utf-8")).toBe("second report");
+    await expect(listTeamReportEvents("team")).resolves.toMatchObject([
+      { id: "one", report: "first report", summary: "First", reportPath: (first as any).reportPath },
+      { id: "two", report: "second report", summary: "Second", reportPath: (second as any).reportPath },
+    ]);
   });
 
   it("returns the original event for duplicate ids", async () => {

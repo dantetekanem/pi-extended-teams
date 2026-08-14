@@ -84,6 +84,7 @@ function installPathSpies() {
   vi.spyOn(paths, "reportEventsPath").mockImplementation((teamName: unknown) => {
     return path.join(root, "teams", paths.sanitizeName(String(teamName)), "reports.json");
   });
+  vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => {
     return path.join(root, "teams", paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`);
   });
@@ -209,6 +210,10 @@ describe("in-process read agent tool wiring", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("isolates completed report persistence in the test temp directory", () => {
+    expect(paths.reportFilesDir()).toBe(path.join(root, "agent", "reports"));
   });
 
   it("steers scope updates directly into an active in-process agent", async () => {

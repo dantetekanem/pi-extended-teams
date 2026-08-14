@@ -24,6 +24,12 @@ function installPathSpies() {
   vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName: string, agentName: string) => {
     return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "runtime", `${paths.sanitizeName(String(agentName))}.json`);
   });
+  vi.spyOn(paths, "reportEventsPath").mockImplementation((teamName: string) => {
+    return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "reports.json");
+  });
+  if (typeof (paths as any).reportFilesDir === "function") {
+    vi.spyOn(paths as any, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
+  }
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: string, agentName: string) => {
     return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`);
   });
@@ -211,7 +217,7 @@ describe("coordination tools", () => {
     });
 
     const sendSpy = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
-    const reportEventSpy = vi.spyOn(reportEvents, "appendTeamReportEvent").mockResolvedValue({} as any);
+    const reportEventSpy = vi.spyOn(reportEvents, "appendTeamReportEvent");
     let notifyClaimReleaseStarted!: () => void;
     const claimReleaseStarted = new Promise<void>((resolve) => { notifyClaimReleaseStarted = resolve; });
     let finishClaimRelease!: () => void;
@@ -314,6 +320,12 @@ describe("coordination tools", () => {
       modelSlot: "write-system",
       metadata: { modelSlot: "write-system" },
     }));
+    expect(reportEventSpy.mock.invocationCallOrder[0]).toBeLessThan(sendSpy.mock.invocationCallOrder[0]);
+    const [persistedReport] = await reportEvents.listTeamReportEvents(teamName, { agentName, limit: 1 });
+    expect(result.details.reportPath).toBe(persistedReport.reportPath);
+    expect(path.dirname(result.details.reportPath)).toBe(path.join(root, "agent", "reports", teamName));
+    expect(path.basename(result.details.reportPath)).toBe("writer.md");
+    expect(fs.readFileSync(result.details.reportPath, "utf-8")).toBe("done");
     expect(JSON.stringify({ inbox: sendSpy.mock.calls, events: reportEventSpy.mock.calls })).not.toContain("writing-hard");
     expect(fs.existsSync(pidFile)).toBe(true);
     expect(await runtime.readRuntimeStatus(teamName, agentName)).toMatchObject({ lifecycleRunId: runId, ready: true });
@@ -337,6 +349,51 @@ describe("coordination tools", () => {
     await vi.runOnlyPendingTimersAsync();
     expect(terminal.kill).not.toHaveBeenCalled();
     expect(ctx.shutdown).toHaveBeenCalled();
+  });
+
+  it("does not send or release claims when report-event persistence fails", async () => {
+    const teamName = "report-persistence-failure-team";
+    const agentName = "writer";
+    const runId = "writer-run";
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", runId);
+    writeConfig({
+      name: teamName,
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), member(agentName, { lifecycleRunId: runId })],
+    });
+
+    const appendError = new Error("report file unavailable");
+    vi.spyOn(reportEvents, "appendTeamReportEvent").mockRejectedValue(appendError);
+    const sendPlainMessage = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
+    const releaseAllClaimsForAgent = vi.fn(async () => []);
+    const tools = new Map<string, any>();
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      agentName,
+      isTeammate: true,
+      terminal: undefined,
+      getTeamName: () => teamName,
+      requireWriteAgentTeam: async () => teamName,
+      requireTeamContext: (explicitTeamName?: string) => explicitTeamName || teamName,
+      releaseAllClaimsForAgent,
+      drainWriteQueue: vi.fn(async () => {}),
+      resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(),
+      renderLeadInboxStatus: vi.fn(async () => {}),
+      resetLeadWakeNotifiedCount: vi.fn(),
+    });
+
+    await expect(tools.get("report_and_exit").execute(
+      "report",
+      { content: "must persist", summary: "Done" },
+      new AbortController().signal,
+      vi.fn(),
+      { cwd: root, shutdown: vi.fn() },
+    )).rejects.toBe(appendError);
+    expect(sendPlainMessage).not.toHaveBeenCalled();
+    expect(releaseAllClaimsForAgent).not.toHaveBeenCalled();
   });
 
   it("rejects an R1 report when the roster already belongs to R2 without fencing or changing R2", async () => {

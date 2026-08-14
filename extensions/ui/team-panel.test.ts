@@ -29,6 +29,7 @@ function installPathSpies() {
   });
   vi.spyOn(paths, "claimsPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "claims.json"));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`));
+  vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
 }
 
 function panelOptions(overrides: any = {}) {

@@ -126,6 +126,23 @@ function defaultEventId(teamName: string, event: NewTeamReportEvent): string {
   return crypto.randomUUID();
 }
 
+function writeStandaloneReport(teamName: string, agentName: string, report: string): string {
+  const dir = path.join(paths.reportFilesDir(), paths.sanitizeName(teamName));
+  const baseName = paths.sanitizeName(agentName);
+  fs.mkdirSync(dir, { recursive: true });
+
+  for (let version = 1; ; version += 1) {
+    const suffix = version === 1 ? "" : `-v${version}`;
+    const reportPath = path.join(dir, `${baseName}${suffix}.md`);
+    try {
+      fs.writeFileSync(reportPath, report, { encoding: "utf-8", flag: "wx" });
+      return reportPath;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+}
+
 function lowerBoundCreatedAt(events: TeamReportEvent[], since: number): number {
   let low = 0;
   let high = events.length;
@@ -187,6 +204,7 @@ export async function appendTeamReportEvent(teamName: string, event: NewTeamRepo
     const existing = cache.byId.get(normalized.id);
     if (existing) return cloneTeamReportEvent(existing);
 
+    normalized.reportPath = writeStandaloneReport(teamName, normalized.agentName, normalized.report);
     writeEventsRaw(p, insertEvent(cache.events, normalized), { sorted: true });
     return cloneTeamReportEvent(normalized);
   });

@@ -129,7 +129,7 @@ describe("legacy tmux writer resource plan", () => {
     );
   });
 
-  it("does not let an R1 spawn rollback remove an R2 replacement admitted during awaited debug logging", async () => {
+  it("releases the failed writer's sleep assertion even when a replacement run is admitted", async () => {
     let replacementAdmitted = false;
     let notifyFailureLogged!: () => void;
     const failureLogged = new Promise<void>(resolve => { notifyFailureLogged = resolve; });
@@ -146,9 +146,15 @@ describe("legacy tmux writer resource plan", () => {
         : [],
     }));
     const onWriterInactive = vi.fn();
+    const releaseSleepAssertion = vi.fn();
+    const sleepController = {
+      retain: vi.fn(() => releaseSleepAssertion),
+      dispose: vi.fn(),
+    };
     const runtime = createWriteAgentRuntime({
       terminal: { spawn: vi.fn(() => { throw new Error("spawn failed"); }) },
       onWriterInactive,
+      sleepController,
       createResourcePlan: async () => ({
         selectionMode: "explicit",
         extensionPaths: [],
@@ -170,6 +176,42 @@ describe("legacy tmux writer resource plan", () => {
     expect(mocks.deleteRuntimeStatusUnderLifecycleLock).not.toHaveBeenCalled();
     expect(mocks.removeMemberMatchingRun).not.toHaveBeenCalled();
     expect(onWriterInactive).not.toHaveBeenCalled();
+    expect(sleepController.retain).toHaveBeenCalledOnce();
+    expect(releaseSleepAssertion).toHaveBeenCalledOnce();
+  });
+
+  it("holds a sleep assertion until the successful writer lifecycle is released", async () => {
+    const releaseSleepAssertion = vi.fn();
+    const sleepController = {
+      retain: vi.fn(() => releaseSleepAssertion),
+      dispose: vi.fn(),
+    };
+    const runtime = createWriteAgentRuntime({
+      terminal: {
+        spawn: vi.fn(() => "%writer"),
+        getWindowIdForPane: vi.fn(() => "@writer"),
+      },
+      sleepController,
+      createResourcePlan: async () => ({
+        selectionMode: "explicit",
+        extensionPaths: [],
+        selfExtensionPath: "self.ts",
+        extensions: [],
+        diagnostics: [],
+        skills: "all",
+        trust: { cwd: "/trusted/project", projectTrusted: true },
+      }),
+    });
+    const member = writer();
+
+    await runtime.startWriteAgent("team", member, "implement the task");
+
+    expect(sleepController.retain).toHaveBeenCalledOnce();
+    expect(releaseSleepAssertion).not.toHaveBeenCalled();
+
+    runtime.releaseWriteAgentSleepAssertion("team", member);
+    runtime.releaseWriteAgentSleepAssertion("team", member);
+    expect(releaseSleepAssertion).toHaveBeenCalledOnce();
   });
 
   it("uses one immutable plan for preflight and spawn and propagates its trust snapshot", async () => {

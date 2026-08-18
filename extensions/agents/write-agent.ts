@@ -14,6 +14,7 @@ import {
   type SpawnResourcePlan,
 } from "../resources/spawn-resource-plan";
 import { readLifecycleTombstone, withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
+import type { ActiveAgentSleepController } from "../runtime/active-agent-sleep";
 
 export interface WriteAgentRuntimeOptions {
   terminal: any;
@@ -21,6 +22,7 @@ export interface WriteAgentRuntimeOptions {
   onWriterInactive?(teamName: string, member: Member): void;
   getProjectTrusted?(cwd: string): boolean;
   createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
+  sleepController?: ActiveAgentSleepController;
 }
 
 function assertWriterUsesConfiguredLevel(member: Member): void {
@@ -36,6 +38,26 @@ function assertWriterUsesConfiguredLevel(member: Member): void {
 
 export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
   let writeQueueDraining = false;
+  const writerSleepAssertions = new Map<string, () => void>();
+
+  function writerSleepAssertionKey(teamName: string, member: Member): string | null {
+    return member.lifecycleRunId ? `${teamName}:${member.name}:${member.lifecycleRunId}` : null;
+  }
+
+  function retainWriteAgentSleepAssertion(teamName: string, member: Member): void {
+    const key = writerSleepAssertionKey(teamName, member);
+    if (!key || writerSleepAssertions.has(key) || !options.sleepController) return;
+    writerSleepAssertions.set(key, options.sleepController.retain());
+  }
+
+  function releaseWriteAgentSleepAssertion(teamName: string, member: Member): void {
+    const key = writerSleepAssertionKey(teamName, member);
+    if (!key) return;
+    const release = writerSleepAssertions.get(key);
+    if (!release) return;
+    writerSleepAssertions.delete(key);
+    release();
+  }
 
   async function startWriteAgent(teamName: string, member: Member, prompt: string): Promise<string> {
     assertWriterUsesConfiguredLevel(member);
@@ -143,6 +165,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       const teamConfig = await teams.readConfig(teamName);
       const leadMember = teamConfig.members.find(m => m.name === "team-lead");
       const anchorPaneId = leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined;
+      retainWriteAgentSleepAssertion(teamName, member);
       const terminalId = options.terminal.spawn({
         name: member.name,
         cwd: member.cwd,
@@ -170,20 +193,24 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
         stack: e instanceof Error ? e.stack ?? null : null,
         debugLogPath: debugLogPath ?? null,
       }, settings);
-      await withLifecycleTombstoneLock(teamName, member.name, async lifecycleLock => {
-        const fence = lifecycleLock.read();
-        if (fence.status === "corrupt") return;
-        if (fence.status === "occupied" && fence.tombstone.runId !== failedRunId) return;
+      try {
+        await withLifecycleTombstoneLock(teamName, member.name, async lifecycleLock => {
+          const fence = lifecycleLock.read();
+          if (fence.status === "corrupt") return;
+          if (fence.status === "occupied" && fence.tombstone.runId !== failedRunId) return;
 
-        const currentConfig = await teams.readConfig(teamName).catch(() => null);
-        const currentMember = currentConfig?.members.find(item => item.name === member.name);
-        if (!currentMember || currentMember.lifecycleRunId !== failedRunId) return;
+          const currentConfig = await teams.readConfig(teamName).catch(() => null);
+          const currentMember = currentConfig?.members.find(item => item.name === member.name);
+          if (!currentMember || currentMember.lifecycleRunId !== failedRunId) return;
 
-        options.onWriterInactive?.(teamName, currentMember);
-        await messaging.removeInboxMessagesByOperationUnderLifecycleLock(teamName, member.name, bootstrapOperationId);
-        await runtime.deleteRuntimeStatusUnderLifecycleLock(teamName, member.name, failedRunId);
-        await teams.removeMemberMatchingRun(teamName, member.name, failedRunId);
-      });
+          options.onWriterInactive?.(teamName, currentMember);
+          await messaging.removeInboxMessagesByOperationUnderLifecycleLock(teamName, member.name, bootstrapOperationId);
+          await runtime.deleteRuntimeStatusUnderLifecycleLock(teamName, member.name, failedRunId);
+          await teams.removeMemberMatchingRun(teamName, member.name, failedRunId);
+        });
+      } finally {
+        releaseWriteAgentSleepAssertion(teamName, member);
+      }
       const debugHint = debugLogPath ? ` (debug log: ${debugLogPath})` : "";
       throw new Error(`Failed to spawn background tmux screen: ${e}${debugHint}`);
     }
@@ -284,5 +311,5 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
     }
   }
 
-  return { startWriteAgent, drainWriteQueue };
+  return { startWriteAgent, drainWriteQueue, releaseWriteAgentSleepAssertion };
 }

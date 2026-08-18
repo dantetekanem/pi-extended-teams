@@ -86,10 +86,11 @@ export default function (pi: ExtensionAPI) {
   let teamToolsRuntime: TeamToolsRuntime | undefined;
   const pendingChildController = createPendingChildController();
   const activeAgentSleepController = createActiveAgentSleepController();
-  const { startWriteAgent, drainWriteQueue } = createWriteAgentRuntime({
+  const { startWriteAgent, drainWriteQueue, releaseWriteAgentSleepAssertion } = createWriteAgentRuntime({
     terminal,
     getProjectTrusted: (cwd) => parentProjectTrustForSpawn(sessionCtx, cwd),
     createResourcePlan: createCurrentSpawnResourcePlan,
+    sleepController: activeAgentSleepController,
     onWriterActive: (tab) => upsertWriterScreenTab(writerScreenState, tab),
     onWriterInactive: (targetTeamName, member) => removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId }),
   });
@@ -104,7 +105,10 @@ export default function (pi: ExtensionAPI) {
     getSessionCwd: () => sessionCtx?.cwd,
     getTeamName: () => teamName,
     extensionInstanceId,
-    onWriterInactive: (targetTeamName, member) => removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId }),
+    onWriterInactive: (targetTeamName, member) => {
+      releaseWriteAgentSleepAssertion(targetTeamName, member);
+      removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId });
+    },
     onTeammateClosing: (targetTeamName, member) => {
       if (!member.lifecycleRunId) return;
       pendingChildController.cancelParent({

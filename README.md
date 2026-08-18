@@ -69,7 +69,7 @@ spawn_agent({
 
 ### macOS sleep behavior
 
-While at least one in-process agent is active, pi-extended-teams holds one `/usr/bin/caffeinate -i` assertion. This prevents idle system sleep so agents can finish, but intentionally allows the display to dim and sleep. The assertion is released after the last agent settles or the lead Pi exits. It does not override lid-close sleep, manual sleep, shutdown, battery exhaustion, or process failure; other platforms and Macs without `caffeinate` use a safe no-op fallback.
+While at least one read or write agent is active, pi-extended-teams holds one shared `/usr/bin/caffeinate -i` assertion. This prevents idle system sleep so agents can finish, but intentionally allows the display to dim and sleep. The assertion is released after the last agent settles or the lead Pi exits. It does not override lid-close sleep, manual sleep, shutdown, battery exhaustion, or process failure; other platforms and Macs without `caffeinate` use a safe no-op fallback.
 
 ## Public tool surface
 

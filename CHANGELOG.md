@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.14] - 2026-08-17
+
+### Fixed
+- Keep macOS idle-sleep protection active for tmux-based write agents as well as in-process read agents.
+
 ## [2.1.13] - 2026-08-01
 
 ### Fixed

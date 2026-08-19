@@ -207,7 +207,7 @@ describe("extension integration", () => {
     vi.useRealTimers();
   });
 
-  it("registers the small public tool surface without legacy /agents or /team commands", async () => {
+  it("registers the small public tool surface without legacy management commands", async () => {
     const setup = await setupExtension();
     try {
       expect(Array.from(setup.tools.keys()).sort()).toEqual([
@@ -1393,6 +1393,18 @@ describe("extension integration", () => {
 
       expect(ctx.ui.custom).toHaveBeenCalledOnce();
       expect(followedComponent.render(140).join("\n")).toContain("Live agent output");
+
+      followedComponent.handleInput("x");
+      await vi.advanceTimersByTimeAsync(1);
+      const messaging = await import("../src/utils/messaging.js");
+      const leadMessages = await messaging.readInbox("session-follow-session", "team-lead", false, false);
+      expect(leadMessages).toContainEqual(expect.objectContaining({
+        from: "system",
+        summary: "Subagent reader kill incomplete",
+        text: "The user tried to kill subagent reader, but teardown ended with status cleanup_failed.",
+        read: false,
+      }));
+
       followedComponent.handleInput("\x1b[A");
       expect(done).toHaveBeenCalledOnce();
       followedComponent.dispose();

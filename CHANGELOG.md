@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.15] - 2026-08-18
+
+### Fixed
+- Notify the lead when the user stops a subagent, including the teardown status when cleanup is incomplete.
+- Replace stale legacy management-command guidance with the live agent view.
+
+### Removed
+- Delete the unreachable legacy management panel and its tests; live agent navigation remains unchanged.
+
 ## [2.1.14] - 2026-08-17
 
 ### Fixed
@@ -165,7 +174,7 @@ All notable changes to this project will be documented in this file.
 - Advanced the extension to the requested `2.0.0` major release while keeping public spawning model-slot-only.
 - Nested writer coordination is bound to the spawned member identity instead of shared process environment.
 - `reading-fast` is the normal collection/research level, `reading-default` handles normal synthesis, and `reading-hard` is reserved for rare irreducibly deep or risky reasoning.
-- Removed the redundant `/agents` and `/team` management commands; the activity card, Down-key live view, pushed reports, and `x` stop action now provide the workflow.
+- Removed the redundant legacy management commands; the activity card, live agent view, pushed reports, and `x` stop action now provide the workflow.
 
 ### Fixed
 - Restored `claim_file`, `release_file`, `list_file_claims`, and `report_and_exit` for in-process `writing-basic` and `writing-hard` agents.
@@ -191,14 +200,14 @@ All notable changes to this project will be documented in this file.
 ## [1.3.15] - 2026-06-28
 
 ### Fixed
-- Bottom agent activity now omits assistant progress snippets; live thinking/progress remains available inside `/agents` only.
-- `/team` now labels each agent's level (`model_slot`), model, and thinking setting explicitly.
+- Bottom agent activity now omits assistant progress snippets; live thinking/progress remains available inside the legacy management overlay only.
+- The legacy management overlay now labels each agent's level (`model_slot`), model, and thinking setting explicitly.
 
 ## [1.3.14] - 2026-06-28
 
 ### Added
 - `/agents-favorite-models` single-screen picker for the five global favorite model slots, populated from the scoped models available to the current Pi session.
-- `model_slot` support for `spawn_agent` and `spawn_swarm_agents`, including persisted model/thinking/slot metadata in `/agents` completed reports.
+- `model_slot` support for `spawn_agent` and `spawn_swarm_agents`, including persisted model/thinking/slot metadata in completed reports.
 - Live agent activity details now include model, thinking, selected slot, and visible assistant progress snippets when available.
 
 ### Changed
@@ -207,7 +216,7 @@ All notable changes to this project will be documented in this file.
 - The bottom agent activity widget remains visible for runtime-backed active agents with fresh heartbeats, including after reload or in-memory state loss.
 
 ### Fixed
-- `/agents` no longer jumps between active and completed rows that share the same agent name during refresh.
+- The legacy management overlay no longer jumps between active and completed rows that share the same agent name during refresh.
 - Lead-inbox progress messages with model/thinking metadata are no longer mistaken for completed reports unless they are explicit final reports.
 - The favorite-model picker no longer displays or saves thinking-only empty slots.
 - Read-agent progress updates no longer mask tool-working state when a non-assistant message update arrives.
@@ -226,7 +235,7 @@ work.
   to expand), is fed into the lead's context, and is synthesized automatically —
   no inbox reading or polling.
 - `promote_teammate`: move a running in-process read agent into its own tmux pane.
-- `/team` shows each agent's model and thinking level.
+- The legacy management overlay shows each agent's model and thinking level.
 
 ### Changed
 - Read agents have the **full toolset** (read, bash, edit, write, grep, find, ls)
@@ -234,16 +243,16 @@ work.
   them to investigate and report rather than edit.
 - `spawn_teammate` defaults to `role: "read"`; write agents are the rare,
   isolated-work option. The lead writes by default.
-- `/team` renders as a centered floating overlay — no inline flicker while the
+- The legacy management view renders as a centered floating overlay — no inline flicker while the
   main agent streams — and bounds its height to the viewport.
-- Any team operation now binds the current team, so `/team` and report wakeups
+- Any team operation now binds the current team, so the management view and report wakeups
   work on existing and reconnected teams.
 - Quieter coordination: teammate/lead nudges use hidden trigger messages instead
   of visible chatter.
 - Rewrote `skills/teams.md` around the rebalanced, minimal flow.
 
 ### Fixed
-- `/team` no longer corrupts the input bar / scrollback on close.
+- The legacy management view no longer corrupts the input bar / scrollback on close.
 - Status bar clears finished read agents and read reports promptly.
 
 ## [1.0.0] - 2026-06-14
@@ -252,7 +261,7 @@ First stable pi-extended-teams release: a tmux-only, role-aware agent team.
 (Renamed from `pi-teams`; earlier multi-terminal history is not carried over.)
 
 ### Added
-- In-process read agents with compact status and a `/team` overview.
+- In-process read agents with compact status and a management overview.
 - Write-agent concurrency cap with a persistent FIFO queue plus inspection/cancel
   tools.
 - Watchdog/reaper loop for stale teammates and queued-writer draining.

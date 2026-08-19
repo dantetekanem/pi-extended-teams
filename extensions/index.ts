@@ -921,7 +921,7 @@ export default function (pi: ExtensionAPI) {
   // Make this session the active lead for `name`: set the current team, register
   // the lead session, and start quiet background maintenance. Idempotent. Without
   // this, operating on an existing/reconnected team leaves `teamName` unset, which
-  // silently breaks /team, the inbox poll, and report wakeups.
+  // silently breaks the active session context, inbox poll, and report wakeups.
   function adoptTeamAsLead(name: string, ctx?: any): void {
     if (isTeammate || !name) return;
     const sessionId = getPiSessionId(ctx ?? sessionCtx);
@@ -955,7 +955,7 @@ export default function (pi: ExtensionAPI) {
         teams.createTeam(requestedTeamName, getPiSessionId(sessionCtx) || "local-session", "lead-agent", payload?.description || "pi-prompt prompt-build", level.model);
       }
       // Prompt-build teams are private fanout jobs owned by pi-prompt. Do not
-      // adopt them as the lead's current team, or normal /team context and
+      // adopt them as the lead's current team, or normal session context and
       // bottom-status widgets get hijacked by the prompt-building run.
       pi.events?.emit?.("pi-prompt:prompt-build:progress", { teamName: requestedTeamName, status: "started", total: prompts.length, text: `building prompt — ${prompts.length} branches started` });
 
@@ -1092,12 +1092,34 @@ export default function (pi: ExtensionAPI) {
           const member = config.members.find(item => item.name === name && item.name !== "team-lead");
           if (!member) return;
           const teardown = await shutdownTeammate(targetTeamName, member);
-          if (teardown.status === "settled" && teardown.finalized && teardown.removedMember) {
+          const killed = teardown.status === "settled" && teardown.finalized && teardown.removedMember;
+          let leadNotificationError: unknown;
+          try {
+            await messaging.sendPlainMessage(
+              targetTeamName,
+              "system",
+              "team-lead",
+              killed
+                ? `The user killed subagent ${name}.`
+                : `The user tried to kill subagent ${name}, but teardown ended with status ${teardown.status}.`,
+              killed ? `Subagent ${name} killed by user` : `Subagent ${name} kill incomplete`,
+              killed ? "yellow" : "red"
+            );
+          } catch (error) {
+            leadNotificationError = error;
+          }
+          if (killed) {
             ctx.ui?.notify?.(`Stopped agent ${name}.`, "info");
           } else if (teardown.status === "timed_out") {
             ctx.ui?.notify?.(`Agent ${name} is inactive but quarantined after teardown timed out.`, "warning");
           } else {
             ctx.ui?.notify?.(`Agent ${name} cleanup is blocked${teardown.error ? `: ${teardown.error}` : "."}`, "warning");
+          }
+          if (leadNotificationError) {
+            ctx.ui?.notify?.(
+              `Could not notify the main agent that ${name} was killed: ${leadNotificationError instanceof Error ? leadNotificationError.message : String(leadNotificationError)}`,
+              "warning"
+            );
           }
         },
         sendMessage: async (name: string, content: string) => {

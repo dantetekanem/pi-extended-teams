@@ -40,7 +40,7 @@ interface ReadAgentStatusClassification {
 
 export function buildReadAgentIdleNudgeMessage(agent: RunningReadAgent, status: ReadAgentStatusDescription): string {
   const severity = status.idleLevel === "hard" ? "appears hung" : "has gone quiet";
-  return `Read agent ${agent.name} on team ${agent.teamName} ${severity}: no response or token change for ${formatElapsed(status.idleMs)}. Status is visible in /agents; do not ping/check repeatedly.`;
+  return `Read agent ${agent.name} on team ${agent.teamName} ${severity}: no response or token change for ${formatElapsed(status.idleMs)}. Status is visible in the live agent view; do not ping/check repeatedly.`;
 }
 
 export function shouldNudgeReadAgentIdle(_previousLevel: "soft" | "hard" | undefined, _currentLevel: ReadAgentIdleLevel): boolean {
@@ -98,14 +98,14 @@ function describeReadAgentStatusFromClassification(
   if (classification.idleLevel === "hard") {
     return {
       ...classification,
-      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · visible in /agents`,
+      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · visible in live agent view`,
     };
   }
 
   if (classification.idleLevel === "soft") {
     return {
       ...classification,
-      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · visible in /agents`,
+      detail: `no response/token change for ${formatElapsed(classification.idleMs)} · visible in live agent view`,
     };
   }
 

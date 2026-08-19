@@ -475,7 +475,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       try {
         await runWatchdogOnce(teamName, () => generation === leadWatchdogGeneration);
       } catch {
-        // Keep watchdog quiet; health is visible via /team and inbox messages on actual reaps.
+        // Keep watchdog quiet; health is visible in the live agent view and inbox messages on actual reaps.
       }
     }, 30000);
   }

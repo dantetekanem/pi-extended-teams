@@ -309,7 +309,7 @@ describe("extension teammate inbox wake", () => {
     expect(isInboxFileWatchEvent(inboxFile, "team-lead.json.lock")).toBe(false);
   });
 
-  it("records writer current action in runtime status for /team", async () => {
+  it("records writer current action in agent runtime status", async () => {
     const { handlers, ctx } = setupEvents(() => true);
 
     for (const handler of handlers.get("session_start") || []) {
@@ -349,7 +349,7 @@ describe("extension teammate inbox wake", () => {
     expect(afterTool).not.toHaveProperty("activeToolName");
   });
 
-  it("records writer token usage in runtime status for /team", async () => {
+  it("records writer token usage in agent runtime status", async () => {
     const { handlers, ctx } = setupEvents(() => true);
     const assistantMessage = {
       role: "assistant",

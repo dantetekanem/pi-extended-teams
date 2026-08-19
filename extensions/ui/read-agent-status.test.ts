@@ -53,7 +53,7 @@ describe("read-agent status descriptions", () => {
 
     expect(describeReadAgentStatus(agent, agent.startedAt + 301_000)).toMatchObject({
       label: "idle",
-      detail: "no response/token change for 5m01s · visible in /agents",
+      detail: "no response/token change for 5m01s · visible in live agent view",
       idleLevel: "soft",
       idleMs: 301_000,
     });
@@ -64,7 +64,7 @@ describe("read-agent status descriptions", () => {
 
     expect(describeReadAgentStatus(agent, agent.startedAt + 901_000)).toMatchObject({
       label: "hanging",
-      detail: "no response/token change for 15m01s · visible in /agents",
+      detail: "no response/token change for 15m01s · visible in live agent view",
       idleLevel: "hard",
       idleMs: 901_000,
     });
@@ -86,14 +86,14 @@ describe("read-agent status descriptions", () => {
       detail: "",
       idleLevel: "soft",
       idleMs: 301_000,
-    })).toBe("Read agent reviewer on team status-team has gone quiet: no response or token change for 5m01s. Status is visible in /agents; do not ping/check repeatedly.");
+    })).toBe("Read agent reviewer on team status-team has gone quiet: no response or token change for 5m01s. Status is visible in the live agent view; do not ping/check repeatedly.");
 
     expect(buildReadAgentIdleNudgeMessage(agent, {
       label: "hanging",
       detail: "",
       idleLevel: "hard",
       idleMs: 901_000,
-    })).toBe("Read agent reviewer on team status-team appears hung: no response or token change for 15m01s. Status is visible in /agents; do not ping/check repeatedly.");
+    })).toBe("Read agent reviewer on team status-team appears hung: no response or token change for 15m01s. Status is visible in the live agent view; do not ping/check repeatedly.");
   });
 
   it("summarizes many agents while limiting detailed status descriptions", () => {

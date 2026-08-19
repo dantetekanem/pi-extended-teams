@@ -36,7 +36,6 @@ describe("agent activity status widget", () => {
     expect(rendered).toContain("1 active");
     expect(rendered).toContain("1 read");
     expect(rendered).toContain("↓ navigate");
-    expect(rendered).not.toContain("/agents");
     expect(rendered).toContain("reader");
     expect(rendered).toContain("thinking");
     expect(rendered).not.toContain("collapse");

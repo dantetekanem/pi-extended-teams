@@ -131,19 +131,21 @@ export function buildPiCommand(
   allowedExtensions: readonly string[] = [],
   projectTrusted?: boolean,
   selfExtensionSource?: string,
+  sessionDir?: string,
 ): string {
   const extensionArgs = buildExtensionArgs(allowedExtensions, projectTrusted, selfExtensionSource);
+  const sessionArgs = sessionDir ? ` --session-dir ${shellQuote(sessionDir)}` : "";
 
   if (chosenModel) {
     const modelArg = thinking ? `${chosenModel}:${thinking}` : chosenModel;
-    return `${piBinary} ${extensionArgs} --model ${shellQuote(modelArg)}`;
+    return `${piBinary} ${extensionArgs}${sessionArgs} --model ${shellQuote(modelArg)}`;
   }
 
   if (thinking) {
-    return `${piBinary} ${extensionArgs} --thinking ${shellQuote(thinking)}`;
+    return `${piBinary} ${extensionArgs}${sessionArgs} --thinking ${shellQuote(thinking)}`;
   }
 
-  return `${piBinary} ${extensionArgs}`;
+  return `${piBinary} ${extensionArgs}${sessionArgs}`;
 }
 
 export type ChildPiModelAvailabilityStatus = "available" | "missing" | "unknown" | "skipped";

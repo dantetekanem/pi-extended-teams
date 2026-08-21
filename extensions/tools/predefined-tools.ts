@@ -11,7 +11,36 @@ import { loadSettings, normalizeFavoriteModelSlot, requireFavoriteModelLevel } f
 import type { Member } from "../../src/utils/models";
 import { requestLeadForTeammateSpawn } from "./delegation-guard";
 import { createSpawnResourcePlan, parentProjectTrustForSpawn } from "../resources/spawn-resource-plan";
-import { withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
+import { generateExtensionInstanceId, withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
+import { cleanupPrivateAgentSessionDirectory, preparePrivateAgentSessionDirectory } from "../internal/agent-session-files";
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function stopAndVerifySpawnedPane(terminal: any, paneId: string): string | null {
+  let killError: unknown;
+  try {
+    terminal.kill(paneId);
+  } catch (error) {
+    killError = error;
+  }
+
+  if (typeof terminal.isAlive !== "function") {
+    return `Could not verify termination of spawned pane ${paneId}: terminal.isAlive is unavailable${killError ? ` after kill failed: ${errorText(killError)}` : ""}.`;
+  }
+
+  try {
+    const alive = terminal.isAlive(paneId);
+    if (alive === false) return null;
+    if (alive === true) {
+      return `Could not verify termination of spawned pane ${paneId}: the terminal still reports it alive${killError ? ` after kill failed: ${errorText(killError)}` : ""}.`;
+    }
+    return `Could not verify termination of spawned pane ${paneId}: terminal.isAlive returned a non-boolean result.`;
+  } catch (error) {
+    return `Could not verify termination of spawned pane ${paneId}: terminal.isAlive failed: ${errorText(error)}${killError ? `; kill also failed: ${errorText(killError)}` : ""}.`;
+  }
+}
 
 export interface PredefinedToolsOptions {
   terminal: any;
@@ -22,6 +51,8 @@ export interface PredefinedToolsOptions {
 }
 
 export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions): void {
+  const extensionInstanceId = generateExtensionInstanceId();
+
   pi.registerTool({
     name: "list_predefined_teams",
     label: "List Predefined Teams",
@@ -86,6 +117,7 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
         throw new Error("create_predefined_team must use model_slot only; direct model, thinking, role, or default_model is not allowed.");
       }
       const settings = loadSettings({ projectDir: ctx.cwd });
+      const agentSettings = loadSettings({ projectDir: params.cwd });
       const requestedSlot = params.model_slot ?? "write-critical";
       const canonicalSlot = normalizeFavoriteModelSlot(requestedSlot);
       const level = requireFavoriteModelLevel(settings, canonicalSlot ?? requestedSlot);
@@ -145,46 +177,59 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
           await teams.addMember(safeTeamName, member);
           const runId = member.lifecycleRunId!;
           const bootstrapOperationId = `bootstrap:${runId}:initial-prompt`;
-          await runtime.writeRuntimeStatus(safeTeamName, safeName, runId, {
-            startedAt: member.joinedAt,
-            lastHeartbeatAt: member.joinedAt,
-            ready: false,
-            currentAction: "starting",
-          });
-          await messaging.sendPlainMessageOnceIfRunning(
-            safeTeamName,
-            "team-lead",
-            safeName,
-            agentDef.prompt,
-            "Initial prompt from predefined team",
-            {
-              operationId: bootstrapOperationId,
-              expectedRecipientRunId: runId,
-            }
-          );
-          const piBinary = getPiLaunchCommand();
-          const piCmd = buildPiCommand(
-            piBinary,
-            chosenModel,
-            member.thinking,
-            resourcePlan.extensionPaths,
-            resourcePlan.trust.projectTrusted,
-            resourcePlan.selfExtensionPath,
-          );
-          const env: Record<string, string> = {
-            ...process.env,
-            PI_TEAM_NAME: safeTeamName,
-            PI_AGENT_NAME: safeName,
-            PI_LIFECYCLE_RUN_ID: runId,
-          };
+          let spawnedTerminalId: string | undefined;
 
           try {
+            const sessionDir = agentSettings.agentSessions.showInResume
+              ? undefined
+              : preparePrivateAgentSessionDirectory(safeTeamName, safeName, runId);
+            await runtime.writeRuntimeStatus(safeTeamName, safeName, runId, {
+              startedAt: member.joinedAt,
+              lastHeartbeatAt: member.joinedAt,
+              ready: false,
+              currentAction: "starting",
+            });
+            await messaging.sendPlainMessageOnceIfRunning(
+              safeTeamName,
+              "team-lead",
+              safeName,
+              agentDef.prompt,
+              "Initial prompt from predefined team",
+              {
+                operationId: bootstrapOperationId,
+                expectedRecipientRunId: runId,
+              }
+            );
+            const piBinary = getPiLaunchCommand();
+            const piCmd = buildPiCommand(
+              piBinary,
+              chosenModel,
+              member.thinking,
+              resourcePlan.extensionPaths,
+              resourcePlan.trust.projectTrusted,
+              resourcePlan.selfExtensionPath,
+              sessionDir,
+            );
+            const env: Record<string, string> = {
+              ...process.env,
+              PI_TEAM_NAME: safeTeamName,
+              PI_AGENT_NAME: safeName,
+              PI_LIFECYCLE_RUN_ID: runId,
+            };
+
             const leadMember = (await teams.readConfig(safeTeamName)).members.find(m => m.name === "team-lead");
             const anchorPaneId = leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined;
-            const terminalId = options.terminal.spawn({ name: safeName, cwd: params.cwd, command: piCmd, env, anchorPaneId });
-            await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: terminalId });
+            spawnedTerminalId = options.terminal.spawn({ name: safeName, cwd: params.cwd, command: piCmd, env, anchorPaneId });
+            await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: spawnedTerminalId });
             spawnResults.push({ name: agentName, status: "spawned", error: undefined });
           } catch (e) {
+            // A pane returned by spawn belongs to this run even if roster ownership
+            // has already moved on. Stop and synchronously verify that exact process
+            // before lifecycle/roster ownership checks can yield or return early.
+            const terminationError = spawnedTerminalId === undefined
+              ? null
+              : stopAndVerifySpawnedPane(options.terminal, spawnedTerminalId);
+
             spawnResults.push({ name: agentName, status: "error", error: `Failed to spawn: ${e}` });
             await withLifecycleTombstoneLock(safeTeamName, safeName, async lifecycleLock => {
               const fence = lifecycleLock.read();
@@ -195,9 +240,33 @@ export function registerPredefinedTools(pi: any, options: PredefinedToolsOptions
               const currentMember = currentConfig?.members.find(item => item.name === safeName);
               if (!currentMember || currentMember.lifecycleRunId !== runId) return;
 
+              if (terminationError) {
+                lifecycleLock.occupy({
+                  team: safeTeamName,
+                  agent: safeName,
+                  runId,
+                  role: "write",
+                  reason: "spawn_rollback",
+                  phase: "cleanup_failed",
+                  extensionInstanceId,
+                });
+                lifecycleLock.updateMatching(runId, {
+                  phase: "cleanup_failed",
+                  error: terminationError,
+                });
+                return;
+              }
+
               await messaging.removeInboxMessagesByOperationUnderLifecycleLock(safeTeamName, safeName, bootstrapOperationId);
               await runtime.deleteRuntimeStatusUnderLifecycleLock(safeTeamName, safeName, runId);
               await teams.removeMemberMatchingRun(safeTeamName, safeName, runId);
+              if (!agentSettings.agentSessions.showInResume) {
+                try {
+                  cleanupPrivateAgentSessionDirectory(safeTeamName, safeName, runId);
+                } catch {
+                  // A later private-session janitor can retry cleanup.
+                }
+              }
             });
           }
         } catch (e) {

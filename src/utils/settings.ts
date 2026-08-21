@@ -111,6 +111,11 @@ export interface DebugConfig {
   enabled: boolean;
 }
 
+export interface AgentSessionsConfig {
+  /** Expose spawned-agent transcripts in Pi's normal /resume session store. */
+  showInResume: boolean;
+}
+
 export interface PiExtendedTeamsSettings {
   watchdog: WatchdogConfig;
   writeAgents: WriteAgentsConfig;
@@ -120,6 +125,7 @@ export interface PiExtendedTeamsSettings {
   favoriteModels: Partial<Record<FavoriteModelSlot, FavoriteModelConfig>>;
   categories: Record<string, CategoryConfig>;
   extensions: ExtensionsConfig;
+  agentSessions: AgentSessionsConfig;
   debug: DebugConfig;
 }
 
@@ -139,6 +145,7 @@ export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
   favoriteModels: {},
   categories: {},
   extensions: { allow: null, block: [] },
+  agentSessions: { showInResume: false },
   debug: { enabled: false },
 };
 
@@ -332,6 +339,11 @@ function applyLayer(acc: PiExtendedTeamsSettings, raw: any, options: { favoriteM
     }
     const block = toStringList(raw.extensions.block);
     if (block) acc.extensions.block = block;
+  }
+
+  if (raw.agentSessions && typeof raw.agentSessions === "object"
+    && typeof raw.agentSessions.showInResume === "boolean") {
+    acc.agentSessions.showInResume = raw.agentSessions.showInResume;
   }
 
   if (typeof raw.debug === "boolean") {

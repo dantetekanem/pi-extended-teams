@@ -27,6 +27,10 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   assistantProgressIncrementalUnsafe?: boolean;
   latestProgress?: string;
   progressUpdatedAt?: number;
+  /** Remove the private child transcript only after durable successful reporting and session disposal. */
+  cleanupPrivateSessionOnFinalize?: boolean;
+  /** Fail finalization closed so runtime, member, fence, and transcript remain recoverable. */
+  finalizationBlockedReason?: string;
   session?: AgentSession;
   finished?: Promise<void>;
 }

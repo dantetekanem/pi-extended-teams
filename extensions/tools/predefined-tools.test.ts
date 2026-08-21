@@ -7,6 +7,7 @@ import * as teams from "../../src/utils/teams.js";
 import * as paths from "../../src/utils/paths.js";
 import * as messaging from "../../src/utils/messaging.js";
 import * as runtime from "../../src/utils/runtime.js";
+import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 import type { Member } from "../../src/utils/models.js";
 
 type RegisteredTool = {
@@ -33,6 +34,12 @@ function writePredefinedFixture() {
   }));
 }
 
+function writeProjectSessionSetting(projectDir: string, showInResume: boolean) {
+  const settingsPath = path.join(projectDir, ".pi", "pi-extended-teams.json");
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify({ agentSessions: { showInResume } }));
+}
+
 function registerTools(terminal: { spawn: ReturnType<typeof vi.fn> } = { spawn: vi.fn(() => "%writer") }) {
   const tools = new Map<string, RegisteredTool>();
   registerPredefinedTools({
@@ -57,6 +64,61 @@ function makeCtx() {
     },
     isProjectTrusted: vi.fn(() => true),
   };
+}
+
+function installReplacementArtifacts(teamName: string, replacementRunId: string) {
+  const configFile = paths.configPath(teamName);
+  const config = JSON.parse(fs.readFileSync(configFile, "utf8"));
+  const currentMember = config.members.find((member: Member) => member.name === "writer");
+  const member = { ...currentMember, lifecycleRunId: replacementRunId, tmuxPaneId: "%r2" };
+  config.members = config.members.map((item: Member) => item.name === "writer" ? member : item);
+  fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
+
+  const runtimeStatus = {
+    teamName,
+    agentName: "writer",
+    lifecycleRunId: replacementRunId,
+    currentAction: "working",
+  };
+  fs.writeFileSync(paths.runtimeStatusPath(teamName, "writer"), JSON.stringify(runtimeStatus, null, 2));
+
+  const inbox = [{
+    from: "team-lead",
+    text: "R2 prompt",
+    summary: "R2 bootstrap",
+    timestamp: new Date(0).toISOString(),
+    read: false,
+    operationId: `bootstrap:${replacementRunId}:initial-prompt`,
+  }];
+  fs.writeFileSync(paths.inboxPath(teamName, "writer"), JSON.stringify(inbox, null, 2));
+
+  const sessionMarker = path.join(
+    paths.teamDir(teamName),
+    "agent-sessions",
+    "writer",
+    replacementRunId,
+    "r2-session",
+  );
+  fs.mkdirSync(path.dirname(sessionMarker), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(sessionMarker, "R2");
+
+  const tombstone = {
+    version: 1,
+    team: teamName,
+    agent: "writer",
+    runId: replacementRunId,
+    role: "write",
+    reason: "replacement",
+    phase: "closing",
+    ownerPid: process.pid,
+    extensionInstanceId: "replacement-extension",
+    timestamps: { createdAt: 1, updatedAt: 1 },
+  };
+  const tombstoneFile = paths.lifecycleTombstonePath(teamName, "writer");
+  fs.mkdirSync(path.dirname(tombstoneFile), { recursive: true });
+  fs.writeFileSync(tombstoneFile, JSON.stringify(tombstone, null, 2));
+
+  return { member, runtimeStatus, inbox, sessionMarker, tombstone };
 }
 
 describe("create_predefined_team tiers", () => {
@@ -107,6 +169,9 @@ describe("create_predefined_team tiers", () => {
     });
     const defaultSpawn = (terminal.spawn.mock.calls as any[][])[0][0];
     expect(defaultSpawn.command).toContain("--model 'provider/model:max'");
+    expect(defaultSpawn.command).toContain(
+      `--session-dir '${path.join(paths.teamDir("default-writers"), "agent-sessions", "writer", defaultWriter.lifecycleRunId!)}'`,
+    );
     expect(defaultSpawn.env).toMatchObject({
       PI_TEAM_NAME: "default-writers",
       PI_AGENT_NAME: "writer",
@@ -258,6 +323,58 @@ describe("create_predefined_team tiers", () => {
     }, new AbortController().signal, undefined, makeCtx())).rejects.toBe(failure);
   });
 
+  it("uses Pi's resumable session store only after an explicit opt-in", async () => {
+    const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    settings.agentSessions = { showInResume: true };
+    fs.writeFileSync(settingsPath, JSON.stringify(settings));
+    const terminal = { spawn: vi.fn(() => "%writer") };
+    const create = registerTools(terminal).get("create_predefined_team")!;
+
+    await create.execute("resumable", {
+      team_name: "resumable-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, makeCtx());
+
+    const spawn = (terminal.spawn.mock.calls as any[][])[0]?.[0];
+    expect(spawn.command).not.toContain("--session-dir");
+  });
+
+  it("resolves session visibility from the spawned target project, not the lead project", async () => {
+    const privateTarget = path.join(root, "private-target");
+    const resumableTarget = path.join(root, "resumable-target");
+    fs.mkdirSync(privateTarget, { recursive: true });
+    fs.mkdirSync(resumableTarget, { recursive: true });
+    writeProjectSessionSetting(root, true);
+    writeProjectSessionSetting(privateTarget, false);
+    writeProjectSessionSetting(resumableTarget, true);
+
+    const terminal = { spawn: vi.fn(() => "%writer") };
+    const create = registerTools(terminal).get("create_predefined_team")!;
+    const leadCtx = makeCtx();
+
+    await create.execute("private-target", {
+      team_name: "private-target-writers",
+      predefined_team: "writers",
+      cwd: privateTarget,
+    }, new AbortController().signal, undefined, leadCtx);
+    const privateWriter = (await teams.readConfig("private-target-writers")).members.find(member => member.name === "writer")!;
+    const privateSpawn = (terminal.spawn.mock.calls as any[][])[0][0];
+    expect(privateSpawn.command).toContain(
+      `--session-dir '${path.join(paths.teamDir("private-target-writers"), "agent-sessions", "writer", privateWriter.lifecycleRunId!)}'`,
+    );
+
+    writeProjectSessionSetting(root, false);
+    await create.execute("resumable-target", {
+      team_name: "resumable-target-writers",
+      predefined_team: "writers",
+      cwd: resumableTarget,
+    }, new AbortController().signal, undefined, leadCtx);
+    const resumableSpawn = (terminal.spawn.mock.calls as any[][])[1][0];
+    expect(resumableSpawn.command).not.toContain("--session-dir");
+  });
+
   it("rejects direct thinking from a predefined agent definition", async () => {
     fs.writeFileSync(
       path.join(root, ".pi", "agents", "writer.md"),
@@ -276,6 +393,171 @@ describe("create_predefined_team tiers", () => {
       expect.objectContaining({ status: "error", error: expect.stringContaining("must not declare direct model or thinking") }),
     ]);
     expect(terminal.spawn).not.toHaveBeenCalled();
+  });
+
+  it.runIf(process.platform !== "win32")("rolls back admission when private session storage is untrusted", async () => {
+    const teamDirectory = paths.teamDir("unsafe-session-writers");
+    const external = path.join(root, "external-sessions");
+    fs.mkdirSync(teamDirectory, { recursive: true });
+    fs.mkdirSync(external);
+    fs.symlinkSync(external, path.join(teamDirectory, "agent-sessions"), "dir");
+    const terminal = { spawn: vi.fn(() => "%writer") };
+    const create = registerTools(terminal).get("create_predefined_team")!;
+
+    const result = await create.execute("unsafe-session", {
+      team_name: "unsafe-session-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, makeCtx());
+
+    expect(result.details.results).toEqual([
+      expect.objectContaining({ status: "error", error: expect.stringMatching(/private agent session directory/i) }),
+    ]);
+    expect((await teams.readConfig("unsafe-session-writers")).members.find(member => member.name === "writer")).toBeUndefined();
+    expect(await runtime.readRuntimeStatus("unsafe-session-writers", "writer")).toBeNull();
+    expect(terminal.spawn).not.toHaveBeenCalled();
+  });
+
+  it("stops and verifies the exact spawned pane before rolling back an updateMember failure", async () => {
+    vi.spyOn(teams, "updateMember").mockRejectedValueOnce(new Error("update failed"));
+    const deleteRuntimeStatus = vi.spyOn(runtime, "deleteRuntimeStatusUnderLifecycleLock");
+    const terminal = {
+      spawn: vi.fn(() => "%writer"),
+      kill: vi.fn(),
+      isAlive: vi.fn(() => false),
+    };
+    const create = registerTools(terminal).get("create_predefined_team")!;
+
+    const result = await create.execute("update-failure", {
+      team_name: "update-failed-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, makeCtx());
+
+    const runId = (terminal.spawn.mock.calls as any[][])[0][0].env.PI_LIFECYCLE_RUN_ID;
+    expect(result.details.results).toEqual([
+      expect.objectContaining({ status: "error", error: expect.stringContaining("Failed to spawn: Error: update failed") }),
+    ]);
+    expect(terminal.kill).toHaveBeenCalledWith("%writer");
+    expect(terminal.isAlive).toHaveBeenCalledWith("%writer");
+    expect((await teams.readConfig("update-failed-writers")).members.find(member => member.name === "writer")).toBeUndefined();
+    expect(await runtime.readRuntimeStatus("update-failed-writers", "writer")).toBeNull();
+    expect(deleteRuntimeStatus).toHaveBeenCalledWith("update-failed-writers", "writer", runId);
+    expect(terminal.isAlive.mock.invocationCallOrder[0]).toBeLessThan(deleteRuntimeStatus.mock.invocationCallOrder[0]!);
+    expect(await messaging.readInbox("update-failed-writers", "writer", false, false)).toEqual([]);
+    expect(fs.existsSync(path.join(paths.teamDir("update-failed-writers"), "agent-sessions", "writer", runId))).toBe(false);
+    expect(await readLifecycleTombstone("update-failed-writers", "writer")).toEqual({ status: "absent" });
+  });
+
+  it("stops and verifies a returned R1 pane before rollback reads and leaves all R2 artifacts untouched", async () => {
+    const configReads = vi.spyOn(teams, "readConfig");
+    vi.spyOn(teams, "updateMember").mockRejectedValueOnce(new Error("update failed"));
+    const replacementRunId = "replacement-run";
+    let artifacts!: ReturnType<typeof installReplacementArtifacts>;
+    const terminal = {
+      spawn: vi.fn(() => "%r1"),
+      kill: vi.fn(() => {
+        artifacts = installReplacementArtifacts("replacement-writers", replacementRunId);
+      }),
+      isAlive: vi.fn(() => false),
+    };
+    const create = registerTools(terminal).get("create_predefined_team")!;
+
+    const result = await create.execute("replacement-race", {
+      team_name: "replacement-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, makeCtx());
+
+    expect(result.details.results).toEqual([
+      expect.objectContaining({ status: "error", error: expect.stringContaining("Failed to spawn: Error: update failed") }),
+    ]);
+    expect(terminal.kill).toHaveBeenCalledWith("%r1");
+    expect(terminal.isAlive).toHaveBeenCalledWith("%r1");
+    expect(configReads).toHaveBeenCalledTimes(1);
+    expect((await teams.readConfig("replacement-writers")).members.find(member => member.name === "writer")).toEqual(artifacts.member);
+    expect(await runtime.readRuntimeStatus("replacement-writers", "writer")).toEqual(artifacts.runtimeStatus);
+    expect(await messaging.peekInbox("replacement-writers", "writer", false)).toEqual(artifacts.inbox);
+    expect(fs.readFileSync(artifacts.sessionMarker, "utf8")).toBe("R2");
+    expect(await readLifecycleTombstone("replacement-writers", "writer")).toEqual({
+      status: "occupied",
+      tombstone: artifacts.tombstone,
+    });
+  });
+
+  it("does not fence or delete R2 artifacts when R1 pane termination cannot be proven", async () => {
+    const configReads = vi.spyOn(teams, "readConfig");
+    vi.spyOn(teams, "updateMember").mockRejectedValueOnce(new Error("update failed"));
+    const replacementRunId = "replacement-run";
+    let artifacts!: ReturnType<typeof installReplacementArtifacts>;
+    const terminal = {
+      spawn: vi.fn(() => "%r1"),
+      kill: vi.fn(() => {
+        artifacts = installReplacementArtifacts("unproven-replacement-writers", replacementRunId);
+      }),
+      isAlive: vi.fn(() => true),
+    };
+    const create = registerTools(terminal).get("create_predefined_team")!;
+
+    const result = await create.execute("unproven-replacement-race", {
+      team_name: "unproven-replacement-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, makeCtx());
+
+    expect(result.details.results).toEqual([
+      expect.objectContaining({ status: "error", error: expect.stringContaining("Failed to spawn: Error: update failed") }),
+    ]);
+    expect(terminal.kill).toHaveBeenCalledWith("%r1");
+    expect(terminal.isAlive).toHaveBeenCalledWith("%r1");
+    expect(configReads).toHaveBeenCalledTimes(1);
+    expect((await teams.readConfig("unproven-replacement-writers")).members.find(member => member.name === "writer")).toEqual(artifacts.member);
+    expect(await runtime.readRuntimeStatus("unproven-replacement-writers", "writer")).toEqual(artifacts.runtimeStatus);
+    expect(await messaging.peekInbox("unproven-replacement-writers", "writer", false)).toEqual(artifacts.inbox);
+    expect(fs.readFileSync(artifacts.sessionMarker, "utf8")).toBe("R2");
+    expect(await readLifecycleTombstone("unproven-replacement-writers", "writer")).toEqual({
+      status: "occupied",
+      tombstone: artifacts.tombstone,
+    });
+  });
+
+  it("fences the exact spawned pane and retains recovery artifacts when termination cannot be proven", async () => {
+    vi.spyOn(teams, "updateMember").mockRejectedValueOnce(new Error("update failed"));
+    const terminal = {
+      spawn: vi.fn(() => "%writer"),
+      kill: vi.fn(),
+      isAlive: vi.fn(() => true),
+    };
+    const create = registerTools(terminal).get("create_predefined_team")!;
+
+    const result = await create.execute("termination-failure", {
+      team_name: "retained-writers",
+      predefined_team: "writers",
+      cwd: root,
+    }, new AbortController().signal, undefined, makeCtx());
+
+    const runId = (terminal.spawn.mock.calls as any[][])[0][0].env.PI_LIFECYCLE_RUN_ID;
+    expect(result.details.results).toEqual([
+      expect.objectContaining({ status: "error", error: expect.stringContaining("Failed to spawn: Error: update failed") }),
+    ]);
+    expect(terminal.kill).toHaveBeenCalledWith("%writer");
+    expect(terminal.isAlive).toHaveBeenCalledWith("%writer");
+    expect((await teams.readConfig("retained-writers")).members.find(member => member.name === "writer")).toMatchObject({
+      lifecycleRunId: runId,
+    });
+    expect(await runtime.readRuntimeStatus("retained-writers", "writer")).toMatchObject({ lifecycleRunId: runId });
+    expect(await messaging.peekInbox("retained-writers", "writer", false)).toEqual([
+      expect.objectContaining({ operationId: `bootstrap:${runId}:initial-prompt` }),
+    ]);
+    expect(fs.existsSync(path.join(paths.teamDir("retained-writers"), "agent-sessions", "writer", runId))).toBe(true);
+    expect(await readLifecycleTombstone("retained-writers", "writer")).toMatchObject({
+      status: "occupied",
+      tombstone: {
+        runId,
+        phase: "cleanup_failed",
+        error: expect.stringContaining("%writer"),
+      },
+    });
   });
 
   it("rolls back only the admitted run when terminal spawn fails and permits same-name readmission", async () => {

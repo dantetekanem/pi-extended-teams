@@ -681,6 +681,175 @@ describe("team lifecycle performance", () => {
     expect(removeMember).toHaveBeenCalledWith("cleanup-failures", "removal-failure", removalMember.lifecycleRunId);
   });
 
+  it("retains transcript, runtime, member, and fence when private-session cleanup fails", async () => {
+    const teamName = "private-cleanup-failure";
+    const runId = "private-run";
+    const reader = member("reader", { role: "read", tmuxPaneId: "", lifecycleRunId: runId });
+    writeConfig({
+      name: teamName,
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), reader],
+    });
+    await runtime.writeRuntimeStatus(teamName, reader.name, runId, {
+      ready: true,
+      startedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+    });
+    const privateRunDirectory = path.join(paths.teamDir(teamName), "agent-sessions", reader.name, runId);
+    const transcript = path.join(privateRunDirectory, "session.jsonl");
+    fs.mkdirSync(privateRunDirectory, { recursive: true });
+    fs.writeFileSync(transcript, "recoverable transcript\n");
+    const originalRemove = fs.rmSync.bind(fs);
+    vi.spyOn(fs, "rmSync").mockImplementation((target: any, options?: any) => {
+      if (String(target) === privateRunDirectory) throw new Error("private cleanup denied");
+      return originalRemove(target, options);
+    });
+
+    const session = {
+      hasExtensionHandlers: vi.fn(() => false),
+      clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
+      abort: vi.fn(async () => {}),
+      dispose: vi.fn(),
+    };
+    const state: RunningReadAgent = {
+      runId,
+      name: reader.name,
+      teamName,
+      role: "read",
+      startedAt: Date.now(),
+      tokensUsed: 0,
+      status: "finishing",
+      recentEvents: [],
+      lastActivityAt: Date.now(),
+      cleanupPrivateSessionOnFinalize: true,
+      session: session as any,
+    };
+    const runningReadAgents = new Map([[`${teamName}:${reader.name}`, state]]);
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents,
+      readAgentKey: (candidateTeam, agentName) => `${candidateTeam}:${agentName}`,
+      isCurrentReadAgentRun: (key, candidate) => runningReadAgents.get(key) === candidate,
+      renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => teamName,
+    });
+
+    await expect(lifecycle.shutdownTeammate(teamName, reader)).resolves.toMatchObject({
+      status: "cleanup_failed",
+      finalized: false,
+      removedMember: false,
+      error: "private cleanup denied",
+    });
+
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(fs.existsSync(transcript)).toBe(true);
+    await expect(runtime.readRuntimeStatus(teamName, reader.name)).resolves.toMatchObject({ lifecycleRunId: runId });
+    expect((await teams.readConfig(teamName)).members.find(item => item.name === reader.name)).toMatchObject({
+      lifecycleRunId: runId,
+      isActive: false,
+    });
+    await expect(readLifecycleTombstone(teamName, reader.name)).resolves.toMatchObject({
+      status: "occupied",
+      tombstone: { runId, phase: "cleanup_failed", error: "private cleanup denied" },
+    });
+    expect(runningReadAgents.get(`${teamName}:${reader.name}`)).toBe(state);
+  });
+
+  it("retains the full recovery bundle when private-run inspection fails", async () => {
+    const teamName = "private-inspection-failure";
+    const runId = "inspection-run";
+    const reader = member("reader", { role: "read", tmuxPaneId: "", lifecycleRunId: runId });
+    writeConfig({
+      name: teamName,
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), reader],
+    });
+    await runtime.writeRuntimeStatus(teamName, reader.name, runId, {
+      ready: true,
+      startedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+    });
+    const privateRunDirectory = path.join(paths.teamDir(teamName), "agent-sessions", reader.name, runId);
+    const transcript = path.join(privateRunDirectory, "session.jsonl");
+    fs.mkdirSync(privateRunDirectory, { recursive: true });
+    fs.writeFileSync(transcript, "recoverable transcript\n");
+    const originalExists = fs.existsSync.bind(fs);
+    vi.spyOn(fs, "existsSync").mockImplementation((target: fs.PathLike) => {
+      if (String(target) === privateRunDirectory) return false;
+      return originalExists(target);
+    });
+    const originalLstat = fs.lstatSync.bind(fs);
+    vi.spyOn(fs, "lstatSync").mockImplementation((target: fs.PathLike, options?: any) => {
+      if (String(target) === privateRunDirectory) {
+        throw Object.assign(new Error("inspection denied"), { code: "EACCES" });
+      }
+      return originalLstat(target, options);
+    });
+
+    const session = {
+      hasExtensionHandlers: vi.fn(() => false),
+      clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
+      abort: vi.fn(async () => {}),
+      dispose: vi.fn(),
+    };
+    const state: RunningReadAgent = {
+      runId,
+      name: reader.name,
+      teamName,
+      role: "read",
+      startedAt: Date.now(),
+      tokensUsed: 0,
+      status: "finishing",
+      recentEvents: [],
+      lastActivityAt: Date.now(),
+      cleanupPrivateSessionOnFinalize: true,
+      session: session as any,
+    };
+    const runningReadAgents = new Map([[`${teamName}:${reader.name}`, state]]);
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents,
+      readAgentKey: (candidateTeam, agentName) => `${candidateTeam}:${agentName}`,
+      isCurrentReadAgentRun: (key, candidate) => runningReadAgents.get(key) === candidate,
+      renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => teamName,
+    });
+
+    await expect(lifecycle.shutdownTeammate(teamName, reader)).resolves.toMatchObject({
+      status: "cleanup_failed",
+      finalized: false,
+      removedMember: false,
+      error: expect.stringContaining("inspect"),
+    });
+
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(fs.existsSync(transcript)).toBe(true);
+    await expect(runtime.readRuntimeStatus(teamName, reader.name)).resolves.toMatchObject({ lifecycleRunId: runId });
+    expect((await teams.readConfig(teamName)).members.find(item => item.name === reader.name)).toMatchObject({
+      lifecycleRunId: runId,
+      isActive: false,
+    });
+    await expect(readLifecycleTombstone(teamName, reader.name)).resolves.toMatchObject({
+      status: "occupied",
+      tombstone: { runId, phase: "cleanup_failed", error: expect.stringContaining("inspect") },
+    });
+    expect(runningReadAgents.get(`${teamName}:${reader.name}`)).toBe(state);
+  });
+
   it("preserves proven member removal when a later queue drain fails", async () => {
     const writer = member("drain-failure");
     writeConfig({

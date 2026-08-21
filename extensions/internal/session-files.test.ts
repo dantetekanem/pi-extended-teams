@@ -150,10 +150,63 @@ describe("session file cleanup", () => {
     expect(terminal.kill).toHaveBeenCalledWith("%7");
   });
 
-  it("never TTL-cleans a team with a lifecycle quarantine file, even when corrupt", () => {
+  it("retains a dead-lead team until its private recovery transcript ages out", () => {
     const terminal = { kill: vi.fn() };
     const now = Date.now();
-    writeTeam("quarantined-orphan", { createdAt: now - 2 * 60 * 60 * 1000 });
+    const maxAgeMs = 60 * 60 * 1000;
+    writeTeam("recoverable-team", { leadPid: 99999999, createdAt: now - 2 * maxAgeMs });
+    const runDirectory = path.join(paths.teamDir("recoverable-team"), "agent-sessions", "reader", "failed-run");
+    const transcript = path.join(runDirectory, "session.jsonl");
+    fs.mkdirSync(runDirectory, { recursive: true });
+    fs.writeFileSync(transcript, "recoverable transcript\n");
+    const recent = new Date(now - 1_000);
+    const stale = new Date(now - maxAgeMs - 1_000);
+    // Retention follows the newest transcript activity, not directory creation.
+    fs.utimesSync(runDirectory, stale, stale);
+    fs.utimesSync(transcript, recent, recent);
+
+    expect(cleanupOrphanedTeams(terminal, { teamsRoot, now, maxAgeMs })).toBe(0);
+    expect(fs.existsSync(transcript)).toBe(true);
+    expect(fs.existsSync(paths.teamDir("recoverable-team"))).toBe(true);
+    expect(terminal.kill).toHaveBeenCalledWith("%7");
+    terminal.kill.mockClear();
+
+    fs.utimesSync(transcript, stale, stale);
+
+    expect(cleanupOrphanedTeams(terminal, { teamsRoot, now, maxAgeMs })).toBe(1);
+    expect(fs.existsSync(paths.teamDir("recoverable-team"))).toBe(false);
+    expect(terminal.kill).toHaveBeenCalledWith("%7");
+  });
+
+  it("retains an orphan when recovery enumeration fails and continues cleaning later teams", () => {
+    const terminal = { kill: vi.fn() };
+    const now = Date.now();
+    const maxAgeMs = 60 * 60 * 1000;
+    writeTeam("a-unreadable-recovery", { leadPid: 99999999, createdAt: now - 2 * maxAgeMs });
+    writeTeam("b-old-orphan", { createdAt: now - 2 * maxAgeMs });
+    const recoveryAgentDirectory = path.join(paths.teamDir("a-unreadable-recovery"), "agent-sessions", "reader");
+    const recoveryRunDirectory = path.join(recoveryAgentDirectory, "failed-run");
+    fs.mkdirSync(recoveryRunDirectory, { recursive: true });
+    fs.writeFileSync(path.join(recoveryRunDirectory, "session.jsonl"), "recoverable transcript\n");
+    const originalReadDirectory = fs.readdirSync.bind(fs);
+    const readDirectory = vi.spyOn(fs, "readdirSync").mockImplementation(((directory: any, options?: any) => {
+      if (directory === recoveryAgentDirectory) throw new Error("simulated transient enumeration failure");
+      return originalReadDirectory(directory, options);
+    }) as typeof fs.readdirSync);
+
+    const cleaned = cleanupOrphanedTeams(terminal, { teamsRoot, now, maxAgeMs });
+
+    expect(cleaned).toBe(1);
+    expect(fs.existsSync(paths.teamDir("a-unreadable-recovery"))).toBe(true);
+    expect(fs.existsSync(path.join(recoveryRunDirectory, "session.jsonl"))).toBe(true);
+    expect(fs.existsSync(paths.teamDir("b-old-orphan"))).toBe(false);
+    expect(readDirectory).toHaveBeenCalledWith(recoveryAgentDirectory, { withFileTypes: true });
+  });
+
+  it("stops orphan processes but never TTL-cleans a fenced dead-lead team", () => {
+    const terminal = { kill: vi.fn() };
+    const now = Date.now();
+    writeTeam("quarantined-orphan", { leadPid: 99999999, createdAt: now - 2 * 60 * 60 * 1000 });
     const quarantineDir = path.join(paths.teamDir("quarantined-orphan"), "lifecycle", "quarantine");
     fs.mkdirSync(quarantineDir, { recursive: true });
     fs.writeFileSync(path.join(quarantineDir, "writer.json"), "{ malformed");
@@ -166,6 +219,7 @@ describe("session file cleanup", () => {
 
     expect(cleaned).toBe(0);
     expect(fs.existsSync(paths.teamDir("quarantined-orphan"))).toBe(true);
-    expect(terminal.kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(paths.teamDir("quarantined-orphan"), "writer.pid"))).toBe(false);
+    expect(terminal.kill).toHaveBeenCalledWith("%7");
   });
 });

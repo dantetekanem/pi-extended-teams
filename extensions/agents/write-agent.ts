@@ -7,13 +7,18 @@ import { loadSettings, requireFavoriteModelLevel } from "../../src/utils/setting
 import type { Member } from "../../src/utils/models";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
 import { buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
+import { cleanupPrivateAgentSessionDirectory, preparePrivateAgentSessionDirectory } from "../internal/agent-session-files";
 import { countWriteMembers } from "../team/roster";
 import type { ActiveWriterTab } from "../team/writer-screens";
 import {
   createSpawnResourcePlan,
   type SpawnResourcePlan,
 } from "../resources/spawn-resource-plan";
-import { readLifecycleTombstone, withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
+import {
+  generateExtensionInstanceId,
+  readLifecycleTombstone,
+  withLifecycleTombstoneLock,
+} from "../../src/utils/lifecycle-tombstone";
 import type { ActiveAgentSleepController } from "../runtime/active-agent-sleep";
 
 export interface WriteAgentRuntimeOptions {
@@ -23,6 +28,34 @@ export interface WriteAgentRuntimeOptions {
   getProjectTrusted?(cwd: string): boolean;
   createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
   sleepController?: ActiveAgentSleepController;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function stopAndVerifySpawnedPane(terminal: any, paneId: string): string | null {
+  let killError: unknown;
+  try {
+    terminal.kill(paneId);
+  } catch (error) {
+    killError = error;
+  }
+
+  if (typeof terminal.isAlive !== "function") {
+    return `Could not verify termination of spawned pane ${paneId}: terminal.isAlive is unavailable${killError ? ` after kill failed: ${errorText(killError)}` : ""}.`;
+  }
+
+  try {
+    const alive = terminal.isAlive(paneId);
+    if (alive === false) return null;
+    if (alive === true) {
+      return `Could not verify termination of spawned pane ${paneId}: the terminal still reports it alive${killError ? ` after kill failed: ${errorText(killError)}` : ""}.`;
+    }
+    return `Could not verify termination of spawned pane ${paneId}: terminal.isAlive returned a non-boolean result.`;
+  } catch (error) {
+    return `Could not verify termination of spawned pane ${paneId}: terminal.isAlive failed: ${errorText(error)}${killError ? `; kill also failed: ${errorText(killError)}` : ""}.`;
+  }
 }
 
 function assertWriterUsesConfiguredLevel(member: Member): void {
@@ -38,6 +71,7 @@ function assertWriterUsesConfiguredLevel(member: Member): void {
 
 export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
   let writeQueueDraining = false;
+  const extensionInstanceId = generateExtensionInstanceId();
   const writerSleepAssertions = new Map<string, () => void>();
 
   function writerSleepAssertionKey(teamName: string, member: Member): string | null {
@@ -88,20 +122,24 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       member = { ...member, model: undefined };
     }
 
-    const piCmd = buildPiCommand(
-      piBinary,
-      launchModel,
-      member.thinking,
-      resourcePlan.extensionPaths,
-      resourcePlan.trust.projectTrusted,
-      extensionSource,
-    );
-
     await teams.addMember(teamName, member);
     const failedRunId = member.lifecycleRunId!;
     const bootstrapOperationId = `bootstrap:${failedRunId}:initial-prompt`;
+    let spawnedTerminalId: string | undefined;
 
     try {
+      const sessionDir = settings.agentSessions.showInResume
+        ? undefined
+        : preparePrivateAgentSessionDirectory(teamName, member.name, failedRunId);
+      const piCmd = buildPiCommand(
+        piBinary,
+        launchModel,
+        member.thinking,
+        resourcePlan.extensionPaths,
+        resourcePlan.trust.projectTrusted,
+        extensionSource,
+        sessionDir,
+      );
       await runtime.writeRuntimeStatus(teamName, member.name, failedRunId, {
         startedAt: member.joinedAt,
         lastHeartbeatAt: member.joinedAt,
@@ -166,7 +204,7 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       const leadMember = teamConfig.members.find(m => m.name === "team-lead");
       const anchorPaneId = leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined;
       retainWriteAgentSleepAssertion(teamName, member);
-      const terminalId = options.terminal.spawn({
+      const terminalId: string = spawnedTerminalId = options.terminal.spawn({
         name: member.name,
         cwd: member.cwd,
         command: piCmd,
@@ -185,15 +223,26 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
       }, settings);
       return terminalId;
     } catch (e) {
-      // Debug I/O may yield; lifecycle ownership is therefore revalidated only
-      // after logging, under the recipient fence, before any rollback mutation.
-      await writeTeamsDebugEvent(teamName, "write-agent.spawn.failure", {
-        agentName: member.name,
-        error: e instanceof Error ? e.message : String(e),
-        stack: e instanceof Error ? e.stack ?? null : null,
-        debugLogPath: debugLogPath ?? null,
-      }, settings);
+      // A pane returned by spawn belongs to this run even if roster ownership has
+      // already moved on. Stop and synchronously verify that exact process before
+      // any awaited diagnostics or lifecycle/roster ownership checks can yield.
+      const terminationError = spawnedTerminalId === undefined
+        ? null
+        : stopAndVerifySpawnedPane(options.terminal, spawnedTerminalId);
+
       try {
+        // Debug I/O may yield or fail; lifecycle ownership is therefore revalidated
+        // only after the best-effort log, under the recipient fence, before rollback.
+        try {
+          await writeTeamsDebugEvent(teamName, "write-agent.spawn.failure", {
+            agentName: member.name,
+            error: e instanceof Error ? e.message : String(e),
+            stack: e instanceof Error ? e.stack ?? null : null,
+            debugLogPath: debugLogPath ?? null,
+          }, settings);
+        } catch {
+          // Spawn rollback must not be skipped because its diagnostic write failed.
+        }
         await withLifecycleTombstoneLock(teamName, member.name, async lifecycleLock => {
           const fence = lifecycleLock.read();
           if (fence.status === "corrupt") return;
@@ -203,10 +252,38 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
           const currentMember = currentConfig?.members.find(item => item.name === member.name);
           if (!currentMember || currentMember.lifecycleRunId !== failedRunId) return;
 
-          options.onWriterInactive?.(teamName, currentMember);
+          if (terminationError) {
+            lifecycleLock.occupy({
+              team: teamName,
+              agent: member.name,
+              runId: failedRunId,
+              role: "write",
+              reason: "spawn_rollback",
+              phase: "cleanup_failed",
+              extensionInstanceId,
+            });
+            lifecycleLock.updateMatching(failedRunId, {
+              phase: "cleanup_failed",
+              error: terminationError,
+            });
+            return;
+          }
+
+          try {
+            options.onWriterInactive?.(teamName, currentMember);
+          } catch {
+            // In-memory observers must not prevent cleanup after exact pane termination.
+          }
           await messaging.removeInboxMessagesByOperationUnderLifecycleLock(teamName, member.name, bootstrapOperationId);
           await runtime.deleteRuntimeStatusUnderLifecycleLock(teamName, member.name, failedRunId);
           await teams.removeMemberMatchingRun(teamName, member.name, failedRunId);
+          if (!settings.agentSessions.showInResume) {
+            try {
+              cleanupPrivateAgentSessionDirectory(teamName, member.name, failedRunId);
+            } catch {
+              // A later private-session janitor can retry cleanup without hiding the spawn error.
+            }
+          }
         });
       } finally {
         releaseWriteAgentSleepAssertion(teamName, member);

@@ -35,6 +35,10 @@ function installPathSpies() {
   });
 }
 
+function privateSessionDirectory(teamName: string, agentName: string, runId: string): string {
+  return path.join(paths.teamDir(teamName), "agent-sessions", agentName, runId);
+}
+
 function member(name: string, overrides: Partial<Member> = {}): Member {
   return {
     agentId: `${name}@exit`,
@@ -209,6 +213,9 @@ describe("coordination tools", () => {
     });
     const pidFile = path.join(paths.teamDir(teamName), `${agentName}.pid`);
     fs.writeFileSync(pidFile, String(process.pid));
+    const privateSessionDir = privateSessionDirectory(teamName, agentName, runId);
+    fs.mkdirSync(privateSessionDir, { recursive: true });
+    fs.writeFileSync(path.join(privateSessionDir, "session.jsonl"), "private transcript\n");
     await runtime.writeRuntimeStatus(teamName, agentName, runId, {
       pid: process.pid,
       startedAt: Date.now(),
@@ -328,6 +335,7 @@ describe("coordination tools", () => {
     expect(fs.readFileSync(result.details.reportPath, "utf-8")).toBe("done");
     expect(JSON.stringify({ inbox: sendSpy.mock.calls, events: reportEventSpy.mock.calls })).not.toContain("writing-hard");
     expect(fs.existsSync(pidFile)).toBe(true);
+    expect(fs.existsSync(privateSessionDir)).toBe(true);
     expect(await runtime.readRuntimeStatus(teamName, agentName)).toMatchObject({ lifecycleRunId: runId, ready: true });
     expect(releaseAllClaimsForAgent).toHaveBeenCalledWith(teamName, agentName);
     expect(drainWriteQueue).not.toHaveBeenCalled();
@@ -341,6 +349,7 @@ describe("coordination tools", () => {
 
     for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
     expect(fs.existsSync(pidFile)).toBe(false);
+    expect(fs.existsSync(path.join(privateSessionDir, "session.jsonl"))).toBe(true);
     expect(await runtime.readRuntimeStatus(teamName, agentName)).toBeNull();
     expect(JSON.parse(fs.readFileSync(paths.configPath(teamName), "utf-8")).members.map((item: Member) => item.name)).toEqual(["team-lead"]);
     await expect(readLifecycleTombstone(teamName, agentName)).resolves.toEqual({ status: "absent" });
@@ -351,7 +360,7 @@ describe("coordination tools", () => {
     expect(ctx.shutdown).toHaveBeenCalled();
   });
 
-  it("does not send or release claims when report-event persistence fails", async () => {
+  it("retains the exact private run and does not send or release claims when report persistence fails", async () => {
     const teamName = "report-persistence-failure-team";
     const agentName = "writer";
     const runId = "writer-run";
@@ -362,15 +371,33 @@ describe("coordination tools", () => {
       createdAt: Date.now(),
       leadAgentId: "lead",
       leadSessionId: "session",
-      members: [member("team-lead"), member(agentName, { lifecycleRunId: runId })],
+      members: [
+        member("team-lead"),
+        member(agentName, { lifecycleRunId: runId, tmuxPaneId: "%writer", modelSlot: "write-critical" }),
+      ],
+    });
+    const privateSessionDir = privateSessionDirectory(teamName, agentName, runId);
+    fs.mkdirSync(privateSessionDir, { recursive: true });
+    fs.writeFileSync(path.join(privateSessionDir, "session.jsonl"), "recoverable writer transcript\n");
+    await runtime.writeRuntimeStatus(teamName, agentName, runId, {
+      startedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+      ready: true,
     });
 
-    const appendError = new Error("report file unavailable");
+    const appendError = new Error("report store unavailable");
     vi.spyOn(reportEvents, "appendTeamReportEvent").mockRejectedValue(appendError);
     const sendPlainMessage = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
     const releaseAllClaimsForAgent = vi.fn(async () => []);
+    const drainWriteQueue = vi.fn(async () => {});
     const tools = new Map<string, any>();
-    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+    const handlers = new Map<string, Function[]>();
+    registerCoordinationTools({
+      registerTool: (tool: any) => tools.set(tool.name, tool),
+      on: (eventName: string, handler: Function) => {
+        handlers.set(eventName, [...(handlers.get(eventName) || []), handler]);
+      },
+    }, {
       agentName,
       isTeammate: true,
       terminal: undefined,
@@ -378,7 +405,7 @@ describe("coordination tools", () => {
       requireWriteAgentTeam: async () => teamName,
       requireTeamContext: (explicitTeamName?: string) => explicitTeamName || teamName,
       releaseAllClaimsForAgent,
-      drainWriteQueue: vi.fn(async () => {}),
+      drainWriteQueue,
       resolveSkillFile: vi.fn(),
       adoptTeamAsLead: vi.fn(),
       renderLeadInboxStatus: vi.fn(async () => {}),
@@ -392,8 +419,32 @@ describe("coordination tools", () => {
       vi.fn(),
       { cwd: root, shutdown: vi.fn() },
     )).rejects.toBe(appendError);
+
     expect(sendPlainMessage).not.toHaveBeenCalled();
     expect(releaseAllClaimsForAgent).not.toHaveBeenCalled();
+    expect(fs.existsSync(privateSessionDir)).toBe(true);
+    expect(await runtime.readRuntimeStatus(teamName, agentName)).toMatchObject({ lifecycleRunId: runId, ready: true });
+    expect((JSON.parse(fs.readFileSync(paths.configPath(teamName), "utf-8")) as TeamConfig).members[1]).toMatchObject({
+      lifecycleRunId: runId,
+      isActive: false,
+    });
+    await expect(readLifecycleTombstone(teamName, agentName)).resolves.toMatchObject({
+      status: "occupied",
+      tombstone: {
+        runId,
+        phase: "cleanup_failed",
+        error: "report store unavailable",
+      },
+    });
+
+    for (const handler of handlers.get("session_shutdown") || []) await handler({}, {});
+    expect(fs.existsSync(privateSessionDir)).toBe(true);
+    expect(await runtime.readRuntimeStatus(teamName, agentName)).toMatchObject({ lifecycleRunId: runId });
+    await expect(readLifecycleTombstone(teamName, agentName)).resolves.toMatchObject({
+      status: "occupied",
+      tombstone: { runId, phase: "cleanup_failed" },
+    });
+    expect(drainWriteQueue).not.toHaveBeenCalled();
   });
 
   it("rejects an R1 report when the roster already belongs to R2 without fencing or changing R2", async () => {
@@ -459,6 +510,9 @@ describe("coordination tools", () => {
         member(agentName, { lifecycleRunId: runId, tmuxPaneId: "%r1" }),
       ],
     });
+    const privateSessionDir = privateSessionDirectory(teamName, agentName, runId);
+    fs.mkdirSync(privateSessionDir, { recursive: true });
+    fs.writeFileSync(path.join(privateSessionDir, "session.jsonl"), "retain on cleanup failure\n");
     await runtime.writeRuntimeStatus(teamName, agentName, runId, {
       startedAt: Date.now(),
       lastHeartbeatAt: Date.now(),
@@ -514,6 +568,7 @@ describe("coordination tools", () => {
       },
     });
     expect((await runtime.readRuntimeStatus(teamName, agentName))?.lifecycleRunId).toBe(runId);
+    expect(fs.existsSync(privateSessionDir)).toBe(true);
     expect((JSON.parse(fs.readFileSync(paths.configPath(teamName), "utf-8")) as TeamConfig).members[1]).toMatchObject({
       lifecycleRunId: "run-r2",
       tmuxPaneId: "%r2",

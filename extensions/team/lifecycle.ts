@@ -22,6 +22,7 @@ import {
 import { releaseAllClaimsForAgent } from "./roster";
 import { cleanupPidFileProcess } from "../internal/session-files";
 import { closePersistedRecipient } from "./recipient-closure";
+import { cleanupPrivateAgentSessionDirectory } from "../internal/agent-session-files";
 
 export interface LifecycleRuntimeOptions {
   isTeammate: boolean;
@@ -236,6 +237,15 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
           return;
         }
 
+        if (expectedState?.finalizationBlockedReason) {
+          cleanupError = new Error(expectedState.finalizationBlockedReason);
+          lifecycleLock.updateMatching(expectedRunId, {
+            phase: "cleanup_failed",
+            error: expectedState.finalizationBlockedReason,
+          });
+          return;
+        }
+
         lifecycleLock.updateMatching(expectedRunId, { phase: "finalizing", error: undefined });
         try {
           const config = teams.teamExists(teamName) ? await teams.readConfig(teamName) : null;
@@ -246,6 +256,14 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
           }
 
           releasedClaims = await releaseClaims(teamName, member.name);
+
+          // Private transcript cleanup is the first destructive recovery step.
+          // If it fails, runtime and roster identity must remain available with
+          // the matching lifecycle fence for manual recovery.
+          if (expectedState?.cleanupPrivateSessionOnFinalize) {
+            cleanupPrivateAgentSessionDirectory(teamName, member.name, expectedRunId);
+          }
+
           await finalizeTeammateRuntime(teamName, currentMember ?? member, expectedRunId);
 
           if (removeMember) {

@@ -64,6 +64,7 @@ describe("loadSettings", () => {
     expect(s.roles.read.model).toBeNull();
     expect(s.favoriteModels).toEqual({});
     expect(s.extensions.allow).toBeNull();
+    expect(s.agentSessions.showInResume).toBe(false);
     expect(s.debug.enabled).toBe(false);
   });
 
@@ -81,6 +82,7 @@ describe("loadSettings", () => {
       readHelpers: { maxConcurrent: 2, queueOverflow: false },
       roles: { write: { thinking: "high" } },
       extensions: { allow: ["pi-emote", "my-ext"] },
+      agentSessions: { showInResume: true },
       debug: { enabled: true },
     });
     const s = loadSettings({ homeDir, projectDir });
@@ -93,6 +95,7 @@ describe("loadSettings", () => {
     expect(s.readHelpers.queueOverflow).toBe(false);
     expect(s.roles.write.thinking).toBe("high");
     expect(s.extensions.allow).toEqual(["pi-emote", "my-ext"]);
+    expect(s.agentSessions.showInResume).toBe(true);
     expect(s.debug.enabled).toBe(true);
   });
 
@@ -101,12 +104,18 @@ describe("loadSettings", () => {
       watchdog: { bufferSeconds: 45 },
       writeAgents: { maxConcurrent: 5 },
       extensions: { allow: ["global-extension"] },
+      agentSessions: { showInResume: true },
     });
-    writeProject({ watchdog: { bufferSeconds: 10 }, extensions: { allow: null } });
+    writeProject({
+      watchdog: { bufferSeconds: 10 },
+      extensions: { allow: null },
+      agentSessions: { showInResume: false },
+    });
     const s = loadSettings({ homeDir, projectDir });
     expect(s.watchdog.bufferSeconds).toBe(10); // project wins
     expect(s.writeAgents.maxConcurrent).toBe(5); // global retained
     expect(s.extensions.allow).toBeNull();
+    expect(s.agentSessions.showInResume).toBe(false);
   });
 
   it("accepts high configured concurrency for large fanouts", () => {
@@ -127,6 +136,7 @@ describe("loadSettings", () => {
       writeAgents: { maxConcurrent: 0 },
       readAgents: { maxConcurrent: 0 },
       readHelpers: { maxConcurrent: 0 },
+      agentSessions: { showInResume: "yes" },
       debug: "yes",
     });
     const s = loadSettings({ homeDir, projectDir });
@@ -134,6 +144,7 @@ describe("loadSettings", () => {
     expect(s.writeAgents.maxConcurrent).toBe(DEFAULT_WRITE_AGENT_MAX_CONCURRENT);
     expect(s.readAgents.maxConcurrent).toBe(DEFAULT_READ_AGENT_MAX_CONCURRENT);
     expect(s.readHelpers.maxConcurrent).toBe(DEFAULT_READ_HELPER_MAX_CONCURRENT);
+    expect(s.agentSessions.showInResume).toBe(false);
     expect(s.debug.enabled).toBe(false);
   });
 

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.16] - 2026-08-22
+
+### Changed
+- Refresh the README as a concise control-first overview with current in-process agent and live-navigation screenshots.
+- Point intent-tier guidance to the README after removing the standalone tips document.
+
+### Removed
+- Remove the obsolete `TIPS.md` guide, its static documentation assertions, and the legacy tmux screenshot.
+
 ## [2.1.15] - 2026-08-18
 
 ### Fixed
@@ -191,7 +200,6 @@ All notable changes to this project will be documented in this file.
 ## [1.3.16] - 2026-06-28
 
 ### Added
-- `TIPS.md` documents which agent level to use and shows correct/incorrect spawn examples.
 - Lead sessions now warn at boot when no favorite agent levels are configured.
 
 ### Changed

@@ -1,6 +1,6 @@
 {
   "name": "pi-extended-teams",
-  "version": "2.1.15",
+  "version": "2.1.16",
   "description": "session-connected helper agents for pi",
   "repository": {
     "type": "git",
@@ -42,8 +42,7 @@
     "skills",
     "src",
     "package.json",
-    "README.md",
-    "TIPS.md"
+    "README.md"
   ],
   "dependencies": {
     "uuid": "^11.1.0"

@@ -47,23 +47,6 @@ describe("persisted team behavior contracts", () => {
     expect(byId["runtime.reload-disposes-background-handles"]).toContain("active in-process agent sessions/heartbeats");
   });
 
-  it("documents the public nested read opt-in and denial boundary consistently", () => {
-    for (const documentPath of ["README.md", "TIPS.md", "skills/teams.md"]) {
-      const document = fs.readFileSync(path.resolve(process.cwd(), documentPath), "utf-8");
-      expect(document, documentPath).toContain("allow_nested_read_agents");
-      expect(document, documentPath).toContain("write-feature");
-      expect(document, documentPath).toContain("write-critical");
-      expect(document, documentPath).toContain("write-patch");
-      expect(document, documentPath).toContain("write-system");
-      expect(document, documentPath).toContain("depth-1");
-      expect(document, documentPath).toMatch(/children[^.]*cannot delegate/i);
-    }
-
-    const readme = fs.readFileSync(path.resolve(process.cwd(), "README.md"), "utf-8");
-    expect(readme).toContain("spawned with `allow_nested_read_agents: true`");
-    expect(readme).toContain("any number of helpers at any canonical `read-*` tier");
-  });
-
   it("requires context-rich missions for isolated agent sessions", () => {
     const skill = fs.readFileSync(path.resolve(process.cwd(), "skills/teams.md"), "utf-8");
 

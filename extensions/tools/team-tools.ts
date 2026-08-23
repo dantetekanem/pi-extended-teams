@@ -118,7 +118,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const forbidden = ["model", "thinking", "role"].filter((key) => hasOwnParam(params, key));
     if (forbidden.length === 0) return;
     throw new Error(
-      `${context} must use model_slot only. Do not pass ${forbidden.join(", ")}; choose a configured intent tier from /agents-favorite-models. See TIPS.md for tier examples.`
+      `${context} must use model_slot only. Do not pass ${forbidden.join(", ")}; choose a configured intent tier from /agents-favorite-models. See README.md for tier examples.`
     );
   }
 
@@ -130,7 +130,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const slot = normalizeFavoriteModelSlot(params?.model_slot);
     if (!slot) {
       throw new Error(
-        `${context} requires a configured model_slot intent tier: ${FAVORITE_MODEL_SLOTS.join(", ")}. Define tiers with /agents-favorite-models and see TIPS.md for examples.`
+        `${context} requires a configured model_slot intent tier: ${FAVORITE_MODEL_SLOTS.join(", ")}. Define tiers with /agents-favorite-models and see README.md for examples.`
       );
     }
     return slot;
@@ -1061,7 +1061,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     }
   });
 
-  const levelDescription = "Required configured intent tier. Read tiers: read-collect gathers bounded facts without owning the conclusion; read-review is the normal default for focused review, verification, and bounded synthesis; read-analyze explains behavior or root cause across connected evidence; read-critical is only for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning. Write tiers: write-patch makes a narrow localized change; write-feature implements a bounded feature with a known design; write-system owns a cross-cutting integration or refactor within explicitly claimed files; write-critical is only for high-risk security, concurrency, recovery, migration, or data-integrity changes. Prefer canonical tiers; legacy reading-*/writing-* aliases remain accepted for this minor release. Do not pass role, model, or thinking directly; see TIPS.md.";
+  const levelDescription = "Required configured intent tier. Read tiers: read-collect gathers bounded facts without owning the conclusion; read-review is the normal default for focused review, verification, and bounded synthesis; read-analyze explains behavior or root cause across connected evidence; read-critical is only for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning. Write tiers: write-patch makes a narrow localized change; write-feature implements a bounded feature with a known design; write-system owns a cross-cutting integration or refactor within explicitly claimed files; write-critical is only for high-risk security, concurrency, recovery, migration, or data-integrity changes. Prefer canonical tiers; legacy reading-*/writing-* aliases remain accepted for this minor release. Do not pass role, model, or thinking directly; see README.md.";
   const publicAgentBaseParams = {
     name: Type.Optional(Type.String({ description: "Stable display name. Defaults to a generated agent name." })),
     prompt: Type.String({ description: "The agent's assignment, relevant prior context, evidence already gathered, constraints, and report shape." }),

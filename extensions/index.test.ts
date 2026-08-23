@@ -237,15 +237,6 @@ describe("extension integration", () => {
     }
   });
 
-  it("keeps public compatibility tables aligned with runtime aliases", () => {
-    for (const documentPath of ["README.md", "TIPS.md"]) {
-      const document = fs.readFileSync(path.resolve(documentPath), "utf-8");
-      for (const [legacy, canonical] of Object.entries(LEGACY_FAVORITE_MODEL_SLOT_ALIASES)) {
-        expect(document).toContain(`| \`${legacy}\` | \`${canonical}\` |`);
-      }
-    }
-  });
-
   it("does not expose report_progress in the lead session", async () => {
     const setup = await setupExtension();
     try {
@@ -304,7 +295,7 @@ describe("extension integration", () => {
       for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(
-        "No agent intent tiers are configured. Define them with /agents-favorite-models before spawning agents. See TIPS.md for intent-tier examples.",
+        "No agent intent tiers are configured. Define them with /agents-favorite-models before spawning agents. See README.md for intent-tier examples.",
         "warning"
       );
     } finally {

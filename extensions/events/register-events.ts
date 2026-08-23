@@ -170,7 +170,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       });
       if (configuredTiers.length === 0) {
         ctx.ui?.notify?.(
-          "No agent intent tiers are configured. Define them with /agents-favorite-models before spawning agents. See TIPS.md for intent-tier examples.",
+          "No agent intent tiers are configured. Define them with /agents-favorite-models before spawning agents. See README.md for intent-tier examples.",
           "warning"
         );
       }

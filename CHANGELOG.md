@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Refresh the README as a concise control-first overview with current in-process agent and live-navigation screenshots.
+- Include the screenshots and gallery metadata in the published package.
 - Point intent-tier guidance to the README after removing the standalone tips document.
 
 ### Removed

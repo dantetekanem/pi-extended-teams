@@ -1,10 +1,14 @@
 {
   "name": "pi-extended-teams",
   "version": "2.1.16",
-  "description": "session-connected helper agents for pi",
+  "description": "Control-first, session-connected subagents for Pi with live navigation and intent-tier routing",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/dantetekanem/pi-extended-teams.git"
+  },
+  "homepage": "https://github.com/dantetekanem/pi-extended-teams#readme",
+  "bugs": {
+    "url": "https://github.com/dantetekanem/pi-extended-teams/issues"
   },
   "author": "dantetekanem",
   "license": "MIT",
@@ -41,6 +45,7 @@
     "extensions",
     "skills",
     "src",
+    "assets",
     "package.json",
     "README.md"
   ],
@@ -53,6 +58,7 @@
     "@sinclair/typebox": "*"
   },
   "pi": {
+    "image": "https://raw.githubusercontent.com/dantetekanem/pi-extended-teams/main/assets/pi-extended-teams-in-action.png",
     "extensions": [
       "extensions/index.ts"
     ],

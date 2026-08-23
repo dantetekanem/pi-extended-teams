@@ -10,7 +10,13 @@ Read agents are the default. Edit agents are opt-in and should own isolated file
 
 ## Install and run
 
-Install from GitHub:
+Install from npm:
+
+```bash
+pi install npm:pi-extended-teams
+```
+
+Or install directly from GitHub:
 
 ```bash
 pi install git:github.com/dantetekanem/pi-extended-teams

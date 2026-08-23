@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.17] - 2026-08-22
+
+### Fixed
+- Make the npm package command the primary README installation path while retaining GitHub as an alternative.
+
 ## [2.1.16] - 2026-08-22
 
 ### Changed

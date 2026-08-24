@@ -1,23 +1,12 @@
 import { Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import type { RunningReadAgent } from "../runtime/types";
 import { initialContextUsage } from "../../src/utils/runtime";
-import { dimAnsi, pink, purple } from "./ansi";
-import { createFramePanelRowRenderer, framePanel } from "./frame";
+import { createFramePanelRowRenderer, framePanel, type FramePanelStyle } from "./frame";
 import { extractTextParts, formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel, sanitizePlainTuiLine, sanitizeTuiLine, sanitizeTuiText } from "./renderers";
+import { resolveExtendedTeamsTheme, type ExtendedTeamsForegroundToken, type ExtendedTeamsTheme } from "./theme";
 
 const REFRESH_INTERVAL_MS = 250;
 const MAX_NAVIGATION_AGENTS = 6;
-const AGENT_FOLLOW_BACKGROUND = "\x1b[48;2;22;23;32m";
-const ACTION_FOREGROUND = "\x1b[38;5;117m";
-const PATH_FOREGROUND = "\x1b[38;5;213m";
-const SUCCESS_FOREGROUND = "\x1b[38;5;114m";
-const FAILURE_FOREGROUND = "\x1b[38;5;210m";
-const PENDING_FOREGROUND = "\x1b[38;5;222m";
-const BODY_FOREGROUND = "\x1b[38;5;253m";
-const MUTED_FOREGROUND = "\x1b[38;5;247m";
-const STRUCTURAL_FOREGROUND = "\x1b[38;5;141m";
-const ANSI_FOREGROUND_RESET = "\x1b[39m";
-const ANSI_RESET = "\x1b[0m";
 const COLLAPSED_TOOL_RESULT_LINE_LIMIT = 14;
 const COLLAPSED_TOOL_RESULT_HEAD_LINES = 8;
 const COLLAPSED_TOOL_RESULT_TAIL_LINES = 3;
@@ -32,6 +21,7 @@ export interface AgentFollowViewOptions {
 export interface AgentFollowTranscriptOptions {
   expandLargeToolResults?: boolean;
   width?: number;
+  theme?: ExtendedTeamsTheme;
 }
 
 type TranscriptBlock =
@@ -78,40 +68,40 @@ function compactTranscriptLine(text: string): string {
   return sanitizePlainTuiLine(text).replace(/\s+/g, " ").trim();
 }
 
-function semanticAnsi(text: string, foreground: string): string {
-  return `${foreground}${text}${ANSI_FOREGROUND_RESET}`;
+function themed(theme: ExtendedTeamsTheme, token: ExtendedTeamsForegroundToken, text: string): string {
+  return theme.fg(token, text);
 }
 
-function actionAnsi(text: string): string {
-  return semanticAnsi(text, ACTION_FOREGROUND);
+function actionText(theme: ExtendedTeamsTheme, text: string): string {
+  return themed(theme, "syntaxFunction", text);
 }
 
-function pathAnsi(text: string): string {
-  return semanticAnsi(text, PATH_FOREGROUND);
+function pathText(theme: ExtendedTeamsTheme, text: string): string {
+  return themed(theme, "syntaxString", text);
 }
 
-function successAnsi(text: string): string {
-  return semanticAnsi(text, SUCCESS_FOREGROUND);
+function successText(theme: ExtendedTeamsTheme, text: string): string {
+  return themed(theme, "success", text);
 }
 
-function failureAnsi(text: string): string {
-  return semanticAnsi(text, FAILURE_FOREGROUND);
+function failureText(theme: ExtendedTeamsTheme, text: string): string {
+  return themed(theme, "error", text);
 }
 
-function pendingAnsi(text: string): string {
-  return semanticAnsi(text, PENDING_FOREGROUND);
+function pendingText(theme: ExtendedTeamsTheme, text: string): string {
+  return themed(theme, "warning", text);
 }
 
-function bodyAnsi(text: string): string {
-  return semanticAnsi(text, BODY_FOREGROUND);
+function bodyText(theme: ExtendedTeamsTheme, text: string): string {
+  return themed(theme, "text", text);
 }
 
-function mutedAnsi(text: string): string {
-  return semanticAnsi(text, MUTED_FOREGROUND);
+function mutedText(theme: ExtendedTeamsTheme, text: string): string {
+  return themed(theme, "muted", text);
 }
 
-function structuralAnsi(text: string): string {
-  return semanticAnsi(text, STRUCTURAL_FOREGROUND);
+function structuralText(theme: ExtendedTeamsTheme, text: string): string {
+  return themed(theme, "borderAccent", text);
 }
 
 function boundTranscriptLine(line: string, width?: number): string {
@@ -146,26 +136,26 @@ function editDiffCounts(details: unknown): { added: number; removed: number } | 
   return { added, removed };
 }
 
-function renderState(state: string): string {
-  if (state === "failed") return failureAnsi(state);
-  if (state === "working" || state === "submitting") return pendingAnsi(state);
-  if (state === "duplicate") return mutedAnsi(state);
-  return successAnsi(state);
+function renderState(theme: ExtendedTeamsTheme, state: string): string {
+  if (state === "failed") return failureText(theme, state);
+  if (state === "working" || state === "submitting") return pendingText(theme, state);
+  if (state === "duplicate") return mutedText(theme, state);
+  return successText(theme, state);
 }
 
-function renderActionPathState(action: string, path: string, state: string, width?: number): string {
+function renderActionPathState(theme: ExtendedTeamsTheme, action: string, path: string, state: string, width?: number): string {
   const renderedState = state === "failed"
-    ? failureAnsi("✗")
+    ? failureText(theme, "✗")
     : state === "succeeded"
-      ? successAnsi("✓")
-      : renderState(state);
+      ? successText(theme, "✓")
+      : renderState(theme, state);
   return boundTranscriptLine(
-    `${actionAnsi(action)}${mutedAnsi(" · ")}${pathAnsi(path)}${mutedAnsi(" · ")}${renderedState}`,
+    `${actionText(theme, action)}${mutedText(theme, " · ")}${pathText(theme, path)}${mutedText(theme, " · ")}${renderedState}`,
     width,
   );
 }
 
-function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, width?: number): string[] | undefined {
+function renderCompactToolBlock(theme: ExtendedTeamsTheme, block: Extract<TranscriptBlock, { kind: "tool" }>, width?: number): string[] | undefined {
   if (block.name === "report_progress") {
     const details = asRecord(block.details);
     const args = asRecord(block.args);
@@ -178,20 +168,20 @@ function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }
 
   if (block.name === "edit") {
     const path = toolPath(block.args);
-    if (block.result === undefined) return [renderActionPathState("edit", path, "working", width)];
-    if (block.isError) return [renderActionPathState("edit", path, "failed", width)];
+    if (block.result === undefined) return [renderActionPathState(theme, "edit", path, "working", width)];
+    if (block.isError) return [renderActionPathState(theme, "edit", path, "failed", width)];
     const counts = editDiffCounts(block.details);
     const added = counts ? `+${counts.added}` : "+?";
     const removed = counts ? `−${counts.removed}` : "−?";
     return [boundTranscriptLine(
-      `${actionAnsi("edit")}${mutedAnsi(" · ")}${pathAnsi(path)}${mutedAnsi(" · ")}${successAnsi(added)} ${failureAnsi(removed)}${mutedAnsi(" · ")}${successAnsi("✓")}`,
+      `${actionText(theme, "edit")}${mutedText(theme, " · ")}${pathText(theme, path)}${mutedText(theme, " · ")}${successText(theme, added)} ${failureText(theme, removed)}${mutedText(theme, " · ")}${successText(theme, "✓")}`,
       width,
     )];
   }
 
   if (block.name === "write") {
     const state = block.result === undefined ? "working" : block.isError ? "failed" : "succeeded";
-    return [renderActionPathState("write", toolPath(block.args), state, width)];
+    return [renderActionPathState(theme, "write", toolPath(block.args), state, width)];
   }
 
   if (block.name === "claim_file" || block.name === "release_file") {
@@ -203,7 +193,7 @@ function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }
         ? "failed"
         : "succeeded";
     const action = block.name === "claim_file" ? "claim" : "release";
-    return [renderActionPathState(action, toolPaths(block.args), state, width)];
+    return [renderActionPathState(theme, action, toolPaths(block.args), state, width)];
   }
 
   if (block.name === "report_and_exit") {
@@ -215,27 +205,27 @@ function renderCompactToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }
         : accepted === false
           ? "duplicate"
           : "accepted";
-    return [boundTranscriptLine(`${actionAnsi("final report")}${mutedAnsi(" · ")}${renderState(state)}`, width)];
+    return [boundTranscriptLine(`${actionText(theme, "final report")}${mutedText(theme, " · ")}${renderState(theme, state)}`, width)];
   }
 
   return undefined;
 }
 
-function renderToolHeader(block: Extract<TranscriptBlock, { kind: "tool" }>): string {
+function renderToolHeader(theme: ExtendedTeamsTheme, block: Extract<TranscriptBlock, { kind: "tool" }>): string {
   const detail = compactToolArgs(block.name, block.args);
-  if (!detail) return actionAnsi(block.name);
+  if (!detail) return actionText(theme, block.name);
   const isPath = typeof asRecord(block.args)?.path === "string";
-  const renderedDetail = isPath ? pathAnsi(detail) : bodyAnsi(`${block.name === "bash" ? "$ " : ""}${detail}`);
-  return `${actionAnsi(block.name)}${mutedAnsi(" · ")}${renderedDetail}`;
+  const renderedDetail = isPath ? pathText(theme, detail) : bodyText(theme, `${block.name === "bash" ? "$ " : ""}${detail}`);
+  return `${actionText(theme, block.name)}${mutedText(theme, " · ")}${renderedDetail}`;
 }
 
-function renderToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, expandLargeToolResults: boolean, width?: number): string[] {
-  const compactBlock = renderCompactToolBlock(block, width);
+function renderToolBlock(theme: ExtendedTeamsTheme, block: Extract<TranscriptBlock, { kind: "tool" }>, expandLargeToolResults: boolean, width?: number): string[] {
+  const compactBlock = renderCompactToolBlock(theme, block, width);
   if (compactBlock) return compactBlock;
 
-  const header = renderToolHeader(block);
+  const header = renderToolHeader(theme, block);
   if (block.result === undefined) {
-    return [header, `${structuralAnsi("│")} ${pendingAnsi("waiting for result…")}`, `${structuralAnsi("╰─")} ${pendingAnsi("running")}`, ""];
+    return [header, `${structuralText(theme, "│")} ${pendingText(theme, "waiting for result…")}`, `${structuralText(theme, "╰─")} ${pendingText(theme, "running")}`, ""];
   }
 
   const result = block.result || "(no output)";
@@ -253,14 +243,15 @@ function renderToolBlock(block: Extract<TranscriptBlock, { kind: "tool" }>, expa
     ? line
     : truncateToWidth(line, resultLineWidth, "…"));
   const body = boundedLines.map((line, index) => isCollapsed && index === COLLAPSED_TOOL_RESULT_HEAD_LINES
-    ? `${structuralAnsi("│")} ${mutedAnsi(line)}`
-    : `${structuralAnsi("│")} ${line}`);
+    ? `${structuralText(theme, "│")} ${mutedText(theme, line)}`
+    : `${structuralText(theme, "│")} ${line}`);
   const summary = `${resultLines.length} line${resultLines.length === 1 ? "" : "s"} · ${formatResultSize(result)}${isCollapsed ? " · collapsed" : ""}`;
-  const renderedSummary = block.isError ? failureAnsi(summary) : successAnsi(summary);
-  return [header, ...body, `${structuralAnsi("╰─")} ${renderedSummary}`, ""];
+  const renderedSummary = block.isError ? failureText(theme, summary) : successText(theme, summary);
+  return [header, ...body, `${structuralText(theme, "╰─")} ${renderedSummary}`, ""];
 }
 
 export function formatAgentFollowTranscript(messages: any[], options: AgentFollowTranscriptOptions = {}): string[] {
+  const theme = resolveExtendedTeamsTheme(options.theme);
   const blocks: TranscriptBlock[] = [];
   const toolsById = new Map<string, Extract<TranscriptBlock, { kind: "tool" }>>();
 
@@ -311,14 +302,15 @@ export function formatAgentFollowTranscript(messages: any[], options: AgentFollo
 
   const lines = blocks.flatMap(block => {
     if (block.kind === "tool") {
-      return renderToolBlock(block, options.expandLargeToolResults === true, options.width);
+      return renderToolBlock(theme, block, options.expandLargeToolResults === true, options.width);
     }
     if (block.label === "thinking") {
-      return [purple(block.label), block.text.replace(/\*\*/g, ""), ""];
+      return [theme.fg("thinkingText", block.label), block.text.replace(/\*\*/g, ""), ""];
     }
-    return [block.label === "user" ? pink(block.label) : purple(block.label), block.text, ""];
+    const labelToken = block.label === "user" ? "customMessageLabel" : "accent";
+    return [theme.fg(labelToken, block.label), block.text, ""];
   });
-  return lines.length > 0 ? lines : [dimAnsi("Waiting for the agent's first transcript event…")];
+  return lines.length > 0 ? lines : [theme.fg("dim", "Waiting for the agent's first transcript event…")];
 }
 
 function currentAgent(agents: RunningReadAgent[], selectedName: string | undefined): RunningReadAgent | undefined {
@@ -328,8 +320,14 @@ function currentAgent(agents: RunningReadAgent[], selectedName: string | undefin
 export function createAgentFollowComponent(
   tui: any,
   done: () => void,
-  options: AgentFollowViewOptions
+  options: AgentFollowViewOptions,
+  providedTheme?: ExtendedTeamsTheme
 ) {
+  const theme = resolveExtendedTeamsTheme(providedTheme);
+  const frameStyle: FramePanelStyle = {
+    border: (text) => theme.fg("borderAccent", text),
+    background: (text) => theme.bg("customMessageBg", text),
+  };
   let selectedName = options.initialAgentName;
   let offsetFromBottom = 0;
   let lastBodyHeight = 10;
@@ -501,32 +499,32 @@ export function createAgentFollowComponent(
       if (!agent) {
         const emptyBodyHeight = Math.max(4, terminalRows - 6);
         return framePanel([
-          pink("agent navigation"),
-          purple("↑  main agent"),
-          dimAnsi("No active agents. Press ↑ or esc to return to main."),
+          theme.fg("accent", "agent navigation"),
+          theme.fg("borderAccent", "↑  main agent"),
+          theme.fg("dim", "No active agents. Press ↑ or esc to return to main."),
           ...Array.from({ length: emptyBodyHeight }, () => ""),
-        ], innerWidth, AGENT_FOLLOW_BACKGROUND);
+        ], innerWidth, frameStyle);
       }
 
       const selectedIndex = Math.max(0, agents.findIndex(item => item.name === agent.name));
       const navigationStart = Math.max(0, Math.min(selectedIndex - 2, agents.length - MAX_NAVIGATION_AGENTS));
       const visibleAgents = agents.slice(navigationStart, navigationStart + MAX_NAVIGATION_AGENTS);
-      const navigationLines = [pink("agent navigation"), purple("↑  main agent")];
-      if (navigationStart > 0) navigationLines.push(dimAnsi(`   … ${navigationStart} agent${navigationStart === 1 ? "" : "s"} above`));
+      const navigationLines = [theme.fg("accent", "agent navigation"), theme.fg("borderAccent", "↑  main agent")];
+      if (navigationStart > 0) navigationLines.push(theme.fg("dim", `   … ${navigationStart} agent${navigationStart === 1 ? "" : "s"} above`));
       for (const item of visibleAgents) {
         const selected = item.name === agent.name;
-        navigationLines.push(`${selected ? pink("->") : "  "} ${item.name}`);
+        navigationLines.push(`${selected ? theme.fg("accent", "->") : "  "} ${item.name}`);
       }
       const remainingAgents = agents.length - navigationStart - visibleAgents.length;
-      if (remainingAgents > 0) navigationLines.push(dimAnsi(`↓  … ${remainingAgents} more agent${remainingAgents === 1 ? "" : "s"}`));
+      if (remainingAgents > 0) navigationLines.push(theme.fg("dim", `↓  … ${remainingAgents} more agent${remainingAgents === 1 ? "" : "s"}`));
 
       const messageLines = options.sendMessage ? [
-        purple("─".repeat(innerWidth)),
-        composingMessage ? pink(`message ${agent.name}`) : dimAnsi(`message ${agent.name}`),
-        ...(composingMessage ? messageInput.render(innerWidth) : [dimAnsi("> Press m to start typing")]),
+        theme.fg("border", "─".repeat(innerWidth)),
+        composingMessage ? theme.fg("accent", `message ${agent.name}`) : theme.fg("dim", `message ${agent.name}`),
+        ...(composingMessage ? messageInput.render(innerWidth) : [theme.fg("dim", "> Press m to start typing")]),
         ...(messageStatus
-          ? [dimAnsi(messageStatus)]
-          : composingMessage ? [dimAnsi("enter send · esc cancel")] : []),
+          ? [theme.fg("dim", messageStatus)]
+          : composingMessage ? [theme.fg("dim", "enter send · esc cancel")] : []),
       ] : [];
       const bodyHeight = Math.max(4, terminalRows - navigationLines.length - 6 - messageLines.length);
       lastBodyHeight = bodyHeight;
@@ -611,6 +609,7 @@ export function createAgentFollowComponent(
         cachedTranscriptLines = formatAgentFollowTranscript(currentMessages, {
           expandLargeToolResults,
           width: currentTranscriptWidth,
+          theme,
         }).flatMap(line => wrapTextWithAnsi(line, currentTranscriptWidth));
       }
       const transcriptLines = cachedTranscriptLines;
@@ -623,10 +622,10 @@ export function createAgentFollowComponent(
 
       const frameContent = [
         ...navigationLines,
-        purple("─".repeat(innerWidth)),
+        theme.fg("border", "─".repeat(innerWidth)),
         headline,
-        dimAnsi(help),
-        purple("─".repeat(innerWidth)),
+        theme.fg("dim", help),
+        theme.fg("border", "─".repeat(innerWidth)),
         ...visible,
         ...messageLines,
       ];
@@ -670,8 +669,8 @@ export function createAgentFollowComponent(
         }
       }
       if (!renderedFrame) {
-        renderedFrame = framePanel(frameContent, innerWidth, AGENT_FOLLOW_BACKGROUND);
-        cachedFrameRowRenderer = createFramePanelRowRenderer(innerWidth, AGENT_FOLLOW_BACKGROUND);
+        renderedFrame = framePanel(frameContent, innerWidth, frameStyle);
+        cachedFrameRowRenderer = createFramePanelRowRenderer(innerWidth, frameStyle);
       }
       cachedFrameWidth = innerWidth;
       cachedFrameContent = frameContent;
@@ -684,6 +683,20 @@ export function createAgentFollowComponent(
     },
     invalidate() {
       messageInput.invalidate();
+      transcriptAgent = undefined;
+      transcriptMessages = undefined;
+      transcriptMessageCount = -1;
+      transcriptLastMessage = undefined;
+      transcriptWidth = -1;
+      cachedTranscriptLines = [];
+      cachedFrameWidth = -1;
+      cachedFrameRowRenderer = undefined;
+      cachedFrameContent = null;
+      cachedFrameLines = null;
+      fastFrameKey = "";
+      fastFrameMessages = undefined;
+      fastFrameMessageCount = -1;
+      fastFrameLastMessage = undefined;
     },
     dispose() {
       clearInterval(refreshTimer);
@@ -765,7 +778,7 @@ export function createAgentFollowComponent(
 export async function openAgentFollowView(ctx: any, options: AgentFollowViewOptions): Promise<void> {
   if (ctx.mode && ctx.mode !== "tui") return;
   await ctx.ui.custom(
-    (tui: any, _theme: any, _keybindings: any, done: () => void) => createAgentFollowComponent(tui, done, options),
+    (tui: any, theme: any, _keybindings: any, done: () => void) => createAgentFollowComponent(tui, done, options, theme),
     {
       overlay: true,
       overlayOptions: {

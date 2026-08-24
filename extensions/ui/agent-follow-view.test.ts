@@ -10,6 +10,29 @@ function stripAnsi(text: string): string {
   return text.replace(ANSI_SGR_SEQUENCE, "");
 }
 
+function makeTheme() {
+  const foregroundCodes: Record<string, number> = {
+    accent: 213,
+    border: 141,
+    borderAccent: 141,
+    customMessageLabel: 213,
+    dim: 247,
+    error: 210,
+    muted: 247,
+    success: 114,
+    syntaxFunction: 117,
+    syntaxString: 213,
+    text: 253,
+    thinkingText: 141,
+    warning: 222,
+  };
+  return {
+    fg: vi.fn((token: string, text: string) => `\x1b[38;5;${foregroundCodes[token] ?? 253}m${text}\x1b[39m`),
+    bg: vi.fn((_token: string, text: string) => `\x1b[48;5;235m${text}\x1b[49m`),
+    bold: vi.fn((text: string) => `\x1b[1m${text}\x1b[22m`),
+  };
+}
+
 function makeAgent(overrides: Partial<RunningReadAgent> = {}): RunningReadAgent {
   return {
     runId: "run-1",
@@ -223,7 +246,8 @@ describe("agent follow transcript", () => {
     expect(lines.join("\n")).not.toContain("complete final report body");
   });
 
-  it("uses semantic chrome colors while leaving prose and raw output neutral", () => {
+  it("uses Pi theme tokens for semantic chrome while leaving prose and raw output neutral", () => {
+    const theme = makeTheme();
     const lines = formatAgentFollowTranscript([
       { role: "assistant", content: [
         { type: "thinking", thinking: "Neutral thinking prose" },
@@ -243,7 +267,7 @@ describe("agent follow transcript", () => {
       },
       { role: "toolResult", toolCallId: "edit-failure", toolName: "edit", content: "Edit failed", isError: true },
       { role: "toolResult", toolCallId: "bash-raw", toolName: "bash", content: "neutral shell output", isError: false },
-    ], { width: 80 });
+    ], { width: 80, theme });
 
     const pendingHeader = lines.find((line) => stripAnsi(line).startsWith("read")) || "";
     const pendingState = lines.find((line) => stripAnsi(line).includes("waiting for result")) || "";
@@ -261,6 +285,12 @@ describe("agent follow transcript", () => {
     expect(rawOutput).toBe("\x1b[38;5;141m│\x1b[39m neutral shell output");
     expect(lines).toContain("Neutral thinking prose");
     expect(lines).toContain("Neutral assistant prose");
+    expect(theme.fg).toHaveBeenCalledWith("syntaxFunction", "read");
+    expect(theme.fg).toHaveBeenCalledWith("syntaxString", "src/pending.ts");
+    expect(theme.fg).toHaveBeenCalledWith("warning", "waiting for result…");
+    expect(theme.fg).toHaveBeenCalledWith("success", "+2");
+    expect(theme.fg).toHaveBeenCalledWith("error", "−1");
+    expect(theme.fg).toHaveBeenCalledWith("borderAccent", "│");
   });
 
   it("keeps claim and release tools compact and semantically colored", () => {
@@ -285,7 +315,7 @@ describe("agent follow transcript", () => {
         details: { released: ["src/a.ts"] },
         isError: false,
       },
-    ], { width: 80 });
+    ], { width: 80, theme: makeTheme() });
 
     expect(lines.map(stripAnsi)).toEqual([
       "claim · src/a.ts, src/b.ts · ✓",
@@ -367,6 +397,7 @@ describe("agent follow component", () => {
     let contextPercent = 23;
     const done = vi.fn();
     const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
+    const theme = makeTheme();
     const agent = makeAgent({
       session: {
         messages: [{ role: "assistant", content: [{ type: "text", text: "Working now" }] }],
@@ -376,15 +407,17 @@ describe("agent follow component", () => {
         }),
       } as any,
     });
-    const component = createAgentFollowComponent(tui, done, { getAgents: () => [agent] });
+    const component = createAgentFollowComponent(tui, done, { getAgents: () => [agent] }, theme);
 
     const first = component.render(140).join("\n");
     expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 46k tok \(23%\) · Verifying assumptions\.{1,3}/);
     expect(first).not.toContain("502k tok");
     expect(first).toContain("Working now");
     expect(stripAnsi(first)).not.toContain("progress:");
-    expect(first).toContain("\x1b[48;2;22;23;32m");
-    expect(first).not.toContain("\x1b[48;5;235m");
+    expect(theme.bg).toHaveBeenCalledWith("customMessageBg", expect.any(String));
+    expect(theme.fg).toHaveBeenCalledWith("borderAccent", expect.any(String));
+    expect(first).toContain("\x1b[48;5;235m");
+    expect(first).not.toContain("\x1b[48;2;22;23;32m");
 
     billedTokens = 2_300_000;
     contextTokens = 80_000;
@@ -397,6 +430,31 @@ describe("agent follow component", () => {
 
     component.handleInput("\x1b[A");
     expect(done).toHaveBeenCalledOnce();
+    component.dispose();
+  });
+
+  it("rebuilds cached themed content when Pi invalidates the component", () => {
+    const tui = { terminal: { rows: 20 }, requestRender: vi.fn() };
+    let color = 31;
+    const theme = {
+      fg: vi.fn((_token: string, text: string) => `\x1b[${color}m${text}\x1b[39m`),
+      bg: vi.fn((_token: string, text: string) => text),
+      bold: vi.fn((text: string) => text),
+    };
+    const agent = makeAgent({
+      session: {
+        messages: [{ role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "README.md" } }] }],
+      } as any,
+    });
+    const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [agent] }, theme);
+
+    expect(component.render(100).join("\n")).toContain("\x1b[31mread");
+    color = 32;
+    component.invalidate();
+    const rerendered = component.render(100).join("\n");
+
+    expect(rerendered).toContain("\x1b[32mread");
+    expect(rerendered).not.toContain("\x1b[31mread");
     component.dispose();
   });
 

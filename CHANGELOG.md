@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.18] - 2026-08-23
+
+### Changed
+- Make the agent activity and live follow views use the active Pi theme for their color roles, borders, and backgrounds.
+
 ## [2.1.17] - 2026-08-22
 
 ### Fixed

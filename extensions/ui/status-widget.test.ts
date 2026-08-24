@@ -14,6 +14,32 @@ function makeSnapshot(overrides: Partial<TeamActivityStatusSnapshot> = {}): Team
 }
 
 describe("agent activity status widget", () => {
+  it("uses Pi theme tokens and refreshes cached styles after invalidation", () => {
+    const snapshot = makeSnapshot({
+      activeCount: 1,
+      readCount: 1,
+      entries: [{ name: "reader", role: "read", status: "thinking" }],
+    });
+    let color = 31;
+    const theme = {
+      fg: vi.fn((_token: string, text: string) => `\x1b[${color}m${text}\x1b[39m`),
+      bg: vi.fn((_token: string, text: string) => text),
+      bold: vi.fn((text: string) => text),
+    };
+    const widget = teamActivityStatusWidget(() => snapshot, () => false, undefined, theme);
+
+    expect(widget.render(120).join("\n")).toContain("\x1b[31magent activity");
+    expect(theme.fg).toHaveBeenCalledWith("accent", "agent activity");
+    expect(theme.fg).toHaveBeenCalledWith("border", expect.any(String));
+
+    color = 32;
+    widget.invalidate();
+    const rerendered = widget.render(120).join("\n");
+    expect(rerendered).toContain("\x1b[32magent activity");
+    expect(rerendered).not.toContain("\x1b[31magent activity");
+    widget.dispose();
+  });
+
   it("renders open snapshots without a collapse hint", () => {
     const entries: TeamActivityStatusEntry[] = [{
       name: "reader",

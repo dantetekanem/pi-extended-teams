@@ -1,6 +1,6 @@
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dimAnsi, pink, purple } from "./ansi";
 import { formatAnimatedProgress } from "./renderers";
+import { resolveExtendedTeamsTheme, type ExtendedTeamsTheme } from "./theme";
 
 export interface TeamActivityStatusEntry {
   name: string;
@@ -62,21 +62,21 @@ function formatStatusSummary(statusCounts: TeamActivityStatusCounts | undefined)
   return shown.join(" · ");
 }
 
-function formatAggregatePreview(snapshot: TeamActivityStatusSnapshot): string {
+function formatAggregatePreview(snapshot: TeamActivityStatusSnapshot, theme: ExtendedTeamsTheme): string {
   const summary = formatStatusSummary(snapshot.statusCounts) || formatRoleSummary(snapshot);
-  return `${pink("summary")} ${purple(summary)} ${dimAnsi("↓ navigate")}`;
+  return `${theme.fg("accent", "summary")} ${theme.fg("borderAccent", summary)} ${theme.fg("dim", "↓ navigate")}`;
 }
 
-function formatExpandedEntry(entry: TeamActivityStatusEntry): string {
+function formatExpandedEntry(entry: TeamActivityStatusEntry, theme: ExtendedTeamsTheme): string {
   if (entry.displayText) return entry.displayText;
-  const status = entry.status ? ` ${purple(entry.status)}` : "";
-  const detail = entry.detail ? ` ${dimAnsi(entry.detail)}` : "";
-  return `${pink(entry.name)} ${purple(entry.role)}${status}${detail}`;
+  const status = entry.status ? ` ${theme.fg("borderAccent", entry.status)}` : "";
+  const detail = entry.detail ? ` ${theme.fg("dim", entry.detail)}` : "";
+  return `${theme.fg("accent", entry.name)} ${theme.fg("borderAccent", entry.role)}${status}${detail}`;
 }
 
-function formatHeader(snapshot: TeamActivityStatusSnapshot): string {
+function formatHeader(snapshot: TeamActivityStatusSnapshot, theme: ExtendedTeamsTheme): string {
   const summary = `${formatCountSummary(snapshot)} · ↓ navigate`;
-  return `${pink("agent activity")}  ${dimAnsi(summary)}`;
+  return `${theme.fg("accent", "agent activity")}  ${theme.fg("dim", summary)}`;
 }
 
 interface ProgressTransition {
@@ -131,8 +131,10 @@ function splitProgressDisplay(displayText: string | undefined): { prefix: string
 export function teamActivityStatusWidget(
   getSnapshot: () => TeamActivityStatusSnapshot | null | undefined,
   _getExpanded: () => boolean,
-  requestRender?: () => void
+  requestRender?: () => void,
+  providedTheme?: ExtendedTeamsTheme
 ) {
+  const theme = resolveExtendedTeamsTheme(providedTheme);
   const transitions = new Map<string, ProgressTransition>();
   let animationTimer: NodeJS.Timeout | null = null;
   let summarySnapshot: TeamActivityStatusSnapshot | null | undefined;
@@ -186,15 +188,15 @@ export function teamActivityStatusWidget(
       if (!hasCachedTransitionEntry || transition) transitionHints[hintIndex] = transition;
     }
     if (!entry.displayText) {
-      return animationResult(`${purple(branch)} ${formatExpandedEntry(entry)}`, false, width);
+      return animationResult(`${theme.fg("border", branch)} ${formatExpandedEntry(entry, theme)}`, false, width);
     }
 
     if (!transition || transition.source !== entry.displayText) {
       const parsed = splitProgressDisplay(entry.displayText);
       if (!parsed) {
-        return animationResult(`${purple(branch)} ${formatExpandedEntry(entry)}`, false, width);
+        return animationResult(`${theme.fg("border", branch)} ${formatExpandedEntry(entry, theme)}`, false, width);
       }
-      const branchPrefix = `${purple(branch)} `;
+      const branchPrefix = `${theme.fg("border", branch)} `;
       const prefixVisibleWidth = SINGLE_COLUMN_STATUS_TEXT.test(parsed.prefix)
         ? parsed.prefix.length
         : visibleWidth(parsed.prefix);
@@ -273,14 +275,14 @@ export function teamActivityStatusWidget(
       transitionHints[hintIndex] = transition;
     } else if (transition.branch !== branch) {
       transition.branch = branch;
-      transition.linePrefix = `${purple(branch)} ${transition.prefix}`;
+      transition.linePrefix = `${theme.fg("border", branch)} ${transition.prefix}`;
     }
 
     const elapsed = Math.max(0, now - transition.startedAt);
     if (elapsed < 200) {
       const remaining = Math.max(0, Math.ceil(transition.previous.length * (1 - elapsed / 200)));
       const progressText = transition.previous.slice(0, remaining);
-      return animationResult(`${transition.linePrefix}${dimAnsi(progressText)}`, true, width, currentTransitionRenderedWidth(transition, progressText, transition.previousSingleColumn, width));
+      return animationResult(`${transition.linePrefix}${theme.fg("dim", progressText)}`, true, width, currentTransitionRenderedWidth(transition, progressText, transition.previousSingleColumn, width));
     }
     if (elapsed < 1000) {
       const revealed = Math.floor(transition.target.length * ((elapsed - 200) / 800));
@@ -324,7 +326,7 @@ export function teamActivityStatusWidget(
           headerWriteCount = snapshot.writeCount;
           headerUnreadCount = snapshot.unreadCount;
           headerWidth = width;
-          headerLine = truncateToWidth(formatHeader(snapshot), width, "…", true);
+          headerLine = truncateToWidth(formatHeader(snapshot, theme), width, "…", true);
         }
         summaryLines = [headerLine];
         if (shouldUseAggregatePreview(snapshot)) {
@@ -350,7 +352,7 @@ export function teamActivityStatusWidget(
             aggregateReadCount = snapshot.readCount;
             aggregateWriteCount = snapshot.writeCount;
             aggregateWidth = width;
-            aggregateLine = truncateToWidth(formatAggregatePreview(snapshot), width, "…", true);
+            aggregateLine = truncateToWidth(formatAggregatePreview(snapshot, theme), width, "…", true);
           }
           summaryLines.push(aggregateLine);
         }
@@ -409,7 +411,7 @@ export function teamActivityStatusWidget(
         if (remainingCount !== remaining || remainingWidth !== width) {
           remainingCount = remaining;
           remainingWidth = width;
-          remainingLine = truncateToWidth(dimAnsi(`└─ … ${remaining} more active agent${remaining === 1 ? "" : "s"}`), width, "…", true);
+          remainingLine = truncateToWidth(theme.fg("dim", `└─ … ${remaining} more active agent${remaining === 1 ? "" : "s"}`), width, "…", true);
         }
         lines.push(remainingLine);
       }
@@ -420,7 +422,7 @@ export function teamActivityStatusWidget(
         stopAnimationTimer();
       }
 
-      const border = purple("─".repeat(Math.max(0, width)));
+      const border = theme.fg("border", "─".repeat(Math.max(0, width)));
       const rendered = [...lines, border];
       if (animationActive) {
         stableLines = null;
@@ -432,7 +434,38 @@ export function teamActivityStatusWidget(
       }
       return rendered;
     },
-    invalidate() {},
+    invalidate() {
+      transitions.clear();
+      summarySnapshot = undefined;
+      summaryUpdatedAt = -1;
+      summaryWidth = -1;
+      summaryLines = [];
+      headerActiveCount = -1;
+      headerReadCount = -1;
+      headerWriteCount = -1;
+      headerUnreadCount = -1;
+      headerWidth = -1;
+      aggregateStatusCounts = {};
+      aggregateStatusCountSize = -1;
+      aggregateActiveCount = -1;
+      aggregateReadCount = -1;
+      aggregateWriteCount = -1;
+      aggregateWidth = -1;
+      remainingCount = -1;
+      remainingWidth = -1;
+      transitionHintSnapshot = undefined;
+      transitionHintUpdatedAt = -1;
+      transitionHintEntries.length = 0;
+      transitionHints.length = 0;
+      transitionRosterRoles.length = 0;
+      transitionRosterNames.length = 0;
+      transitionRosterKeys.length = 0;
+      transitionRosterCount = -1;
+      stableSnapshot = undefined;
+      stableUpdatedAt = -1;
+      stableWidth = -1;
+      stableLines = null;
+    },
     dispose() {
       stopAnimationTimer();
     },

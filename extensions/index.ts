@@ -496,12 +496,13 @@ export default function (pi: ExtensionAPI) {
     teamActivityWidgetMounted = true;
     sessionCtx.ui.setWidget(
       "01-pi-extended-teams-readers",
-      (tui: any) => {
+      (tui: any, theme: any) => {
         teamActivityWidgetTui = tui;
         return teamActivityStatusWidget(
           () => teamActivityStatusSnapshot,
           isTeamActivityExpanded,
-          () => tui.requestRender?.()
+          () => tui.requestRender?.(),
+          theme
         );
       },
       { placement: "belowEditor" }

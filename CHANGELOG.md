@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.19] - 2026-08-25
+
+### Fixed
+- Keep Page Up and Page Down inside the active subagent follow view when Pi runs in Herdr's regular pane mode.
+
 ## [2.1.18] - 2026-08-23
 
 ### Changed

@@ -369,7 +369,31 @@ describe("agent follow transcript", () => {
 
 describe("agent follow component", () => {
   beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
+  it("makes Herdr forward page keys while a regular-mode follow view is open", () => {
+    vi.stubEnv("HERDR_ENV", "1");
+    const terminal = { rows: 18, write: vi.fn() };
+    const tui = { mode: "regular", terminal, requestRender: vi.fn() };
+    const messages = Array.from({ length: 20 }, (_, index) => ({
+      role: "assistant",
+      content: [{ type: "text", text: `transcript entry ${index + 1}` }],
+    }));
+    const component = createAgentFollowComponent(tui, vi.fn(), {
+      getAgents: () => [makeAgent({ session: { messages } as any })],
+    });
+
+    expect(terminal.write).toHaveBeenCalledWith("\x1b[?1000h");
+    expect(stripAnsi(component.render(80).join("\n"))).toContain("transcript entry 20");
+    component.handleInput("\x1b[5~");
+    expect(stripAnsi(component.render(80).join("\n"))).not.toContain("transcript entry 20");
+
+    component.dispose();
+    expect(terminal.write).toHaveBeenLastCalledWith("\x1b[?1000l");
+  });
 
   it("starts at zero instead of showing the pre-response message estimate", () => {
     const tui = { terminal: { rows: 24 }, requestRender: vi.fn() };

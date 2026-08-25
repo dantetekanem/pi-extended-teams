@@ -324,6 +324,9 @@ export function createAgentFollowComponent(
   providedTheme?: ExtendedTeamsTheme
 ) {
   const theme = resolveExtendedTeamsTheme(providedTheme);
+  // Herdr reserves plain page keys for primary-screen scrollback unless an app owns mouse input.
+  const forwardHerdrPageKeys = process.env.HERDR_ENV === "1" && tui.mode !== "fullscreen" && typeof tui.terminal?.write === "function";
+  if (forwardHerdrPageKeys) tui.terminal.write("\x1b[?1000h");
   const frameStyle: FramePanelStyle = {
     border: (text) => theme.fg("borderAccent", text),
     background: (text) => theme.bg("customMessageBg", text),
@@ -700,6 +703,7 @@ export function createAgentFollowComponent(
     },
     dispose() {
       clearInterval(refreshTimer);
+      if (forwardHerdrPageKeys) tui.terminal.write("\x1b[?1000l");
     },
     handleInput(data: string) {
       if (composingMessage) {

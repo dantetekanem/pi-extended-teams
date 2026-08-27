@@ -438,7 +438,7 @@ describe("agent follow component", () => {
     expect(first).not.toContain("502k tok");
     expect(first).toContain("Working now");
     expect(stripAnsi(first)).not.toContain("progress:");
-    expect(theme.bg).toHaveBeenCalledWith("customMessageBg", expect.any(String));
+    expect(theme.bg).toHaveBeenCalledWith("toolPendingBg", expect.any(String));
     expect(theme.fg).toHaveBeenCalledWith("borderAccent", expect.any(String));
     expect(first).toContain("\x1b[48;5;235m");
     expect(first).not.toContain("\x1b[48;2;22;23;32m");

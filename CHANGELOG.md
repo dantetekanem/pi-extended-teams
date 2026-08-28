@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-08-28
+
+### Added
+- Add the lead-only `interrupt_teammate` tool and live-view `i` shortcut for interrupting a stuck tool command without stopping the agent or releasing its claims.
+- Include runtime-proven tmux writers in live navigation and deliver Pi's Escape interrupt without killing their panes.
+
 ## [2.1.19] - 2026-08-25
 
 ### Fixed

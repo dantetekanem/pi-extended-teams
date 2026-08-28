@@ -10,18 +10,39 @@ import type { Member } from "../../src/utils/models";
 import type { ReadAgentTeardownResult } from "../agents/read-agent-session-lifecycle";
 import type { ShutdownTeammateOptions } from "../team/lifecycle";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
+import type { TeammateInterruptResult } from "../runtime/teammate-interrupt";
 
 export interface TaskRuntimeToolsOptions {
   isTeammate: boolean;
   terminal: any;
   runningReadAgents: Map<string, RunningReadAgent>;
   readAgentKey(teamName: string, agentName: string): string;
+  interruptTeammate?(agentName: string): Promise<TeammateInterruptResult>;
   shutdownTeammate(teamName: string, member: Member, options?: ShutdownTeammateOptions): Promise<ReadAgentTeardownResult>;
   getTeamName(): string | null | undefined;
 }
 
 export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptions): void {
   if (!options.isTeammate) {
+    if (options.interruptTeammate) {
+      pi.registerTool({
+        name: "interrupt_teammate",
+        label: "Interrupt Agent Command",
+        description: "Interrupt one active agent's currently running tool command without stopping the agent, removing it from the roster, or releasing its claims. Cancellation is cooperative for in-process tools, so the result may remain pending. Use this only for a command that is actually stuck; normal agent silence is not a reason to interrupt.",
+        parameters: Type.Object({ agent_name: Type.String() }),
+        async execute(_toolCallId: string, params: any) {
+          const teamName = options.getTeamName();
+          if (!teamName) throw new Error("No active agent session. Spawn an agent first.");
+
+          const result = await options.interruptTeammate!(params.agent_name);
+          return {
+            content: [{ type: "text", text: result.message }],
+            details: { session: teamName, ...result },
+          };
+        },
+      });
+    }
+
     pi.registerTool({
       name: "stop_teammate",
       label: "Stop Agent",

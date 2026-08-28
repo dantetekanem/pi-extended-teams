@@ -13,7 +13,7 @@
     },
     {
       "id": "ui.agent-follow-navigation",
-      "description": "From an empty main editor, Down opens the first active agent in a full-window interactive live-follow view. Down moves to the next agent; Up moves to the previous agent and returns to main only from the first agent; Escape always returns to main. The view exposes transcript, thinking, progress, elapsed time, and tokens; pairs tool calls with their results in readable blocks; collapses large results with head/tail context and an expansion toggle; and provides an input for direct messages to the selected active agent. Pressing x stops the selected subagent while keeping the live view open."
+      "description": "From an empty main editor, Down opens the first active agent in a full-window interactive live-follow view. Down moves to the next agent; Up moves to the previous agent and returns to main only from the first agent; Escape always returns to main. The view exposes transcript, thinking, progress, elapsed time, and tokens; pairs tool calls with their results in readable blocks; collapses large results with head/tail context and an expansion toggle; and provides an input for direct messages to the selected active agent. Pressing i interrupts the selected subagent's running tool command while preserving its session and claims. Pressing x stops the selected subagent completely. Both actions keep the live view open."
     },
     {
       "id": "helpers.requested-by-writer",

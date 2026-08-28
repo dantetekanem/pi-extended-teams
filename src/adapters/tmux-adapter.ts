@@ -154,6 +154,17 @@ export class TmuxAdapter implements TerminalAdapter {
     return newPaneId;
   }
 
+  interrupt(paneId: string): boolean {
+    const targetPaneId = paneId?.trim();
+    if (!targetPaneId) return false;
+
+    try {
+      return execCommand("tmux", ["send-keys", "-t", targetPaneId, "Escape"]).status === 0;
+    } catch {
+      return false;
+    }
+  }
+
   kill(paneId: string): void {
     if (!paneId) return;
 

@@ -141,13 +141,14 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 - Once a final report is accepted, new message admission is closed and the agent is self-exiting; teardown may still be finishing. Do not call `stop_teammate` after normal completion. If genuinely new work appears after the report, spawn a fresh bounded `read-collect` lane rather than trying to revive that closing session.
 - Do not wake the lead just to ping idle agents.
 - Use `check_teammate` only when a specific agent appears stalled or unhealthy after several minutes, not immediately after sending a message.
-- Use `stop_teammate` only when the user explicitly asks to cancel/stop an active agent or an active agent is no longer needed.
+- Use `interrupt_teammate` only when an active agent has a proven stuck tool command. It interrupts that command without closing the session, removing the agent, or releasing its claims; in-process cancellation may remain pending, and tmux success proves Escape delivery rather than command settlement. Send follow-up work after a confirmed in-process interruption.
+- Use `stop_teammate` only when the user explicitly asks to cancel/stop the whole active agent or the agent is no longer needed. Do not substitute it for command interruption.
 - Ask before applying fixes during an investigation.
 - Never commit, push, deploy, install packages, or start services unless the user authorizes that side effect.
 
 ## Watching and inspecting
 
-- Use the below-editor activity card for active status. From an empty editor, press Down for the live view, Down/Up to navigate, `x` to stop the selected agent, and Escape to return.
+- Use the below-editor activity card for active status. From an empty editor, press Down for the live view, Down/Up to navigate, `i` to interrupt the selected agent's running tool command, `x` to stop the whole selected agent, and Escape to return.
 - Completed reports arrive in the lead session as open report entries.
 - Use `check_teammate({ agent_name: "name" })` only for targeted liveness diagnostics.
 
@@ -157,7 +158,8 @@ Default lead tools:
 
 - `spawn_agent` — start one read or edit-allowed agent in the current Pi session using required `model_slot`; optional `session_context: "lazy"` exposes a filtered session snapshot for on-demand reference.
 - `spawn_swarm_agents` — start a batch of agents with optional shared `model_slot`, `session_context`, and `allow_nested_read_agents` defaults.
-- `stop_teammate` — explicitly stop one active agent when cancellation is requested.
+- `interrupt_teammate` — interrupt one active agent's currently running tool command while preserving the agent session, task context, and claims; the result may be pending for cooperative tools or delivery-only for tmux.
+- `stop_teammate` — explicitly stop one whole active agent when cancellation is requested.
 - `check_teammate` — inspect one agent's health when needed.
 - `send_message` — send a direct message in the current session.
 - `read_inbox` — read the current session inbox.

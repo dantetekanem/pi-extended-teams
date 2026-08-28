@@ -20,6 +20,11 @@ function registerTools(isTeammate: boolean) {
     terminal: null,
     runningReadAgents: new Map(),
     readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+    interruptTeammate: vi.fn(async (agentName: string) => ({
+      status: "no_command" as const,
+      agentName,
+      message: `Agent ${agentName} has no running tool command to interrupt.`,
+    })),
     shutdownTeammate: vi.fn(async () => ({
       status: "settled" as const,
       reason: "quit" as const,
@@ -55,14 +60,50 @@ describe("task runtime tools", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("keeps stop_teammate lead-only while leaving diagnostics available", () => {
+  it("keeps process-control tools lead-only while leaving diagnostics available", () => {
     const leadTools = registerTools(false);
     const teammateTools = registerTools(true);
 
+    expect(leadTools.has("interrupt_teammate")).toBe(true);
     expect(leadTools.has("stop_teammate")).toBe(true);
     expect(leadTools.has("check_teammate")).toBe(true);
+    expect(teammateTools.has("interrupt_teammate")).toBe(false);
     expect(teammateTools.has("stop_teammate")).toBe(false);
     expect(teammateTools.has("check_teammate")).toBe(true);
+  });
+
+  it("renders the shared interruption result without invoking whole-agent teardown", async () => {
+    const tools = new Map<string, any>();
+    const shutdownTeammate = vi.fn();
+    const interruptTeammate = vi.fn(async (agentName: string) => ({
+      status: "interrupt_sent" as const,
+      agentName,
+      agentKind: "write" as const,
+      lifecycleRunId: "writer-run",
+      mechanism: "tmux-escape" as const,
+      message: `Sent Pi's Escape interrupt to writer's running bash command.`,
+    }));
+    registerTaskRuntimeTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents: new Map(),
+      readAgentKey: (teamName: string, agentName: string) => `${teamName}:${agentName}`,
+      interruptTeammate,
+      shutdownTeammate,
+      getTeamName: () => "team",
+    });
+
+    const result = await tools.get("interrupt_teammate").execute("interrupt", { agent_name: "writer" });
+
+    expect(interruptTeammate).toHaveBeenCalledWith("writer");
+    expect(shutdownTeammate).not.toHaveBeenCalled();
+    expect(result.content).toEqual([{ type: "text", text: `Sent Pi's Escape interrupt to writer's running bash command.` }]);
+    expect(result.details).toMatchObject({
+      session: "team",
+      status: "interrupt_sent",
+      agentName: "writer",
+      mechanism: "tmux-escape",
+    });
   });
 
   it("reports timeout quarantine instead of claiming the agent stopped cleanly", async () => {

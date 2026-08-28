@@ -66,6 +66,13 @@ export interface TerminalAdapter {
   focusPane?(paneId: string): boolean;
 
   /**
+   * Send Pi's operation-interrupt key to a pane without terminating it.
+   *
+   * @returns true when the terminal accepted key delivery
+   */
+  interrupt?(paneId: string): boolean;
+
+  /**
    * Kill/terminate a terminal pane.
    * Should be idempotent - no error if pane doesn't exist.
    *

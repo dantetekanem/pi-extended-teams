@@ -45,6 +45,45 @@ export { closeReadAgentMessageDelivery } from "./read-agent-session-lifecycle";
 
 const pendingParentWakeSignals = new WeakMap<RunningReadAgent, () => void>();
 
+interface ReadAgentWakeState {
+  generation: number;
+  waiters: Set<() => void>;
+}
+
+const readAgentWakeStates = new WeakMap<RunningReadAgent, ReadAgentWakeState>();
+
+function readAgentWakeState(agent: RunningReadAgent): ReadAgentWakeState {
+  let state = readAgentWakeStates.get(agent);
+  if (!state) {
+    state = { generation: 0, waiters: new Set() };
+    readAgentWakeStates.set(agent, state);
+  }
+  return state;
+}
+
+function readAgentWakeGeneration(agent: RunningReadAgent): number {
+  return readAgentWakeState(agent).generation;
+}
+
+function signalReadAgentWake(agent: RunningReadAgent): void {
+  const state = readAgentWakeState(agent);
+  state.generation += 1;
+  const waiters = Array.from(state.waiters);
+  state.waiters.clear();
+  for (const resolve of waiters) resolve();
+}
+
+function waitForReadAgentWake(agent: RunningReadAgent, generation: number): Promise<void> {
+  const state = readAgentWakeState(agent);
+  if (state.generation !== generation) return Promise.resolve();
+  return new Promise<void>((resolve) => { state.waiters.add(resolve); });
+}
+
+function disposeReadAgentWake(agent: RunningReadAgent): void {
+  signalReadAgentWake(agent);
+  readAgentWakeStates.delete(agent);
+}
+
 export interface RunReadAgentOptions {
   isTeammate: boolean;
   getTeamName(): string | null | undefined;
@@ -93,6 +132,52 @@ function markReadAgentActivity(
   agent.activeToolName = activeToolName;
   agent.idleNudgeLevel = undefined;
   pushReadAgentEvent(agent, text);
+}
+
+interface ReadAgentOperationOutcome {
+  generation: number;
+  interrupted: boolean;
+}
+
+async function runReadAgentSessionOperation(
+  state: RunningReadAgent,
+  operation: () => Promise<void>,
+): Promise<ReadAgentOperationOutcome> {
+  const generation = (state.operationGeneration ?? 0) + 1;
+  state.operationGeneration = generation;
+  state.activeOperationGeneration = generation;
+  state.completedOperationError = undefined;
+  let settleOperation!: () => void;
+  const operationSettlement = new Promise<void>((resolve) => { settleOperation = resolve; });
+  state.activeOperationSettlementPromise = operationSettlement;
+
+  try {
+    let failure: unknown;
+    try {
+      await operation();
+    } catch (error) {
+      failure = error;
+    }
+
+    if (state.activeOperationGeneration === generation) state.activeOperationGeneration = undefined;
+    const interrupted = state.interruptRequestedGeneration === generation;
+    if (interrupted) state.interruptRequestedGeneration = undefined;
+    state.completedOperationGeneration = generation;
+    state.completedOperationInterrupted = interrupted;
+    state.completedOperationError = interrupted ? undefined : failure;
+
+    if (interrupted) {
+      markReadAgentActivity(state, "command interrupted; waiting for lead", "thinking");
+      return { generation, interrupted: true };
+    }
+    if (failure) throw failure;
+    return { generation, interrupted: false };
+  } finally {
+    if (state.activeOperationSettlementPromise === operationSettlement) {
+      state.activeOperationSettlementPromise = undefined;
+    }
+    settleOperation();
+  }
 }
 
 function refreshReadAgentStats(agent: RunningReadAgent, session: AgentSession, activityAlreadyMarked = false): void {
@@ -265,12 +350,20 @@ export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | un
   }
 
   const session = agent.session;
-  const delivery = session.isStreaming ? { deliverAs: "steer" as const } : undefined;
   const deliveryResult = enqueueReadAgentMessageDelivery(
     agent,
     agent.name,
-    () => session.sendUserMessage(content, delivery)
+    async () => {
+      const pendingInterrupt = agent.operationInterruptPromise;
+      if (pendingInterrupt) await pendingInterrupt.catch(() => {});
+      if (session.isStreaming) {
+        await session.sendUserMessage(content, { deliverAs: "steer" as const });
+        return;
+      }
+      await runReadAgentSessionOperation(agent, () => session.sendUserMessage(content, undefined));
+    }
   );
+  signalReadAgentWake(agent);
   pendingParentWakeSignals.get(agent)?.();
   await deliveryResult;
   markReadAgentActivity(agent, "received lead message", "thinking");
@@ -908,10 +1001,51 @@ export async function runReadAgentInProcess(
       );
     };
 
+    const waitForPostInterruptOperation = async (
+      interruptedGeneration: number,
+      initialWakeGeneration: number,
+    ): Promise<boolean> => {
+      state.operationAwaitingResume = true;
+      let observedOperationGeneration = interruptedGeneration;
+      let observedWakeGeneration = initialWakeGeneration;
+      try {
+        while (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
+          const currentWakeGeneration = readAgentWakeGeneration(state);
+          if (currentWakeGeneration === observedWakeGeneration) {
+            const wake = waitForReadAgentWake(state, observedWakeGeneration);
+            await (state.finished ? Promise.race([wake, state.finished]) : wake);
+          }
+          observedWakeGeneration = readAgentWakeGeneration(state);
+          if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) return false;
+
+          const deliveryTail = state.messageDeliveryTail;
+          if (deliveryTail) await deliveryTail.catch(() => {});
+          const completedGeneration = state.completedOperationGeneration ?? 0;
+          if (completedGeneration <= observedOperationGeneration) continue;
+          observedOperationGeneration = completedGeneration;
+          if (state.completedOperationError) throw state.completedOperationError;
+          if (state.completedOperationInterrupted) continue;
+          return true;
+        }
+        return false;
+      } finally {
+        state.operationAwaitingResume = false;
+      }
+    };
+
     state.acceptingMessages = true;
     try {
-      await session.prompt(prompt, { source: "extension" as any });
+      const initialWakeGeneration = readAgentWakeGeneration(state);
+      const initialOperation = await runReadAgentSessionOperation(
+        state,
+        () => session.prompt(prompt, { source: "extension" as any }),
+      );
       refreshReadAgentStats(state, session);
+      if (initialOperation.interrupted) {
+        const resumed = await waitForPostInterruptOperation(initialOperation.generation, initialWakeGeneration);
+        if (!resumed) return;
+        refreshReadAgentStats(state, session);
+      }
       if (pendingChildController && pendingChildParent) {
         while (!submittedFinalReport && !state.stopRequested) {
           const snapshot = pendingChildController.observeParent(pendingChildParent);
@@ -945,8 +1079,20 @@ export async function runReadAgentInProcess(
           markReadAgentActivity(state, "recovering missing report", "thinking");
           options.renderReadAgentStatus();
           try {
-            await session.prompt(EMPTY_REPORT_RECOVERY_PROMPT, { source: "extension" as any });
+            const recoveryWakeGeneration = readAgentWakeGeneration(state);
+            const recoveryOperation = await runReadAgentSessionOperation(
+              state,
+              () => session.prompt(EMPTY_REPORT_RECOVERY_PROMPT, { source: "extension" as any }),
+            );
             refreshReadAgentStats(state, session);
+            if (recoveryOperation.interrupted) {
+              const resumed = await waitForPostInterruptOperation(
+                recoveryOperation.generation,
+                recoveryWakeGeneration,
+              );
+              if (!resumed) return;
+              refreshReadAgentStats(state, session);
+            }
           } catch (error) {
             throw unavailableReportError(
               `The report-only recovery turn failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -1105,6 +1251,7 @@ export async function runReadAgentInProcess(
     }
   } finally {
     pendingParentWakeSignals.delete(state);
+    disposeReadAgentWake(state);
     settleSessionCreation(state.session);
     // End run-owned activity even when persisted lifecycle cleanup is refused.
     if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);

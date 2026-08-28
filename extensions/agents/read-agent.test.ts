@@ -69,6 +69,7 @@ import { sanitizeTuiLine } from "../ui/renderers.js";
 import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "./read-agent-session-lifecycle.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 import { createPendingChildController, type PendingChildRun } from "../runtime/pending-child-controller.js";
+import { createTeammateInterrupter } from "../runtime/teammate-interrupt.js";
 
 let root: string;
 
@@ -3073,5 +3074,124 @@ describe("in-process read agent tool wiring", () => {
     expect(options.notifyLeadOfInboxReports).toHaveBeenCalledTimes(1);
     expect(options.notifyLeadOfInboxReports).toHaveBeenCalledWith("team");
     expect(options.quietTrigger).not.toHaveBeenCalled();
+  });
+
+  it("keeps a report-recovery interruption alive for a follow-up on the same session", async () => {
+    const reader = fixtureMember("reader");
+    writeTeamConfig("team", reader);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const session = makeSession();
+    session.messages = [];
+    let streaming = false;
+    Object.defineProperty(session, "isStreaming", { get: () => streaming });
+    let recoveryStarted!: () => void;
+    const started = new Promise<void>((resolve) => { recoveryStarted = resolve; });
+    let releaseRecovery!: () => void;
+    const pendingRecovery = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+    session.prompt.mockImplementationOnce(async () => {}).mockImplementationOnce(async () => {
+      streaming = true;
+      recoveryStarted();
+      await pendingRecovery;
+      streaming = false;
+    });
+    session.abort.mockImplementation(async () => {});
+    let followUpGeneration: number | undefined;
+    session.sendUserMessage.mockImplementation(async () => {
+      followUpGeneration = runningReadAgents.get("team:reader")?.activeOperationGeneration;
+      session.messages = [{ role: "assistant", content: "resumed recovery report" }];
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions(runningReadAgents);
+    const run = runReadAgentInProcess("team", reader, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+
+    await started;
+    const state = runningReadAgents.get("team:reader")!;
+    Object.assign(state, { status: "working", activeToolName: "bash" });
+    const interrupt = createTeammateInterrupter({
+      terminal: null, runningReadAgents, readAgentKey: (team, agent) => `${team}:${agent}`,
+      getTeamName: () => "team", settleTimeoutMs: 50,
+    });
+    await expect(interrupt("reader")).resolves.toMatchObject({ status: "pending", lifecycleRunId: state.runId });
+
+    const followUp = sendMessageToRunningReadAgent(state, "Finish with the recovered report");
+    await Promise.resolve();
+    expect(session.sendUserMessage).not.toHaveBeenCalled();
+    expect(state.operationInterruptPromise).toBeDefined();
+    expect(runningReadAgents.get("team:reader")).toBe(state);
+    expect(state).toMatchObject({ acceptingMessages: true, teardownState: "active" });
+    for (const cleanup of [session.clearQueue, session.dispose, options.releaseAllClaimsForAgent, options.rememberCompletedAgentReport]) {
+      expect(cleanup).not.toHaveBeenCalled();
+    }
+
+    releaseRecovery();
+    await expect(followUp).resolves.toBe(true);
+    await run;
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect(session.sendUserMessage).toHaveBeenCalledWith("Finish with the recovered report", undefined);
+    expect(followUpGeneration).toBe(3);
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      name: "reader", status: "completed", report: "resumed recovery report",
+    }));
+  });
+
+  it("keeps an interrupted read agent alive for a follow-up turn on the same session", async () => {
+    const reader = fixtureMember("reader");
+    writeTeamConfig("team", reader);
+    const session = makeSession();
+    session.messages = [];
+    let streaming = false;
+    Object.defineProperty(session, "isStreaming", { get: () => streaming });
+    let promptStarted!: () => void;
+    let releasePrompt!: () => void;
+    const started = new Promise<void>((resolve) => { promptStarted = resolve; });
+    const pending = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    session.prompt.mockImplementationOnce(async () => {
+      streaming = true;
+      promptStarted();
+      await pending;
+      streaming = false;
+    });
+    session.abort.mockImplementation(async () => { streaming = false; releasePrompt(); });
+    session.sendUserMessage.mockImplementation(async () => {
+      session.messages = [{ role: "assistant", content: "resumed final report" }];
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = makeRunOptions(runningReadAgents);
+    const run = runReadAgentInProcess("team", reader, "run a long command", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+
+    await started;
+    const state = runningReadAgents.get("team:reader")!;
+    Object.assign(state, { status: "working", activeToolName: "bash" });
+    const interrupt = createTeammateInterrupter({
+      terminal: null, runningReadAgents, readAgentKey: (team, agent) => `${team}:${agent}`,
+      getTeamName: () => "team", settleTimeoutMs: 50,
+    });
+    await expect(interrupt("reader")).resolves.toMatchObject({
+      status: "interrupted", lifecycleRunId: state.runId, mechanism: "agent-session-abort",
+    });
+    await vi.waitFor(() => expect(state.operationAwaitingResume).toBe(true));
+
+    const liveMember = (await teams.readConfig("team")).members.find(item => item.name === "reader");
+    expect(liveMember).toMatchObject({ lifecycleRunId: state.runId, role: "read" });
+    expect(liveMember?.isActive).not.toBe(false);
+    expect(runningReadAgents.get("team:reader")).toBe(state);
+    expect(state).toMatchObject({ acceptingMessages: true, teardownState: "active" });
+    expect(state.stopRequested).not.toBe(true);
+    for (const cleanup of [session.clearQueue, session.dispose, options.releaseAllClaimsForAgent, options.rememberCompletedAgentReport]) {
+      expect(cleanup).not.toHaveBeenCalled();
+    }
+
+    await expect(sendMessageToRunningReadAgent(state, "Continue without the long command")).resolves.toBe(true);
+    await run;
+    expect(session.sendUserMessage).toHaveBeenCalledWith("Continue without the long command", undefined);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      name: "reader", status: "completed", report: "resumed final report",
+    }));
   });
 });

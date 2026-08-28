@@ -527,6 +527,46 @@ describe("agent follow component", () => {
     component.dispose();
   });
 
+  it("interrupts the selected agent with i once while preserving the view and message input", async () => {
+    const done = vi.fn();
+    const tui = { terminal: { rows: 24 }, requestRender: vi.fn() };
+    const agents = [makeAgent({ name: "alpha" }), makeAgent({ name: "beta" })];
+    let finishInterrupt!: () => void;
+    const interruptAgent = vi.fn(() => new Promise<void>((resolve) => { finishInterrupt = resolve; }));
+    const stopAgent = vi.fn();
+    const sendMessage = vi.fn(async () => {});
+    const component = createAgentFollowComponent(tui, done, {
+      getAgents: () => agents,
+      initialAgentName: "beta",
+      interruptAgent,
+      stopAgent,
+      sendMessage,
+    });
+
+    expect(stripAnsi(component.render(120).join("\n"))).toContain("i interrupt");
+    component.handleInput("i");
+    component.handleInput("I");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(interruptAgent).toHaveBeenCalledOnce();
+    expect(interruptAgent).toHaveBeenCalledWith("beta");
+    expect(stopAgent).not.toHaveBeenCalled();
+    expect(done).not.toHaveBeenCalled();
+    expect(agents.map(agent => agent.name)).toEqual(["alpha", "beta"]);
+    expect(stripAnsi(component.render(120).join("\n"))).toContain("interrupting");
+
+    finishInterrupt();
+    await vi.advanceTimersByTimeAsync(0);
+    component.focused = true;
+    component.handleInput("m");
+    component.handleInput("i");
+    component.handleInput("\r");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sendMessage).toHaveBeenCalledWith("beta", "i");
+    expect(interruptAgent).toHaveBeenCalledOnce();
+    expect(component.render(120).join("\n")).toContain("(beta)");
+    component.dispose();
+  });
+
   it("shows a direct-message input and sends to the selected agent", async () => {
     const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
     const sendMessage = vi.fn(async () => {});

@@ -13,6 +13,21 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   recentEvents: string[];
   lastActivityAt: number;
   activeToolName?: string;
+  /** Monotonic identity for the current nested AgentSession turn. */
+  operationGeneration?: number;
+  /** Present only while the matching AgentSession turn is active. */
+  activeOperationGeneration?: number;
+  /** Settles only after the exact active AgentSession turn has unwound. */
+  activeOperationSettlementPromise?: Promise<void>;
+  /** Marks the exact active turn for an expected command interruption. */
+  interruptRequestedGeneration?: number;
+  /** Coalesces cancellation of the active turn without exposing teardown state. */
+  operationInterruptPromise?: Promise<void>;
+  /** Latest settled turn observed by the runner while waiting for post-interrupt work. */
+  completedOperationGeneration?: number;
+  completedOperationInterrupted?: boolean;
+  completedOperationError?: unknown;
+  operationAwaitingResume?: boolean;
   lastError?: RuntimeError;
   idleNudgeLevel?: "soft" | "hard";
   role?: string;

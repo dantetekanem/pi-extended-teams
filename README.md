@@ -36,7 +36,7 @@ The current Pi session becomes the agent group automatically. There is no separa
 
 - Read and edit agents run in-process and stay connected to the current Pi session.
 - The activity card shows progress, intent tier, elapsed time, tokens, and tool activity.
-- You can open an agent's transcript, send it a message, or stop it.
+- You can open an agent's transcript, send it a message, interrupt a stuck tool command, or stop it.
 - Completed reports return to the lead automatically and remain recoverable when needed.
 - Every spawn uses a configured intent tier instead of ad hoc model settings.
 - Edit agents can claim isolated files. Claims coordinate cooperative agents; they are not access control.
@@ -46,7 +46,9 @@ This works well for multi-angle code review, root-cause investigation, parallel 
 
 ## Live control
 
-With the editor empty, press Down to open agent navigation. Use Down/Up to move, `l` to expand large tool logs, `m` to message an agent, `x` to stop it, and Escape to return.
+With the editor empty, press Down to open agent navigation. Use Down/Up to move, `l` to expand large tool logs, `m` to message an agent, `i` to interrupt its currently running tool command, `x` to stop the whole agent, and Escape to return.
+
+The lead can invoke the same command-only behavior with `interrupt_teammate({ agent_name: "agent" })`. It keeps the agent's session, task context, and file claims intact so you can send follow-up work. In-process cancellation is cooperative and may report that it is still pending; for tmux-backed agents, success means Pi's Escape key was delivered, not that command settlement was independently confirmed.
 
 [![Inspecting and messaging a running agent](assets/pi-extended-teams-agent-navigation.png)](assets/pi-extended-teams-agent-navigation.png)
 

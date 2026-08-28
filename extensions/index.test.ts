@@ -54,6 +54,7 @@ async function setupExtension(
   const terminal = {
     spawn: vi.fn(() => `%${terminal.spawn.mock.calls.length}`),
     kill: vi.fn(),
+    interrupt: vi.fn(() => true),
     isAlive: vi.fn(() => true),
     setTitle: vi.fn(),
     focusPane: vi.fn(() => true),
@@ -213,6 +214,7 @@ describe("extension integration", () => {
       expect(Array.from(setup.tools.keys()).sort()).toEqual([
         "check_teammate",
         "claim_file",
+        "interrupt_teammate",
         "list_file_claims",
         "read_inbox",
         "release_file",
@@ -1398,6 +1400,54 @@ describe("extension integration", () => {
 
       followedComponent.handleInput("\x1b[A");
       expect(done).toHaveBeenCalledOnce();
+      followedComponent.dispose();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+  it("selects an active tmux writer in live navigation and interrupts it without stopping it", async () => {
+    const setup = await setupExtension();
+    try {
+      const runtime = await import("../src/utils/runtime.js");
+      const ctx = makeCtx(setup.root, "follow-writer-session");
+      let followedComponent: any;
+      ctx.ui.custom.mockImplementation(async (factory: any) => { followedComponent = factory({ terminal: { rows: 30 }, requestRender: vi.fn() }, {}, {}, vi.fn()); });
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), { runId: member.lifecycleRunId, name: member.name, teamName, startedAt: Date.now(), tokensUsed: 0, status: "working", recentEvents: [], lastActivityAt: Date.now(), role: "read" });
+      });
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader",
+        prompt: "Create the session",
+        cwd: setup.root,
+        model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      const teamName = "session-follow-writer-session";
+      const now = Date.now();
+      await setup.teams.addMember(teamName, {
+        agentId: "writer@team", name: "writer", agentType: "teammate", role: "write",
+        model: "provider/model", thinking: "high", joinedAt: now, tmuxPaneId: "%writer",
+        cwd: setup.root, subscriptions: [], isActive: true,
+      });
+      const writerRunId = (await setup.teams.readConfig(teamName)).members.find((member: any) => member.name === "writer")!.lifecycleRunId!;
+      await runtime.writeRuntimeStatus(teamName, "writer", writerRunId, {
+        ready: true, startedAt: now, lastHeartbeatAt: now, currentAction: "working", activeToolName: "edit",
+      });
+      await vi.advanceTimersByTimeAsync(1_200);
+      const editorFactory = ctx.ui.setEditorComponent.mock.calls.at(-1)?.[0];
+      const editor = editorFactory({}, {}, {});
+      editor.handleInput("\x1b[B");
+      expect(followedComponent.render(120).join("\n")).toContain("(reader)");
+      followedComponent.handleInput("\x1b[B");
+      const writerView = followedComponent.render(120).join("\n");
+      expect(writerView).toContain("(writer)");
+      expect(writerView).toContain("Waiting for the agent's first transcript event…");
+      followedComponent.handleInput("i");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(setup.terminal.interrupt).toHaveBeenCalledWith("%writer");
+      expect(setup.terminal.kill).not.toHaveBeenCalled();
+      expect((await setup.teams.readConfig(teamName)).members.find((member: any) => member.name === "writer")?.isActive).toBe(true);
       followedComponent.dispose();
     } finally {
       setup.restoreEnv();

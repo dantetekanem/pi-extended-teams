@@ -263,6 +263,25 @@ describe("TmuxAdapter", () => {
     expect(mockExecCommand).toHaveBeenCalledWith("tmux", ["select-pane", "-t", "%42"]);
   });
 
+  it("sends Pi's Escape interrupt to the exact pane without killing it", () => {
+    mockExecCommand.mockReturnValue({ stdout: "", stderr: "", status: 0 });
+
+    expect(adapter.interrupt("%42")).toBe(true);
+
+    expect(mockExecCommand).toHaveBeenCalledOnce();
+    expect(mockExecCommand).toHaveBeenCalledWith("tmux", ["send-keys", "-t", "%42", "Escape"]);
+    expect(mockExecCommand).not.toHaveBeenCalledWith("tmux", expect.arrayContaining(["kill-pane"]));
+  });
+
+  it("reports a rejected tmux interrupt without falling back to pane teardown", () => {
+    mockExecCommand.mockReturnValue({ stdout: "", stderr: "missing pane", status: 1 });
+
+    expect(adapter.interrupt("%missing")).toBe(false);
+
+    expect(mockExecCommand).toHaveBeenCalledWith("tmux", ["send-keys", "-t", "%missing", "Escape"]);
+    expect(mockExecCommand).not.toHaveBeenCalledWith("tmux", expect.arrayContaining(["kill-pane"]));
+  });
+
   it("should target the current pane when setting the title", () => {
     mockExecCommand.mockReturnValue({ stdout: "", stderr: "", status: 0 });
 

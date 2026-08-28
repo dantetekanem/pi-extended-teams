@@ -14,6 +14,7 @@ const COLLAPSED_TOOL_RESULT_TAIL_LINES = 3;
 export interface AgentFollowViewOptions {
   getAgents(): RunningReadAgent[];
   initialAgentName?: string;
+  interruptAgent?(name: string): void | Promise<void>;
   stopAgent?(name: string): void | Promise<void>;
   sendMessage?(name: string, content: string): void | Promise<void>;
 }
@@ -341,6 +342,7 @@ export function createAgentFollowComponent(
   let messageStatus = "";
   let focused = false;
   const messageInput = new Input();
+  const interruptingAgents = new Set<string>();
   const stoppingAgents = new Set<string>();
   let transcriptAgent: RunningReadAgent | undefined;
   let transcriptMessages: unknown[] | undefined;
@@ -400,6 +402,7 @@ export function createAgentFollowComponent(
       formatContextUsage(agent.contextUsage),
       agent.status,
       agent.latestProgress,
+      interruptingAgents.has(agent.name),
       stoppingAgents.has(agent.name),
       expandLargeToolResults,
       offsetFromBottom,
@@ -550,6 +553,7 @@ export function createAgentFollowComponent(
       const currentMessages = agent.session?.messages || [];
       const lastMessage = currentMessages[currentMessages.length - 1];
       const renderNow = Date.now();
+      const isInterrupting = interruptingAgents.has(agent.name);
       const isStopping = stoppingAgents.has(agent.name);
       const currentFastFrameKey = composingMessage ? "" : [
         innerWidth,
@@ -565,6 +569,7 @@ export function createAgentFollowComponent(
         formatContextUsage(agent.contextUsage),
         agent.status,
         agent.latestProgress,
+        isInterrupting,
         isStopping,
         expandLargeToolResults,
         offsetFromBottom,
@@ -584,17 +589,20 @@ export function createAgentFollowComponent(
       const elapsed = formatElapsed(renderNow - agent.startedAt);
       const activity = isStopping
         ? "stopping"
-        : agent.latestProgress
-          ? formatAnimatedProgress(agent.latestProgress, renderNow)
-          : agent.status;
+        : isInterrupting
+          ? "interrupting"
+          : agent.latestProgress
+            ? formatAnimatedProgress(agent.latestProgress, renderNow)
+            : agent.status;
       const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatContextUsage(agent.contextUsage)} · ${activity}`;
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";
       const messageAction = options.sendMessage ? " · m message" : "";
+      const interruptAction = options.interruptAgent ? " · i interrupt" : "";
       const help = composingMessage
         ? `message ${agent.name} · enter send · esc cancel`
         : agents.length > 1
-          ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction} · x stop · pgup/pgdn scroll · esc main`
-          : `↑/esc main · ${logAction}${messageAction} · x stop · pgup/pgdn scroll · end follow`;
+          ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction}${interruptAction} · x stop · pgup/pgdn scroll · esc main`
+          : `↑/esc main · ${logAction}${messageAction}${interruptAction} · x stop · pgup/pgdn scroll · end follow`;
 
       const currentTranscriptWidth = Math.max(20, innerWidth);
       if (transcriptAgent !== agent
@@ -734,6 +742,20 @@ export function createAgentFollowComponent(
         messageStatus = "";
         syncInputFocus();
         tui.requestRender();
+        return;
+      }
+      if (data.toLowerCase() === "i" && options.interruptAgent) {
+        const agent = currentAgent(sortedAgents(), selectedName);
+        if (!agent || interruptingAgents.has(agent.name)) return;
+        interruptingAgents.add(agent.name);
+        tui.requestRender();
+        void Promise.resolve()
+          .then(() => options.interruptAgent?.(agent.name))
+          .catch(() => {})
+          .finally(() => {
+            interruptingAgents.delete(agent.name);
+            tui.requestRender();
+          });
         return;
       }
       if (data.toLowerCase() === "x" && options.stopAgent) {

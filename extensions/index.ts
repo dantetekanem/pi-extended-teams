@@ -22,6 +22,7 @@ import { formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelL
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 import { createPendingChildController } from "./runtime/pending-child-controller.js";
 import { createActiveAgentSleepController, runWithActiveAgentSleepAssertion } from "./runtime/active-agent-sleep.js";
+import { createTeammateInterrupter } from "./runtime/teammate-interrupt.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
 import * as messaging from "../src/utils/messaging";
 import * as teams from "../src/utils/teams";
@@ -62,6 +63,9 @@ export default function (pi: ExtensionAPI) {
     if (clearedTeamName === teamName) void drainReadHelperQueueOnce();
   });
   const runningReadAgents = new Map<string, RunningReadAgent>();
+  // Tmux writers have no nested AgentSession, but status rendering already
+  // maintains a lifecycle-fenced view of their active roster/runtime state.
+  const navigationWriterAgents = new Map<string, RunningReadAgent>();
   const completedAgentReports = new Map<string, CompletedAgentReport[]>();
   const TEAM_ACTIVITY_RENDER_DEBOUNCE_MS = 75;
   let readAgentStatusTimer: NodeJS.Timeout | null = null;
@@ -91,8 +95,8 @@ export default function (pi: ExtensionAPI) {
     getProjectTrusted: (cwd) => parentProjectTrustForSpawn(sessionCtx, cwd),
     createResourcePlan: createCurrentSpawnResourcePlan,
     sleepController: activeAgentSleepController,
-    onWriterActive: (tab) => upsertWriterScreenTab(writerScreenState, tab),
-    onWriterInactive: (targetTeamName, member) => removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId }),
+    onWriterActive: (tab) => { upsertWriterScreenTab(writerScreenState, tab); markTeamActivityStatusDirty(0); },
+    onWriterInactive: (targetTeamName, member) => { removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId }); markTeamActivityStatusDirty(0); },
   });
   const { shutdownTeammate, startLeadWatchdog, stopLeadWatchdog } = createLifecycleRuntime({
     isTeammate,
@@ -108,6 +112,7 @@ export default function (pi: ExtensionAPI) {
     onWriterInactive: (targetTeamName, member) => {
       releaseWriteAgentSleepAssertion(targetTeamName, member);
       removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId });
+      markTeamActivityStatusDirty(0);
     },
     onTeammateClosing: (targetTeamName, member) => {
       if (!member.lifecycleRunId) return;
@@ -139,6 +144,13 @@ export default function (pi: ExtensionAPI) {
   function readAgentKey(targetTeamName: string, targetAgentName: string): string {
     return `${targetTeamName}:${targetAgentName}`;
   }
+
+  const interruptTeammate = createTeammateInterrupter({
+    terminal,
+    runningReadAgents,
+    readAgentKey,
+    getTeamName: () => teamName,
+  });
 
   function runInProcessAgentWithSleepAssertion(
     ...args: Parameters<typeof runReadAgentInProcess>
@@ -230,6 +242,17 @@ export default function (pi: ExtensionAPI) {
     return member.isActive !== false
       && runtimeStatus?.ready === true
       && runtimeHeartbeatIsRecent(runtimeStatus, now);
+  }
+
+  function navigationWriterAgent(teamName: string, member: Member, status: runtime.AgentRuntimeStatus): RunningReadAgent {
+    return {
+      runId: member.lifecycleRunId!, name: member.name, teamName,
+      startedAt: status.startedAt || member.joinedAt, tokensUsed: 0, contextUsage: status.contextUsage,
+      status: status.currentAction === "thinking" ? "thinking" : status.currentAction === "starting" ? "starting" : "working",
+      recentEvents: [], lastActivityAt: status.lastHeartbeatAt || member.joinedAt, role: "write",
+      model: member.model, thinking: member.thinking, modelSlot: canonicalPersistedModelSlot(member.modelSlot),
+      latestProgress: status.latestProgress,
+    };
   }
 
   function runtimeOnlyStatusLabel(status: runtime.AgentRuntimeStatus, now: number): string {
@@ -592,6 +615,12 @@ export default function (pi: ExtensionAPI) {
         .filter(member => member.name !== "team-lead" && member.isActive !== false && memberActivityRole(member) === "write")
         .filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId)) && !runningReadAgents.has(readAgentKey(activityTeamName, member.name)) && !runtimeOnlyMemberNames.has(member.name)) ?? []
       : [];
+    navigationWriterAgents.clear();
+    for (const { member, runtimeStatus } of runtimeOnlyWriteMembers) {
+      if (member.tmuxPaneId && member.lifecycleRunId === runtimeStatus.lifecycleRunId) {
+        navigationWriterAgents.set(member.name, navigationWriterAgent(activityTeamName!, member, runtimeStatus));
+      }
+    }
     const unreadLeadMessages = activityTeamName ? await messaging.readInbox(activityTeamName, agentName, true, false).catch(() => []) : [];
     leadInboxUnreadCount = unreadLeadMessages.length;
     clearLeadInboxWidgetOnce();
@@ -1084,8 +1113,20 @@ export default function (pi: ExtensionAPI) {
   if (!isTeammate) {
     pi.on("session_start", async (_event: any, ctx: any) => {
       installAgentNavigation(ctx, {
-        getAgents: () => Array.from(runningReadAgents.values())
-          .filter(agent => !teamName || agent.teamName === teamName),
+        getAgents: () => {
+          const readers = Array.from(runningReadAgents.values())
+            .filter(agent => !teamName || agent.teamName === teamName);
+          return [...readers, ...Array.from(navigationWriterAgents.values())
+            .filter(agent => !teamName || agent.teamName === teamName)]
+            .filter((agent, index, agents) => agents.findIndex(candidate => candidate.name === agent.name) === index);
+        },
+        interruptAgent: async (name: string) => {
+          const result = await interruptTeammate(name);
+          const warning = result.status === "pending"
+            || result.status === "unsupported"
+            || result.status === "failed";
+          ctx.ui?.notify?.(result.message, warning ? "warning" : "info");
+        },
         stopAgent: async (name: string) => {
           const targetTeamName = teamName;
           if (!targetTeamName) return;
@@ -1222,6 +1263,7 @@ export default function (pi: ExtensionAPI) {
     terminal,
     runningReadAgents,
     readAgentKey,
+    interruptTeammate,
     shutdownTeammate,
     getTeamName: () => teamName,
   });

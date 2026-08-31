@@ -135,12 +135,13 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 - Complete outcome-to-lane mapping before delegation; agents are useful only for genuine independent lanes.
 - Keep integration, cross-lane decisions, and final acceptance in the lead.
 - Keep implementation in the lead when there is only one substantive execution lane. Otherwise, a writer may own only one isolated sub-outcome.
-- Never sleep, busy-wait, or poll. The extension wakes the lead when reports arrive.
+- When no unrelated work remains, end the turn. The extension resumes the lead when reports arrive.
+- One `get_agent_status` snapshot is allowed when current status is needed. Never call it repeatedly, sleep, busy-wait, or loop on inbox/status.
 - Trust quiet agents. Do not ping, message, or check an agent just because it has been quiet for less than several minutes; active status remains visible in the activity card and Down-key live view.
 - When new, changed, or previously omitted evidence affects an active owner, use `send_message` with an **Evidence delta** as defined below instead of replacing or stopping it. Active in-process read agents receive the message as a steering turn and can continue intelligently; active tmux writers wake through their inbox.
 - Once a final report is accepted, new message admission is closed and the agent is self-exiting; teardown may still be finishing. Do not call `stop_teammate` after normal completion. If genuinely new work appears after the report, spawn a fresh bounded `read-collect` lane rather than trying to revive that closing session.
 - Do not wake the lead just to ping idle agents.
-- Use `check_teammate` only when a specific agent appears stalled or unhealthy after several minutes, not immediately after sending a message.
+- Use `check_teammate` only when `get_agent_status` shows a suspected stall or failure. It is a lifecycle diagnostic and may clean up an agent classified as dead.
 - Use `interrupt_teammate` only when an active agent has a proven stuck tool command. It interrupts that command without closing the session, removing the agent, or releasing its claims; in-process cancellation may remain pending, and tmux success proves Escape delivery rather than command settlement. Send follow-up work after a confirmed in-process interruption.
 - Use `stop_teammate` only when the user explicitly asks to cancel/stop the whole active agent or the agent is no longer needed. Do not substitute it for command interruption.
 - Ask before applying fixes during an investigation.
@@ -150,7 +151,6 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 
 - Use the below-editor activity card for active status. From an empty editor, press Down for the live view, Down/Up to navigate, `i` to interrupt the selected agent's running tool command, `x` to stop the whole selected agent, and Escape to return.
 - Completed reports arrive in the lead session as open report entries.
-- Use `check_teammate({ agent_name: "name" })` only for targeted liveness diagnostics.
 
 ## Public tools
 
@@ -158,9 +158,10 @@ Default lead tools:
 
 - `spawn_agent` — start one read or edit-allowed agent in the current Pi session using required `model_slot`; optional `session_context: "lazy"` exposes a filtered session snapshot for on-demand reference.
 - `spawn_swarm_agents` — start a batch of agents with optional shared `model_slot`, `session_context`, and `allow_nested_read_agents` defaults.
+- `get_agent_status` — get one read-only snapshot of one or all owned active, queued, or recently completed agents.
 - `interrupt_teammate` — interrupt one active agent's currently running tool command while preserving the agent session, task context, and claims; the result may be pending for cooperative tools or delivery-only for tmux.
 - `stop_teammate` — explicitly stop one whole active agent when cancellation is requested.
-- `check_teammate` — inspect one agent's health when needed.
+- `check_teammate` — diagnose one suspected lifecycle stall or failure; it may clean up an agent classified as dead.
 - `send_message` — send a direct message in the current session.
 - `read_inbox` — read the current session inbox.
 
@@ -251,8 +252,8 @@ Good edit missions use the same card. The complete `docs-fix` and `parser-featur
 
 - Start by reading your initial instructions.
 - Use `send_message` for direct communication and `read_inbox` when the extension wakes you or you expect a reply.
-- Never sleep, busy-wait, or poll.
+- Never sleep, busy-wait, or poll. An opted-in nested parent may use one `get_agent_status` snapshot when current child status is needed, but must not call it repeatedly.
 - Unless you are an explicitly opted-in depth-0 `write-feature` / `write-critical` writer, you cannot spawn other agents; ask the lead with `send_message`.
-- If opted in, use only the restricted spawn tools for depth-1 read helpers within your lane. Any canonical `read-*` tier and helper count is allowed subject to global capacity; children report to you and cannot delegate. Give each child the same Context handoff contract because it does not inherit your conversation or implementation context.
+- If opted in, use only the restricted status and spawn tools for depth-1 read helpers within your lane. Any canonical `read-*` tier and helper count is allowed subject to global capacity; children report to you and cannot delegate. Give each child the same Context handoff contract because it does not inherit your conversation or implementation context.
 - Read agents: investigate, report, and stop.
 - Edit agents: claim files before editing, release claims when done, and call `report_and_exit` with your final report.

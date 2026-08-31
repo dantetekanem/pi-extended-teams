@@ -214,8 +214,8 @@ describe("extension teammate inbox wake", () => {
     expect(result.systemPrompt).toContain("write-system for a cross-cutting integration/refactor");
     expect(result.systemPrompt).toContain("write-critical only for high-risk");
     expect(result.systemPrompt).toContain("A spawned agent owns its assigned lane");
-    expect(result.systemPrompt).toContain("wait literally idle");
-    expect(result.systemPrompt).toContain("Do not sleep, poll");
+    expect(result.systemPrompt).toContain("end the turn");
+    expect(result.systemPrompt).toContain("One get_agent_status snapshot is allowed");
     expect(result.systemPrompt).toContain("Wait for the actual report before synthesizing");
     expect(result.systemPrompt).toContain("concrete, reproducible findings with file/line evidence or a focused failing regression may proceed directly to TDD repair");
     expect(result.systemPrompt).toContain("Use a separate read-only confirmation only when evidence is missing or weak, the claim is disputed, or irreducible high-risk uncertainty remains");

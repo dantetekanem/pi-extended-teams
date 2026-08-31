@@ -268,7 +268,7 @@ async function observeKnownTeammate(
   const unreadCount = (await messaging.peekInbox(teamName, member.name, true).catch(() => [])).length;
   const runtimeStatus = member.name === "team-lead" ? null : await runtime.readRuntimeStatus(teamName, member.name).catch(() => null);
   const now = options.now ?? Date.now();
-  const hasRecentHeartbeat = !!runtimeStatus?.lastHeartbeatAt && (now - runtimeStatus.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
+  const hasRecentHeartbeat = runtime.isHeartbeatFresh(runtimeStatus, now);
 
   let alive: boolean | null;
   if (member.name === "team-lead") {

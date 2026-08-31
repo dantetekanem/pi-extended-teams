@@ -128,8 +128,8 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
     name: "check_teammate",
     label: "Check Agent",
     description: options.isTeammate
-      ? "Check one agent's active status in the current Pi session only for targeted diagnostics after it has been quiet for several minutes or appears unhealthy. Do not use immediately after sending a message or while waiting for normal work."
-      : "Check one agent's status in the current Pi session only for targeted diagnostics after it has been quiet for several minutes or appears unhealthy. If the agent already left the roster before its report reached you, this recovers its latest persisted report. Do not use immediately after sending a message, while waiting for normal work, or after a report has already arrived.",
+      ? "Diagnose one agent's lifecycle only after it has been quiet for several minutes or appears unhealthy. This may clean up an agent classified as dead, so do not use it for status polling."
+      : "Diagnose one agent's lifecycle only after get_agent_status shows a suspected stall or failure. This may clean up an agent classified as dead. It can also recover the latest persisted report after an agent leaves the roster.",
     parameters: Type.Object({ agent_name: Type.String() }),
     async execute(_toolCallId: string, params: any) {
       const teamName = options.getTeamName();
@@ -196,7 +196,7 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
       const unreadCount = (await messaging.readInbox(teamName, params.agent_name, true, false)).length;
       const runtimeStatus = await runtime.readRuntimeStatus(teamName, params.agent_name).catch(() => null);
       const now = Date.now();
-      const hasRecentHeartbeat = !!runtimeStatus?.lastHeartbeatAt && (now - runtimeStatus.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
+      const hasRecentHeartbeat = runtime.isHeartbeatFresh(runtimeStatus, now);
       const runningState = options.runningReadAgents.get(options.readAgentKey(teamName, member.name));
       const lifecycleHealth = runningState?.teardownState === "persistence_failed" ? "persistence-failed"
         : runningState?.teardownState === "quarantined" ? "quarantined"

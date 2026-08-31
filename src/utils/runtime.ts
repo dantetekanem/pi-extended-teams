@@ -49,6 +49,10 @@ export interface AgentRuntimeStatus {
   lastError?: RuntimeError;
 }
 
+export function isHeartbeatFresh(status: AgentRuntimeStatus | null | undefined, now = Date.now()): boolean {
+  return status?.lastHeartbeatAt !== undefined && now - status.lastHeartbeatAt <= HEARTBEAT_STALE_MS;
+}
+
 export class RuntimeStatusWriteRejectedError extends Error {
   readonly code = "RUNTIME_STATUS_WRITE_REJECTED";
 }

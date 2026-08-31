@@ -226,10 +226,27 @@ describe("public agent spawn tools", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("registers only the public spawn tools from team-tools", () => {
+  it("registers the public spawn and status tools from team-tools", () => {
     const { tools } = registerTools();
 
-    expect(Array.from(tools.keys()).sort()).toEqual(["spawn_agent", "spawn_swarm_agents"]);
+    expect(Array.from(tools.keys()).sort()).toEqual(["get_agent_status", "spawn_agent", "spawn_swarm_agents"]);
+  });
+
+  it("includes queued edit agents in one-shot status snapshots", async () => {
+    const { tools } = registerTools();
+    teams.createTeam("session-test-session", "test-session", "lead-agent", "Pi session agents", "provider/model");
+    await writeQueue.enqueueWriteSpawn("session-test-session", {
+      name: "queued-writer",
+      prompt: "edit the claimed file",
+      cwd: root,
+      modelSlot: "write-patch",
+    });
+
+    const result = await tools.get("get_agent_status")!.execute("status", {}, new AbortController().signal, undefined, makeCtx());
+
+    expect(result.details.statuses).toEqual([
+      expect.objectContaining({ name: "queued-writer", role: "write", phase: "queued", queuePosition: 1 }),
+    ]);
   });
 
   it("publishes all canonical intent tiers, compatibility aliases, and agent-friendly defaults", () => {
@@ -266,8 +283,8 @@ describe("public agent spawn tools", () => {
     expect(spawn.description).toContain("read-analyze for connected explanation/root cause");
     expect(spawn.description).toContain("relevant goal, decisions, prior attempts");
     expect(spawn.description).toContain("session_context=lazy");
-    expect(spawn.description).toContain("wait literally idle");
-    expect(spawn.description).toContain("never sleep, poll");
+    expect(spawn.description).toContain("end the turn so the automatic report can resume you");
+    expect(spawn.description).toContain("One get_agent_status snapshot is allowed");
     expect(swarm.description).toContain("delegation-locked");
     expect(swarm.description).toContain("automatic reports");
   });
@@ -286,6 +303,11 @@ describe("public agent spawn tools", () => {
     }, abort, undefined, ctx);
 
     expect(result.details).toMatchObject({ name: "reader", role: "read", mode: "in-process", terminalId: null, session: "session-test-session", modelSlot: "read-review", sessionContext: "none", sessionContextAvailable: false });
+    expect(result.content[0].text).toContain("Use get_agent_status once");
+    const status = await tools.get("get_agent_status")!.execute("status", {}, abort, undefined, ctx);
+    expect(status.details.statuses).toEqual([
+      expect.objectContaining({ name: "reader", phase: "thinking", role: "read" }),
+    ]);
     expect(sessionCtx.sessionManager.buildContextEntries).not.toHaveBeenCalled();
     expect(adoptTeamAsLead).toHaveBeenCalledWith("session-test-session", ctx);
     expect(runReadAgentInProcess).toHaveBeenCalledWith(
@@ -393,6 +415,12 @@ describe("public agent spawn tools", () => {
       session_context: "lazy",
     }, new AbortController().signal, undefined, ctx);
     expect(write.details).toMatchObject({ role: "write", sessionContext: "lazy", sessionContextAvailable: true });
+    const writerStatus = await harness.tools.get("get_agent_status")!.execute("writer-status", {
+      agent_name: "writer-context",
+    }, new AbortController().signal, undefined, ctx);
+    expect(writerStatus.details.statuses).toEqual([
+      expect.objectContaining({ name: "writer-context", role: "write", phase: "thinking" }),
+    ]);
     expect(harness.runReadAgentInProcess.mock.calls.find(call => call[1].name === "writer-context")?.[2])
       .toContain("Session fallback (lazy, historical evidence only)");
   });
@@ -1063,7 +1091,7 @@ describe("public agent spawn tools", () => {
     };
     const nestedTools = new Map(harness.teamToolsRuntime.createNestedReadAgentTools(binding).map((tool: any) => [tool.name, tool]));
 
-    expect(Array.from(nestedTools.keys()).sort()).toEqual(["spawn_agent", "spawn_swarm_agents"]);
+    expect(Array.from(nestedTools.keys()).sort()).toEqual(["get_agent_status", "spawn_agent", "spawn_swarm_agents"]);
     expect(nestedTools.get("spawn_agent")!.parameters.properties.model_slot.enum).toEqual(NESTED_READ_MODEL_SLOTS);
     expect(nestedTools.get("spawn_swarm_agents")!.parameters.properties.defaults.properties.model_slot.enum).toEqual(NESTED_READ_MODEL_SLOTS);
     expect(nestedTools.get("spawn_swarm_agents")!.parameters.properties.agents.items.properties.model_slot.enum).toEqual(NESTED_READ_MODEL_SLOTS);
@@ -1136,6 +1164,7 @@ describe("public agent spawn tools", () => {
       model_slot: "read-critical",
     });
     expect(single.details).toMatchObject({ name: "child-one", role: "read", queued: false, modelSlot: "read-critical" });
+    expect(JSON.stringify(single.content)).toContain("Use get_agent_status once");
     expect(harness.runReadAgentInProcess).toHaveBeenLastCalledWith(
       "session-test-session",
       expect.objectContaining({
@@ -1438,6 +1467,10 @@ describe("public agent spawn tools", () => {
       model_slot: "read-collect",
     });
     expect(queued.details).toMatchObject({ name: "queued-child", queued: true, role: "read" });
+    const status = await nestedTools.get("get_agent_status")!.execute("status", {});
+    expect(status.details.statuses).toEqual([
+      expect.objectContaining({ name: "queued-child", phase: "queued", queuePosition: 1 }),
+    ]);
     await expect(nestedTools.get("spawn_agent")!.execute("queued-duplicate", {
       name: "queued-child",
       prompt: "must not replace queued work",

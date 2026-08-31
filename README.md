@@ -38,6 +38,7 @@ The current Pi session becomes the agent group automatically. There is no separa
 - The activity card shows progress, intent tier, elapsed time, tokens, and tool activity.
 - You can open an agent's transcript, send it a message, interrupt a stuck tool command, or stop it.
 - Completed reports return to the lead automatically and remain recoverable when needed.
+- `get_agent_status` gives the lead or an eligible nested parent one read-only snapshot of owned active, queued, stalled, or recently completed read and edit agents.
 - Every spawn uses a configured intent tier instead of ad hoc model settings.
 - Edit agents can claim isolated files. Claims coordinate cooperative agents; they are not access control.
 - Lazy session context and nested read helpers are available when a bounded task needs them.
@@ -52,7 +53,7 @@ The lead can invoke the same command-only behavior with `interrupt_teammate({ ag
 
 [![Inspecting and messaging a running agent](assets/pi-extended-teams-agent-navigation.png)](assets/pi-extended-teams-agent-navigation.png)
 
-Completed reports wake the lead automatically. Do not poll with sleeps, loops, or repeated status checks. Use `check_teammate` only when one agent appears unhealthy or a persisted report needs recovery.
+Completed reports wake the lead automatically. End the current turn to wait. One `get_agent_status` snapshot is allowed when current status is needed; do not poll with sleeps, loops, or repeated checks. Use `check_teammate` only when `get_agent_status` shows a suspected lifecycle failure or a persisted report needs recovery.
 
 The lead owns decomposition, integration, and acceptance. Pi packages and spawned agents run with your system permissions, so review project-local instructions and configuration through Pi's normal trust flow.
 

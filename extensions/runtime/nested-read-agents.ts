@@ -9,7 +9,7 @@ export const NESTED_READ_MODEL_SLOTS = [
 
 export type NestedReadModelSlot = (typeof NESTED_READ_MODEL_SLOTS)[number];
 
-export const NESTED_DELEGATION_TOOL_NAMES = ["spawn_agent", "spawn_swarm_agents"] as const;
+export const NESTED_DELEGATION_TOOL_NAMES = ["get_agent_status", "spawn_agent", "spawn_swarm_agents"] as const;
 
 const ELIGIBLE_PARENT_MODEL_SLOTS = new Set(["write-feature", "write-critical"]);
 

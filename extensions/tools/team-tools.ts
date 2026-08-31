@@ -30,6 +30,12 @@ import {
   type PendingChildController,
   type PendingChildRun,
 } from "../runtime/pending-child-controller";
+import {
+  AGENT_WAIT_CONTRACT,
+  createAgentStatusTool,
+  type AgentStatusScope,
+  type QueuedAgentStatus,
+} from "./agent-status-tool";
 
 export const CHILD_AGENT_LIFECYCLE_PROBE = "pi-extended-teams:child-agent-lifecycle-probe";
 
@@ -277,6 +283,35 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   function readQueue(teamName: string): QueuedReadSpawn[] {
     return queuedReadSpawnsByTeam.get(teamName) ?? [];
+  }
+
+  async function listQueuedAgentStatuses(teamName: string): Promise<QueuedAgentStatus[]> {
+    const readers = readQueue(teamName).map((queued, index) => ({
+      name: queued.member.name,
+      role: queued.member.role || "read",
+      queuedAt: queued.requestedAt,
+      queuePosition: index + 1,
+      parentAgentName: queued.member.parentAgentName,
+      parentLifecycleRunId: queued.member.parentLifecycleRunId,
+    }));
+    const writers = (await writeQueue.listWriteQueue(teamName)).map((queued, index) => ({
+      name: queued.name,
+      role: "write",
+      queuedAt: queued.requestedAt,
+      queuePosition: index + 1,
+    }));
+    return [...readers, ...writers];
+  }
+
+  function statusTool(scope?: AgentStatusScope, fixedTeamName?: string): any {
+    return createAgentStatusTool({
+      getTeamName: () => fixedTeamName ?? options.getTeamName(),
+      runningReadAgents: options.runningReadAgents,
+      readAgentKey: options.readAgentKey,
+      terminal: options.terminal,
+      listQueuedAgents: listQueuedAgentStatuses,
+      scope,
+    });
   }
 
   const lifecycleFenceUnsubscribe = onLifecycleTombstoneCleared((clearedTeamName) => {
@@ -1097,8 +1132,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       team_name: sessionName,
     }, ctx, { allowNestedReadAgents: params.allow_nested_read_agents === true });
 
+    const outcome = result.details.queued
+      ? `Agent ${name} queued at position ${result.details.queuePosition}.`
+      : `Agent ${name} started (${result.details.role}, ${result.details.mode || "in-process"}).`;
     return {
-      content: [{ type: "text", text: `Agent ${name} started (${result.details.role}, ${result.details.mode || "in-process"}).` }],
+      content: [{ type: "text", text: `${outcome}\n${AGENT_WAIT_CONTRACT}` }],
       details: { ...result.details, name, session: sessionName },
     };
   }
@@ -1138,7 +1176,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       },
     });
     return {
-      content: result.content,
+      content: [...result.content, { type: "text", text: AGENT_WAIT_CONTRACT }],
       details: { ...result.details, name, session: binding.teamName },
     };
   }
@@ -1150,7 +1188,14 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       return [];
     }
 
+    const statusScope: AgentStatusScope = {
+      parentName: binding.parent.name,
+      parentRunId: binding.parentRunId,
+      parentStartedAt: binding.parent.joinedAt,
+    };
+
     return [
+      statusTool(statusScope, binding.teamName),
       {
         name: "spawn_agent",
         label: "Spawn Read Agent",
@@ -1200,16 +1245,19 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
           const lines = [`Spawned ${spawned.length}/${params.agents.length} nested read agents.`];
           for (const item of spawned) lines.push(`- ${item.name}: ${item.queued ? "queued" : "started"}`);
           for (const item of failed) lines.push(`- ${item.name}: failed — ${item.error}`);
+          lines.push(AGENT_WAIT_CONTRACT);
           return { content: [{ type: "text", text: lines.join("\n") }], details: { session: binding.teamName, spawned, failed } };
         },
       },
     ];
   }
 
+  pi.registerTool(statusTool());
+
   pi.registerTool({
     name: "spawn_agent",
     label: "Spawn Agent",
-    description: "Spawn one agent by configured intent tier only. Give it the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta rather than a context-free task. Use session_context=lazy only as an on-demand fallback when omitted session history may materially matter; it never replaces a good mission prompt. read-review is the normal read default; use read-collect for bounded fact gathering, read-analyze for connected explanation/root cause, and read-critical only for irreducible high-stakes reasoning. For edits, choose write-patch, write-feature, write-system, or the rare high-risk write-critical by scope and risk. After spawning, do not duplicate or take over its lane; work only on unrelated work, then wait literally idle for the automatic report—never sleep, poll, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
+    description: "Spawn one agent by configured intent tier only. Give it the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta rather than a context-free task. Use session_context=lazy only as an on-demand fallback when omitted session history may materially matter; it never replaces a good mission prompt. read-review is the normal read default; use read-collect for bounded fact gathering, read-analyze for connected explanation/root cause, and read-critical only for irreducible high-stakes reasoning. For edits, choose write-patch, write-feature, write-system, or the rare high-risk write-critical by scope and risk. After spawning, do not duplicate or take over its lane; work only on unrelated work, then end the turn so the automatic report can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
     parameters: Type.Object(publicAgentParams),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       return spawnPublicAgent(params, ctx);
@@ -1219,7 +1267,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   pi.registerTool({
     name: "spawn_swarm_agents",
     label: "Spawn Swarm Agents",
-    description: "Spawn a batch by configured intent tiers only. Give each lane the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta. Use session_context=lazy selectively as an on-demand fallback, never instead of a good mission prompt. Use read-review as the normal default, read-collect for bounded collection lanes, read-analyze for connected explanation, and read-critical only for irreducible high-stakes reasoning; choose write-patch/feature/system/critical by edit scope and risk. Each spawned lane is delegation-locked: do not duplicate/take it over, and after unrelated work is done wait literally idle for automatic reports without sleep, polling, repeated inbox/status reads, or premature intervention. Synthesize only after actual reports; intervene only on blocker/error, actual failure, or explicit cancellation. Each agent gets model_slot directly or from defaults; do not pass role, model, or thinking directly.",
+    description: "Spawn a batch by configured intent tiers only. Give each lane the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta. Use session_context=lazy selectively as an on-demand fallback, never instead of a good mission prompt. Use read-review as the normal default, read-collect for bounded collection lanes, read-analyze for connected explanation, and read-critical only for irreducible high-stakes reasoning; choose write-patch/feature/system/critical by edit scope and risk. Each spawned lane is delegation-locked: do not duplicate or take it over. After unrelated work is done, end the turn so automatic reports can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or intervene early. Synthesize only after actual reports; intervene only on blocker/error, actual failure, or explicit cancellation. Each agent gets model_slot directly or from defaults; do not pass role, model, or thinking directly.",
     parameters: Type.Object({
       defaults: Type.Optional(Type.Object({
         cwd: Type.Optional(Type.String()),
@@ -1260,8 +1308,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       }
 
       const lines = [`Spawned ${spawned.length}/${params.agents.length} agents in the current Pi session.`];
-      for (const item of spawned) lines.push(`- ${item.name}: ${item.role}, ${item.mode || "in-process"}`);
+      for (const item of spawned) lines.push(`- ${item.name}: ${item.queued ? `queued at position ${item.queuePosition}` : `${item.role}, ${item.mode || "in-process"}`}`);
       for (const item of failed) lines.push(`- ${item.name}: failed — ${item.error}`);
+      lines.push(AGENT_WAIT_CONTRACT);
       return { content: [{ type: "text", text: lines.join("\n") }], details: { session: sessionName, spawned, failed } };
     },
   });

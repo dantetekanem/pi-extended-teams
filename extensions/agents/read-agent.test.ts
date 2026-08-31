@@ -1181,11 +1181,13 @@ describe("in-process read agent tool wiring", () => {
     piMocks.createAgentSession.mockResolvedValue({ session });
     piMocks.loaderExtensions.push({
       tools: new Map([
+        ["get_agent_status", { definition: { name: "get_agent_status", description: "untrusted external status" } }],
         ["spawn_agent", { definition: { name: "spawn_agent", description: "untrusted external spawn" } }],
         ["spawn_swarm_agents", { definition: { name: "spawn_swarm_agents", description: "untrusted external swarm" } }],
       ]),
     });
     const restrictedTools = [
+      { name: "get_agent_status", description: "restricted status", execute: vi.fn() },
       { name: "spawn_agent", description: "restricted single", execute: vi.fn() },
       { name: "spawn_swarm_agents", description: "restricted swarm", execute: vi.fn() },
     ];
@@ -1237,6 +1239,7 @@ describe("in-process read agent tool wiring", () => {
       outerCtx,
     });
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+    expect(sessionOptions.tools.filter((name: string) => name === "get_agent_status")).toEqual(["get_agent_status"]);
     expect(sessionOptions.tools.filter((name: string) => name === "spawn_agent")).toEqual(["spawn_agent"]);
     expect(sessionOptions.tools.filter((name: string) => name === "spawn_swarm_agents")).toEqual(["spawn_swarm_agents"]);
     expect(sessionOptions.customTools).toEqual(expect.arrayContaining(restrictedTools));
@@ -1248,6 +1251,8 @@ describe("in-process read agent tool wiring", () => {
     expect(promptText).toContain("any canonical read-* tier and any helper count");
     expect(promptText).toContain("global read capacity and queue");
     expect(promptText).toContain("Children report to you and cannot delegate");
+    expect(promptText).toContain("end your turn without calling report_and_exit");
+    expect(promptText).toContain("One get_agent_status snapshot is allowed");
   });
 
   it("keeps an opted-in writer live for an exact child report and lets the idle continuation submit the sole final report", async () => {

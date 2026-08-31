@@ -443,6 +443,7 @@ async function recordReadAgentReportEvent(
       metadata: {
         ...(member.prompt ? { initialPrompt: member.prompt } : {}),
         ...(modelSlot ? { modelSlot } : {}),
+        ...(member.parentLifecycleRunId ? { parentLifecycleRunId: member.parentLifecycleRunId } : {}),
         ...reportMetadata,
       },
     });
@@ -862,6 +863,7 @@ export async function runReadAgentInProcess(
             ? [
                 "This opted-in depth-0 write-feature/write-critical run may use restricted spawn_agent or spawn_swarm_agents for depth-1 read-only helpers. Choose any canonical read-* tier and any helper count, subject to the team's global read capacity and queue. Children report to you and cannot delegate.",
                 "Use spawn_agent with only name (optional), prompt, and model_slot. Use spawn_swarm_agents with optional defaults.model_slot plus agents using only name (optional), prompt, and model_slot.",
+                "When waiting on children, end your turn without calling report_and_exit; each child report resumes you automatically. One get_agent_status snapshot is allowed when current status is needed, but never call it repeatedly.",
                 "Do not request write tiers, cwd/team overrides, metadata, replacement of an active/queued name, or delegation outside your assigned scope.",
               ]
             : ["You cannot spawn or create other agents. If another agent is needed, use send_message to ask team-lead; only the lead decides and performs the spawn."]),

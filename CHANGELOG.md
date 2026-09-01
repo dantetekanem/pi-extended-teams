@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-09-01
+
+### Changed
+- Use the darker base-panel theme color for the live agent view instead of the brighter custom-message background.
+
 ## [2.2.0] - 2026-08-28
 
 ### Added

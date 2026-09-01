@@ -13,7 +13,7 @@ export type ExtendedTeamsForegroundToken =
   | "thinkingText"
   | "warning";
 
-export type ExtendedTeamsBackgroundToken = "customMessageBg";
+export type ExtendedTeamsBackgroundToken = "customMessageBg" | "toolPendingBg";
 
 export interface ExtendedTeamsTheme {
   fg(token: ExtendedTeamsForegroundToken, text: string): string;

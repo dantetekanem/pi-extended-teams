@@ -330,7 +330,7 @@ export function createAgentFollowComponent(
   if (forwardHerdrPageKeys) tui.terminal.write("\x1b[?1000h");
   const frameStyle: FramePanelStyle = {
     border: (text) => theme.fg("borderAccent", text),
-    background: (text) => theme.bg("customMessageBg", text),
+    background: (text) => theme.bg("toolPendingBg", text),
   };
   let selectedName = options.initialAgentName;
   let offsetFromBottom = 0;

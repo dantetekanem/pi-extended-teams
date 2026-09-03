@@ -36,6 +36,8 @@ export interface AgentRuntimeStatus {
   agentName: string;
   lifecycleRunId?: string;
   pid?: number;
+  paneId?: string;
+  processIdentity?: string;
   startedAt?: number;
   lastHeartbeatAt?: number;
   lastInboxReadAt?: number;
@@ -102,6 +104,17 @@ export async function writeRuntimeStatus(
       if (member.lifecycleRunId !== expectedRunId) {
         rejectRuntimeWrite(teamName, agentName, `roster belongs to lifecycle run ${member.lifecycleRunId || "unknown"}, not ${expectedRunId}.`);
       }
+      const herdrRosterOwner = member.backendType === "herdr" || member.backendType === "herdr-pending";
+      const exactHerdrOwnerProof = herdrRosterOwner
+        && member.tmuxPaneId === updates.paneId
+        && !!member.processIdentity
+        && member.processIdentity === updates.processIdentity
+        && typeof updates.pid === "number"
+        && typeof updates.startedAt === "number"
+        && typeof updates.ready === "boolean";
+      if (herdrRosterOwner && !exactHerdrOwnerProof) {
+        rejectRuntimeWrite(teamName, agentName, "runtime update does not match the complete Herdr roster owner proof.");
+      }
 
       return withLock(p, async () => {
         let current: AgentRuntimeStatus = { teamName, agentName, lifecycleRunId: expectedRunId };
@@ -113,7 +126,10 @@ export async function writeRuntimeStatus(
           }
         }
         if (current.lifecycleRunId && current.lifecycleRunId !== expectedRunId) {
-          rejectRuntimeWrite(teamName, agentName, `runtime file belongs to lifecycle run ${current.lifecycleRunId}.`);
+          if (!exactHerdrOwnerProof) {
+            rejectRuntimeWrite(teamName, agentName, `runtime file belongs to lifecycle run ${current.lifecycleRunId}.`);
+          }
+          current = { teamName, agentName, lifecycleRunId: expectedRunId };
         }
 
         const next: AgentRuntimeStatus = {

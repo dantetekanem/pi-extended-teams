@@ -7,6 +7,8 @@ import * as paths from "../../src/utils/paths.js";
 import * as runtime from "../../src/utils/runtime.js";
 import * as settings from "../../src/utils/settings.js";
 import { sendPlainMessage } from "../../src/utils/messaging.js";
+import { createLifecycleRuntime } from "../team/lifecycle.js";
+import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 
 let root: string;
 let teamsRoot: string;
@@ -285,6 +287,169 @@ describe("extension teammate inbox wake", () => {
     await vi.advanceTimersByTimeAsync(250);
 
     expect(quietTrigger).toHaveBeenCalledWith("You have 1 new inbox message(s). Read them with read_inbox and act.");
+  });
+
+  it("keeps heartbeating a Herdr teammate while its agent turn is busy", async () => {
+    vi.stubEnv("HERDR_ENV", "1");
+    vi.stubEnv("HERDR_PANE_ID", "w1:p9");
+    vi.stubEnv("PI_AGENT_PROCESS_IDENTITY", "handoff-token-1");
+    const runtimeWrite = vi.spyOn(runtime, "writeRuntimeStatus");
+    const { handlers, ctx } = setupEvents(() => false);
+
+    for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+    await expect(runtime.readRuntimeStatus("team", "writer")).resolves.toMatchObject({
+      paneId: "w1:p9",
+      processIdentity: "handoff-token-1",
+    });
+    runtimeWrite.mockClear();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(runtimeWrite).toHaveBeenCalledWith("team", "writer", "writer-run", {
+      lastHeartbeatAt: expect.any(Number),
+      pid: process.pid,
+      paneId: "w1:p9",
+      processIdentity: "handoff-token-1",
+      startedAt: expect.any(Number),
+      ready: false,
+    });
+    for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
+  });
+
+  it("republishes complete exact Herdr owner proof after missing, corrupt, and wrong-run runtime", async () => {
+    vi.stubEnv("HERDR_ENV", "1");
+    vi.stubEnv("HERDR_PANE_ID", "w1:p9");
+    vi.stubEnv("PI_AGENT_PROCESS_IDENTITY", "handoff-token-1");
+    writeTeamConfig("read");
+    const config = JSON.parse(fs.readFileSync(paths.configPath("team"), "utf-8"));
+    Object.assign(config.members[1], {
+      backendType: "herdr",
+      tmuxPaneId: "w1:p9",
+      processIdentity: "handoff-token-1",
+    });
+    fs.writeFileSync(paths.configPath("team"), JSON.stringify(config, null, 2));
+    const runtimePath = paths.runtimeStatusPath("team", "writer");
+    fs.mkdirSync(path.dirname(runtimePath), { recursive: true });
+    fs.writeFileSync(runtimePath, JSON.stringify({
+      teamName: "team",
+      agentName: "writer",
+      lifecycleRunId: "replaced-run",
+      paneId: "w1:p1",
+      processIdentity: "old-token",
+      pid: 111,
+      startedAt: 1,
+      ready: true,
+    }));
+    const { handlers, ctx } = setupEvents(() => false);
+
+    for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+    await expect(runtime.readRuntimeStatus("team", "writer")).resolves.toMatchObject({
+      lifecycleRunId: "writer-run",
+      paneId: "w1:p9",
+      processIdentity: "handoff-token-1",
+      pid: process.pid,
+      ready: false,
+    });
+    const [beforeAgentStart] = handlers.get("before_agent_start") || [];
+    await beforeAgentStart({ systemPrompt: "base" });
+    const expectedProof = {
+      lifecycleRunId: "writer-run",
+      pid: process.pid,
+      paneId: "w1:p9",
+      processIdentity: "handoff-token-1",
+      ready: true,
+      startedAt: expect.any(Number),
+      lastHeartbeatAt: expect.any(Number),
+    };
+
+    fs.unlinkSync(runtimePath);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expect(runtime.readRuntimeStatus("team", "writer")).resolves.toMatchObject(expectedProof);
+
+    fs.writeFileSync(runtimePath, "{not-json");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expect(runtime.readRuntimeStatus("team", "writer")).resolves.toMatchObject(expectedProof);
+
+    fs.writeFileSync(runtimePath, JSON.stringify({
+      teamName: "team",
+      agentName: "writer",
+      lifecycleRunId: "replaced-run",
+      lastHeartbeatAt: Date.now(),
+    }));
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expect(runtime.readRuntimeStatus("team", "writer")).resolves.toMatchObject(expectedProof);
+
+    for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
+  });
+
+  it("lets a real full Herdr heartbeat win the watchdog race before fencing", async () => {
+    vi.stubEnv("HERDR_ENV", "1");
+    vi.stubEnv("HERDR_PANE_ID", "w1:p9");
+    vi.stubEnv("PI_AGENT_PROCESS_IDENTITY", "handoff-token-1");
+    writeTeamConfig("read");
+    const config = JSON.parse(fs.readFileSync(paths.configPath("team"), "utf-8"));
+    Object.assign(config.members[1], {
+      backendType: "herdr",
+      tmuxPaneId: "w1:p9",
+      processIdentity: "handoff-token-1",
+      joinedAt: Date.now() - runtime.STARTUP_STALL_MS - 1,
+      isActive: true,
+    });
+    fs.writeFileSync(paths.configPath("team"), JSON.stringify(config, null, 2));
+    const { handlers, ctx } = setupEvents(() => false);
+    for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+    const [beforeAgentStart] = handlers.get("before_agent_start") || [];
+    await beforeAgentStart({ systemPrompt: "base" });
+
+    const runtimePath = paths.runtimeStatusPath("team", "writer");
+    const current = await runtime.readRuntimeStatus("team", "writer");
+    const stale = { ...current!, lastHeartbeatAt: Date.now() - 600_000 };
+    fs.writeFileSync(runtimePath, JSON.stringify(stale, null, 2));
+    let notifySnapshot!: () => void;
+    const snapshotStarted = new Promise<void>(resolve => { notifySnapshot = resolve; });
+    let releaseSnapshot!: () => void;
+    const snapshotBlocked = new Promise<void>(resolve => { releaseSnapshot = resolve; });
+    const realRead = runtime.readRuntimeStatus.bind(runtime);
+    vi.spyOn(runtime, "readRuntimeStatus")
+      .mockImplementationOnce(async () => {
+        notifySnapshot();
+        await snapshotBlocked;
+        return stale;
+      })
+      .mockImplementation((teamName, agentName) => realRead(teamName, agentName));
+    const closeHerdrPane = vi.fn();
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      closeHerdrPane,
+      runningReadAgents: new Map(),
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: () => true,
+      renderReadAgentStatus: vi.fn(),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => "team",
+    });
+
+    const watchdog = lifecycle.runWatchdogOnce("team");
+    await snapshotStarted;
+    await vi.advanceTimersByTimeAsync(30_000);
+    releaseSnapshot();
+    await watchdog;
+
+    const retained = JSON.parse(fs.readFileSync(paths.configPath("team"), "utf-8")).members
+      .find((member: any) => member.name === "writer");
+    expect(retained).toMatchObject({ isActive: true, lifecycleRunId: "writer-run" });
+    expect(closeHerdrPane).not.toHaveBeenCalled();
+    await expect(readLifecycleTombstone("team", "writer")).resolves.toEqual({ status: "absent" });
+    await expect(runtime.readRuntimeStatus("team", "writer")).resolves.toMatchObject({
+      lifecycleRunId: "writer-run",
+      paneId: "w1:p9",
+      processIdentity: "handoff-token-1",
+      ready: true,
+      lastHeartbeatAt: expect.any(Number),
+    });
+    for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
   });
 
   it("does not reject the inbox wake when runtime status writes keep failing", async () => {

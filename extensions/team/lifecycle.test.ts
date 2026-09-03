@@ -266,6 +266,99 @@ describe("team lifecycle performance", () => {
     }
   });
 
+  it("lets a stop captured before same-run Herdr publication finalize the transferred owner", async () => {
+    const teamName = "stop-handoff-race";
+    const runId = "reader-run";
+    const reader = member("reader", {
+      role: "read",
+      tmuxPaneId: "",
+      lifecycleRunId: runId,
+      isActive: true,
+    });
+    writeConfig({
+      name: teamName,
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), reader],
+    });
+    const session = {
+      hasExtensionHandlers: vi.fn(() => false),
+      clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
+      abort: vi.fn(async () => {}),
+      dispose: vi.fn(),
+    };
+    const state: RunningReadAgent = {
+      runId,
+      name: reader.name,
+      teamName,
+      role: "read",
+      startedAt: Date.now(),
+      tokensUsed: 0,
+      status: "working",
+      recentEvents: [],
+      lastActivityAt: Date.now(),
+      acceptingMessages: true,
+      session: session as any,
+    };
+    const key = `${teamName}:${reader.name}`;
+    const runningReadAgents = new Map([[key, state]]);
+    let releaseRuntimeRead!: (status: runtime.AgentRuntimeStatus) => void;
+    let notifyRuntimeRead!: () => void;
+    const runtimeReadStarted = new Promise<void>(resolve => { notifyRuntimeRead = resolve; });
+    const deferredRuntime = new Promise<runtime.AgentRuntimeStatus>(resolve => { releaseRuntimeRead = resolve; });
+    const originalReadRuntime = runtime.readRuntimeStatus.bind(runtime);
+    vi.spyOn(runtime, "readRuntimeStatus")
+      .mockImplementationOnce(async () => {
+        notifyRuntimeRead();
+        return deferredRuntime;
+      })
+      .mockImplementation((candidateTeam, agentName) => originalReadRuntime(candidateTeam, agentName));
+    const closeHerdrPane = vi.fn();
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      closeHerdrPane,
+      runningReadAgents,
+      readAgentKey: (candidateTeam, agentName) => `${candidateTeam}:${agentName}`,
+      isCurrentReadAgentRun: (candidateKey, candidate) => runningReadAgents.get(candidateKey) === candidate,
+      renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => teamName,
+    });
+
+    const stopping = lifecycle.shutdownTeammate(teamName, reader);
+    await runtimeReadStarted;
+    await expect(teams.updateActiveMemberMatchingRun(teamName, reader.name, runId, {
+      tmuxPaneId: "w1:p9",
+      backendType: "herdr",
+      processIdentity: "birth-token",
+    })).resolves.toBe(true);
+    runningReadAgents.delete(key);
+    const externalRuntime = {
+      teamName,
+      agentName: reader.name,
+      lifecycleRunId: runId,
+      pid: 4242,
+      paneId: "w1:p9",
+      processIdentity: "birth-token",
+      ready: true,
+      startedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+    };
+    await runtime.writeRuntimeStatus(teamName, reader.name, runId, externalRuntime);
+    releaseRuntimeRead(externalRuntime);
+
+    await expect(stopping).resolves.toMatchObject({ status: "settled", finalized: true, removedMember: true });
+    expect(closeHerdrPane).toHaveBeenCalledWith("w1:p9");
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect((await teams.readConfig(teamName)).members.map(item => item.name)).toEqual(["team-lead"]);
+    await expect(readLifecycleTombstone(teamName, reader.name)).resolves.toEqual({ status: "absent" });
+  });
+
   it("protects a newer same-name state, member, runtime, and claim from an old deferred finalizer", async () => {
     vi.useFakeTimers();
     try {
@@ -941,6 +1034,310 @@ describe("team lifecycle performance", () => {
     expect(session.extensionRunner.emit).not.toHaveBeenCalled();
     expect(session.abort).not.toHaveBeenCalled();
     expect(session.dispose).not.toHaveBeenCalled();
+  });
+
+  it("does not reap a healthy Herdr-backed agent as a missing legacy tmux pane", async () => {
+    const herdrAgent = member("herdr-reader", {
+      role: "read",
+      tmuxPaneId: "w1:p9",
+      backendType: "herdr",
+      processIdentity: "herdr-token",
+      lifecycleRunId: "herdr-run",
+    });
+    writeConfig({
+      name: "watchdog-herdr-live",
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), herdrAgent],
+    });
+    vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue({
+      teamName: "watchdog-herdr-live",
+      agentName: herdrAgent.name,
+      lifecycleRunId: "herdr-run",
+      pid: 222,
+      paneId: "w1:p9",
+      processIdentity: "herdr-token",
+      ready: true,
+      startedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+    });
+    vi.spyOn(runtime, "cleanupStaleRuntimeFiles").mockResolvedValue(0);
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents: new Map(),
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: () => true,
+      renderReadAgentStatus: vi.fn(),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => "watchdog-herdr-live",
+    });
+
+    await lifecycle.runWatchdogOnce("watchdog-herdr-live");
+
+    const retained = (await teams.readConfig("watchdog-herdr-live")).members.find(item => item.name === herdrAgent.name);
+    expect(retained).toMatchObject({ backendType: "herdr" });
+    expect(retained?.isActive).not.toBe(false);
+  });
+
+  it("abandons watchdog teardown when an exact Herdr heartbeat recovers after the stale snapshot", async () => {
+    const teamName = "watchdog-herdr-recovered";
+    const herdrAgent = member("herdr-reader", {
+      role: "read",
+      tmuxPaneId: "w1:p15",
+      backendType: "herdr",
+      processIdentity: "birth-token",
+      lifecycleRunId: "herdr-run",
+      joinedAt: Date.now() - runtime.STARTUP_STALL_MS - 1,
+      isActive: true,
+    });
+    writeConfig({
+      name: teamName,
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), herdrAgent],
+    });
+    const staleStatus = {
+      teamName,
+      agentName: herdrAgent.name,
+      lifecycleRunId: "herdr-run",
+      pid: 222,
+      paneId: "w1:p15",
+      processIdentity: "birth-token",
+      ready: true,
+      startedAt: Date.now() - 600_000,
+      lastHeartbeatAt: Date.now() - 600_000,
+    };
+    const recoveredStatus = {
+      ...staleStatus,
+      lastHeartbeatAt: Date.now(),
+    };
+    vi.spyOn(runtime, "readRuntimeStatus")
+      .mockResolvedValueOnce(staleStatus)
+      .mockResolvedValue(recoveredStatus);
+    vi.spyOn(runtime, "cleanupStaleRuntimeFiles").mockResolvedValue(0);
+    const closeHerdrPane = vi.fn();
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      closeHerdrPane,
+      runningReadAgents: new Map(),
+      readAgentKey: (candidateTeam, agentName) => `${candidateTeam}:${agentName}`,
+      isCurrentReadAgentRun: () => true,
+      renderReadAgentStatus: vi.fn(),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => teamName,
+    });
+
+    await lifecycle.runWatchdogOnce(teamName);
+
+    expect((await teams.readConfig(teamName)).members.find(item => item.name === herdrAgent.name))
+      .toMatchObject({ isActive: true, lifecycleRunId: "herdr-run" });
+    expect(closeHerdrPane).not.toHaveBeenCalled();
+    await expect(readLifecycleTombstone(teamName, herdrAgent.name)).resolves.toEqual({ status: "absent" });
+  });
+
+  it("reaps an old Herdr member with missing runtime proof but preserves startup grace", async () => {
+    const oldAgent = member("missing-herdr", {
+      role: "read",
+      tmuxPaneId: "w1:p11",
+      backendType: "herdr",
+      lifecycleRunId: "missing-run",
+      joinedAt: Date.now() - runtime.STARTUP_STALL_MS - 1,
+      isActive: true,
+    });
+    const corruptAgent = member("corrupt-herdr", {
+      role: "read",
+      tmuxPaneId: "w1:p14",
+      backendType: "herdr",
+      lifecycleRunId: "corrupt-run",
+      joinedAt: Date.now() - runtime.STARTUP_STALL_MS - 1,
+      isActive: true,
+    });
+    const recentAgent = member("starting-herdr", {
+      role: "read",
+      tmuxPaneId: "w1:p12",
+      backendType: "herdr",
+      lifecycleRunId: "starting-run",
+      joinedAt: Date.now(),
+      isActive: true,
+    });
+    writeConfig({
+      name: "watchdog-herdr-missing",
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), oldAgent, corruptAgent, recentAgent],
+    });
+    const corruptRuntime = paths.runtimeStatusPath("watchdog-herdr-missing", corruptAgent.name);
+    fs.mkdirSync(path.dirname(corruptRuntime), { recursive: true });
+    fs.writeFileSync(corruptRuntime, "{not-json");
+    vi.spyOn(runtime, "cleanupStaleRuntimeFiles").mockResolvedValue(0);
+    vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      closeHerdrPane: vi.fn(),
+      runningReadAgents: new Map(),
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: () => true,
+      renderReadAgentStatus: vi.fn(),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => "watchdog-herdr-missing",
+    });
+
+    await lifecycle.runWatchdogOnce("watchdog-herdr-missing");
+
+    expect((await teams.readConfig("watchdog-herdr-missing")).members.map(item => item.name))
+      .toEqual(["team-lead", "starting-herdr"]);
+  });
+
+  it("still reaps a Herdr-backed agent after its runtime heartbeat becomes stale", async () => {
+    const herdrAgent = member("stale-herdr-reader", {
+      role: "read",
+      tmuxPaneId: "w1:p10",
+      backendType: "herdr",
+      lifecycleRunId: "stale-herdr-run",
+      isActive: true,
+    });
+    writeConfig({
+      name: "watchdog-herdr-stale",
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), herdrAgent],
+    });
+    await runtime.writeRuntimeStatus("watchdog-herdr-stale", herdrAgent.name, "stale-herdr-run", {
+      pid: 99_999_999,
+      ready: true,
+      startedAt: Date.now() - 600_000,
+      lastHeartbeatAt: Date.now() - 600_000,
+    });
+    vi.spyOn(runtime, "cleanupStaleRuntimeFiles").mockResolvedValue(0);
+    vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      closeHerdrPane: vi.fn(),
+      runningReadAgents: new Map(),
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: () => true,
+      renderReadAgentStatus: vi.fn(),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => "watchdog-herdr-stale",
+    });
+
+    await lifecycle.runWatchdogOnce("watchdog-herdr-stale");
+
+    expect((await teams.readConfig("watchdog-herdr-stale")).members.map(item => item.name)).toEqual(["team-lead"]);
+  });
+
+  it.each(["herdr", "herdr-pending"])(
+    "closes the exact %s pane without signalling a reused PID when stop wins",
+    async backendType => {
+    const herdrAgent = member("herdr-cleanup", {
+      role: "read",
+      tmuxPaneId: "w1:p13",
+      backendType,
+      lifecycleRunId: "cleanup-run",
+      isActive: true,
+    });
+    writeConfig({
+      name: "herdr-cleanup-team",
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), herdrAgent],
+    });
+    await runtime.writeRuntimeStatus("herdr-cleanup-team", herdrAgent.name, "cleanup-run", {
+      pid: 4242,
+      ready: true,
+      startedAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+    });
+    const pidFile = path.join(paths.teamDir("herdr-cleanup-team"), `${herdrAgent.name}.pid`);
+    fs.writeFileSync(pidFile, "4242");
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const closeHerdrPane = vi.fn();
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      closeHerdrPane,
+      runningReadAgents: new Map(),
+      readAgentKey: (teamName, agentName) => `${teamName}:${agentName}`,
+      isCurrentReadAgentRun: () => true,
+      renderReadAgentStatus: vi.fn(),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => "herdr-cleanup-team",
+    });
+
+    await expect(lifecycle.shutdownTeammate("herdr-cleanup-team", herdrAgent)).resolves.toMatchObject({
+      status: "settled",
+      finalized: true,
+    });
+    expect(closeHerdrPane).toHaveBeenCalledWith("w1:p13");
+    expect(kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(pidFile)).toBe(false);
+    },
+  );
+
+  it("fails closed without signalling a Herdr PID when no pane closer is available", async () => {
+    const teamName = "herdr-no-controller";
+    const herdrAgent = member("herdr-cleanup", {
+      role: "read",
+      tmuxPaneId: "w1:p16",
+      backendType: "herdr",
+      lifecycleRunId: "cleanup-run",
+      isActive: true,
+    });
+    writeConfig({
+      name: teamName,
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [member("team-lead"), herdrAgent],
+    });
+    const pidFile = path.join(paths.teamDir(teamName), `${herdrAgent.name}.pid`);
+    fs.writeFileSync(pidFile, "4242");
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const lifecycle = createLifecycleRuntime({
+      isTeammate: false,
+      terminal: null,
+      runningReadAgents: new Map(),
+      readAgentKey: (candidateTeam, agentName) => `${candidateTeam}:${agentName}`,
+      isCurrentReadAgentRun: () => true,
+      renderReadAgentStatus: vi.fn(),
+      drainWriteQueue: vi.fn(async () => {}),
+      getSessionCwd: () => root,
+      getTeamName: () => teamName,
+    });
+
+    await expect(lifecycle.shutdownTeammate(teamName, herdrAgent)).resolves.toMatchObject({
+      status: "cleanup_failed",
+      finalized: false,
+      error: expect.stringContaining("Herdr pane closer"),
+    });
+    expect(kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(pidFile)).toBe(true);
+    expect((await teams.readConfig(teamName)).members.find(item => item.name === herdrAgent.name))
+      .toMatchObject({ isActive: false, lifecycleRunId: "cleanup-run" });
+    await expect(readLifecycleTombstone(teamName, herdrAgent.name)).resolves.toMatchObject({
+      status: "occupied",
+      tombstone: { runId: "cleanup-run", phase: "cleanup_failed" },
+    });
   });
 
   it("retains an inactive watchdog candidate when structured shutdown cleanup fails", async () => {

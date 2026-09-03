@@ -63,7 +63,7 @@ vi.mock("../internal/pi-runtime-api", () => ({
   loadPiRuntimeApi: async () => mockedPiRuntimeApi(),
 }));
 
-import { closeReadAgentMessageDelivery, handleReadAgentSessionEvent, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./read-agent.js";
+import { closeReadAgentMessageDelivery, handleReadAgentSessionEvent, requestReadAgentHandoff, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./read-agent.js";
 import { createLifecycleRuntime } from "../team/lifecycle.js";
 import { sanitizeTuiLine } from "../ui/renderers.js";
 import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "./read-agent-session-lifecycle.js";
@@ -3139,6 +3139,163 @@ describe("in-process read agent tool wiring", () => {
     expect(options.rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
       name: "reader", status: "completed", report: "resumed recovery report",
     }));
+  });
+
+  it("detaches an active read agent for Herdr resume without finalizing its team lifecycle", async () => {
+    const reader = fixtureMember("reader");
+    writeTeamConfig("team", reader);
+    const session = makeSession();
+    session.messages = [];
+    let streaming = false;
+    Object.defineProperty(session, "isStreaming", { get: () => streaming });
+    let promptStarted!: () => void;
+    let releasePrompt!: () => void;
+    const started = new Promise<void>((resolve) => { promptStarted = resolve; });
+    const pending = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    session.prompt.mockImplementationOnce(async () => {
+      streaming = true;
+      promptStarted();
+      await pending;
+      streaming = false;
+    });
+    session.abort.mockImplementation(async () => {
+      streaming = false;
+      releasePrompt();
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const sessionFile = path.join(root, "handoff sessions", "reader.jsonl");
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(sessionFile, "persisted child transcript\n");
+    piMocks.sessionManagerCreate.mockImplementationOnce((cwd: string, sessionDir?: string) => ({
+      cwd,
+      getSessionId: () => "handoff-child",
+      getSessionDir: () => sessionDir,
+      getSessionFile: () => sessionFile,
+    }));
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = makeRunOptions(runningReadAgents);
+    const run = runReadAgentInProcess("team", reader, "run a long command", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+
+    await started;
+    const state = runningReadAgents.get("team:reader")!;
+    Object.assign(state, { status: "working", activeToolName: "bash" });
+    const handoff = requestReadAgentHandoff(state);
+
+    await run;
+    await expect(handoff).resolves.toMatchObject({
+      status: "ready",
+      sessionFile,
+      resumeCommand: expect.stringContaining(`--session '${sessionFile}'`),
+    });
+    expect(session.abort).toHaveBeenCalled();
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(state.messageDeliveryClosed).not.toBe(true);
+    expect(state.handoffDetached).toBe(true);
+    expect(state.handoffPrivateSessionCleanup).toBe(true);
+    expect(fs.existsSync(sessionFile)).toBe(true);
+    expect(options.releaseAllClaimsForAgent).not.toHaveBeenCalled();
+    expect(options.rememberCompletedAgentReport).not.toHaveBeenCalled();
+    expect(options.emitAgentReport).not.toHaveBeenCalled();
+    const liveMember = (await teams.readConfig("team")).members.find(item => item.name === "reader");
+    expect(liveMember).toMatchObject({ lifecycleRunId: state.runId, role: "read" });
+    expect(liveMember?.isActive).not.toBe(false);
+    await expect(runtime.readRuntimeStatus("team", "reader")).resolves.toMatchObject({ lifecycleRunId: state.runId });
+    expect(runningReadAgents.get("team:reader")).toBe(state);
+  });
+
+  it("keeps a timed-out handoff pending until deferred session disposal makes retry safe", async () => {
+    vi.useFakeTimers();
+    try {
+      const reader = fixtureMember("reader");
+      writeTeamConfig("team", reader);
+      const session = makeSession();
+      let promptStarted!: () => void;
+      let releasePrompt!: () => void;
+      let resolveAbort!: () => void;
+      const started = new Promise<void>((resolve) => { promptStarted = resolve; });
+      const promptPending = new Promise<void>((resolve) => { releasePrompt = resolve; });
+      const abortPending = new Promise<void>((resolve) => { resolveAbort = resolve; });
+      session.prompt.mockImplementationOnce(async () => {
+        promptStarted();
+        await promptPending;
+      });
+      session.abort.mockImplementation(() => {
+        releasePrompt();
+        return abortPending;
+      });
+      piMocks.createAgentSession.mockResolvedValue({ session });
+      const runningReadAgents = new Map<string, RunningReadAgent>();
+      const run = runReadAgentInProcess("team", reader, "keep working", {
+        modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+      }, makeRunOptions(runningReadAgents));
+
+      await started;
+      const state = runningReadAgents.get("team:reader")!;
+      const handoff = requestReadAgentHandoff(state);
+      let settled = false;
+      void handoff.then(() => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(NESTED_SESSION_TEARDOWN_TIMEOUT_MS);
+      await run;
+      expect(settled).toBe(false);
+      expect(session.dispose).not.toHaveBeenCalled();
+      expect(runningReadAgents.get("team:reader")).toBe(state);
+
+      resolveAbort();
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(handoff).resolves.toMatchObject({ status: "ready" });
+      expect(session.dispose).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves the persisted recipient when handoff starts just after the agent operation settles", async () => {
+    const reader = fixtureMember("reader");
+    writeTeamConfig("team", reader);
+    const session = makeSession();
+    session.isStreaming = false;
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const options = makeRunOptions(runningReadAgents);
+    let state!: RunningReadAgent;
+    let handoff!: Promise<unknown>;
+    session.getSessionStats.mockImplementationOnce(() => {
+      state = runningReadAgents.get("team:reader")!;
+      handoff = requestReadAgentHandoff(state);
+      return { tokens: { total: 42 } };
+    });
+
+    await runReadAgentInProcess("team", reader, "finish while moving", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+    await expect(handoff).resolves.toMatchObject({ status: "ready" });
+
+    const liveMember = (await teams.readConfig("team")).members.find(item => item.name === "reader");
+    expect(liveMember?.isActive).not.toBe(false);
+    await expect(readLifecycleTombstone("team", "reader")).resolves.toMatchObject({ status: "absent" });
+    expect(state.persistedRecipientClosed).not.toBe(true);
+    expect(runningReadAgents.get("team:reader")).toBe(state);
+  });
+
+  it("does not advertise a Herdr resume command for a nested read helper", async () => {
+    const helper: Member = { ...fixtureMember("writer-reader"), requestedBy: "writer" };
+    writeTeamConfig("team", helper, [fixtureMember("writer", "write")]);
+    const session = makeSession();
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    let observedState: RunningReadAgent | undefined;
+    session.prompt.mockImplementationOnce(async () => {
+      observedState = runningReadAgents.get("team:writer-reader");
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+
+    await runReadAgentInProcess("team", helper, "inspect for writer", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, makeRunOptions(runningReadAgents));
+
+    expect(observedState?.handoffResumeCommand).toBeUndefined();
   });
 
   it("keeps an interrupted read agent alive for a follow-up turn on the same session", async () => {

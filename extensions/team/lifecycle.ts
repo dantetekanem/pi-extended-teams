@@ -27,6 +27,7 @@ import { cleanupPrivateAgentSessionDirectory } from "../internal/agent-session-f
 export interface LifecycleRuntimeOptions {
   isTeammate: boolean;
   terminal: any;
+  closeHerdrPane?(paneId: string): void;
   runningReadAgents: Map<string, RunningReadAgent>;
   readAgentKey(teamName: string, agentName: string): string;
   isCurrentReadAgentRun(key: string, state: RunningReadAgent): boolean;
@@ -45,6 +46,7 @@ export interface ShutdownTeammateOptions {
   drainQueue?: boolean;
   removeMember?: boolean;
   reason?: unknown;
+  verifyCanClose?(member: Member | undefined): Promise<boolean> | boolean;
 }
 
 interface ReapedTeammate {
@@ -56,6 +58,10 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isHerdrBackend(member: Member): boolean {
+  return member.backendType === "herdr" || member.backendType === "herdr-pending";
+}
+
 export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
   let leadWatchdogStarted = false;
   let leadWatchdogTimer: NodeJS.Timeout | null = null;
@@ -65,16 +71,25 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
   async function finalizeTeammateRuntime(teamName: string, member: Member, expectedRunId: string): Promise<void> {
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
     const pidFileExisted = fs.existsSync(pidFile);
-    const pidCleanup = cleanupPidFileProcess(pidFile, { skipPid: process.pid });
-    if (pidFileExisted && !pidCleanup.unlinked) {
-      throw new Error(`Could not remove pid file for ${member.name}.`);
-    }
-    const killErrorCode = (pidCleanup.killError as NodeJS.ErrnoException | undefined)?.code;
-    if (pidCleanup.killError && killErrorCode !== "ESRCH") {
-      throw new Error(`Could not stop pid ${pidCleanup.pid} for ${member.name}: ${errorText(pidCleanup.killError)}`);
+    if (isHerdrBackend(member)) {
+      if (!member.tmuxPaneId || !options.closeHerdrPane) {
+        throw new Error(`Herdr pane closer is unavailable for ${member.name}; retaining recovery state without signalling its PID.`);
+      }
+      options.closeHerdrPane(member.tmuxPaneId);
+      if (pidFileExisted) fs.unlinkSync(pidFile);
+      if (fs.existsSync(pidFile)) throw new Error(`Could not remove pid file for ${member.name}.`);
+    } else {
+      const pidCleanup = cleanupPidFileProcess(pidFile, { skipPid: process.pid });
+      if (pidFileExisted && !pidCleanup.unlinked) {
+        throw new Error(`Could not remove pid file for ${member.name}.`);
+      }
+      const killErrorCode = (pidCleanup.killError as NodeJS.ErrnoException | undefined)?.code;
+      if (pidCleanup.killError && killErrorCode !== "ESRCH") {
+        throw new Error(`Could not stop pid ${pidCleanup.pid} for ${member.name}: ${errorText(pidCleanup.killError)}`);
+      }
     }
 
-    if (member.tmuxPaneId && options.terminal) {
+    if (!isHerdrBackend(member) && member.tmuxPaneId && options.terminal) {
       options.terminal.kill(member.tmuxPaneId);
     }
 
@@ -151,13 +166,6 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       }
       member.lifecycleRunId = expectedRunId;
     }
-    try {
-      options.onTeammateClosing?.(teamName, { ...member, lifecycleRunId: expectedRunId });
-    } catch {
-      // Lifecycle cancellation hooks are in-memory notifications only. Persisted
-      // teardown ownership remains authoritative if an observer fails.
-    }
-
     const persistedRuntime = await runtime.readRuntimeStatus(teamName, member.name).catch(() => null);
     if (persistedRuntime?.lifecycleRunId && persistedRuntime.lifecycleRunId !== expectedRunId) {
       return boundedQuarantineResult(
@@ -232,10 +240,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
           return;
         }
 
-        if (expectedState && !options.isCurrentReadAgentRun(key, expectedState)) {
-          staleFence = true;
-          return;
-        }
+        const inProcessOwnerChanged = expectedState && !options.isCurrentReadAgentRun(key, expectedState);
 
         if (expectedState?.finalizationBlockedReason) {
           cleanupError = new Error(expectedState.finalizationBlockedReason);
@@ -251,6 +256,12 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
           const config = teams.teamExists(teamName) ? await teams.readConfig(teamName) : null;
           const currentMember = config?.members.find(item => item.name === member.name);
           if (currentMember && currentMember.lifecycleRunId !== expectedRunId) {
+            staleFence = true;
+            return;
+          }
+          const becameSameRunHerdrOwner = currentMember?.lifecycleRunId === expectedRunId
+            && isHerdrBackend(currentMember);
+          if (inProcessOwnerChanged && !becameSameRunHerdrOwner) {
             staleFence = true;
             return;
           }
@@ -332,6 +343,16 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       return { finalized: true, removedMember, releasedClaims };
     };
 
+    let closingNotified = false;
+    const notifyClosing = () => {
+      if (closingNotified) return;
+      closingNotified = true;
+      try {
+        options.onTeammateClosing?.(teamName, { ...member, lifecycleRunId: expectedRunId });
+      } catch {
+        // In-memory cancellation observers cannot invalidate persisted teardown ownership.
+      }
+    };
     const closePersistence = async (): Promise<void> => {
       if (expectedState) {
         if (!expectedState.recipientClosurePromise) {
@@ -344,10 +365,12 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
               role: (member.role ?? "write") === "read" ? "read" : "write",
               reason,
               extensionInstanceId,
+              verifyCanClose: shutdownOptions.verifyCanClose,
             }
           ).then(() => { expectedState.persistedRecipientClosed = true; });
         }
         await expectedState.recipientClosurePromise;
+        notifyClosing();
         return;
       }
       await closePersistedRecipient(teamName, member.name, expectedRunId, {
@@ -355,7 +378,9 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
         role: (member.role ?? "write") === "read" ? "read" : "write",
         reason,
         extensionInstanceId,
+        verifyCanClose: shutdownOptions.verifyCanClose,
       });
+      notifyClosing();
     };
 
     if (expectedState) {
@@ -406,6 +431,24 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
     return lastActivity > 0 && (now - lastActivity) > maxAgeMs;
   }
 
+  function herdrRuntimeMatchesMember(member: Member, status: runtime.AgentRuntimeStatus | null): boolean {
+    return isHerdrBackend(member)
+      && status?.ready === true
+      && status.lifecycleRunId === member.lifecycleRunId
+      && !!member.processIdentity
+      && status.processIdentity === member.processIdentity
+      && status.paneId === member.tmuxPaneId;
+  }
+
+  function herdrRuntimeIsHealthy(
+    member: Member,
+    status: runtime.AgentRuntimeStatus | null,
+    maxAgeMs: number,
+    now = Date.now()
+  ): boolean {
+    return herdrRuntimeMatchesMember(member, status) && !teammateRuntimeIsStale(status, maxAgeMs, now);
+  }
+
   async function readRuntimeStatusByMember(teamName: string, members: Member[]): Promise<Map<string, runtime.AgentRuntimeStatus | null>> {
     const entries = await Promise.all(members.map(async (member) => {
       const status = await runtime.readRuntimeStatus(teamName, member.name);
@@ -451,17 +494,34 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
         const runtimeStale = teammateRuntimeIsStale(runtimeStatus, staleMs, now);
         const key = options.readAgentKey(targetTeamName, member.name);
         const inProcessAlive = options.runningReadAgents.has(key);
+        const invalidHerdrRuntime = isHerdrBackend(member)
+          && !herdrRuntimeMatchesMember(member, runtimeStatus);
+        const herdrStartupGraceExpired = invalidHerdrRuntime
+          && now - member.joinedAt > runtime.STARTUP_STALL_MS;
 
-        if (runtimeStale && !inProcessAlive) {
-          const result = await shutdownTeammate(targetTeamName, member, { drainQueue: false });
+        if ((runtimeStale || herdrStartupGraceExpired) && !inProcessAlive) {
+          const result = await shutdownTeammate(targetTeamName, member, {
+            drainQueue: false,
+            ...(isHerdrBackend(member) ? {
+              verifyCanClose: async currentMember => {
+                if (!currentMember || currentMember.lifecycleRunId !== member.lifecycleRunId) return false;
+                if (currentMember.isActive === false) return true;
+                const currentRuntime = await runtime.readRuntimeStatus(targetTeamName, member.name);
+                return !herdrRuntimeIsHealthy(currentMember, currentRuntime, staleMs);
+              },
+            } : {}),
+          });
           if (result.status === "settled" && result.finalized) {
-            reaped.push({ member, reason: `${role}-agent heartbeat is stale and no in-process session is running` });
+            const reason = herdrStartupGraceExpired
+              ? `${role}-agent has no matching Herdr runtime after startup grace`
+              : `${role}-agent heartbeat is stale and no in-process session is running`;
+            reaped.push({ member, reason });
           }
           continue;
         }
 
         const legacyPaneAlive = !!(member.tmuxPaneId && options.terminal?.isAlive(member.tmuxPaneId));
-        if (!inProcessAlive && member.tmuxPaneId && !legacyPaneAlive) {
+        if (!inProcessAlive && !isHerdrBackend(member) && member.tmuxPaneId && !legacyPaneAlive) {
           const result = await shutdownTeammate(targetTeamName, member, { drainQueue: false });
           if (result.status === "settled" && result.finalized) {
             reaped.push({ member, reason: "legacy tmux screen is gone" });

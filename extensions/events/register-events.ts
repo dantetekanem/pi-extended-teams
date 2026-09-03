@@ -23,6 +23,7 @@ export interface RegisterEventsOptions {
   getTeamName(): string | null | undefined;
   setSessionCtx(ctx: any): void;
   terminal: any;
+  closeHerdrPane?(paneId: string): void;
   quietTrigger(content: string): void;
   startLeadInboxPolling(): void;
   startLeadWatchdog(): void;
@@ -42,14 +43,19 @@ export function isInboxFileWatchEvent(inboxFile: string, filename: string | Buff
   return !changedName || changedName === inboxBase || changedName === `${inboxBase}.lock`;
 }
 
+const TEAMMATE_HEARTBEAT_INTERVAL_MS = 30_000;
+
 export function registerExtensionEvents(pi: any, options: RegisterEventsOptions): void {
   let teammateWakeIfUnread: (() => Promise<void>) | null = null;
   let teammatePendingInboxWake = false;
   let teammateInboxWakeTimer: NodeJS.Timeout | null = null;
   let teammateInboxPollTimer: NodeJS.Timeout | null = null;
+  let teammateHeartbeatTimer: NodeJS.Timeout | null = null;
   let teammateInboxWatcher: fs.FSWatcher | null = null;
   let teammateInboxDisposed = false;
   let teammateLifecycleRunId: string | undefined = process.env.PI_LIFECYCLE_RUN_ID;
+  let teammateStartedAt: number | undefined;
+  let teammateReady = false;
   const teammateOneShotTimers = new Set<NodeJS.Timeout>();
 
   const scheduleTeammateOneShot = (callback: () => void, delayMs: number) => {
@@ -64,11 +70,13 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     teammateInboxDisposed = true;
     if (teammateInboxWakeTimer) clearTimeout(teammateInboxWakeTimer);
     if (teammateInboxPollTimer) clearInterval(teammateInboxPollTimer);
+    if (teammateHeartbeatTimer) clearInterval(teammateHeartbeatTimer);
     for (const timer of teammateOneShotTimers) clearTimeout(timer);
     teammateOneShotTimers.clear();
     teammateInboxWatcher?.close();
     teammateInboxWakeTimer = null;
     teammateInboxPollTimer = null;
+    teammateHeartbeatTimer = null;
     teammateInboxWatcher = null;
     teammateWakeIfUnread = null;
     teammatePendingInboxWake = false;
@@ -112,8 +120,23 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     updates: Omit<Partial<runtime.AgentRuntimeStatus>, "teamName" | "agentName" | "lifecycleRunId">
   ): Promise<runtime.AgentRuntimeStatus | null> => {
     if (!teammateLifecycleRunId) throw new Error(`Missing lifecycle run id for ${options.agentName}.`);
+    const herdrOwnerProof = process.env.HERDR_ENV === "1"
+      && process.env.HERDR_PANE_ID
+      && process.env.PI_AGENT_PROCESS_IDENTITY
+      && teammateStartedAt !== undefined
+      ? {
+          pid: process.pid,
+          paneId: process.env.HERDR_PANE_ID,
+          processIdentity: process.env.PI_AGENT_PROCESS_IDENTITY,
+          startedAt: teammateStartedAt,
+          ready: teammateReady,
+        }
+      : {};
     try {
-      return await runtime.writeRuntimeStatus(teamName, options.agentName, teammateLifecycleRunId, updates);
+      return await runtime.writeRuntimeStatus(teamName, options.agentName, teammateLifecycleRunId, {
+        ...updates,
+        ...herdrOwnerProof,
+      });
     } catch (error) {
       // report_and_exit closes persistence before Pi emits its trailing
       // tool/message/turn events. Those telemetry writes are benign no-ops.
@@ -140,7 +163,10 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     // forced-shutdown leftovers (team dirs, debug.log, runtime files, pid files)
     // from accumulating across Pi sessions.
     try {
-      cleanupOrphanedTeams(options.terminal, { maxAgeMs: 24 * 60 * 60 * 1000 });
+      cleanupOrphanedTeams(options.terminal, {
+        maxAgeMs: 24 * 60 * 60 * 1000,
+        closeHerdrPane: options.closeHerdrPane,
+      });
     } catch {
       // Session-start janitors are best-effort and must not block initialization.
     }
@@ -194,9 +220,17 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
         const pidFile = path.join(paths.teamDir(teamName), `${options.agentName}.pid`);
         fs.mkdirSync(path.dirname(pidFile), { recursive: true });
         fs.writeFileSync(pidFile, process.pid.toString());
+        teammateStartedAt = Date.now();
+        teammateReady = false;
         await runtime.writeRuntimeStatus(teamName, options.agentName, teammateLifecycleRunId, {
           pid: process.pid,
-          startedAt: Date.now(),
+          ...(process.env.HERDR_ENV === "1" && process.env.HERDR_PANE_ID
+            ? {
+                paneId: process.env.HERDR_PANE_ID,
+                processIdentity: process.env.PI_AGENT_PROCESS_IDENTITY,
+              }
+            : {}),
+          startedAt: teammateStartedAt,
           lastHeartbeatAt: Date.now(),
           ready: false,
           currentAction: "starting",
@@ -204,6 +238,9 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           contextUsage: runtime.initialContextUsage(modelContextWindow(ctx)),
           lastError: undefined,
         });
+        teammateHeartbeatTimer = setInterval(() => {
+          void writeTeammateRuntimeStatus(teamName, { lastHeartbeatAt: Date.now() }).catch(() => {});
+        }, TEAMMATE_HEARTBEAT_INTERVAL_MS);
       }
       ctx.ui.notify(`Teammate: ${options.agentName} (Team: ${teamName})`, "info");
 
@@ -240,7 +277,13 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           wakeInFlight = true;
           teammatePendingInboxWake = false;
           try {
-            const unread = await messaging.readInbox(teamName, options.agentName, true, false);
+            const unread = await messaging.readInbox(
+              teamName,
+              options.agentName,
+              true,
+              false,
+              teammateLifecycleRunId,
+            );
             if (teammateInboxDisposed) return;
             await writeTeammateRuntimeStatus(teamName, {
               lastHeartbeatAt: Date.now(),
@@ -367,7 +410,8 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
 
       if (teamName) {
         if (!teammateLifecycleRunId) throw new Error(`Missing lifecycle run id for ${options.agentName}.`);
-        await runtime.writeRuntimeStatus(teamName, options.agentName, teammateLifecycleRunId, {
+        teammateReady = true;
+        await writeTeammateRuntimeStatus(teamName, {
           lastHeartbeatAt: Date.now(),
           ready: true,
           currentAction: "thinking",

@@ -29,6 +29,7 @@ export interface SendPlainMessageOnceResult {
 export interface ReadInboxTailOptions {
   unreadOnly?: boolean;
   markAsRead?: boolean;
+  expectedRecipientRunId?: string;
 }
 
 export function nowIso(): string {
@@ -156,11 +157,21 @@ function normalizeInboxLimit(limit: number): number {
   return limit;
 }
 
-function selectInboxMessages(allMsgs: InboxMessage[], unreadOnly: boolean, limit?: number): InboxMessage[] {
-  const matches = (message: InboxMessage) => !unreadOnly || !message.read;
+function selectInboxMessages(
+  allMsgs: InboxMessage[],
+  unreadOnly: boolean,
+  limit?: number,
+  expectedRecipientRunId?: string,
+): InboxMessage[] {
+  const matches = (message: InboxMessage) => {
+    const runMatches = expectedRecipientRunId === undefined
+      || message.recipientLifecycleRunId === undefined
+      || message.recipientLifecycleRunId === expectedRecipientRunId;
+    return runMatches && (!unreadOnly || !message.read);
+  };
 
   if (limit === undefined) {
-    return unreadOnly ? allMsgs.filter(matches) : allMsgs;
+    return unreadOnly || expectedRecipientRunId !== undefined ? allMsgs.filter(matches) : allMsgs;
   }
 
   const normalizedLimit = normalizeInboxLimit(limit);
@@ -231,14 +242,15 @@ export async function readInbox(
   teamName: string,
   agentName: string,
   unreadOnly = false,
-  markAsRead = true
+  markAsRead = true,
+  expectedRecipientRunId?: string,
 ): Promise<InboxMessage[]> {
   const p = inboxPath(teamName, agentName);
   if (!fs.existsSync(p)) return [];
 
   return await withLock(p, async () => {
     const allMsgs = readInboxRaw(p);
-    const result = selectInboxMessages(allMsgs, unreadOnly);
+    const result = selectInboxMessages(allMsgs, unreadOnly, undefined, expectedRecipientRunId);
 
     if (markAsRead && result.length > 0 && markMessagesRead(result)) {
       writeJsonAtomic(p, allMsgs);
@@ -260,7 +272,12 @@ export async function readInboxTail(
 
   return await withLock(p, async () => {
     const allMsgs = readInboxRaw(p);
-    const result = selectInboxMessages(allMsgs, options.unreadOnly === true, normalizedLimit);
+    const result = selectInboxMessages(
+      allMsgs,
+      options.unreadOnly === true,
+      normalizedLimit,
+      options.expectedRecipientRunId,
+    );
 
     if (options.markAsRead === true && result.length > 0 && markMessagesRead(result)) {
       writeJsonAtomic(p, allMsgs);
@@ -320,6 +337,7 @@ export function buildInboxMessage(
     color: options.color,
     operationId: options.operationId,
     workflowRunId: options.workflowRunId,
+    recipientLifecycleRunId: options.expectedRecipientRunId,
     metadata: options.metadata,
   };
 }

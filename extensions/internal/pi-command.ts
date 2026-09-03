@@ -148,6 +148,27 @@ export function buildPiCommand(
   return `${piBinary} ${extensionArgs}${sessionArgs}`;
 }
 
+export function buildPiResumeCommand(
+  piBinary: string,
+  sessionFile: string,
+  chosenModel?: string,
+  thinking?: string,
+  allowedExtensions: readonly string[] = [],
+  projectTrusted?: boolean,
+  selfExtensionSource?: string,
+  sessionDir?: string,
+): string {
+  return `${buildPiCommand(
+    piBinary,
+    chosenModel,
+    thinking,
+    allowedExtensions,
+    projectTrusted,
+    selfExtensionSource,
+    sessionDir,
+  )} --session ${shellQuote(sessionFile)}`;
+}
+
 export type ChildPiModelAvailabilityStatus = "available" | "missing" | "unknown" | "skipped";
 
 export interface ChildPiModelAvailability {

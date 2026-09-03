@@ -10,6 +10,17 @@ function stripAnsi(text: string): string {
   return text.replace(ANSI_SGR_SEQUENCE, "");
 }
 
+function makeHandoffAgent(overrides: Partial<RunningReadAgent> = {}): RunningReadAgent {
+  return makeAgent({
+    handoffSessionFile: "/tmp/child.jsonl",
+    handoffResumeCommand: "pi --session /tmp/child.jsonl",
+    acceptingMessages: true,
+    teardownState: "active",
+    session: {} as any,
+    ...overrides,
+  });
+}
+
 function makeTheme() {
   const foregroundCodes: Record<string, number> = {
     accent: 213,
@@ -564,6 +575,88 @@ describe("agent follow component", () => {
     expect(sendMessage).toHaveBeenCalledWith("beta", "i");
     expect(interruptAgent).toHaveBeenCalledOnce();
     expect(component.render(120).join("\n")).toContain("(beta)");
+    component.dispose();
+  });
+
+  it("hides the Herdr shortcut when the selected agent has no resumable session", () => {
+    const component = createAgentFollowComponent(
+      { terminal: { rows: 24 }, requestRender: vi.fn() },
+      vi.fn(),
+      { getAgents: () => [makeAgent()], handoffAgent: vi.fn() },
+    );
+
+    expect(stripAnsi(component.render(120).join("\n"))).not.toContain("h Herdr");
+    component.dispose();
+  });
+
+  it.each([
+    ["pre-session", { session: undefined }],
+    ["missing-session-file", { handoffSessionFile: undefined }],
+    ["admission-not-open", { acceptingMessages: undefined }],
+    ["finishing", { status: "finishing" }],
+    ["closed-recipient", { messageDeliveryClosed: true, acceptingMessages: false }],
+    ["quarantined", { teardownState: "quarantined", finalizationBlockedReason: "cleanup failed" }],
+    ["nested-helper", { requestedBy: "writer", delegationDepth: 1 }],
+  ] as Array<[string, Partial<RunningReadAgent>]>) (
+    "hides and rejects the Herdr shortcut for %s state",
+    async (_label, overrides) => {
+      const handoffAgent = vi.fn();
+      const component = createAgentFollowComponent(
+        { terminal: { rows: 24 }, requestRender: vi.fn() },
+        vi.fn(),
+        {
+          getAgents: () => [makeHandoffAgent(overrides)],
+          handoffAgent,
+        },
+      );
+
+      expect(stripAnsi(component.render(120).join("\n"))).not.toContain("h Herdr");
+      component.handleInput("h");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(handoffAgent).not.toHaveBeenCalled();
+      component.dispose();
+    },
+  );
+
+  it("hands the selected agent to Herdr with h once and closes the follow view after success", async () => {
+    const done = vi.fn();
+    const tui = { terminal: { rows: 24 }, requestRender: vi.fn() };
+    let finishHandoff!: () => void;
+    const handoffAgent = vi.fn(() => new Promise<void>((resolve) => { finishHandoff = resolve; }));
+    const component = createAgentFollowComponent(tui, done, {
+      getAgents: () => [makeHandoffAgent({ name: "reader" })],
+      handoffAgent,
+    });
+
+    expect(stripAnsi(component.render(120).join("\n"))).toContain("h Herdr");
+    component.handleInput("h");
+    component.handleInput("H");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(handoffAgent).toHaveBeenCalledOnce();
+    expect(handoffAgent).toHaveBeenCalledWith("reader");
+    expect(stripAnsi(component.render(120).join("\n"))).toContain("moving to Herdr");
+    expect(done).not.toHaveBeenCalled();
+
+    finishHandoff();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(done).toHaveBeenCalledOnce();
+    component.dispose();
+  });
+
+  it("keeps the follow view open and reports a failed Herdr handoff", async () => {
+    const done = vi.fn();
+    const tui = { terminal: { rows: 24 }, requestRender: vi.fn() };
+    const component = createAgentFollowComponent(tui, done, {
+      getAgents: () => [makeHandoffAgent()],
+      handoffAgent: async () => { throw new Error("Herdr pane could not start"); },
+    });
+
+    component.handleInput("h");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(done).not.toHaveBeenCalled();
+    expect(stripAnsi(component.render(120).join("\n"))).toContain("Herdr pane could not start");
     component.dispose();
   });
 

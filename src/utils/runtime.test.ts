@@ -20,7 +20,14 @@ describe("runtime status", () => {
   const runId = "worker-run";
   let root: string;
 
-  function writeRoster(members: Array<{ name: string; lifecycleRunId: string; isActive?: boolean }>): void {
+  function writeRoster(members: Array<{
+    name: string;
+    lifecycleRunId: string;
+    isActive?: boolean;
+    backendType?: string;
+    tmuxPaneId?: string;
+    processIdentity?: string;
+  }>): void {
     fs.writeFileSync(paths.configPath(teamName), JSON.stringify({ name: teamName, members }, null, 2));
   }
 
@@ -84,6 +91,95 @@ describe("runtime status", () => {
     expect(runtime?.activeToolName).toBe("read");
     expect(runtime?.latestProgress).toBe("Inspecting runtime state");
     expect(runtime?.progressUpdatedAt).toBe(1500);
+  });
+
+  it("rejects a delayed same-run old-token write for a Herdr owner", async () => {
+    writeRoster([{
+      name: agentName,
+      lifecycleRunId: runId,
+      isActive: true,
+      backendType: "herdr",
+      tmuxPaneId: "w1:p2",
+      processIdentity: "token-2",
+    }]);
+    await writeRuntimeStatus(teamName, agentName, runId, {
+      pid: 202,
+      startedAt: 2000,
+      ready: true,
+      paneId: "w1:p2",
+      processIdentity: "token-2",
+      lastHeartbeatAt: 2100,
+    });
+
+    await expect(writeRuntimeStatus(teamName, agentName, runId, {
+      pid: 101,
+      startedAt: 1000,
+      ready: true,
+      paneId: "w1:p1",
+      processIdentity: "token-1",
+      lastHeartbeatAt: 2200,
+    })).rejects.toThrow("does not match the complete Herdr roster owner proof");
+    await expect(readRuntimeStatus(teamName, agentName)).resolves.toMatchObject({
+      pid: 202,
+      paneId: "w1:p2",
+      processIdentity: "token-2",
+      lastHeartbeatAt: 2100,
+    });
+  });
+
+  it("repairs a wrong-run runtime from exact pending-Herdr startup proof before ready", async () => {
+    writeRoster([{
+      name: agentName,
+      lifecycleRunId: runId,
+      isActive: true,
+      backendType: "herdr-pending",
+      tmuxPaneId: "w1:p2",
+      processIdentity: "token-2",
+    }]);
+    const runtimePath = paths.runtimeStatusPath(teamName, agentName);
+    fs.mkdirSync(path.dirname(runtimePath), { recursive: true });
+    fs.writeFileSync(runtimePath, JSON.stringify({
+      teamName,
+      agentName,
+      lifecycleRunId: "old-run",
+      pid: 101,
+      paneId: "w1:p1",
+      processIdentity: "token-1",
+      startedAt: 1000,
+      ready: true,
+    }));
+
+    await expect(writeRuntimeStatus(teamName, agentName, runId, {
+      pid: 202,
+      startedAt: 2000,
+      ready: false,
+      paneId: "w1:p2",
+      processIdentity: "token-2",
+      lastHeartbeatAt: 2100,
+    })).resolves.toMatchObject({ lifecycleRunId: runId, ready: false, paneId: "w1:p2" });
+    await expect(readRuntimeStatus(teamName, agentName)).resolves.toMatchObject({
+      lifecycleRunId: runId,
+      pid: 202,
+      paneId: "w1:p2",
+      processIdentity: "token-2",
+      ready: false,
+    });
+  });
+
+  it("rejects partial writes even when the Herdr runtime file is missing", async () => {
+    writeRoster([{
+      name: agentName,
+      lifecycleRunId: runId,
+      isActive: true,
+      backendType: "herdr-pending",
+      tmuxPaneId: "w1:p2",
+      processIdentity: "token-2",
+    }]);
+
+    await expect(writeRuntimeStatus(teamName, agentName, runId, {
+      lastHeartbeatAt: 2100,
+    })).rejects.toThrow("does not match the complete Herdr roster owner proof");
+    await expect(readRuntimeStatus(teamName, agentName)).resolves.toBeNull();
   });
 
   it("returns null when status does not exist", async () => {

@@ -4,7 +4,7 @@ import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { findLeadTeamForSession, getPiSessionId, registerLeadSession, resolveSkillFile } from "./internal/session-files.js";
 import { buildReadAgentIdleNudgeMessage, describeReadAgentStatus, shouldNudgeReadAgentIdle, type ReadAgentStatusDescription } from "./ui/read-agent-status.js";
 import { teamActivityStatusWidget, type TeamActivityStatusEntry, type TeamActivityStatusSnapshot } from "./ui/status-widget.js";
-import { runReadAgentInProcess, sendMessageToRunningReadAgent } from "./agents/read-agent.js";
+import { requestReadAgentHandoff, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./agents/read-agent.js";
 import { createWriteAgentRuntime } from "./agents/write-agent.js";
 import { registerExtensionEvents } from "./events/register-events.js";
 import { createLifecycleRuntime } from "./team/lifecycle.js";
@@ -23,6 +23,11 @@ import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js"
 import { createPendingChildController } from "./runtime/pending-child-controller.js";
 import { createActiveAgentSleepController, runWithActiveAgentSleepAssertion } from "./runtime/active-agent-sleep.js";
 import { createTeammateInterrupter } from "./runtime/teammate-interrupt.js";
+import {
+  createHerdrPaneController,
+  performReadAgentHerdrHandoff,
+  waitForExternalAgentReady,
+} from "./runtime/herdr-handoff.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
 import * as messaging from "../src/utils/messaging";
 import * as teams from "../src/utils/teams";
@@ -90,6 +95,10 @@ export default function (pi: ExtensionAPI) {
   let teamToolsRuntime: TeamToolsRuntime | undefined;
   const pendingChildController = createPendingChildController();
   const activeAgentSleepController = createActiveAgentSleepController();
+  const herdrPaneController = createHerdrPaneController();
+  const closeHerdrPane = !isTeammate && herdrPaneController.isAvailable()
+    ? (paneId: string) => herdrPaneController.closePane(paneId)
+    : undefined;
   const { startWriteAgent, drainWriteQueue, releaseWriteAgentSleepAssertion } = createWriteAgentRuntime({
     terminal,
     getProjectTrusted: (cwd) => parentProjectTrustForSpawn(sessionCtx, cwd),
@@ -101,6 +110,7 @@ export default function (pi: ExtensionAPI) {
   const { shutdownTeammate, startLeadWatchdog, stopLeadWatchdog } = createLifecycleRuntime({
     isTeammate,
     terminal,
+    closeHerdrPane,
     runningReadAgents,
     readAgentKey,
     isCurrentReadAgentRun,
@@ -145,6 +155,15 @@ export default function (pi: ExtensionAPI) {
     return `${targetTeamName}:${targetAgentName}`;
   }
 
+  function isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+
   const interruptTeammate = createTeammateInterrupter({
     terminal,
     runningReadAgents,
@@ -164,6 +183,86 @@ export default function (pi: ExtensionAPI) {
     // The runner reports its own terminal failures and owns teardown. This
     // observer exists only to terminate the fire-and-forget rejection chain.
     void Promise.resolve(launch).catch(() => {});
+  }
+
+  async function handoffReadAgentToHerdr(targetAgentName: string): Promise<void> {
+    if (!herdrPaneController.isAvailable()) {
+      throw new Error("This Pi session is not running inside Herdr.");
+    }
+    const targetTeamName = teamName;
+    if (!targetTeamName) throw new Error("No active agent session context is available.");
+
+    const config = await teams.readConfig(targetTeamName);
+    const member = config.members.find(item => item.name === targetAgentName && item.isActive !== false);
+    if (!member || member.role !== "read") {
+      throw new Error(`Agent ${targetAgentName} is not an active in-process read agent.`);
+    }
+    if (member.requestedBy || member.delegationDepth === 1) {
+      throw new Error(`Read helper ${targetAgentName} must stay attached to its requesting agent.`);
+    }
+    const key = readAgentKey(targetTeamName, targetAgentName);
+    const state = runningReadAgents.get(key);
+    if (!state || state.runId !== member.lifecycleRunId) {
+      throw new Error(`Agent ${targetAgentName} no longer has a live in-process session.`);
+    }
+
+    try {
+      await performReadAgentHerdrHandoff({
+        teamName: targetTeamName,
+        agentName: targetAgentName,
+        lifecycleRunId: state.runId,
+        cwd: member.cwd,
+        state,
+      }, {
+        controller: herdrPaneController,
+        detach: () => requestReadAgentHandoff(state),
+        publishPendingOwner: (paneId, processIdentity) => teams.updateActiveMemberMatchingRun(
+          targetTeamName,
+          targetAgentName,
+          state.runId,
+          {
+            tmuxPaneId: paneId,
+            backendType: "herdr-pending",
+            processIdentity,
+            cleanupPrivateSessionOnFinalize: state.handoffPrivateSessionCleanup,
+          },
+        ),
+        queueMessage: async () => {
+          await messaging.sendPlainMessageOnceIfRunning(
+            targetTeamName,
+            "team-lead",
+            targetAgentName,
+            "Continue your assigned work from the resumed session in this Herdr pane. Keep using the existing team communication tools and report_and_exit when finished.",
+            "Continue in Herdr",
+            {
+              operationId: `herdr-handoff:${state.runId}`,
+              expectedRecipientRunId: state.runId,
+            },
+          );
+        },
+        waitForReady: input => waitForExternalAgentReady(input, {
+          readStatus: runtime.readRuntimeStatus,
+          isProcessAlive,
+          isPaneAlive: paneId => herdrPaneController.isPaneAlive(paneId),
+        }),
+        publishExternalOwner: paneId => teams.publishHerdrOwnerMatchingRun(
+          targetTeamName,
+          targetAgentName,
+          state.runId,
+          {
+            tmuxPaneId: paneId,
+            backendType: "herdr",
+            processIdentity: state.handoffProcessIdentity,
+            cleanupPrivateSessionOnFinalize: state.handoffPrivateSessionCleanup,
+          },
+        ),
+        removeInProcessState: () => {
+          if (runningReadAgents.get(key) === state) runningReadAgents.delete(key);
+        },
+      });
+    } finally {
+      renderReadAgentStatus();
+    }
   }
 
   async function deliverMessageToActiveAgent(
@@ -1099,6 +1198,7 @@ export default function (pi: ExtensionAPI) {
     getTeamName: () => teamName,
     setSessionCtx,
     terminal,
+    closeHerdrPane,
     quietTrigger,
     startLeadInboxPolling,
     startLeadWatchdog,
@@ -1127,6 +1227,9 @@ export default function (pi: ExtensionAPI) {
             || result.status === "failed";
           ctx.ui?.notify?.(result.message, warning ? "warning" : "info");
         },
+        handoffAgent: herdrPaneController.isAvailable()
+          ? handoffReadAgentToHerdr
+          : undefined,
         stopAgent: async (name: string) => {
           const targetTeamName = teamName;
           if (!targetTeamName) return;

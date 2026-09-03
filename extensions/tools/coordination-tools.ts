@@ -10,6 +10,7 @@ import * as reportEvents from "../../src/utils/report-events";
 import { canonicalPersistedModelSlot } from "../../src/utils/settings";
 import { createFileClaimTools } from "./file-claim-tools";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
+import { cleanupPrivateAgentSessionDirectory } from "../internal/agent-session-files";
 import { unlinkPidFile } from "../internal/session-files";
 import { summarizeSessionUsage } from "../internal/session-usage";
 import { closePersistedRecipient } from "../team/recipient-closure";
@@ -53,7 +54,12 @@ function requireCurrentSession(options: CoordinationToolsOptions): string {
 
 export function registerCoordinationTools(pi: any, options: CoordinationToolsOptions): void {
   const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
-  const pendingWriterFinalization = new Map<string, { teamName: string; agentName: string; runId: string }>();
+  const pendingWriterFinalization = new Map<string, {
+    teamName: string;
+    agentName: string;
+    runId: string;
+    cleanupPrivateSession: boolean;
+  }>();
 
   pi.on?.("session_shutdown", async () => {
     const pending = Array.from(pendingWriterFinalization.values());
@@ -104,6 +110,9 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
           }
           if (fs.existsSync(paths.runtimeStatusPath(item.teamName, item.agentName))) {
             throw new Error(`Runtime for ${item.agentName} still exists after run ${item.runId} cleanup.`);
+          }
+          if (item.cleanupPrivateSession) {
+            cleanupPrivateAgentSessionDirectory(item.teamName, item.agentName, item.runId);
           }
 
           if (!lifecycleLock.clearMatching(item.runId)) {
@@ -174,6 +183,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         teamName: targetTeamName,
         agentName: options.agentName,
         runId,
+        cleanupPrivateSession: member.cleanupPrivateSessionOnFinalize === true,
       });
       const sessionUsage = summarizeSessionUsage(ctx);
       const tokensUsed = typeof sessionUsage.tokensUsed === "number" ? sessionUsage.tokensUsed : runtimeStatus?.tokensUsed;
@@ -273,21 +283,29 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       const targetAgent = params.agent_name || options.agentName;
       const markAsRead = params.mark_as_read !== false;
       const unreadOnly = params.unread_only !== false;
-      const msgs = await messaging.readInbox(targetTeamName, targetAgent, unreadOnly, markAsRead);
+      const recipientRunId = options.isTeammate && targetAgent === options.agentName
+        ? process.env.PI_LIFECYCLE_RUN_ID
+        : undefined;
+      const msgs = await messaging.readInbox(
+        targetTeamName,
+        targetAgent,
+        unreadOnly,
+        markAsRead,
+        recipientRunId,
+      );
 
-      if (markAsRead && options.isTeammate && targetAgent === options.agentName) {
-        const config = await teams.readConfig(targetTeamName).catch(() => null);
-        const lifecycleRunId = config?.members.find(member => member.name === options.agentName)?.lifecycleRunId;
-        if (lifecycleRunId) {
-          await runtime.writeRuntimeStatus(targetTeamName, options.agentName, lifecycleRunId, {
-            lastHeartbeatAt: Date.now(),
-            lastInboxReadAt: Date.now(),
-            ready: true,
-            currentAction: "thinking",
-            activeToolName: undefined,
-            lastError: undefined,
-          }).catch(() => {});
-        }
+      if (markAsRead
+        && options.isTeammate
+        && targetAgent === options.agentName
+        && recipientRunId) {
+        await runtime.writeRuntimeStatus(targetTeamName, options.agentName, recipientRunId, {
+          lastHeartbeatAt: Date.now(),
+          lastInboxReadAt: Date.now(),
+          ready: true,
+          currentAction: "thinking",
+          activeToolName: undefined,
+          lastError: undefined,
+        }).catch(() => {});
       }
 
       if (markAsRead && !options.isTeammate && targetAgent === options.agentName) {

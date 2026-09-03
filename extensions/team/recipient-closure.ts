@@ -1,4 +1,5 @@
 import * as teams from "../../src/utils/teams";
+import type { Member } from "../../src/utils/models";
 import {
   generateExtensionInstanceId,
   withLifecycleTombstoneLock,
@@ -9,6 +10,8 @@ export interface ClosePersistedRecipientOptions {
   role?: "read" | "write";
   reason?: string;
   extensionInstanceId?: string;
+  /** Final exact-run health gate executed under the lifecycle lock before fencing. */
+  verifyCanClose?(member: Member | undefined): Promise<boolean> | boolean;
 }
 
 const FALLBACK_EXTENSION_INSTANCE_ID = generateExtensionInstanceId();
@@ -62,6 +65,10 @@ export async function closePersistedRecipient(
       const message = `Could not close message admission for ${agentName} in ${teamName}: verification failed: ${errorText(error)}`;
       lifecycleLock.updateMatching(expectedRunId, { phase: "cleanup_failed", error: message });
       throw new Error(message);
+    }
+
+    if (options.verifyCanClose && !(await options.verifyCanClose(initialMember))) {
+      throw new Error(`Lifecycle cleanup for ${agentName} was superseded before fencing.`);
     }
 
     lifecycleLock.occupy(tombstoneInput);

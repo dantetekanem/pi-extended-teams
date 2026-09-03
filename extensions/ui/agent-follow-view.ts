@@ -1,4 +1,5 @@
 import { Input, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { isReadAgentHerdrHandoffEligible, readAgentHerdrHandoffMode } from "../runtime/types";
 import type { RunningReadAgent } from "../runtime/types";
 import { initialContextUsage } from "../../src/utils/runtime";
 import { createFramePanelRowRenderer, framePanel, type FramePanelStyle } from "./frame";
@@ -15,8 +16,13 @@ export interface AgentFollowViewOptions {
   getAgents(): RunningReadAgent[];
   initialAgentName?: string;
   interruptAgent?(name: string): void | Promise<void>;
+  handoffAgent?(name: string): void | Promise<void>;
   stopAgent?(name: string): void | Promise<void>;
   sendMessage?(name: string, content: string): void | Promise<void>;
+}
+
+export function isHerdrHandoffEligible(agent: RunningReadAgent): boolean {
+  return isReadAgentHerdrHandoffEligible(agent);
 }
 
 export interface AgentFollowTranscriptOptions {
@@ -343,7 +349,13 @@ export function createAgentFollowComponent(
   let focused = false;
   const messageInput = new Input();
   const interruptingAgents = new Set<string>();
+  const handoffAgents = new Set<string>();
   const stoppingAgents = new Set<string>();
+  const canHandoff = (agent: RunningReadAgent) => !!options.handoffAgent
+    && isHerdrHandoffEligible(agent)
+    && !handoffAgents.has(agent.name)
+    && !stoppingAgents.has(agent.name);
+  let handoffStatus = "";
   let transcriptAgent: RunningReadAgent | undefined;
   let transcriptMessages: unknown[] | undefined;
   let transcriptMessageCount = -1;
@@ -403,7 +415,10 @@ export function createAgentFollowComponent(
       agent.status,
       agent.latestProgress,
       interruptingAgents.has(agent.name),
+      handoffAgents.has(agent.name),
       stoppingAgents.has(agent.name),
+      canHandoff(agent),
+      handoffStatus,
       expandLargeToolResults,
       offsetFromBottom,
       composingMessage,
@@ -532,7 +547,8 @@ export function createAgentFollowComponent(
           ? [theme.fg("dim", messageStatus)]
           : composingMessage ? [theme.fg("dim", "enter send · esc cancel")] : []),
       ] : [];
-      const bodyHeight = Math.max(4, terminalRows - navigationLines.length - 6 - messageLines.length);
+      const handoffLines = handoffStatus ? [theme.fg("dim", handoffStatus)] : [];
+      const bodyHeight = Math.max(4, terminalRows - navigationLines.length - 6 - messageLines.length - handoffLines.length);
       lastBodyHeight = bodyHeight;
 
       selectedName = agent.name;
@@ -554,6 +570,7 @@ export function createAgentFollowComponent(
       const lastMessage = currentMessages[currentMessages.length - 1];
       const renderNow = Date.now();
       const isInterrupting = interruptingAgents.has(agent.name);
+      const isHandoff = handoffAgents.has(agent.name);
       const isStopping = stoppingAgents.has(agent.name);
       const currentFastFrameKey = composingMessage ? "" : [
         innerWidth,
@@ -570,7 +587,10 @@ export function createAgentFollowComponent(
         agent.status,
         agent.latestProgress,
         isInterrupting,
+        isHandoff,
         isStopping,
+        canHandoff(agent),
+        handoffStatus,
         expandLargeToolResults,
         offsetFromBottom,
         messageStatus,
@@ -589,20 +609,25 @@ export function createAgentFollowComponent(
       const elapsed = formatElapsed(renderNow - agent.startedAt);
       const activity = isStopping
         ? "stopping"
-        : isInterrupting
-          ? "interrupting"
-          : agent.latestProgress
+        : isHandoff
+          ? "moving to Herdr"
+          : isInterrupting
+            ? "interrupting"
+            : agent.latestProgress
             ? formatAnimatedProgress(agent.latestProgress, renderNow)
             : agent.status;
       const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatContextUsage(agent.contextUsage)} · ${activity}`;
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";
       const messageAction = options.sendMessage ? " · m message" : "";
       const interruptAction = options.interruptAgent ? " · i interrupt" : "";
+      const handoffAction = canHandoff(agent)
+        ? ` · h ${readAgentHerdrHandoffMode(agent) === "retry" ? "Retry Herdr" : "Herdr"}`
+        : "";
       const help = composingMessage
         ? `message ${agent.name} · enter send · esc cancel`
         : agents.length > 1
-          ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction}${interruptAction} · x stop · pgup/pgdn scroll · esc main`
-          : `↑/esc main · ${logAction}${messageAction}${interruptAction} · x stop · pgup/pgdn scroll · end follow`;
+          ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction}${interruptAction}${handoffAction} · x stop · pgup/pgdn scroll · esc main`
+          : `↑/esc main · ${logAction}${messageAction}${interruptAction}${handoffAction} · x stop · pgup/pgdn scroll · end follow`;
 
       const currentTranscriptWidth = Math.max(20, innerWidth);
       if (transcriptAgent !== agent
@@ -636,6 +661,7 @@ export function createAgentFollowComponent(
         theme.fg("border", "─".repeat(innerWidth)),
         headline,
         theme.fg("dim", help),
+        ...handoffLines,
         theme.fg("border", "─".repeat(innerWidth)),
         ...visible,
         ...messageLines,
@@ -754,6 +780,24 @@ export function createAgentFollowComponent(
           .catch(() => {})
           .finally(() => {
             interruptingAgents.delete(agent.name);
+            tui.requestRender();
+          });
+        return;
+      }
+      if (data.toLowerCase() === "h" && options.handoffAgent) {
+        const agent = currentAgent(sortedAgents(), selectedName);
+        if (!agent || !canHandoff(agent)) return;
+        handoffAgents.add(agent.name);
+        handoffStatus = "";
+        tui.requestRender();
+        void Promise.resolve()
+          .then(() => options.handoffAgent?.(agent.name))
+          .then(() => done())
+          .catch((error: unknown) => {
+            handoffStatus = error instanceof Error ? error.message : `Could not move ${agent.name} to Herdr.`;
+          })
+          .finally(() => {
+            handoffAgents.delete(agent.name);
             tui.requestRender();
           });
         return;

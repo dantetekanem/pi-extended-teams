@@ -218,6 +218,54 @@ export async function removeMemberMatchingRun(
   });
 }
 
+export async function updateActiveMemberMatchingRun(
+  teamName: string,
+  agentName: string,
+  expectedRunId: string,
+  updates: Partial<Member>
+): Promise<boolean> {
+  const p = configPath(teamName);
+  return withLifecycleTombstoneLock(teamName, agentName, async lifecycleLock => {
+    if (lifecycleLock.read().status !== "absent") return false;
+    return withLock(p, async () => {
+      if (!fs.existsSync(p)) return false;
+      const config = readConfigRaw(p);
+      const member = config.members.find(item => item.name === agentName);
+      if (!member || member.isActive === false || member.lifecycleRunId !== expectedRunId) return false;
+      Object.assign(member, updates);
+      fs.writeFileSync(p, JSON.stringify(config, null, 2));
+      return true;
+    });
+  });
+}
+
+export type HerdrOwnerPublicationResult = "published" | "finalizing" | "rejected";
+
+export async function publishHerdrOwnerMatchingRun(
+  teamName: string,
+  agentName: string,
+  expectedRunId: string,
+  updates: Partial<Member>,
+): Promise<HerdrOwnerPublicationResult> {
+  const p = configPath(teamName);
+  return withLifecycleTombstoneLock(teamName, agentName, async lifecycleLock => {
+    const fence = lifecycleLock.read();
+    if (fence.status === "corrupt") return "rejected";
+    if (fence.status === "occupied") {
+      return fence.tombstone.runId === expectedRunId ? "finalizing" : "rejected";
+    }
+    return withLock(p, async () => {
+      if (!fs.existsSync(p)) return "rejected";
+      const config = readConfigRaw(p);
+      const member = config.members.find(item => item.name === agentName);
+      if (!member || member.isActive === false || member.lifecycleRunId !== expectedRunId) return "rejected";
+      Object.assign(member, updates);
+      fs.writeFileSync(p, JSON.stringify(config, null, 2));
+      return "published";
+    });
+  });
+}
+
 export async function updateMember(teamName: string, agentName: string, updates: Partial<Member>) {
   const p = configPath(teamName);
   await withLock(p, async () => {

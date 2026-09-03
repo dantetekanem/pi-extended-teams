@@ -125,22 +125,46 @@ export function cleanupPidFileProcess(
   return result;
 }
 
-function killTeamMemberProcesses(teamName: string, config: any, terminal: any): void {
+function killTeamMemberProcesses(
+  teamName: string,
+  config: any,
+  terminal: any,
+  closeHerdrPane?: (paneId: string) => void
+): boolean {
+  let safeToRemoveTeam = true;
   for (const member of config?.members || []) {
     if (member.name === "team-lead") continue;
 
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
-    cleanupPidFileProcess(pidFile, { skipPid: process.pid });
+    if (member.backendType === "herdr" || member.backendType === "herdr-pending") {
+      if (!member.tmuxPaneId || !closeHerdrPane) {
+        safeToRemoveTeam = false;
+        continue;
+      }
+      try {
+        closeHerdrPane(member.tmuxPaneId);
+        unlinkPidFile(pidFile);
+      } catch {
+        safeToRemoveTeam = false;
+      }
+      continue;
+    }
 
+    cleanupPidFileProcess(pidFile, { skipPid: process.pid });
     if (terminal && member.tmuxPaneId) {
       try { terminal.kill(member.tmuxPaneId); } catch {}
     }
   }
+  return safeToRemoveTeam;
 }
 
-export function forceCleanupTeam(teamName: string, terminal: any): boolean {
+export function forceCleanupTeam(
+  teamName: string,
+  terminal: any,
+  options: { closeHerdrPane?: (paneId: string) => void } = {}
+): boolean {
   const config = readJsonFile(paths.configPath(teamName));
-  killTeamMemberProcesses(teamName, config, terminal);
+  if (!killTeamMemberProcesses(teamName, config, terminal, options.closeHerdrPane)) return false;
 
   const teamDirectory = paths.teamDir(teamName);
   const tasksDirectory = paths.taskDir(teamName);
@@ -177,6 +201,8 @@ export interface CleanupOrphanedTeamsOptions {
   maxAgeMs?: number;
   /** Test seam; defaults to ~/.pi/teams. */
   teamsRoot?: string;
+  /** Exact-pane cleanup for Herdr members. Without it, Herdr orphans remain recoverable. */
+  closeHerdrPane?(paneId: string): void;
   now?: number;
 }
 
@@ -215,7 +241,7 @@ export function cleanupOrphanedTeams(
       // keep child processes alive after their lead is gone.
       if (hasLifecycleFence) {
         if (shouldCleanOrphan) {
-          killTeamMemberProcesses(dir, readJsonFile(paths.configPath(dir)), terminal);
+          killTeamMemberProcesses(dir, readJsonFile(paths.configPath(dir)), terminal, options.closeHerdrPane);
         }
         continue;
       }
@@ -226,10 +252,10 @@ export function cleanupOrphanedTeams(
         // directory cleanup bypass the private transcript TTL.
         const privateSessionRetention = hasRecentPrivateAgentSessions(teamDirectory, { now, maxAgeMs });
         if (privateSessionRetention !== "none") {
-          killTeamMemberProcesses(dir, readJsonFile(paths.configPath(dir)), terminal);
+          killTeamMemberProcesses(dir, readJsonFile(paths.configPath(dir)), terminal, options.closeHerdrPane);
           continue;
         }
-        if (forceCleanupTeam(dir, terminal)) cleaned++;
+        if (forceCleanupTeam(dir, terminal, { closeHerdrPane: options.closeHerdrPane })) cleaned++;
       }
     } catch {
       // Ignore malformed team directories; cleanup should never disrupt startup.

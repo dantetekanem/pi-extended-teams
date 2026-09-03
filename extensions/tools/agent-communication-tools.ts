@@ -120,8 +120,14 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         const teamName = requireCurrentSession(options);
         const markAsRead = params.mark_as_read !== false;
         const unreadOnly = params.unread_only !== false;
-        const msgs = await messaging.readInbox(teamName, options.agentName, unreadOnly, markAsRead);
         const lifecycleRunId = options.getLifecycleRunId();
+        const msgs = await messaging.readInbox(
+          teamName,
+          options.agentName,
+          unreadOnly,
+          markAsRead,
+          lifecycleRunId,
+        );
         // Do not fail after read flags are persisted; telemetry is best-effort.
         if (markAsRead && lifecycleRunId) {
           await runtime.writeRuntimeStatus(teamName, options.agentName, lifecycleRunId, {

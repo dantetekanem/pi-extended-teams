@@ -3,7 +3,7 @@ import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as writeQueue from "../../src/utils/write-queue";
-import { loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
+import { loadSettings, normalizeFavoriteModelSlot, requireConfiguredFavoriteModel, roleForFavoriteModelSlot } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
 import { buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
@@ -60,12 +60,15 @@ function stopAndVerifySpawnedPane(terminal: any, paneId: string): string | null 
 
 function assertWriterUsesConfiguredLevel(member: Member): void {
   const settings = loadSettings({ projectDir: member.cwd });
-  const level = requireFavoriteModelLevel(settings, member.modelSlot);
-  if (level.role !== "write" || member.role !== "write") {
+  const configured = requireConfiguredFavoriteModel(settings, member.modelSlot);
+  const slot = configured?.slot ?? normalizeFavoriteModelSlot(member.modelSlot);
+  if (!slot) throw new Error(`Unknown favorite model slot "${String(member.modelSlot)}".`);
+  const role = roleForFavoriteModelSlot(slot);
+  if (role !== "write" || member.role !== "write") {
     throw new Error(`Write agent ${member.name} must use a write-* intent tier configured via /agents-favorite-models. Spawn agents by intent tier only.`);
   }
-  if (member.model !== level.model || member.thinking !== level.thinking) {
-    throw new Error(`Write agent ${member.name} must use configured intent tier ${level.slot}; direct model/thinking overrides are not allowed.`);
+  if (configured && (member.model !== configured.config.model || member.thinking !== configured.config.thinking)) {
+    throw new Error(`Write agent ${member.name} must use configured intent tier ${configured.slot}; direct model/thinking overrides are not allowed.`);
   }
 }
 

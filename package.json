@@ -28,7 +28,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:focused": "vitest run src/utils/claims.test.ts src/utils/tasks.test.ts src/utils/model-resolution.test.ts src/utils/settings.test.ts src/utils/write-queue.test.ts src/utils/shared-memory.test.ts extensions/index.test.ts extensions/events/register-events.test.ts extensions/internal/session-files.test.ts extensions/team/contracts.test.ts extensions/tools/delegation-guard.test.ts extensions/tools/agent-communication-tools.test.ts extensions/tools/read-helper.test.ts extensions/agents/read-agent.test.ts",
+    "test:focused": "vitest run src/utils/claims.test.ts src/utils/tasks.test.ts src/utils/model-resolution.test.ts src/utils/settings.test.ts src/utils/write-queue.test.ts src/utils/shared-memory.test.ts extensions/index.test.ts extensions/events/register-events.test.ts extensions/internal/session-files.test.ts extensions/team/contracts.test.ts extensions/tools/delegation-guard.test.ts extensions/tools/agent-communication-tools.test.ts extensions/tools/read-helper.test.ts extensions/agents/read-agent.test.ts extensions/agents/write-agent.test.ts extensions/tools/team-tools.read-agent.test.ts",
     "build": "tsc --noEmit"
   },
   "main": "extensions/index.ts",
@@ -43,11 +43,16 @@
   },
   "files": [
     "extensions",
+    "!extensions/**/*.test.ts",
     "skills",
     "src",
-    "assets",
+    "!src/**/*.test.ts",
+    "!src/**/*.race.child.ts",
     "package.json",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "docs/access.md"
   ],
   "dependencies": {
     "uuid": "^11.1.0"

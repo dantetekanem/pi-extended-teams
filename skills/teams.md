@@ -35,7 +35,7 @@ Before spawning for substantial work:
 
 ## Default flow
 
-Run the outcome-to-lane gate first, then use `spawn_agent` for one genuine helper lane or `spawn_swarm_agents` for a batch of independent lanes. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by canonical `model_slot` intent tier only; never pass `role`, raw `model`, or `thinking` directly. `/agents-favorite-models` maps the eight tiers—`read-collect`, `read-review`, `read-analyze`, `read-critical`, `write-patch`, `write-feature`, `write-system`, and `write-critical`—to read/write behavior, model, and effort. See `README.md` for tier-selection examples.
+Run the outcome-to-lane gate first, then use `spawn_agent` for one genuine helper lane or `spawn_swarm_agents` for a batch of independent lanes. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by canonical `model_slot` intent tier only; never pass `role`, raw `model`, or `thinking` directly. `/agents-favorite-models` can map the eight tiers—`read-collect`, `read-review`, `read-analyze`, `read-critical`, `write-patch`, `write-feature`, `write-system`, and `write-critical`—to specific models and effort. Until a tier is configured, it uses the current lead-session model and thinking level. See `README.md` for tier-selection examples.
 
 ```text
 spawn_swarm_agents({
@@ -69,7 +69,7 @@ Inspect only the concurrent rotation path and focused tests. Report gaps, covera
 
 Then:
 
-1. Each agent runs in-process and reports back to the lead.
+1. Read agents run in-process; edit agents run in separate Pi sessions through the configured terminal adapter. Both report back to the lead.
 2. The lead synthesizes the reports for the user.
 3. Finished agents leave the active status list; completed reports remain available in the session UI.
 

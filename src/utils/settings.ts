@@ -549,6 +549,8 @@ export interface ResolveModelInput {
   teamDefaultModel?: string | null;
   /** Current session model, used as the final fallback. */
   currentModel?: string | null;
+  /** Current session thinking level, used when an unset tier inherits the lead. */
+  currentThinking?: string | null;
 }
 
 export interface ResolvedModel {
@@ -563,6 +565,9 @@ export interface ResolvedModel {
  *
  * Model precedence:   explicit -> favorite slot -> category -> role default -> team default -> current
  * Thinking precedence: explicit -> favorite slot -> category -> role default (else none)
+ *
+ * An explicitly requested but unset favorite tier inherits the current lead
+ * model and thinking before stale category, role, or team defaults.
  *
  * Today read and write typically resolve to the same model (role defaults are
  * null = inherit). The precedence chain lets that diverge purely via settings,
@@ -583,7 +588,18 @@ export function resolveModel(
 
   const explicitModel = toStringOrNull(input.explicitModel ?? null);
   const explicitThinkingInput = toStringOrNull(input.explicitThinking ?? null);
-  const favorite = requireConfiguredFavoriteModel(settings, input.modelSlot);
+  const canonicalSlot = input.modelSlot === undefined || input.modelSlot === null || input.modelSlot === ""
+    ? null
+    : normalizeFavoriteModelSlot(input.modelSlot);
+  if (input.modelSlot !== undefined && input.modelSlot !== null && input.modelSlot !== "" && !canonicalSlot) {
+    throw new Error(
+      `Unknown favorite model slot "${String(input.modelSlot)}". Use one of: ${FAVORITE_MODEL_SLOTS.join(", ")}.`
+    );
+  }
+  const configuredSlot = canonicalSlot ? settings.favoriteModels[canonicalSlot] : undefined;
+  const favorite = configuredSlot?.model && configuredSlot.thinking
+    ? { slot: canonicalSlot!, config: configuredSlot }
+    : null;
   if (favorite && (explicitModel || explicitThinkingInput)) {
     throw new Error(
       `model_slot cannot be combined with explicit model or thinking. Slot "${favorite.slot}" already defines both.`
@@ -592,12 +608,17 @@ export function resolveModel(
 
   const teamDefault = toStringOrNull(input.teamDefaultModel ?? null);
   const current = toStringOrNull(input.currentModel ?? null);
+  const currentThinking = normalizeThinking(input.currentThinking);
+  const unsetRequestedSlot = canonicalSlot !== null && !favorite;
 
   let model: string | null;
   let modelSource: ResolvedModel["modelSource"];
   if (explicitModel) {
     model = explicitModel;
     modelSource = "explicit";
+  } else if (unsetRequestedSlot && current) {
+    model = current;
+    modelSource = "current";
   } else if (favorite?.config.model) {
     model = favorite.config.model;
     modelSource = "favorite-slot";
@@ -622,6 +643,7 @@ export function resolveModel(
   const thinking =
     explicitThinking ??
     favorite?.config.thinking ??
+    (unsetRequestedSlot ? currentThinking : null) ??
     category?.thinking ??
     roleDefaults.thinking ??
     null;

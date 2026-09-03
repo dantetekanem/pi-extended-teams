@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "../internal/schema";
 import { isTeamsDebugEnabled, teamDebugLogPath, writeTeamsDebugEvent } from "../internal/debug";
-import { getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
+import { getCurrentQualifiedModel, getModelSelectionState, requireQualifiedKnownModel } from "../internal/model-selection";
 import { getPiSessionId } from "../internal/session-files";
 import { createSessionContextReference, removeSessionContextReference } from "../internal/session-context-reference";
 import * as paths from "../../src/utils/paths";
@@ -124,7 +124,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const forbidden = ["model", "thinking", "role"].filter((key) => hasOwnParam(params, key));
     if (forbidden.length === 0) return;
     throw new Error(
-      `${context} must use model_slot only. Do not pass ${forbidden.join(", ")}; choose a configured intent tier from /agents-favorite-models. See README.md for tier examples.`
+      `${context} must use model_slot only. Do not pass ${forbidden.join(", ")}; choose an intent tier. Configured favorites are optional; see README.md for tier examples.`
     );
   }
 
@@ -136,7 +136,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const slot = normalizeFavoriteModelSlot(params?.model_slot);
     if (!slot) {
       throw new Error(
-        `${context} requires a configured model_slot intent tier: ${FAVORITE_MODEL_SLOTS.join(", ")}. Define tiers with /agents-favorite-models and see README.md for examples.`
+        `${context} requires a model_slot intent tier: ${FAVORITE_MODEL_SLOTS.join(", ")}. Unconfigured tiers inherit the current lead model and thinking; see README.md for examples.`
       );
     }
     return slot;
@@ -145,7 +145,16 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   function configuredFavoriteModelForSpawn(params: any, ctx: any, context = "spawn_agent"): string {
     const slot = requireSpawnLevel(params, context);
     const settings = loadSettings({ projectDir: params.cwd || ctx.cwd });
-    return requireFavoriteModelLevel(settings, slot).model;
+    const configured = settings.favoriteModels[slot];
+    if (configured?.model && configured.thinking) return configured.model;
+
+    const currentModel = getCurrentQualifiedModel(ctx);
+    if (!currentModel) {
+      throw new Error(
+        `${context} could not resolve model_slot "${slot}": it is not configured and the current lead session has no model.`
+      );
+    }
+    return currentModel;
   }
 
   function requireNestedReadSpawnLevel(params: any, context: string): NestedReadModelSlot {
@@ -899,26 +908,28 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       ? requireNestedReadSpawnLevel(params, `Nested read agent ${safeName}`)
       : requireSpawnLevel(params, `Agent ${safeName}`);
     const role: AgentRole = roleForFavoriteModelSlot(modelSlot);
-    const requestedLevel = requireFavoriteModelLevel(settings, modelSlot);
-    const requestedFavoriteModel = requestedLevel.model;
-    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, requestedFavoriteModel].filter(Boolean) as string[]);
+    const configuredFavorite = settings.favoriteModels[modelSlot];
+    const requestedFavoriteModel = configuredFavorite?.model && configuredFavorite.thinking ? configuredFavorite.model : undefined;
+    const currentModel = getCurrentQualifiedModel(ctx);
+    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, requestedFavoriteModel, currentModel].filter(Boolean) as string[]);
     const resolved = resolveModel(settings, {
       role,
       modelSlot,
       explicitModel: null,
       explicitThinking: null,
       teamDefaultModel: teamConfig.defaultModel,
-      currentModel: null,
+      currentModel,
+      currentThinking: ctx.thinkingLevel,
     });
 
     const chosenModel = requireQualifiedKnownModel(resolved.model ?? undefined, availableModels, "resolved model");
     if (!chosenModel) {
       throw new Error(
-        "No model could be resolved from the configured model_slot level. Define levels with /agents-favorite-models before spawning agents."
+        `Agent ${safeName} could not resolve model_slot "${modelSlot}": it is not configured and neither the team nor current lead session has a model.`
       );
     }
 
-    const chosenThinking = requestedLevel.thinking as Member["thinking"];
+    const chosenThinking = (resolved.thinking ?? ctx.thinkingLevel ?? null) as Member["thinking"];
     const debugLogPath = role === "write" && isTeamsDebugEnabled(settings) ? teamDebugLogPath(safeTeamName) : undefined;
 
     const member: Member = {
@@ -1096,7 +1107,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     }
   });
 
-  const levelDescription = "Required configured intent tier. Read tiers: read-collect gathers bounded facts without owning the conclusion; read-review is the normal default for focused review, verification, and bounded synthesis; read-analyze explains behavior or root cause across connected evidence; read-critical is only for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning. Write tiers: write-patch makes a narrow localized change; write-feature implements a bounded feature with a known design; write-system owns a cross-cutting integration or refactor within explicitly claimed files; write-critical is only for high-risk security, concurrency, recovery, migration, or data-integrity changes. Prefer canonical tiers; legacy reading-*/writing-* aliases remain accepted for this minor release. Do not pass role, model, or thinking directly; see README.md.";
+  const levelDescription = "Required intent tier. Configured favorites take priority; an unconfigured tier inherits the current lead model and thinking. Read tiers: read-collect gathers bounded facts without owning the conclusion; read-review is the normal default for focused review, verification, and bounded synthesis; read-analyze explains behavior or root cause across connected evidence; read-critical is only for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning. Write tiers: write-patch makes a narrow localized change; write-feature implements a bounded feature with a known design; write-system owns a cross-cutting integration or refactor within explicitly claimed files; write-critical is only for high-risk security, concurrency, recovery, migration, or data-integrity changes. Prefer canonical tiers; legacy reading-*/writing-* aliases remain accepted for this minor release. Do not pass role, model, or thinking directly; see README.md.";
   const publicAgentBaseParams = {
     name: Type.Optional(Type.String({ description: "Stable display name. Defaults to a generated agent name." })),
     prompt: Type.String({ description: "The agent's assignment, relevant prior context, evidence already gathered, constraints, and report shape." }),
@@ -1257,7 +1268,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   pi.registerTool({
     name: "spawn_agent",
     label: "Spawn Agent",
-    description: "Spawn one agent by configured intent tier only. Give it the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta rather than a context-free task. Use session_context=lazy only as an on-demand fallback when omitted session history may materially matter; it never replaces a good mission prompt. read-review is the normal read default; use read-collect for bounded fact gathering, read-analyze for connected explanation/root cause, and read-critical only for irreducible high-stakes reasoning. For edits, choose write-patch, write-feature, write-system, or the rare high-risk write-critical by scope and risk. After spawning, do not duplicate or take over its lane; work only on unrelated work, then end the turn so the automatic report can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
+    description: "Spawn one agent by intent tier only. Configured favorites take priority; an unconfigured tier inherits the current lead model and thinking. Give it the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta rather than a context-free task. Use session_context=lazy only as an on-demand fallback when omitted session history may materially matter; it never replaces a good mission prompt. read-review is the normal read default; use read-collect for bounded fact gathering, read-analyze for connected explanation/root cause, and read-critical only for irreducible high-stakes reasoning. For edits, choose write-patch, write-feature, write-system, or the rare high-risk write-critical by scope and risk. After spawning, do not duplicate or take over its lane; work only on unrelated work, then end the turn so the automatic report can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
     parameters: Type.Object(publicAgentParams),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       return spawnPublicAgent(params, ctx);
@@ -1267,7 +1278,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   pi.registerTool({
     name: "spawn_swarm_agents",
     label: "Spawn Swarm Agents",
-    description: "Spawn a batch by configured intent tiers only. Give each lane the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta. Use session_context=lazy selectively as an on-demand fallback, never instead of a good mission prompt. Use read-review as the normal default, read-collect for bounded collection lanes, read-analyze for connected explanation, and read-critical only for irreducible high-stakes reasoning; choose write-patch/feature/system/critical by edit scope and risk. Each spawned lane is delegation-locked: do not duplicate or take it over. After unrelated work is done, end the turn so automatic reports can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or intervene early. Synthesize only after actual reports; intervene only on blocker/error, actual failure, or explicit cancellation. Each agent gets model_slot directly or from defaults; do not pass role, model, or thinking directly.",
+    description: "Spawn a batch by intent tier only. Configured favorites take priority; unconfigured tiers inherit the current lead model and thinking. Give each lane the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta. Use session_context=lazy selectively as an on-demand fallback, never instead of a good mission prompt. Use read-review as the normal default, read-collect for bounded collection lanes, read-analyze for connected explanation, and read-critical only for irreducible high-stakes reasoning; choose write-patch/feature/system/critical by edit scope and risk. Each spawned lane is delegation-locked: do not duplicate or take it over. After unrelated work is done, end the turn so automatic reports can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or intervene early. Synthesize only after actual reports; intervene only on blocker/error, actual failure, or explicit cancellation. Each agent gets model_slot directly or from defaults; do not pass role, model, or thinking directly.",
     parameters: Type.Object({
       defaults: Type.Optional(Type.Object({
         cwd: Type.Optional(Type.String()),

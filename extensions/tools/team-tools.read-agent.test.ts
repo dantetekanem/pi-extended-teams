@@ -654,23 +654,33 @@ describe("public agent spawn tools", () => {
     );
   });
 
-  it("requires a configured model_slot level", async () => {
-    const { tools } = registerTools();
-    const ctx = makeCtx();
+  it("requires a model_slot but falls back to the current session model for an unconfigured tier", async () => {
+    const { tools, runReadAgentInProcess } = registerTools();
+    const ctx: any = makeCtx();
+    ctx.thinkingLevel = "high";
     const abort = new AbortController().signal;
 
     await expect(tools.get("spawn_agent")!.execute("spawn", {
       name: "missing-level",
       prompt: "inspect quickly",
       cwd: root,
-    }, abort, undefined, ctx)).rejects.toThrow(/requires a configured model_slot intent tier/);
+    }, abort, undefined, ctx)).rejects.toThrow(/requires a model_slot intent tier/);
 
-    await expect(tools.get("spawn_agent")!.execute("spawn", {
+    const result = await tools.get("spawn_agent")!.execute("spawn", {
       name: "unset-level",
       prompt: "inspect quickly",
       cwd: root,
       model_slot: "reading-fast",
-    }, abort, undefined, ctx)).rejects.toThrow(/Favorite model slot "read-collect" is not configured/);
+    }, abort, undefined, ctx);
+
+    expect(result.details).toMatchObject({ model: "provider/model", thinking: "high", modelSlot: "read-collect", modelSource: "current" });
+    expect(runReadAgentInProcess).toHaveBeenCalledWith(
+      "session-test-session",
+      expect.objectContaining({ name: "unset-level", model: "provider/model", thinking: "high", modelSlot: "read-collect" }),
+      "inspect quickly",
+      ctx,
+      expect.any(Object),
+    );
   });
 
   it("rejects direct model, thinking, or role selection", async () => {
@@ -908,20 +918,32 @@ describe("public agent spawn tools", () => {
     expect(respond).toHaveBeenCalledTimes(1);
   });
 
-  it("spawn_swarm_agents requires every agent to have a configured level", async () => {
-    writeFavoriteLevels();
+  it("spawn_swarm_agents requires every agent to name a level but falls back for unconfigured tiers", async () => {
     const { tools, runReadAgentInProcess } = registerTools();
-    const ctx = makeCtx();
+    const ctx: any = makeCtx();
+    ctx.thinkingLevel = "high";
     const abort = new AbortController().signal;
 
     await expect(tools.get("spawn_swarm_agents")!.execute("swarm", {
       defaults: { cwd: root },
       agents: [
-        { name: "a", prompt: "inspect a" },
+        { name: "missing-level", prompt: "inspect a" },
       ],
-    }, abort, undefined, ctx)).rejects.toThrow(/requires a configured model_slot intent tier/);
+    }, abort, undefined, ctx)).rejects.toThrow(/requires a model_slot intent tier/);
 
-    expect(runReadAgentInProcess).not.toHaveBeenCalled();
+    const result = await tools.get("spawn_swarm_agents")!.execute("swarm", {
+      defaults: { cwd: root, model_slot: "read-review" },
+      agents: [
+        { name: "a", prompt: "inspect a" },
+        { name: "b", prompt: "inspect b", model_slot: "read-critical" },
+      ],
+    }, abort, undefined, ctx);
+
+    expect(result.details.spawned).toEqual([
+      expect.objectContaining({ name: "a", model: "provider/model", thinking: "high", modelSlot: "read-review", modelSource: "current" }),
+      expect.objectContaining({ name: "b", model: "provider/model", thinking: "high", modelSlot: "read-critical", modelSource: "current" }),
+    ]);
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(2);
   });
 
   it("spawn_swarm_agents applies default and per-agent levels", async () => {

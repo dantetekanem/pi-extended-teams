@@ -50,6 +50,10 @@ const mocks = vi.hoisted(() => ({
     model: "provider/model",
     thinking: "xhigh",
   },
+  configuredFavorite: {
+    slot: "writing-hard",
+    config: { model: "provider/model", thinking: "xhigh" },
+  },
 }));
 
 vi.mock("../../src/utils/settings", () => ({
@@ -58,6 +62,9 @@ vi.mock("../../src/utils/settings", () => ({
     agentSessions: { showInResume: mocks.showInResume },
   })),
   requireFavoriteModelLevel: vi.fn(() => mocks.favoriteLevel),
+  requireConfiguredFavoriteModel: vi.fn(() => mocks.configuredFavorite),
+  normalizeFavoriteModelSlot: vi.fn((slot: string) => slot === "write-patch" ? slot : null),
+  roleForFavoriteModelSlot: vi.fn((slot: string) => slot.startsWith("read-") ? "read" : "write"),
 }));
 vi.mock("../../src/utils/teams", () => ({
   addMember: mocks.addMember,
@@ -133,14 +140,39 @@ describe("legacy tmux writer resource plan", () => {
       model: "provider/model",
       thinking: "xhigh",
     };
+    mocks.configuredFavorite = {
+      slot: "writing-hard",
+      config: { model: "provider/model", thinking: "xhigh" },
+    };
+  });
+
+  it("starts an unconfigured write tier using the already-resolved current lead model and thinking", async () => {
+    mocks.configuredFavorite = null as any;
+    const terminal = { spawn: vi.fn(() => "%writer") };
+    const runtime = createWriteAgentRuntime({
+      terminal,
+      createResourcePlan: async () => ({
+        selectionMode: "explicit",
+        extensionPaths: [],
+        selfExtensionPath: "self.ts",
+        extensions: [],
+        diagnostics: [],
+        skills: "all",
+        trust: { cwd: "/trusted/project", projectTrusted: true },
+      }),
+    });
+    const member = { ...writer(), modelSlot: "write-patch", model: "current/model", thinking: "high" as const };
+
+    await expect(runtime.startWriteAgent("team", member, "implement the task")).resolves.toBe("%writer");
+    expect(mocks.buildCommand).toHaveBeenCalledWith(
+      "pi", "current/model", "high", [], true, "self.ts", "/private/team/writer/writer-run",
+    );
   });
 
   it("uses canonical write-* intent-tier wording for read-tier validation failures", async () => {
-    mocks.favoriteLevel = {
+    mocks.configuredFavorite = {
       slot: "read-review",
-      role: "read",
-      model: "provider/model",
-      thinking: "xhigh",
+      config: { model: "provider/model", thinking: "xhigh" },
     };
     const runtime = createWriteAgentRuntime({ terminal: { spawn: vi.fn() } });
 

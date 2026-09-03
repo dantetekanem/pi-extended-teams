@@ -364,13 +364,25 @@ describe("resolveModel", () => {
     ).toThrow(/Unknown category/);
   });
 
-  it("throws when a requested favorite slot is unset or combined with explicit overrides", () => {
-    expect(() =>
-      resolveModel(structuredClone(DEFAULT_SETTINGS), { role: "read", modelSlot: "reading-fast" })
-    ).toThrow(/not configured/);
+  it("falls back to the current lead model and thinking for an unset requested tier ahead of stale defaults", () => {
+    const settings = withCategories({
+      stale: { role: "read", model: "category/model", thinking: "low" },
+    });
+    settings.roles.read = { model: "role/model", thinking: "medium" };
 
+    expect(resolveModel(settings, {
+      role: "read",
+      category: "stale",
+      modelSlot: "reading-fast",
+      teamDefaultModel: "team/model",
+      currentModel: "current/model",
+      currentThinking: "xhigh",
+    })).toMatchObject({ model: "current/model", thinking: "xhigh", modelSource: "current" });
+  });
+
+  it("rejects explicit overrides when a requested favorite slot is configured", () => {
     const settings = structuredClone(DEFAULT_SETTINGS);
-    settings.favoriteModels["reading-fast"] = { model: "provider/fast", thinking: "low" };
+    settings.favoriteModels["read-collect"] = { model: "provider/fast", thinking: "low" };
     expect(() =>
       resolveModel(settings, { role: "read", modelSlot: "reading-fast", explicitThinking: "high" })
     ).toThrow(/cannot be combined/);

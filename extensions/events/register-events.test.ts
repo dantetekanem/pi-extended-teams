@@ -5,7 +5,6 @@ import path from "node:path";
 import { isInboxFileWatchEvent, registerExtensionEvents } from "./register-events.js";
 import * as paths from "../../src/utils/paths.js";
 import * as runtime from "../../src/utils/runtime.js";
-import * as settings from "../../src/utils/settings.js";
 import { sendPlainMessage } from "../../src/utils/messaging.js";
 
 let root: string;
@@ -153,6 +152,10 @@ describe("extension teammate inbox wake", () => {
     for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
 
     expect(cleanupStalePrivateAgentSessions).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+      expect.stringContaining("/pi-extended-teams-onboard"),
+      expect.anything(),
+    );
   });
 
   it("continues lead session_start initialization when the private-session janitor fails", async () => {
@@ -163,7 +166,6 @@ describe("extension teammate inbox wake", () => {
       throw new Error("simulated janitor failure");
     });
     const cleanupStaleSessionContextReferences = vi.fn(() => 0);
-    const loadSettings = vi.spyOn(settings, "loadSettings").mockReturnValue({ favoriteModels: {} } as any);
     const { handlers, ctx } = setupEvents(() => true, {
       isTeammate: false,
       agentName: "team-lead",
@@ -178,7 +180,6 @@ describe("extension teammate inbox wake", () => {
     await expect(Promise.all((handlers.get("session_start") || []).map(handler => handler({}, ctx)))).resolves.toBeDefined();
 
     expect(setSessionCtx).toHaveBeenCalledWith(ctx);
-    expect(loadSettings).toHaveBeenCalledWith({ projectDir: root });
     expect(cleanupStaleSessionContextReferences).toHaveBeenCalledOnce();
     expect(startLeadInboxPolling).toHaveBeenCalledOnce();
     expect(startLeadWatchdog).toHaveBeenCalledOnce();

@@ -30,13 +30,21 @@ Or install directly from GitHub:
 pi install git:github.com/dantetekanem/pi-extended-teams
 ```
 
+For the first run, start with:
+
+```text
+/pi-extended-teams-onboard
+```
+
+On a new installation with no pi-extended-teams settings, a startup notice points to this command. It gives the current agent a read-only snapshot of the models, favorite tiers, shared extensions, and package source available in that Pi session. The agent recommends a setup, shows the exact changes it wants to make, and explains how to update the installed package. Nothing changes until you approve it. Run the command again whenever your models or extensions change.
+
 Then ask for help naturally:
 
 ```text
 Review the current changes with separate agents for correctness, test gaps, and security. Give me the evidence so I can make the final call.
 ```
 
-The current Pi session becomes the agent group automatically. There is no separate setup step. Until you configure a tier, it uses the current lead-session model and thinking level. Run `/agents-favorite-models` when you want particular tiers to use different models.
+The current Pi session becomes the agent group automatically. Setup remains optional: an unset tier inherits the current lead-session model and thinking level. Use `/agents-favorite-models` to configure tiers directly and `/agents-extensions` to choose which observable loaded extensions spawned agents receive.
 
 ## How it works
 
@@ -98,7 +106,7 @@ For an edit, choose a write tier and name the files it may claim. Never run over
 
 ## Configuration
 
-Global settings live at `~/.pi/agent/pi-extended-teams/settings.json`. Project overrides live at `.pi/pi-extended-teams.json`. Favorite intent tiers are global so `/agents-favorite-models` and spawning use the same choices. Configuring favorites is optional; an unset tier falls back to the current lead-session model and thinking level.
+Global settings live at `~/.pi/agent/pi-extended-teams/settings.json`. Project overrides live at `.pi/pi-extended-teams.json`. Favorite intent tiers are global so `/agents-favorite-models` and spawning use the same choices. Configuring favorites is optional; an unset tier falls back to the current lead-session model and thinking level. `/pi-extended-teams-onboard` inspects both settings layers, recommends a complete model and extension policy, and gives source-specific package update instructions without changing either file on its first pass.
 
 Spawned sessions are private by default under `~/.pi/teams/<team>/agent-sessions/` and stay out of Pi's normal `/resume` picker.
 

@@ -214,6 +214,7 @@ describe("extension integration", () => {
       expect(Array.from(setup.tools.keys()).sort()).toEqual([
         "check_teammate",
         "claim_file",
+        "get_agent_status",
         "interrupt_teammate",
         "list_file_claims",
         "read_inbox",

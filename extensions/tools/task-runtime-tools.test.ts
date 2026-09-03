@@ -70,6 +70,8 @@ describe("task runtime tools", () => {
     expect(teammateTools.has("interrupt_teammate")).toBe(false);
     expect(teammateTools.has("stop_teammate")).toBe(false);
     expect(teammateTools.has("check_teammate")).toBe(true);
+    expect(leadTools.get("check_teammate").description).toContain("get_agent_status");
+    expect(leadTools.get("check_teammate").description).toContain("may clean up");
   });
 
   it("renders the shared interruption result without invoking whole-agent teardown", async () => {

@@ -1,6 +1,6 @@
 {
   "name": "pi-extended-teams",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Control-first, session-connected subagents for Pi with live navigation and intent-tier routing",
   "repository": {
     "type": "git",

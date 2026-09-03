@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Add one-shot `get_agent_status` snapshots for leads and eligible nested write parents, including active, queued, and recently completed read and edit agents.
+
+### Changed
+- Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
+
 ## [2.2.1] - 2026-09-01
 
 ### Changed

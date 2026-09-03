@@ -142,10 +142,10 @@ export function renderInboxMessages(result: any, expanded: boolean, theme: any) 
 
 export function formatTeammateStatusForModel(agentName: string, details: any): string {
   const heartbeat = details.hasRecentHeartbeat ? "fresh heartbeat" : "stale/no heartbeat";
-  const ready = details.agentLoopReady ? "ready" : "not ready";
+  const loopState = details.agentLoopReady ? "loop started (liveness only)" : "loop not started";
   const unread = `${details.unreadCount ?? 0} unread`;
   const released = details.releasedClaims?.length ? `; released claims: ${details.releasedClaims.join(", ")}` : "";
-  return `${agentName}: ${details.health}; ${unread}; ${ready}; ${heartbeat}${released}`;
+  return `${agentName}: ${details.health}; ${unread}; ${loopState}; ${heartbeat}${released}`;
 }
 
 export function renderTeammateStatus(result: any, expanded: boolean, theme: any) {
@@ -153,7 +153,7 @@ export function renderTeammateStatus(result: any, expanded: boolean, theme: any)
   const agentName = details.agentName || "teammate";
   const health = details.health || (details.alive ? "alive" : "dead");
   const color = health === "dead" || health === "stalled" ? "warning" : "success";
-  const headline = `${agentName}: ${health} • ${details.unreadCount ?? 0} unread • ${details.agentLoopReady ? "ready" : "not ready"}`;
+  const headline = `${agentName}: ${health} • ${details.unreadCount ?? 0} unread • ${details.agentLoopReady ? "loop started" : "loop not started"}`;
 
   if (!expanded) {
     return new Text(theme.fg(color, headline), 0, 0);
@@ -188,7 +188,7 @@ function memberStatusLine(member: any): string {
     member.role,
     member.health,
     `${member.unreadCount ?? 0} unread`,
-    member.agentLoopReady ? "ready" : "not ready",
+    member.agentLoopReady ? "loop started" : "loop not started",
     member.hasRecentHeartbeat ? "fresh heartbeat" : "stale/no heartbeat",
     runtimeStatus.currentAction,
     runtimeStatus.activeToolName ? `tool: ${runtimeStatus.activeToolName}` : "",

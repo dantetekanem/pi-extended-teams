@@ -18,6 +18,10 @@ export interface Member {
   thinking?: ThinkingLevel;
   planModeRequired?: boolean;
   backendType?: string;
+  /** Runtime-owned process birth identity for an externally hosted lifecycle run. */
+  processIdentity?: string;
+  /** Remove this read run's hidden child transcript after durable external finalization. */
+  cleanupPrivateSessionOnFinalize?: boolean;
   isActive?: boolean;
   /** Optional programmatic orchestration/idempotency metadata. */
   metadata?: Record<string, any>;
@@ -86,6 +90,8 @@ export interface InboxMessage {
   color?: string;
   operationId?: string;
   workflowRunId?: string;
+  /** Restricts delivery to the exact recipient lifecycle run admitted at append time. */
+  recipientLifecycleRunId?: string;
   metadata?: Record<string, any>;
 }
 

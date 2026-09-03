@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { buildExtensionArgs, buildPiCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand, isModelListed, resolvePiExtendedTeamsExtensionSource } from "./pi-command";
+import { buildExtensionArgs, buildPiCommand, buildPiResumeCommand, checkChildPiModelAvailability, getPiExtendedTeamsExtensionSource, getPiLaunchCommand, isModelListed, resolvePiExtendedTeamsExtensionSource } from "./pi-command";
 
 const originalExtendedSource = process.env.PI_EXTENDED_TEAMS_EXTENSION_SOURCE;
 const originalLegacySource = process.env.PI_TEAMS_EXTENSION_SOURCE;
@@ -93,6 +93,25 @@ describe("pi command helpers", () => {
     );
 
     expect(command).toContain("--session-dir '/tmp/$HOME/private agent sessions'");
+    expect(command).toContain("--model 'provider/model:high'");
+  });
+
+  it("resumes the exact child session with shell-safe paths", () => {
+    const command = buildPiResumeCommand(
+      "pi",
+      "/tmp/$HOME/private agent sessions/child.jsonl",
+      "provider/model",
+      "high",
+      ["/tmp/selected extension.ts"],
+      false,
+      "/tmp/self extension.ts",
+      "/tmp/$HOME/private agent sessions",
+    );
+
+    expect(command).toContain("--session-dir '/tmp/$HOME/private agent sessions'");
+    expect(command).toContain("--session '/tmp/$HOME/private agent sessions/child.jsonl'");
+    expect(command).toContain("--extension '/tmp/self extension.ts'");
+    expect(command).toContain("--extension '/tmp/selected extension.ts'");
     expect(command).toContain("--model 'provider/model:high'");
   });
 

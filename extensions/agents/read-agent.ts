@@ -4,7 +4,8 @@ import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
-import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
+import { readAgentHerdrHandoffMode } from "../runtime/types";
+import type { AgentReportSource, CompletedAgentReport, ReadAgentHandoffResult, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
 import { requireWriteAgentTeam } from "../team/roster";
@@ -20,6 +21,7 @@ import {
 } from "../resources/spawn-resource-plan";
 import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
 import { preparePrivateAgentSessionDirectory } from "../internal/agent-session-files";
+import { buildPiResumeCommand, getPiExtendedTeamsExtensionSource, getPiLaunchCommand } from "../internal/pi-command";
 import { isEligibleNestedReadParent, NESTED_DELEGATION_TOOL_NAMES } from "../runtime/nested-read-agents";
 import type { NestedReadAgentToolBinding } from "../tools/team-tools";
 import type { ParentRunIdentity, PendingChildController } from "../runtime/pending-child-controller";
@@ -343,6 +345,32 @@ export function handleReadAgentSessionEvent(
   }
 }
 
+export function requestReadAgentHandoff(agent: RunningReadAgent): Promise<ReadAgentHandoffResult> {
+  const mode = readAgentHerdrHandoffMode(agent);
+  if (mode === "retry" && agent.handoffPromise) return agent.handoffPromise;
+  if (mode !== "start") {
+    return Promise.resolve({
+      status: "failed",
+      error: `Agent ${agent.name} does not have a persisted session that Herdr can resume.`,
+    });
+  }
+  const session = agent.session!;
+  let resolveHandoff!: (result: ReadAgentHandoffResult) => void;
+  agent.handoffPromise = new Promise<ReadAgentHandoffResult>((resolve) => { resolveHandoff = resolve; });
+  agent.resolveHandoff = resolveHandoff;
+  agent.handoffRequested = true;
+  agent.stopRequested = true;
+  agent.acceptingMessages = false;
+  if (agent.activeOperationGeneration) {
+    agent.interruptRequestedGeneration = agent.activeOperationGeneration;
+  }
+  signalReadAgentWake(agent);
+  if (session.isStreaming) {
+    void Promise.resolve(session.abort()).catch(() => {});
+  }
+  return agent.handoffPromise;
+}
+
 export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | undefined, content: string): Promise<boolean> {
   if (!agent) return false;
   if (!agent.session || !agent.acceptingMessages || agent.messageDeliveryClosed || agent.stopRequested) {
@@ -594,6 +622,8 @@ export async function runReadAgentInProcess(
     name: member.name,
     teamName: readTeamName,
     role,
+    requestedBy: member.requestedBy,
+    delegationDepth: member.delegationDepth,
     startedAt: Date.now(),
     tokensUsed: 0,
     contextUsage: runtime.initialContextUsage(),
@@ -939,6 +969,21 @@ export async function runReadAgentInProcess(
     childSessionManager = privateSessionDirectory
       ? SessionManager.create(member.cwd, privateSessionDirectory)
       : SessionManager.create(member.cwd);
+    const handoffSessionFile = nonEmptyReportText(childSessionManager.getSessionFile?.());
+    if (handoffSessionFile && !member.requestedBy && member.delegationDepth !== 1) {
+      state.handoffSessionFile = handoffSessionFile;
+      state.handoffPrivateSessionCleanup = !!privateSessionDirectory;
+      state.handoffResumeCommand = buildPiResumeCommand(
+        getPiLaunchCommand(),
+        handoffSessionFile,
+        member.model,
+        member.thinking,
+        resourcePlan.extensionPaths,
+        resourcePlan.trust.projectTrusted,
+        resourcePlan.selfExtensionPath ?? getPiExtendedTeamsExtensionSource(),
+        privateSessionDirectory,
+      );
+    }
     const parentModelRuntime: unknown = Reflect.get(ctx.modelRegistry, "runtime");
     const { session } = await createAgentSession({
       cwd: member.cwd,
@@ -1115,6 +1160,7 @@ export async function runReadAgentInProcess(
     } finally {
       state.acceptingMessages = false;
     }
+    if (state.handoffRequested) return;
     await closeRecipient();
     state.status = "finishing";
     state.activeToolName = undefined;
@@ -1143,7 +1189,7 @@ export async function runReadAgentInProcess(
     state.lastError = lastError;
     options.renderReadAgentStatus();
     settleSessionCreation(state.session);
-    await closeRecipient();
+    if (!state.handoffRequested) await closeRecipient();
     if (!state.stopRequested && options.isCurrentReadAgentRun(key, state) && !privateCompletedReportPersisted) {
       let failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
       const failureStats = state.session?.getSessionStats();
@@ -1258,11 +1304,55 @@ export async function runReadAgentInProcess(
     // End run-owned activity even when persisted lifecycle cleanup is refused.
     if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
     state.heartbeatTimer = undefined;
-    closeReadAgentMessageDelivery(state);
-    const teardown = await shutdownTeammate(readTeamName, member, { reason: "quit" });
-    if (pendingChildController && pendingChildParent) {
-      pendingChildController.forgetParent(pendingChildParent);
+
+    if (state.handoffRequested) {
+      const readyHandoff = (): ReadAgentHandoffResult => {
+        state.handoffDetached = true;
+        return {
+          status: "ready",
+          sessionFile: state.handoffSessionFile,
+          resumeCommand: state.handoffResumeCommand,
+        };
+      };
+      const failedHandoff = (error: unknown): ReadAgentHandoffResult => ({
+        status: "failed",
+        sessionFile: state.handoffSessionFile,
+        resumeCommand: state.handoffResumeCommand,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      try {
+        const session = state.session;
+        if (!session || !state.handoffSessionFile || !state.handoffResumeCommand) {
+          throw new Error(`Agent ${state.name} no longer has a resumable session.`);
+        }
+        const sessionLifecycle = installReadAgentSessionLifecycle(session);
+        const teardown = await sessionLifecycle.requestShutdown(
+          "quit",
+          state.messageDeliveryTail ?? Promise.resolve(),
+        );
+        if (teardown.status === "timed_out" && teardown.dispose === "deferred") {
+          void sessionLifecycle.finalized.then(
+            () => state.resolveHandoff?.(readyHandoff()),
+            error => state.resolveHandoff?.(failedHandoff(error)),
+          );
+        } else if (teardown.status === "settled" && teardown.dispose === "settled") {
+          state.resolveHandoff?.(readyHandoff());
+        } else {
+          state.resolveHandoff?.(failedHandoff(
+            new Error(`Nested session handoff did not settle (${teardown.status}, dispose ${teardown.dispose}).`),
+          ));
+        }
+      } catch (error) {
+        state.resolveHandoff?.(failedHandoff(error));
+      }
+      options.renderReadAgentStatus();
+    } else {
+      closeReadAgentMessageDelivery(state);
+      const teardown = await shutdownTeammate(readTeamName, member, { reason: "quit" });
+      if (pendingChildController && pendingChildParent) {
+        pendingChildController.forgetParent(pendingChildParent);
+      }
+      if (!teardown.finalized) options.renderReadAgentStatus();
     }
-    if (!teardown.finalized) options.renderReadAgentStatus();
   }
 }

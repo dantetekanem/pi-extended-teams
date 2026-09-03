@@ -5,7 +5,7 @@ import path from "node:path";
 import { createAgentCommunicationTools } from "./agent-communication-tools.js";
 import * as paths from "../../src/utils/paths.js";
 import { readInbox, sendPlainMessage } from "../../src/utils/messaging.js";
-import { readRuntimeStatus } from "../../src/utils/runtime.js";
+import { readRuntimeStatus, writeRuntimeStatus } from "../../src/utils/runtime.js";
 
 let root: string;
 
@@ -65,6 +65,46 @@ describe("read-agent communication tools", () => {
     const result = await tools.get("read_inbox")!.execute("read", { unread_only: true });
 
     expect(result.content[0].text).toContain("Initial instructions");
+    await expect(readRuntimeStatus("session", "reader")).resolves.toBeNull();
+  });
+
+  it("keeps process-bound read_inbox telemetry out of a replacement lifecycle run", async () => {
+    const configPath = paths.configPath("session");
+    fs.writeFileSync(configPath, JSON.stringify({
+      name: "session",
+      members: [
+        { name: "team-lead" },
+        { name: "reader", lifecycleRunId: "run-b", isActive: true },
+      ],
+    }));
+    await writeRuntimeStatus("session", "reader", "run-b", {
+      ready: false,
+      startedAt: 2000,
+      lastHeartbeatAt: 2000,
+      currentAction: "working",
+      activeToolName: "replacement-tool",
+    });
+    await sendPlainMessage(
+      "session",
+      "team-lead",
+      "reader",
+      "run A instruction",
+      "stale instruction",
+      undefined,
+      { expectedRecipientRunId: "run-a" },
+    );
+    const tools = makeTools("session", "reader", "read", "run-a");
+
+    const result = await tools.get("read_inbox")!.execute("read", { unread_only: true });
+
+    expect(result.content[0].text).toContain("run A instruction");
+    await expect(readRuntimeStatus("session", "reader")).resolves.toMatchObject({
+      lifecycleRunId: "run-b",
+      ready: false,
+      lastHeartbeatAt: 2000,
+      currentAction: "working",
+      activeToolName: "replacement-tool",
+    });
   });
 
   it("exposes direct communication and complete final reporting to read agents", () => {

@@ -2,6 +2,40 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import type { ContextUsageSnapshot, RuntimeError } from "../../src/utils/runtime";
 import type { ManagedReadAgentLifecycleState } from "../agents/read-agent-session-lifecycle";
 
+export type ReadAgentHerdrHandoffMode = "start" | "retry";
+
+export function readAgentHerdrHandoffMode(agent: RunningReadAgent): ReadAgentHerdrHandoffMode | null {
+  const topLevelReadAgent = agent.role === "read"
+    && !agent.requestedBy
+    && agent.delegationDepth !== 1;
+  const sharedProof = topLevelReadAgent
+    && agent.teardownState === "active"
+    && !agent.finalizationBlockedReason
+    && !!agent.handoffSessionFile
+    && !!agent.handoffResumeCommand;
+  if (!sharedProof) return null;
+  if (agent.handoffDetached === true && agent.handoffPromise) return "retry";
+  if (agent.acceptingMessages === true
+    && agent.messageDeliveryClosed !== true
+    && agent.stopRequested !== true
+    && (agent.status === "thinking" || agent.status === "working")
+    && agent.session) {
+    return "start";
+  }
+  return null;
+}
+
+export function isReadAgentHerdrHandoffEligible(agent: RunningReadAgent): boolean {
+  return readAgentHerdrHandoffMode(agent) !== null;
+}
+
+export interface ReadAgentHandoffResult {
+  status: "ready" | "failed";
+  sessionFile?: string;
+  resumeCommand?: string;
+  error?: string;
+}
+
 export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   runId: string;
   name: string;
@@ -28,9 +62,26 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   completedOperationInterrupted?: boolean;
   completedOperationError?: unknown;
   operationAwaitingResume?: boolean;
+  /** True while the in-process session is being detached for an external Herdr pane. */
+  handoffRequested?: boolean;
+  /** The nested session is disposed and the exact persisted run can be retried externally. */
+  handoffDetached?: boolean;
+  handoffSessionFile?: string;
+  handoffResumeCommand?: string;
+  handoffPrivateSessionCleanup?: boolean;
+  handoffPromise?: Promise<ReadAgentHandoffResult>;
+  resolveHandoff?: (result: ReadAgentHandoffResult) => void;
+  handoffPaneId?: string;
+  handoffExternalPid?: number;
+  handoffExternalStartedAt?: number;
+  handoffProcessIdentity?: string;
+  handoffExternalReady?: boolean;
+  handoffTransactionPromise?: Promise<void>;
   lastError?: RuntimeError;
   idleNudgeLevel?: "soft" | "hard";
   role?: string;
+  requestedBy?: string;
+  delegationDepth?: number;
   model?: string;
   thinking?: string;
   modelSlot?: string;

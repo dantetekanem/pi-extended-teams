@@ -113,6 +113,71 @@ describe("coordination tools", () => {
     expect(renderLeadInboxStatus).toHaveBeenCalledOnce();
   });
 
+  it("never lets stale process A write read_inbox telemetry into replacement run B", async () => {
+    const teamName = "replacement-inbox-team";
+    const agentName = "writer";
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", "run-a");
+    writeConfig({
+      name: teamName,
+      description: "",
+      createdAt: Date.now(),
+      leadAgentId: "lead",
+      leadSessionId: "session",
+      members: [
+        member("team-lead"),
+        member(agentName, { lifecycleRunId: "run-b", isActive: true }),
+      ],
+    });
+    await runtime.writeRuntimeStatus(teamName, agentName, "run-b", {
+      ready: false,
+      startedAt: 2000,
+      lastHeartbeatAt: 2000,
+      currentAction: "working",
+      activeToolName: "replacement-tool",
+    });
+    await messaging.sendPlainMessage(
+      teamName,
+      "team-lead",
+      agentName,
+      "run A instruction",
+      "stale instruction",
+      undefined,
+      { expectedRecipientRunId: "run-a" },
+    );
+    const tools = new Map<string, any>();
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      agentName,
+      isTeammate: true,
+      terminal: undefined,
+      getTeamName: () => teamName,
+      requireWriteAgentTeam: async () => teamName,
+      requireTeamContext: (explicitTeamName?: string) => explicitTeamName || teamName,
+      releaseAllClaimsForAgent: vi.fn(async () => []),
+      drainWriteQueue: vi.fn(async () => {}),
+      resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(),
+      renderLeadInboxStatus: vi.fn(async () => {}),
+      resetLeadWakeNotifiedCount: vi.fn(),
+    });
+
+    const result = await tools.get("read_inbox").execute(
+      "read",
+      {},
+      new AbortController().signal,
+      vi.fn(),
+      {},
+    );
+
+    expect(result.content[0].text).toContain("run A instruction");
+    await expect(runtime.readRuntimeStatus(teamName, agentName)).resolves.toMatchObject({
+      lifecycleRunId: "run-b",
+      ready: false,
+      lastHeartbeatAt: 2000,
+      currentAction: "working",
+      activeToolName: "replacement-tool",
+    });
+  });
+
   it("send_message fails when the recipient subagent is not running", async () => {
     const teamName = "message-team";
     writeConfig({
@@ -208,7 +273,16 @@ describe("coordination tools", () => {
       leadSessionId: "session",
       members: [
         member("team-lead"),
-        member(agentName, { lifecycleRunId: runId, tmuxPaneId: "%writer", model: "provider/model", thinking: "high", modelSlot: "writing-hard" }),
+        member(agentName, {
+          lifecycleRunId: runId,
+          model: "provider/model",
+          thinking: "high",
+          modelSlot: "writing-hard",
+          backendType: "herdr-pending",
+          tmuxPaneId: "w1:p9",
+          processIdentity: "handoff-token-1",
+          cleanupPrivateSessionOnFinalize: true,
+        }),
       ],
     });
     const pidFile = path.join(paths.teamDir(teamName), `${agentName}.pid`);
@@ -218,6 +292,8 @@ describe("coordination tools", () => {
     fs.writeFileSync(path.join(privateSessionDir, "session.jsonl"), "private transcript\n");
     await runtime.writeRuntimeStatus(teamName, agentName, runId, {
       pid: process.pid,
+      paneId: "w1:p9",
+      processIdentity: "handoff-token-1",
       startedAt: Date.now(),
       lastHeartbeatAt: Date.now(),
       ready: true,
@@ -349,7 +425,7 @@ describe("coordination tools", () => {
 
     for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
     expect(fs.existsSync(pidFile)).toBe(false);
-    expect(fs.existsSync(path.join(privateSessionDir, "session.jsonl"))).toBe(true);
+    expect(fs.existsSync(privateSessionDir)).toBe(false);
     expect(await runtime.readRuntimeStatus(teamName, agentName)).toBeNull();
     expect(JSON.parse(fs.readFileSync(paths.configPath(teamName), "utf-8")).members.map((item: Member) => item.name)).toEqual(["team-lead"]);
     await expect(readLifecycleTombstone(teamName, agentName)).resolves.toEqual({ status: "absent" });
@@ -373,7 +449,12 @@ describe("coordination tools", () => {
       leadSessionId: "session",
       members: [
         member("team-lead"),
-        member(agentName, { lifecycleRunId: runId, tmuxPaneId: "%writer", modelSlot: "write-critical" }),
+        member(agentName, {
+          lifecycleRunId: runId,
+          tmuxPaneId: "%writer",
+          modelSlot: "write-critical",
+          cleanupPrivateSessionOnFinalize: true,
+        }),
       ],
     });
     const privateSessionDir = privateSessionDirectory(teamName, agentName, runId);

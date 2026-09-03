@@ -100,11 +100,19 @@ export interface TerminalAdapter {
 /**
  * Base helper for adapters to execute commands synchronously.
  */
-export function execCommand(command: string, args: string[]): { stdout: string; stderr: string; status: number | null } {
-  const result = spawnSync(command, args, { encoding: "utf-8" });
+export function execCommand(
+  command: string,
+  args: string[],
+  options: { timeoutMs?: number } = {},
+): { stdout: string; stderr: string; status: number | null; error?: unknown } {
+  const result = spawnSync(command, args, {
+    encoding: "utf-8",
+    ...(options.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
+  });
   return {
     stdout: result.stdout?.toString() ?? "",
     stderr: result.stderr?.toString() ?? "",
     status: result.status,
+    error: result.error,
   };
 }

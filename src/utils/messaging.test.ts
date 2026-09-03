@@ -262,6 +262,39 @@ describe("Messaging Utilities", () => {
     ).rejects.toThrow("lifecycle-quarantined");
   });
 
+  it("keeps an admitted run-A operation invisible and unread to a run-B replacement", async () => {
+    const configPath = path.join(testDir, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify({
+      name: "test-team",
+      members: [{ name: "receiver", lifecycleRunId: "run-a", isActive: true }],
+    }));
+    await sendPlainMessageIfRunning(
+      "test-team",
+      "team-lead",
+      "receiver",
+      "Continue in Herdr.",
+      "Herdr handoff",
+      undefined,
+      { expectedRecipientRunId: "run-a", operationId: "herdr-handoff:run-a" },
+    );
+    await closePersistedRecipient("test-team", "receiver", "run-a");
+    fs.unlinkSync(paths.lifecycleTombstonePath("test-team", "receiver"));
+    fs.writeFileSync(configPath, JSON.stringify({
+      name: "test-team",
+      members: [{ name: "receiver", lifecycleRunId: "run-b", isActive: true }],
+    }));
+
+    await expect(readInbox("test-team", "receiver", true, true, "run-b")).resolves.toEqual([]);
+    const persisted = await readInbox("test-team", "receiver", false, false);
+    expect(persisted).toEqual([expect.objectContaining({
+      text: "Continue in Herdr.",
+      read: false,
+      recipientLifecycleRunId: "run-a",
+    })]);
+    await expect(readInbox("test-team", "receiver", true, true, "run-a"))
+      .resolves.toEqual([expect.objectContaining({ text: "Continue in Herdr.", read: true })]);
+  });
+
   it("rejects a send that follows close without creating or changing the inbox", async () => {
     fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({
       name: "test-team",

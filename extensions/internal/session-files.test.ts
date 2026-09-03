@@ -16,7 +16,13 @@ function installPathSpies() {
   vi.spyOn(paths, "leadSessionPath").mockImplementation((teamName: string) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lead-session.json"));
 }
 
-function writeTeam(teamName: string, options: { leadPid?: number; sessionId?: string; createdAt?: number; paneId?: string } = {}) {
+function writeTeam(teamName: string, options: {
+  leadPid?: number;
+  sessionId?: string;
+  createdAt?: number;
+  paneId?: string;
+  backendType?: string;
+} = {}) {
   const teamDir = paths.teamDir(teamName);
   fs.mkdirSync(teamDir, { recursive: true });
   fs.mkdirSync(paths.taskDir(teamName), { recursive: true });
@@ -25,7 +31,13 @@ function writeTeam(teamName: string, options: { leadPid?: number; sessionId?: st
     createdAt: options.createdAt ?? Date.now(),
     members: [
       { name: "team-lead", agentType: "lead" },
-      { name: "writer", agentType: "teammate", role: "write", tmuxPaneId: options.paneId ?? "%7" },
+      {
+        name: "writer",
+        agentType: "teammate",
+        role: "write",
+        tmuxPaneId: options.paneId ?? "%7",
+        ...(options.backendType ? { backendType: options.backendType } : {}),
+      },
     ],
   }, null, 2));
   if (options.leadPid !== undefined) {
@@ -176,6 +188,95 @@ describe("session file cleanup", () => {
     expect(cleanupOrphanedTeams(terminal, { teamsRoot, now, maxAgeMs })).toBe(1);
     expect(fs.existsSync(paths.teamDir("recoverable-team"))).toBe(false);
     expect(terminal.kill).toHaveBeenCalledWith("%7");
+  });
+
+  it("retains an orphaned Herdr member without signalling its unverified PID", () => {
+    const terminal = { kill: vi.fn() };
+    const now = Date.now();
+    writeTeam("herdr-orphan", {
+      leadPid: 99999999,
+      createdAt: now - 2 * 60 * 60 * 1000,
+      paneId: "w1:p20",
+      backendType: "herdr",
+    });
+    const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === 0) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      return true;
+    }) as typeof process.kill);
+
+    const cleaned = cleanupOrphanedTeams(terminal, {
+      teamsRoot,
+      now,
+      maxAgeMs: 60 * 60 * 1000,
+    });
+
+    expect(cleaned).toBe(0);
+    expect(fs.existsSync(paths.teamDir("herdr-orphan"))).toBe(true);
+    expect(fs.existsSync(path.join(paths.teamDir("herdr-orphan"), "writer.pid"))).toBe(true);
+    expect(kill).not.toHaveBeenCalledWith(99999999, "SIGKILL");
+    expect(terminal.kill).not.toHaveBeenCalled();
+  });
+
+  it("cleans an orphaned Herdr member through its exact pane without signalling its PID", () => {
+    const terminal = { kill: vi.fn() };
+    const closeHerdrPane = vi.fn();
+    const now = Date.now();
+    writeTeam("closable-herdr-orphan", {
+      leadPid: 99999999,
+      createdAt: now - 2 * 60 * 60 * 1000,
+      paneId: "w1:p21",
+      backendType: "herdr-pending",
+    });
+    const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === 0) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      return true;
+    }) as typeof process.kill);
+
+    const cleaned = cleanupOrphanedTeams(terminal, {
+      teamsRoot,
+      now,
+      maxAgeMs: 60 * 60 * 1000,
+      closeHerdrPane,
+    });
+
+    expect(cleaned).toBe(1);
+    expect(closeHerdrPane).toHaveBeenCalledWith("w1:p21");
+    expect(kill).not.toHaveBeenCalledWith(99999999, "SIGKILL");
+    expect(terminal.kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(paths.teamDir("closable-herdr-orphan"))).toBe(false);
+  });
+
+  it("closes a fenced pending-Herdr pane without signalling its PID or deleting recovery state", () => {
+    const terminal = { kill: vi.fn() };
+    const closeHerdrPane = vi.fn();
+    const now = Date.now();
+    writeTeam("fenced-pending-herdr", {
+      leadPid: 99999999,
+      createdAt: now - 2 * 60 * 60 * 1000,
+      paneId: "w1:p22",
+      backendType: "herdr-pending",
+    });
+    const quarantineDir = path.join(paths.teamDir("fenced-pending-herdr"), "lifecycle", "quarantine");
+    fs.mkdirSync(quarantineDir, { recursive: true });
+    fs.writeFileSync(path.join(quarantineDir, "writer.json"), "{ malformed");
+    const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === 0) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      return true;
+    }) as typeof process.kill);
+
+    const cleaned = cleanupOrphanedTeams(terminal, {
+      teamsRoot,
+      now,
+      maxAgeMs: 60 * 60 * 1000,
+      closeHerdrPane,
+    });
+
+    expect(cleaned).toBe(0);
+    expect(closeHerdrPane).toHaveBeenCalledWith("w1:p22");
+    expect(kill).not.toHaveBeenCalledWith(99999999, "SIGKILL");
+    expect(terminal.kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(paths.teamDir("fenced-pending-herdr"))).toBe(true);
+    expect(fs.existsSync(path.join(paths.teamDir("fenced-pending-herdr"), "writer.pid"))).toBe(false);
   });
 
   it("retains an orphan when recovery enumeration fails and continues cleaning later teams", () => {

@@ -1,4 +1,59 @@
-# Goal: Interrupt a stuck teammate command without killing the teammate
+# Current goal: Agent-led first-run onboarding
+
+## Goal
+
+Give a newly installed pi-extended-teams user one discoverable command,
+`/pi-extended-teams-onboard`, that starts the current lead agent with enough
+runtime evidence to recommend model-tier and shared-extension settings.
+
+## Scope
+
+- Keep onboarding agent-led. Do not add a custom setup wizard or automatic
+  first-run mutation.
+- Gather the current lead model/thinking level, available model capabilities,
+  configured favorite tiers, observable shared-extension candidates/policy,
+  and the package registration source before starting the agent.
+- Make the first onboarding report read-only. It must explain what it recommends,
+  what would change, how the user can apply or revise the settings, and how the
+  installed package can be updated.
+- Register the command only for the lead session.
+- When no global or trusted-project pi-extended-teams settings exist, show the
+  lead a startup notice pointing to the onboarding command; stop showing it once
+  settings exist.
+- Reuse `/agents-favorite-models` and `/agents-extensions` as the configuration
+  surfaces rather than adding duplicate persistence logic.
+- Add focused behavior tests before implementation.
+- Update the install/onboarding documentation.
+- Do not add dependencies, install or update packages, commit, push, publish, or
+  change unrelated orchestration behavior.
+
+## Acceptance criteria
+
+1. `/pi-extended-teams-onboard` is available in a lead session and absent from a
+   teammate session.
+2. Running it while idle sends one user prompt to the current agent containing
+   the actual model, favorite-tier, extension-policy, and package-source snapshot.
+3. The prompt requires a concise recommendation and exact proposed changes, stays
+   read-only until approval, and explains both settings changes and package updates.
+4. Busy sessions and inventory failures report a truthful warning without sending
+   a partial or duplicate onboarding prompt.
+5. Focused tests and `pnpm typecheck` pass.
+6. README directs a first-time user to the command and explains that rerunning it
+   is safe because its initial pass does not mutate configuration.
+7. A lead with no persisted settings sees a startup notice for the onboarding
+   command; teammates and leads with existing settings do not.
+
+## Verification plan
+
+- Add a failing command-level test for the generated prompt and error paths.
+- Register the command through the real extension entrypoint and verify lead-only
+  exposure in the existing index tests.
+- Run the onboarding command test, the affected index test, and `pnpm typecheck`.
+- Inspect the final diff and complete changed files against every criterion.
+
+---
+
+# Prior completed goal: Interrupt a stuck teammate command without killing the teammate
 
 ## Goal
 

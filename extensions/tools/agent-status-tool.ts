@@ -2,6 +2,7 @@ import { Type } from "@sinclair/typebox";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as reportEvents from "../../src/utils/report-events";
+import { readLifecycleTombstone, type LifecycleTombstoneReadResult } from "../../src/utils/lifecycle-tombstone";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
 import type { RunningReadAgent } from "../runtime/types";
 import { isWriteMemberAlive } from "../team/roster";
@@ -84,16 +85,39 @@ function ownsReport(report: TeamReportEvent, scope?: AgentStatusScope): boolean 
     && (typeof parentRunId !== "string" || parentRunId === scope.parentRunId);
 }
 
+function lifecycleMatches(member: Member, runId?: string): boolean {
+  return member.lifecycleRunId === runId;
+}
+
+function persistedLifecycleStatus(
+  member: Member,
+  result: LifecycleTombstoneReadResult,
+): Pick<AgentStatusSnapshot, "phase" | "error"> | undefined {
+  if (result.status === "absent") return undefined;
+  if (result.status === "corrupt") return { phase: "quarantined", error: result.error };
+
+  const tombstone = result.tombstone;
+  const runMismatch = member.lifecycleRunId && tombstone.runId !== member.lifecycleRunId
+    ? `Lifecycle fence belongs to run ${tombstone.runId}, not roster run ${member.lifecycleRunId}.`
+    : undefined;
+  const phase = tombstone.phase === "cleanup_failed" || tombstone.phase === "timed_out"
+    ? "quarantined"
+    : "stopping";
+  return { phase, error: runMismatch || tombstone.error };
+}
+
 function phaseForActiveAgent(
   member: Member,
   state: RunningReadAgent | undefined,
   runtimeStatus: runtime.AgentRuntimeStatus | null,
+  persistedStatus: Pick<AgentStatusSnapshot, "phase" | "error"> | undefined,
   now: number,
   terminal: any,
 ): AgentStatusPhase {
   if (state?.teardownState === "persistence_failed") return "persistence-failed";
   if (state?.teardownState === "quarantined") return "quarantined";
   if (state?.teardownState === "stopping") return "stopping";
+  if (persistedStatus) return persistedStatus.phase;
   if (state && state.teardownState !== "finalized") {
     return describeReadAgentStatus(state, now).label === "hanging" ? "stalled" : state.status;
   }
@@ -116,20 +140,33 @@ async function activeStatus(
   options: AgentStatusToolOptions,
   now: number,
 ): Promise<AgentStatusSnapshot> {
-  const state = options.runningReadAgents.get(options.readAgentKey(teamName, member.name));
-  const runtimeStatus = await runtime.readRuntimeStatus(teamName, member.name).catch(() => null);
+  const candidateState = options.runningReadAgents.get(options.readAgentKey(teamName, member.name));
+  const [candidateRuntimeStatus, lifecycleResult] = await Promise.all([
+    runtime.readRuntimeStatus(teamName, member.name).catch(() => null),
+    readLifecycleTombstone(teamName, member.name).catch(error => ({
+      status: "corrupt" as const,
+      error: error instanceof Error ? error.message : String(error),
+    })),
+  ]);
+  const state = candidateState && lifecycleMatches(member, candidateState.runId)
+    ? candidateState
+    : undefined;
+  const runtimeStatus = candidateRuntimeStatus && lifecycleMatches(member, candidateRuntimeStatus.lifecycleRunId)
+    ? candidateRuntimeStatus
+    : null;
+  const persistedStatus = persistedLifecycleStatus(member, lifecycleResult);
   const progress = state?.latestProgress || runtimeStatus?.latestProgress;
   const progressUpdatedAt = state?.progressUpdatedAt || runtimeStatus?.progressUpdatedAt;
   return {
     name: member.name,
     role: member.role || state?.role || "read",
-    phase: phaseForActiveAgent(member, state, runtimeStatus, now, options.terminal),
+    phase: phaseForActiveAgent(member, state, runtimeStatus, persistedStatus, now, options.terminal),
     progress,
     progressAgeMs: age(now, progressUpdatedAt),
     activeTool: state?.activeToolName || runtimeStatus?.activeToolName,
     activityAgeMs: age(now, state?.lastActivityAt),
     heartbeatAgeMs: age(now, runtimeStatus?.lastHeartbeatAt),
-    error: state?.lastError?.message || runtimeStatus?.lastError?.message,
+    error: state?.lastError?.message || persistedStatus?.error || runtimeStatus?.lastError?.message,
   };
 }
 
@@ -195,7 +232,9 @@ export function createAgentStatusTool(options: AgentStatusToolOptions): any {
       const config = await teams.readConfig(teamName);
       const now = Date.now();
       const activeMembers = config.members.filter(member => ownsMember(member, options.scope));
-      const queued = (await options.listQueuedAgents(teamName)).filter(item => ownsQueue(item, options.scope));
+      const rosterNames = new Set(config.members.map(member => member.name));
+      const queued = (await options.listQueuedAgents(teamName))
+        .filter(item => ownsQueue(item, options.scope) && !rosterNames.has(item.name));
       const reportSince = options.scope?.parentStartedAt ?? config.createdAt;
       const reports = (await reportEvents.listTeamReportEvents(teamName, {
         since: reportSince,

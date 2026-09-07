@@ -7,6 +7,7 @@ import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import * as reportEvents from "../../src/utils/report-events";
+import { createReportResult, normalizeReportedTaskDetails, ReportedTaskDetailsSchema } from "../../src/results/report-result";
 import { canonicalPersistedModelSlot } from "../../src/utils/settings";
 import { createFileClaimTools } from "./file-claim-tools";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
@@ -143,10 +144,12 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
     parameters: Type.Object({
       content: Type.String({ description: "Final report to send to the lead." }),
       summary: Type.Optional(Type.String({ description: "Short report summary." })),
+      ...ReportedTaskDetailsSchema.properties,
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       const targetTeamName = requireCurrentSession(options);
       if (!options.isTeammate) throw new Error("report_and_exit is only available to spawned agents.");
+      const reported = normalizeReportedTaskDetails(params);
 
       const config = await teams.readConfig(targetTeamName);
       const member = config.members.find(m => m.name === options.agentName);
@@ -157,6 +160,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         throw new Error(`Refusing stale report run ${processRunId} for ${options.agentName}; current roster run is ${runId}.`);
       }
       member.lifecycleRunId = runId;
+      const result = createReportResult(targetTeamName, options.agentName, runId, reported);
       let runtimeStatus = await runtime.readRuntimeStatus(targetTeamName, options.agentName).catch(() => null);
       if (runtimeStatus?.lifecycleRunId && runtimeStatus.lifecycleRunId !== runId) {
         throw new Error(`Refusing to report from stale run ${runId}; runtime status belongs to ${runtimeStatus.lifecycleRunId}.`);
@@ -199,6 +203,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
           agentName: options.agentName,
           role: member?.role || "write",
           status: "completed",
+          result,
           report: params.content,
           summary: params.summary || "Final report",
           startedAt: runtimeStatus?.startedAt,
@@ -231,7 +236,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         try { ctx.shutdown(); } catch { process.exit(0); }
       }, 250);
 
-      return { content: [{ type: "text", text: `Final report sent. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { session: targetTeamName, releasedClaims, reportPath } };
+      return { content: [{ type: "text", text: `Final report sent. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { session: targetTeamName, releasedClaims, reportPath, result } };
     },
   });
 

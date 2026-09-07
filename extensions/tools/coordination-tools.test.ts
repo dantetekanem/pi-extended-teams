@@ -280,7 +280,7 @@ describe("coordination tools", () => {
 
     const report = tools.get("report_and_exit").execute(
       "report",
-      { content: "done", summary: "Done" },
+      { content: "done", summary: "Done", outcome: "blocked", artifacts: [{ path: "notes.md" }] },
       new AbortController().signal,
       vi.fn(),
       ctx
@@ -329,6 +329,11 @@ describe("coordination tools", () => {
     }));
     expect(reportEventSpy.mock.invocationCallOrder[0]).toBeLessThan(sendSpy.mock.invocationCallOrder[0]);
     const [persistedReport] = await reportEvents.listTeamReportEvents(teamName, { agentName, limit: 1 });
+    expect(persistedReport).toMatchObject({
+      id: "report:exit-team:writer:writer-run", status: "completed",
+      result: { version: 1, runId, outcome: "blocked", artifacts: [{ path: "notes.md" }],
+        verification: { state: "not-requested" }, acceptance: { state: "pending" } },
+    });
     expect(result.details.reportPath).toBe(persistedReport.reportPath);
     expect(path.dirname(result.details.reportPath)).toBe(path.join(root, "agent", "reports", teamName));
     expect(path.basename(result.details.reportPath)).toBe("writer.md");

@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { TeamReportEvent } from "./models";
 import * as paths from "./paths";
 import { withLock } from "./lock";
+import { writeJsonAtomic } from "./atomic-json";
 
 export type NewTeamReportEvent = Omit<TeamReportEvent, "id" | "teamName" | "createdAt"> & Partial<Pick<TeamReportEvent, "id" | "teamName" | "createdAt">>;
 
@@ -67,9 +68,7 @@ function compareCreatedAt(a: TeamReportEvent, b: TeamReportEvent): number {
 }
 
 function cloneTeamReportEvent(event: TeamReportEvent): TeamReportEvent {
-  const cloned = { ...event };
-  if (event.metadata !== undefined) cloned.metadata = structuredClone(event.metadata);
-  return cloned;
+  return structuredClone(event);
 }
 
 function cloneTeamReportEvents(events: readonly TeamReportEvent[]): TeamReportEvent[] {
@@ -115,7 +114,7 @@ function readEventsCache(p: string): ReportEventsCache {
 }
 
 function writeEventsRaw(p: string, events: TeamReportEvent[], options: { sorted?: boolean } = {}): void {
-  fs.writeFileSync(p, JSON.stringify(events, null, 2));
+  writeJsonAtomic(p, events);
   buildCache(p, events, reportEventsStatKey(p), options);
 }
 
@@ -196,17 +195,41 @@ export async function appendTeamReportEvent(teamName: string, event: NewTeamRepo
     const cache = readEventsCache(p);
     const normalized: TeamReportEvent = cloneTeamReportEvent({
       ...event,
-      id: event.id || defaultEventId(teamName, event),
+      id: event.id || event.result?.reportId || defaultEventId(teamName, event),
       teamName,
       createdAt: event.createdAt || Date.now(),
     });
 
+    if (normalized.result && normalized.result.reportId !== normalized.id) {
+      throw new Error("Structured report identity does not match its event ID.");
+    }
     const existing = cache.byId.get(normalized.id);
     if (existing) return cloneTeamReportEvent(existing);
 
     normalized.reportPath = writeStandaloneReport(teamName, normalized.agentName, normalized.report);
     writeEventsRaw(p, insertEvent(cache.events, normalized), { sorted: true });
     return cloneTeamReportEvent(normalized);
+  });
+}
+
+export async function recordReportAcceptance(
+  teamName: string,
+  reportId: string,
+  state: "accepted" | "rejected",
+  reason?: string,
+): Promise<TeamReportEvent> {
+  if (state !== "accepted" && state !== "rejected") throw new Error("Report acceptance must be accepted or rejected.");
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => {
+    const cache = readEventsCache(p);
+    const existing = cache.byId.get(reportId);
+    if (!existing?.result || existing.result.version !== 1) throw new Error(`Structured report ${reportId} is unavailable.`);
+    const updated = cloneTeamReportEvent({
+      ...existing,
+      result: { ...existing.result, acceptance: { state, reason, decidedAt: Date.now() } },
+    });
+    writeEventsRaw(p, cache.events.map(event => event.id === reportId ? updated : event), { sorted: true });
+    return cloneTeamReportEvent(updated);
   });
 }
 

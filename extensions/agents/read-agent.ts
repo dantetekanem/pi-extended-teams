@@ -4,6 +4,7 @@ import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
+import { createReportResult, normalizeReportedTaskDetails, type ReportResult } from "../../src/results/report-result";
 import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
@@ -415,6 +416,7 @@ async function recordReadAgentReportEvent(
   summary: string,
   startedAt: number,
   tokensUsed: number,
+  result: ReportResult,
   costUsd?: number,
   color?: string,
   reportMetadata: Record<string, any> = {}
@@ -426,6 +428,7 @@ async function recordReadAgentReportEvent(
       agentName: member.name,
       role: member.role || "read",
       status,
+      result,
       report,
       summary,
       startedAt,
@@ -637,7 +640,8 @@ export async function runReadAgentInProcess(
   let finalReportSubmissionInProgress = false;
   let childSessionManager: any;
   let privateSessionDirectory: string | undefined;
-  let privateCompletedReportPersisted = false;
+  let completedReportPersisted = false;
+  let resolvedTaskResult: ReportResult | undefined;
   const pendingChildController = options.pendingChildController;
   const pendingChildParent: ParentRunIdentity | undefined = isEligibleNestedReadParent(member)
     ? {
@@ -680,6 +684,8 @@ export async function runReadAgentInProcess(
     const session = state.session;
     if (!session) throw new Error(`Agent ${member.name} completed without a nested session.`);
     const report = resolution.report!;
+    const result = createReportResult(readTeamName, member.name, state.runId, resolution);
+    resolvedTaskResult = result;
     const completionStats = session.getSessionStats();
     // Private child transcripts are deleted after teardown; never publish pointers
     // that would outlive a successful run's recovery artifact.
@@ -699,6 +705,7 @@ export async function runReadAgentInProcess(
       name: member.name,
       role,
       status: "completed",
+      result,
       report,
       summary: completionSummary,
       completedAt: Date.now(),
@@ -735,6 +742,7 @@ export async function runReadAgentInProcess(
       completionSummary,
       state.startedAt,
       state.tokensUsed,
+      result,
       completionStats.cost,
       undefined,
       reportMetadata,
@@ -747,11 +755,11 @@ export async function runReadAgentInProcess(
       );
       throw new Error(state.finalizationBlockedReason);
     }
+    completedReportPersisted = true;
     // The lifecycle finalizer consumes this flag only after session disposal and
     // successful lifecycle finalization, so every successful private run is removed.
     if (privateSessionDirectory) {
       state.cleanupPrivateSessionOnFinalize = true;
-      privateCompletedReportPersisted = true;
     }
     const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
     if (member.requestedBy) {
@@ -899,6 +907,7 @@ export async function runReadAgentInProcess(
         try {
           const deliveryClose = await closeRecipient();
           submittedFinalReport = {
+            ...normalizeReportedTaskDetails(report),
             content,
             summary: nonEmptyReportText(report.summary),
           };
@@ -1144,7 +1153,7 @@ export async function runReadAgentInProcess(
     options.renderReadAgentStatus();
     settleSessionCreation(state.session);
     await closeRecipient();
-    if (!state.stopRequested && options.isCurrentReadAgentRun(key, state) && !privateCompletedReportPersisted) {
+    if (!state.stopRequested && options.isCurrentReadAgentRun(key, state) && !completedReportPersisted) {
       let failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
       const failureStats = state.session?.getSessionStats();
       const reportUnavailable = e instanceof ReadAgentReportUnavailableError ? e : undefined;
@@ -1162,6 +1171,7 @@ export async function runReadAgentInProcess(
           : {}),
       };
       const failureSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`;
+      const result = resolvedTaskResult ?? createReportResult(readTeamName, member.name, state.runId, {});
       const failureEventPersistence = await recordReadAgentReportEvent(
         readTeamName,
         member,
@@ -1170,6 +1180,7 @@ export async function runReadAgentInProcess(
         failureSummary,
         state.startedAt,
         state.tokensUsed,
+        result,
         failureStats?.cost,
         "red",
         failureReportMetadata,
@@ -1190,6 +1201,7 @@ export async function runReadAgentInProcess(
         name: member.name,
         role,
         status: "failed",
+        result,
         report: failureReport,
         summary: failureSummary,
         completedAt: Date.now(),

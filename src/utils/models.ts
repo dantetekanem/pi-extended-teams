@@ -1,4 +1,5 @@
 import { THINKING_LEVEL_NAMES, type ThinkingLevelName } from "./thinking-levels";
+import type { ReportResult } from "../results/report-result";
 
 export const THINKING_LEVELS = THINKING_LEVEL_NAMES;
 export type ThinkingLevel = ThinkingLevelName;
@@ -95,6 +96,7 @@ export interface TeamReportEvent {
   agentName: string;
   role?: string;
   status: "completed" | "failed";
+  result?: ReportResult;
   report: string;
   summary?: string;
   reportPath?: string;

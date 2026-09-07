@@ -8,6 +8,7 @@ import * as teams from "../../src/utils/teams.js";
 import * as runtime from "../../src/utils/runtime.js";
 import * as messaging from "../../src/utils/messaging.js";
 import * as reportEvents from "../../src/utils/report-events.js";
+import { createReportResult } from "../../src/results/report-result";
 import type { Member } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 
@@ -46,6 +47,7 @@ function registerTools(isTeammate: boolean) {
 describe("task runtime tools", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "task-runtime-tools-"));
+    vi.spyOn(paths, "teamDir").mockImplementation(teamName => path.join(root, String(teamName)));
     vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName, agentName) => {
       return path.join(root, String(teamName), "lifecycle", "quarantine", `${String(agentName)}.json`);
     });
@@ -178,13 +180,15 @@ describe("task runtime tools", () => {
     }
   });
 
-  it("limits post-roster persisted report recovery to the lead", async () => {
+  it.each([undefined, "blocked"] as const)("limits post-roster report recovery to the lead with outcome %s", async outcome => {
     const leadTools = registerTools(false);
     const teammateTools = registerTools(true);
     vi.spyOn(teams, "readConfig").mockResolvedValue({
       name: "team", description: "", createdAt: Date.now(), leadAgentId: "lead", leadSessionId: "session", members: [],
     });
+    const structured = outcome ? createReportResult("team", "finished-reader", "run-1", { outcome }) : undefined;
     await reportEvents.appendTeamReportEvent("team", {
+      result: structured,
       agentName: "finished-reader",
       role: "read",
       status: "completed",
@@ -208,6 +212,7 @@ describe("task runtime tools", () => {
       completedReport: { agentName: "finished-reader", report: "Durable completed report" },
     });
 
+    expect(result.details.completedReport.result).toEqual(structured);
     const listReports = vi.spyOn(reportEvents, "listTeamReportEvents");
     await expect(teammateTools.get("check_teammate").execute("check", { agent_name: "finished-reader" }))
       .rejects.toThrow("Agent finished-reader not found");

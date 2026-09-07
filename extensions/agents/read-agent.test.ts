@@ -94,10 +94,11 @@ function installPathSpies() {
   });
 }
 
-function writeFavoriteLevels() {
+function writeFavoriteLevels(overrides: Record<string, unknown> = {}) {
   const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify({
+    ...overrides,
     favoriteModels: {
       "reading-default": { model: "provider/model", thinking: "high" },
       "writing-basic": { model: "provider/model", thinking: "high" },
@@ -230,6 +231,41 @@ describe("in-process read agent tool wiring", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["read", "write"] as const)("keeps a blocked %s task distinct from clean completion and duplicate submission", async role => {
+    const member = { ...fixtureMember("reporter", role), lifecycleRunId: `${role}-run` };
+    writeTeamConfig("team", member);
+    const session = makeSession();
+    session.prompt.mockImplementation(async () => {
+      const reportTool = piMocks.createAgentSession.mock.calls[0][0].customTools.find((tool: any) => tool.name === "report_and_exit");
+      const first = await reportTool.execute("first", {
+        content: "Full report: requires a decision", summary: "Decision needed", outcome: "blocked",
+        changedPaths: ["src/api.ts"], questions: ["Which API?"],
+      });
+      expect(first.details.accepted).toBe(true);
+      const duplicate = await reportTool.execute("duplicate", { content: "Later claim", outcome: "succeeded" });
+      expect(duplicate.details.accepted).toBe(false);
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    options.emitAgentReport.mockImplementation(() => {
+      const stored = JSON.parse(fs.readFileSync(path.join(paths.teamDir("team"), "reports.json"), "utf8"));
+      expect(stored[0].result.outcome).toBe("blocked");
+    });
+    await runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+    const [persisted] = await listTeamReportEvents("team");
+    expect(persisted).toMatchObject({
+      id: `report:team:reporter:${role}-run`, status: "completed", report: "Full report: requires a decision",
+      result: { version: 1, runId: `${role}-run`, outcome: "blocked", changedPaths: ["src/api.ts"], questions: ["Which API?"],
+        verification: { state: "not-requested" }, acceptance: { state: "pending" } },
+    });
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1].result).toEqual(persisted.result);
+    expect(options.emitAgentReport).toHaveBeenCalledOnce();
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(options.runningReadAgents.size).toBe(0);
   });
 
   it("isolates completed report persistence in the test temp directory", () => {
@@ -540,6 +576,48 @@ describe("in-process read agent tool wiring", () => {
     expect(privateSessionDir).not.toBe("");
     expect(session.dispose).toHaveBeenCalledOnce();
     expect(fs.existsSync(privateSessionDir)).toBe(false);
+  });
+
+  it("preserves accepted task details in the recovery report after persistence fails", async () => {
+    const session = makeSession();
+    session.prompt.mockImplementation(async () => {
+      const report = piMocks.createAgentSession.mock.calls[0][0].customTools.find((tool: any) => tool.name === "report_and_exit");
+      await report.execute("report", { content: "Needs product input", outcome: "blocked", questions: ["Which API?"] });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    vi.spyOn(reportEvents, "appendTeamReportEvent").mockRejectedValueOnce(new Error("storage unavailable"));
+    const options = makeRunOptions();
+    await runReadAgentInProcess("team", fixtureMember("reader"), "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+    const [persisted] = await listTeamReportEvents("team");
+    expect(persisted).toMatchObject({ status: "failed", result: { outcome: "blocked", questions: ["Which API?"] } });
+    expect(options.rememberCompletedAgentReport.mock.calls.at(-1)![1].result).toEqual(persisted.result);
+    expect(await readLifecycleTombstone("team", "reader")).toMatchObject({ status: "occupied" });
+  });
+
+  it("retains the completed result when delivery fails for a resume-visible session", async () => {
+    writeFavoriteLevels({ agentSessions: { showInResume: true } });
+    const member = fixtureMember("reader");
+    const session = makeSession();
+    session.prompt.mockImplementation(async () => {
+      const report = piMocks.createAgentSession.mock.calls[0][0].customTools.find((tool: any) => tool.name === "report_and_exit");
+      await report.execute("report", { content: "Needs product input", outcome: "blocked" });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    options.emitAgentReport.mockImplementation(() => { throw new Error("lead delivery failed"); });
+    await runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledOnce();
+    const remembered = options.rememberCompletedAgentReport.mock.calls[0][1];
+    expect(remembered).toMatchObject({ status: "completed", result: { outcome: "blocked" } });
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(1);
+    expect(reports[0].result).toEqual(remembered.result);
+    expect(reports[0].report).toBe("Needs product input");
+    expect(session.dispose).toHaveBeenCalledOnce();
   });
 
   it("cleans a private session after completed report emission fails without stale recovery pointers", async () => {

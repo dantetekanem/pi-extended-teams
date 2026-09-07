@@ -92,6 +92,24 @@ describe("read-agent communication tools", () => {
     expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" });
   });
 
+  it("passes validated task details to final submission without trusting claimed verification", async () => {
+    const onReportAndExit = vi.fn(async () => ({ accepted: true }));
+    const tools = createAgentCommunicationTools({
+      isTeammate: true, agentName: "reader", role: "read", getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run", authorizeWriteMember: vi.fn(async () => {}), onReportAndExit,
+    });
+    const tool = tools.find(tool => tool.name === "report_and_exit")!;
+    await tool.execute("report", {
+      content: "Waiting for a decision", outcome: "blocked", questions: ["Which API should be used?"],
+      verification: { state: "passed" }, acceptance: { state: "accepted" },
+    });
+    expect(onReportAndExit).toHaveBeenCalledWith({
+      content: "Waiting for a decision", summary: undefined, outcome: "blocked", questions: ["Which API should be used?"],
+    });
+    await expect(tool.execute("invalid", { content: "Done", outcome: "completed" })).rejects.toThrow(/reported task/i);
+    expect(onReportAndExit).toHaveBeenCalledOnce();
+  });
+
   it("rejects blank final reports before closing report admission", async () => {
     const onReportAndExit = vi.fn(async () => ({ accepted: true }));
     const tools = new Map<string, Tool>(createAgentCommunicationTools({

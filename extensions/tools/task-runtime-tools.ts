@@ -177,6 +177,9 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
             : undefined;
           const text = [
             `Agent ${params.agent_name} is no longer active. Recovered its latest persisted ${latestReport.status} report from ${reportPath}.`,
+            latestReport.result
+              ? `Task: ${latestReport.result.outcome ?? "unspecified"}; verification: ${latestReport.result.verification.state}; acceptance: ${latestReport.result.acceptance.state}. Report ID: ${latestReport.result.reportId}.`
+              : undefined,
             recoverySessionFile
               ? `Its durable child transcript is available at ${recoverySessionFile}. Use the read tool on that path if the report is incomplete.`
               : undefined,

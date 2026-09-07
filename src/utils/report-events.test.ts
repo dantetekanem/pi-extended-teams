@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { appendTeamReportEvent, listTeamReportEvents } from "./report-events";
+import { appendTeamReportEvent, listTeamReportEvents, recordReportAcceptance } from "./report-events";
+import { createReportResult } from "../results/report-result";
 import * as paths from "./paths";
 import type { TeamReportEvent } from "./models";
 
@@ -142,6 +143,53 @@ describe("report events", () => {
       { id: "one", report: "first report", summary: "First", reportPath: (first as any).reportPath },
       { id: "two", report: "second report", summary: "Second", reportPath: (second as any).reportPath },
     ]);
+  });
+
+  it("persists and replays a blocked task result without sharing mutable evidence", async () => {
+    const result = createReportResult("team", "reader", "run-1", {
+      outcome: "blocked", findings: [{ id: "F1", text: "Missing input", evidence: ["file.ts:1"] }],
+    });
+    const input = { agentName: "reader", status: "completed" as const, report: "Waiting for input", source: "read-agent" as const, result };
+    const first = await appendTeamReportEvent("team", input);
+    expect(first.id).toBe(result.reportId);
+    first.result!.findings![0].text = "mutated return";
+    result.findings![0].evidence.push("mutated input");
+    const replay = await appendTeamReportEvent("team", { ...input, report: "Duplicate delivery" });
+    expect(replay).toMatchObject({
+      id: result.reportId, status: "completed", report: "Waiting for input",
+      result: { outcome: "blocked", findings: [{ id: "F1", text: "Missing input", evidence: ["file.ts:1"] }],
+        verification: { state: "not-requested" }, acceptance: { state: "pending" } },
+    });
+    expect(fs.readFileSync(replay.reportPath!, "utf8")).toBe("Waiting for input");
+    expect(await listTeamReportEvents("team")).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(reportsPath(), "utf8"))[0].result).toMatchObject({ outcome: "blocked", runId: "run-1" });
+  });
+
+  it("records explicit lead acceptance without changing the task outcome or verification", async () => {
+    const result = createReportResult("team", "reader", "run-1", { outcome: "blocked" });
+    const original = await appendTeamReportEvent("team", {
+      agentName: "reader", status: "completed", report: "Needs product input", source: "read-agent", result,
+    });
+    const accepted = await recordReportAcceptance("team", original.id, "accepted", "Blocker acknowledged");
+    expect(accepted.result).toMatchObject({
+      outcome: "blocked", verification: { state: "not-requested" },
+      acceptance: { state: "accepted", reason: "Blocker acknowledged", decidedAt: expect.any(Number) },
+    });
+    expect(accepted.reportPath).toBe(original.reportPath);
+    expect((await listTeamReportEvents("team"))[0].result).toEqual(accepted.result);
+    await expect(recordReportAcceptance("team", "missing", "accepted")).rejects.toThrow(/report/i);
+  });
+
+  it("preserves the durable result if acceptance persistence fails", async () => {
+    const result = createReportResult("team", "reader", "run-1", { outcome: "succeeded" });
+    const original = await appendTeamReportEvent("team", {
+      agentName: "reader", status: "completed", report: "Implemented", source: "read-agent", result,
+    });
+    const rename = vi.spyOn(fs, "renameSync").mockImplementationOnce(() => { throw new Error("storage unavailable"); });
+    await expect(recordReportAcceptance("team", original.id, "accepted")).rejects.toThrow("storage unavailable");
+    rename.mockRestore();
+    expect((await listTeamReportEvents("team"))[0]).toEqual(original);
+    expect(JSON.parse(fs.readFileSync(reportsPath(), "utf8"))[0].result.acceptance).toEqual({ state: "pending" });
   });
 
   it("returns the original event for duplicate ids", async () => {

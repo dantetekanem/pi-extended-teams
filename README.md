@@ -63,6 +63,27 @@ Completed reports wake the lead automatically. End the current turn to wait. One
 
 The lead owns decomposition, integration, and acceptance. Pi packages and spawned agents run with your system permissions, so review project-local instructions and configuration through Pi's normal trust flow.
 
+## Task outcomes and full reports
+
+A final report or clean exit does not mean the task succeeded. Agents can include an explicit outcome with their full report:
+
+```text
+report_and_exit({
+  content: "The implementation needs a product decision. Full findings follow…",
+  summary: "API decision needed",
+  outcome: "blocked",
+  questions: ["Should the endpoint require authentication?"]
+})
+```
+
+Optional outcomes are `succeeded`, `blocked`, `failed`, and `cancelled`. Reports can also include `changedPaths`, `artifacts` (`path`, optional `label`), and `findings` (`id`, `text`, `evidence`). Finding IDs must be unique within the report. These are agent-reported claims and references, not independent verification.
+
+New reports store a versioned `result` with runtime-assigned task, run, and report IDs in `reports.json`; the full Markdown report remains unchanged. Repeating the same run's report preserves the first stored report. Plain reports remain supported, and omitted outcomes stay unspecified.
+
+Verification starts as `not-requested`; lead acceptance starts as `pending`. Neither a submitted report nor a claimed outcome changes those states. Trusted integrations can record an explicit decision through `recordReportAcceptance(teamName, reportId, "accepted" | "rejected", reason?)` in `src/utils/report-events.ts`. Final-report tools cannot assign identities, verification, or acceptance.
+
+`get_agent_status` shows task outcome separately from lifecycle status. The lead can recover the full persisted result through `check_teammate` after the agent leaves the roster.
+
 ## Intent tiers
 
 Every spawn names a `model_slot`. Configured favorites take priority; otherwise the tier uses the current lead-session model and thinking level:

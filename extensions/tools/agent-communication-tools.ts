@@ -4,8 +4,9 @@ import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import { formatInboxMessagesForModel, sanitizePlainTuiLine } from "../ui/renderers";
 import { createFileClaimTools } from "./file-claim-tools";
+import { normalizeReportedTaskDetails, ReportedTaskDetailsSchema, type ReportedTaskDetails } from "../../src/results/report-result";
 
-export interface SubmittedAgentReport {
+export interface SubmittedAgentReport extends ReportedTaskDetails {
   content: string;
   summary?: string;
 }
@@ -143,12 +144,13 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
     parameters: Type.Object({
       content: Type.String({ minLength: 1, description: "Complete non-empty final report to send to the lead; do not replace required output with a summary." }),
       summary: Type.Optional(Type.String({ description: "Short report summary." })),
+      ...ReportedTaskDetailsSchema.properties,
     }),
     async execute(_toolCallId: string, params: SubmittedAgentReport) {
       const teamName = requireCurrentSession(options);
       const content = normalizeFinalReportContent(params.content);
       const summary = typeof params.summary === "string" && params.summary.trim() ? params.summary.trim() : undefined;
-      const result = await options.onReportAndExit({ content, summary });
+      const result = await options.onReportAndExit({ content, summary, ...normalizeReportedTaskDetails(params) });
       const text = result.accepted
         ? "Final report accepted. Finish immediately; the outer runner will release claims and stop this nested session."
         : "A final report was already accepted for this run. This duplicate was ignored; finish immediately.";

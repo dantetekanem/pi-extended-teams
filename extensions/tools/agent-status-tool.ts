@@ -5,6 +5,7 @@ import * as reportEvents from "../../src/utils/report-events";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
 import { projectAgentStatus, type ActiveAgentPhase } from "../../src/orchestration/status-projection";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
+import type { ReportResult } from "../../src/results/report-result";
 import type { RunningReadAgent } from "../runtime/types";
 import { isWriteMemberAlive } from "../team/roster";
 import { formatElapsed } from "../ui/renderers";
@@ -40,6 +41,12 @@ export interface AgentStatusSnapshot {
   queuePosition?: number;
   queuedAgeMs?: number;
   completedAgeMs?: number;
+  taskId?: string;
+  runId?: string;
+  reportId?: string;
+  outcome?: ReportResult["outcome"];
+  verification?: ReportResult["verification"]["state"];
+  acceptance?: ReportResult["acceptance"]["state"];
   summary?: string;
   error?: string;
 }
@@ -131,6 +138,10 @@ function completedStatus(report: TeamReportEvent, now: number): AgentStatusSnaps
     name: report.agentName,
     role: report.role || "read",
     phase: report.status,
+    ...(report.result && {
+      taskId: report.result.taskId, runId: report.result.runId, reportId: report.result.reportId,
+      outcome: report.result.outcome, verification: report.result.verification.state, acceptance: report.result.acceptance.state,
+    }),
     completedAgeMs: age(now, report.createdAt),
     summary: report.summary,
   };
@@ -155,6 +166,7 @@ export function formatAgentStatusesForModel(statuses: AgentStatusSnapshot[]): st
     if (queued) lines.push(`  ${queued}`);
     const completed = formatAge(status.phase === "failed" ? "failed" : "completed", status.completedAgeMs);
     if (completed) lines.push(`  ${completed}`);
+    if (status.reportId) lines.push(`  task: ${status.outcome ?? "unspecified"}; verification: ${status.verification}; acceptance: ${status.acceptance}`);
     if (status.summary) lines.push(`  summary: ${status.summary}`);
     if (status.error) lines.push(`  error: ${status.error}`);
     return lines.join("\n");

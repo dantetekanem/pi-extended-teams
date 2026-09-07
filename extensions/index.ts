@@ -1264,6 +1264,7 @@ export default function (pi: ExtensionAPI) {
     runningReadAgents,
     readAgentKey,
     interruptTeammate,
+    cancelQueuedAgent: (targetTeamName, targetAgentName) => teamToolsRuntime?.cancelQueuedAgent(targetTeamName, targetAgentName) ?? false,
     shutdownTeammate,
     getTeamName: () => teamName,
   });

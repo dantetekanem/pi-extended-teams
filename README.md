@@ -40,11 +40,11 @@ The current Pi session becomes the agent group automatically. There is no separa
 
 ## How it works
 
-- Read agents run in-process. Edit agents run in separate Pi sessions through the configured terminal adapter. Both stay connected to the lead session.
+- Public read and edit agents run in separate in-process Pi sessions. A write tier grants edit tools; it does not open a terminal pane. The terminal runtime remains available for existing integrations.
 - The activity card shows progress, intent tier, elapsed time, tokens, and tool activity.
 - You can open an agent's transcript, send it a message, interrupt a stuck tool command, or stop it.
 - Completed reports return to the lead automatically and remain recoverable when needed.
-- `get_agent_status` gives the lead or an eligible nested parent one read-only snapshot of owned active, queued, stalled, or recently completed read and edit agents.
+- `get_agent_status` gives the lead or an eligible nested parent one read-only snapshot of owned active, queued, stalled, or recently completed read and edit agents. It uses current-run evidence, preserves lifecycle quarantine, and does not perform cleanup.
 - Every spawn names an intent tier instead of choosing ad hoc model settings. Configured favorites take priority; unset tiers inherit the current lead model and thinking.
 - Edit agents can claim isolated files. Claims coordinate cooperative agents; they are not access control.
 - Lazy session context and nested read helpers are available when a bounded task needs them.
@@ -99,6 +99,8 @@ For an edit, choose a write tier and name the files it may claim. Never run over
 ## Configuration
 
 Global settings live at `~/.pi/agent/pi-extended-teams/settings.json`. Project overrides live at `.pi/pi-extended-teams.json`. Favorite intent tiers are global so `/agents-favorite-models` and spawning use the same choices. Configuring favorites is optional; an unset tier falls back to the current lead-session model and thinking level.
+
+Public read and edit spawns respect their role's concurrency limit and overflow setting. Enabled overflow queues accepted work; disabled overflow returns a capacity error. Quarantined requests stay fenced without blocking unrelated eligible work. `stop_teammate` can cancel a queued request before launch. Failed admissions trigger an attempted recipient notification and remain visible in status (up to 20 recent failures). The public queue and recent failure index are session-local, not restart-durable.
 
 Spawned sessions are private by default under `~/.pi/teams/<team>/agent-sessions/` and stay out of Pi's normal `/resume` picker.
 

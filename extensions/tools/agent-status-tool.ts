@@ -2,27 +2,22 @@ import { Type } from "@sinclair/typebox";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as reportEvents from "../../src/utils/report-events";
-import { readLifecycleTombstone, type LifecycleTombstoneReadResult } from "../../src/utils/lifecycle-tombstone";
+import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
+import { projectAgentStatus, type ActiveAgentPhase } from "../../src/orchestration/status-projection";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
 import type { RunningReadAgent } from "../runtime/types";
 import { isWriteMemberAlive } from "../team/roster";
-import { describeReadAgentStatus } from "../ui/read-agent-status";
 import { formatElapsed } from "../ui/renderers";
 
-export type AgentStatusPhase =
-  | RunningReadAgent["status"]
-  | TeamReportEvent["status"]
-  | "queued"
-  | "stalled"
-  | "stopping"
-  | "quarantined"
-  | "persistence-failed";
+export type AgentStatusPhase = ActiveAgentPhase | TeamReportEvent["status"] | "queued";
 
 export interface QueuedAgentStatus {
   name: string;
   role: string;
   queuedAt: number;
   queuePosition: number;
+  error?: string;
+  failed?: boolean;
   parentAgentName?: string;
   parentLifecycleRunId?: string;
 }
@@ -85,55 +80,6 @@ function ownsReport(report: TeamReportEvent, scope?: AgentStatusScope): boolean 
     && (typeof parentRunId !== "string" || parentRunId === scope.parentRunId);
 }
 
-function lifecycleMatches(member: Member, runId?: string): boolean {
-  return member.lifecycleRunId === runId;
-}
-
-function persistedLifecycleStatus(
-  member: Member,
-  result: LifecycleTombstoneReadResult,
-): Pick<AgentStatusSnapshot, "phase" | "error"> | undefined {
-  if (result.status === "absent") return undefined;
-  if (result.status === "corrupt") return { phase: "quarantined", error: result.error };
-
-  const tombstone = result.tombstone;
-  const runMismatch = member.lifecycleRunId && tombstone.runId !== member.lifecycleRunId
-    ? `Lifecycle fence belongs to run ${tombstone.runId}, not roster run ${member.lifecycleRunId}.`
-    : undefined;
-  const phase = tombstone.phase === "cleanup_failed" || tombstone.phase === "timed_out"
-    ? "quarantined"
-    : "stopping";
-  return { phase, error: runMismatch || tombstone.error };
-}
-
-function phaseForActiveAgent(
-  member: Member,
-  state: RunningReadAgent | undefined,
-  runtimeStatus: runtime.AgentRuntimeStatus | null,
-  persistedStatus: Pick<AgentStatusSnapshot, "phase" | "error"> | undefined,
-  now: number,
-  terminal: any,
-): AgentStatusPhase {
-  if (state?.teardownState === "persistence_failed") return "persistence-failed";
-  if (state?.teardownState === "quarantined") return "quarantined";
-  if (state?.teardownState === "stopping") return "stopping";
-  if (persistedStatus) return persistedStatus.phase;
-  if (state && state.teardownState !== "finalized") {
-    return describeReadAgentStatus(state, now).label === "hanging" ? "stalled" : state.status;
-  }
-
-  const heartbeatFresh = runtime.isHeartbeatFresh(runtimeStatus, now);
-  const paneAlive = member.isActive !== false && isWriteMemberAlive(member, terminal);
-  if (!heartbeatFresh && !paneAlive) {
-    if (member.isActive !== false && !runtimeStatus?.ready && now - member.joinedAt <= runtime.STARTUP_STALL_MS) return "starting";
-    return "stalled";
-  }
-
-  const action = runtimeStatus?.currentAction;
-  if (action) return action === "done" ? "finishing" : action;
-  return runtimeStatus?.ready ? "working" : "starting";
-}
-
 async function activeStatus(
   teamName: string,
   member: Member,
@@ -148,25 +94,24 @@ async function activeStatus(
       error: error instanceof Error ? error.message : String(error),
     })),
   ]);
-  const state = candidateState && lifecycleMatches(member, candidateState.runId)
-    ? candidateState
-    : undefined;
-  const runtimeStatus = candidateRuntimeStatus && lifecycleMatches(member, candidateRuntimeStatus.lifecycleRunId)
-    ? candidateRuntimeStatus
-    : null;
-  const persistedStatus = persistedLifecycleStatus(member, lifecycleResult);
+  const projected = projectAgentStatus({
+    member, activity: candidateState, runtime: candidateRuntimeStatus, fence: lifecycleResult,
+    terminalAlive: member.tmuxPaneId && options.terminal?.isAlive ? isWriteMemberAlive(member, options.terminal) : null,
+    now,
+  });
+  const { state, runtime: runtimeStatus } = projected;
   const progress = state?.latestProgress || runtimeStatus?.latestProgress;
   const progressUpdatedAt = state?.progressUpdatedAt || runtimeStatus?.progressUpdatedAt;
   return {
     name: member.name,
     role: member.role || state?.role || "read",
-    phase: phaseForActiveAgent(member, state, runtimeStatus, persistedStatus, now, options.terminal),
+    phase: projected.phase,
     progress,
     progressAgeMs: age(now, progressUpdatedAt),
     activeTool: state?.activeToolName || runtimeStatus?.activeToolName,
     activityAgeMs: age(now, state?.lastActivityAt),
     heartbeatAgeMs: age(now, runtimeStatus?.lastHeartbeatAt),
-    error: state?.lastError?.message || persistedStatus?.error || runtimeStatus?.lastError?.message,
+    error: projected.error,
   };
 }
 
@@ -174,7 +119,8 @@ function queuedStatus(item: QueuedAgentStatus, now: number): AgentStatusSnapshot
   return {
     name: item.name,
     role: item.role,
-    phase: "queued",
+    phase: item.failed ? "failed" : "queued",
+    error: item.error,
     queuePosition: item.queuePosition,
     queuedAgeMs: age(now, item.queuedAt),
   };

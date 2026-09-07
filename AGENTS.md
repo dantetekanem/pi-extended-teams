@@ -1,111 +1,78 @@
-# pi-extended-teams: Agent Guide 🤖
+# pi-extended-teams agent guide
 
-This guide explains how `pi-extended-teams` transforms your single Pi agent into a coordinated team of specialists. It covers the roles, capabilities, and coordination patterns available to you as the **Team Lead**.
+The current Pi session is the agent group. Use `spawn_agent` for one bounded helper or `spawn_swarm_agents` for independent lanes. The lead owns scope, integration, verification, and final acceptance.
 
----
+## Autoresearch conflict guard
 
-## 🛑 Autoresearch Conflict Guard
-
-If autoresearch mode/session is active, running, or being resumed, do **not** create teams, spawn agents, use subagents, or run reviewer agents. Autoresearch must stay single-agent while active because delegating research/review during the optimization loop is a conflict of interest. This guard overrides every pi-extended-teams trigger, including hot-word requests like "agents" or "spawn agents".
+If autoresearch mode/session is active, running, or being resumed, do not spawn agents, subagents, or reviewer agents. Autoresearch must stay single-agent while active because delegating research or review during the optimization loop is a conflict of interest. This guard overrides every delegation trigger, including requests to use agents.
 
 Treat autoresearch as running when `/autoresearch` is active, the prompt says autoresearch mode is active, the agent is following `.auto/prompt.md`, an experiment is running or pending, or the user says autoresearch is running. Do not infer running state from a `.auto/` folder alone.
 
-If team help is needed, stop and ask the user to turn off or finish autoresearch first.
+If team help is needed, ask the user to turn off or finish autoresearch first.
 
----
+## Roles and delegation
 
-## 🎭 The Two Roles
+Public read and edit agents run in separate in-process Pi sessions. Choosing a write tier grants edit tools; it does not select a terminal pane. The terminal runtime remains available for existing integrations.
 
-In a `pi-extended-teams` environment, there are two distinct types of agents:
+Read agents are the default. Edit agents are opt-in and must own isolated files. Before delegating:
 
-### 1. The Team Lead (You)
-The agent in your main terminal window. You are responsible for:
-- **Strategy**: Creating the team and defining its goals.
-- **Delegation**: Spawning teammates and assigning them specific roles.
-- **Coordination**: Managing the shared task board and broadcasting updates.
-- **Quality Control**: Reviewing plans and approving finished work.
+1. Map the requested outcomes to genuine independent questions or sub-outcomes.
+2. Give each lane its scope, relevant decisions and evidence, forbidden side effects, and expected result.
+3. Keep cross-lane decisions and final acceptance with the lead.
+4. Reject overlapping lanes. If only one substantive execution lane exists, the lead implements it; an independent read-only check may still help.
 
-### 2. Teammates (The Specialists)
-Agents running either in-process for read-only work or in tmux panes for write work. They are designed for:
-- **Focus**: Executing specific, isolated tasks (e.g., "Security Audit", "Frontend Refactor").
-- **Parallelism**: Working on multiple parts of the project simultaneously.
-- **Autonomy**: Checking their own inboxes, submitting plans, and reporting progress without constant hand-holding.
+A request to use agents triggers this mapping, not a fixed-size swarm or delegation of the whole request to one writer. Honor user restrictions on delegation. See `skills/teams.md` for the context handoff contract.
 
----
+## Intent tiers
 
-## 🛠 Capabilities
+Pass `model_slot`, not a raw role, model, or thinking level. Configured favorites take priority; an unconfigured tier inherits the lead-session model and thinking. Use `/agents-favorite-models` to configure tiers.
 
-### 🚀 Specialist Spawning
-Create teammates for a bounded outcome and select one canonical intent tier configured in `/agents-favorite-models`; never pass a raw model or thinking level.
+| Tier | Outcome |
+| --- | --- |
+| `read-collect` | Bounded facts and evidence |
+| `read-review` | Focused review, verification, and test gaps |
+| `read-analyze` | Connected explanation or root cause |
+| `read-critical` | Irreducible high-stakes reasoning |
+| `write-patch` | Narrow localized edit |
+| `write-feature` | Bounded feature with a known design |
+| `write-system` | Integration or refactoring within an isolated scope |
+| `write-critical` | High-risk security, concurrency, recovery, or data-integrity change |
 
-- `read-collect`: bounded fact and evidence gathering.
-- `read-review`: normal default for focused review, verification, and bounded synthesis.
-- `read-analyze`: explanation across connected evidence.
-- `read-critical`: irreducible high-stakes reasoning.
-- `write-patch`: narrow localized edit.
-- `write-feature`: bounded feature with a known design.
-- `write-system`: normal complex implementation, integration, or refactor within explicitly claimed files.
-- `write-critical`: rare high-risk security, concurrency, recovery, migration, or data-integrity work.
+Nested read helpers require explicit `allow_nested_read_agents: true` on a depth-0 `write-feature` or `write-critical` spawn. Children remain read-only and cannot delegate. Other tiers cannot spawn helpers.
 
-`/agents-favorite-models` maps these tiers to the available scoped models and thinking settings.
+## Public tools
 
-### 📋 Shared Task Board
-A centralized source of truth for the entire team:
-- **Visibility**: Everyone can see the full task list and who owns what.
-- **Status Tracking**: Tasks move through `pending` ➔ `planning` ➔ `in_progress` ➔ `completed`.
-- **Ownership**: Assigning a task to a teammate automatically notifies them.
+The extension registers these tools; role and ownership checks still apply:
 
-### 💬 Coordination & Messaging
-Communication flows naturally between team members:
-- **Direct Messaging**: Send specific instructions to one teammate.
-- **Broadcasts**: Announce global changes (like API updates) to everyone at once.
-- **Inbox Polling**: Teammates automatically "wake up" to check for new work every 30 seconds when idle.
+- Spawn: `spawn_agent`, `spawn_swarm_agents`.
+- Observe: `get_agent_status`.
+- Communicate: `send_message`, `read_inbox`.
+- Control: `interrupt_teammate`, `stop_teammate`, `check_teammate`.
+- Coordinate files: `claim_file`, `release_file`, `list_file_claims`.
+- Finish an edit agent: `report_and_exit`.
 
-### 🛡️ Plan Approval Mode
-For critical changes, you can require teammates to submit a plan before they start:
-1. Teammate analyzes the task and calls `task_submit_plan`.
-2. You review the plan in the Lead pane.
-3. You `approve` (to start work) or `reject` (with feedback for revision).
+Runtime-backed teammates also receive `report_progress`; it is not a lead tool. Task-board tools come from a separate integration, not this extension's public registration.
 
----
+## Working patterns
 
-## 💡 Coordination Patterns
+For independent checks, use a batch with a bounded question per agent. For a plan-before-edit workflow, request read-only analysis, make the decision as lead, then assign an authorized edit with that decision in its prompt. Do not assume a task-board status or hook notification proves that checks passed.
 
-### Pattern 1: The "Parallel Sprint"
-Use this when you have 3-4 independent features to build.
-1. Create a team: `team_create({ team_name: "feature-sprint" })`
-2. Spawn specialists for each feature.
-3. Create tasks for each specialist.
-4. Monitor progress while you work on the core architecture.
+Edit agents claim paths before changes and release their own claims when finished. Claims coordinate cooperative agents; they are not access control. Report changed paths and the exact checks run, including failures and unverified limits. The lead verifies acceptance before marking work complete.
 
-### Pattern 2: The "Safety First" Audit
-Use this for refactoring or security work.
-1. Spawn a teammate with `plan_mode_required: true`.
-2. Assign the refactoring task.
-3. Review their proposed changes before any code is touched.
-4. Approve the plan to let them execute.
+## Status, queues, and recovery
 
-### Pattern 3: The "Quality Gate"
-Use automated hooks to ensure standards.
-1. Define a script at `.pi/team-hooks/task_completed.sh`.
-2. When any teammate marks a task as `completed`, the hook runs (e.g., runs `npm test`).
-3. If the hook fails, you'll know the work isn't ready.
+`get_agent_status` is read-only. It distinguishes current-run activity from lifecycle health and retains persisted quarantine even when the process is gone. Old-run heartbeats do not establish replacement-run health. Observation does not clean up agents.
 
----
+Public spawns honor role-specific capacity. When overflow is enabled, accepted work queues; when disabled, capacity exhaustion returns an error. A quarantined entry stays fenced while unrelated eligible work can proceed. Failed admissions remain visible through status, with up to 20 recent failures retained in memory, and the runtime attempts recipient notification. This public queue and its recent failure index are session-local, not restart-durable.
 
-## 🛑 When to Use pi-extended-teams
-- **Complex Projects**: Tasks that involve multiple files and logic layers.
-- **Research & Execution**: One agent researches while another implements.
-- **Parallel Testing**: Running different test suites in parallel.
-- **Code Review**: Having one agent write code and another (specialized) agent review it.
+Use `stop_teammate` to cancel accepted queued work or stop a whole active agent when cancellation is requested or it is no longer needed. Use `interrupt_teammate` only for a proven stuck tool command: it preserves the session, task context, and claims. In-process cancellation is cooperative and may remain pending; terminal-backed success confirms Escape delivery, not command settlement.
 
-## 🎯 Hot-word trigger: "agents"
-When the user says "agents", "use agents", "spawn agents", "send agents", or any phrase meaning "delegate to parallel helpers", create a team and spawn read agents immediately — do not wait for a more specific instruction. Default: team_create with 2-3 focused read agents. Exception: if the Autoresearch Conflict Guard is active, do not spawn anything; explain that agents are disabled until autoresearch is off.
+## Live control and reports
 
-## ⚠️ Best Practices
-- **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.
-- **Clear Prompts**: Be specific about the teammate's role and boundaries when spawning.
-- **Check-ins**: Use `task_list` regularly to see the "big picture" of your team's progress.
-- **Scope updates go to active owners**: When requirements change while an agent is still running, use `send_message` so it can continue with the new context. Active in-process read agents receive a steering turn; active tmux writers wake through their inbox.
-- **NEVER sleep, busy-wait, or poll**: One `get_agent_status` snapshot is allowed when current status is needed. Do not call it repeatedly or use bash `sleep`, `while true`, or any wait loop. End the turn; the extension delivers reports and resumes you.
-- **Agents self-exit**: Write agents call `report_and_exit` when done; read agents report and stop. Once a final report is accepted, new message admission is closed and session teardown is underway, so no manual `stop_teammate` call is needed after normal completion. Spawn a fresh bounded `read-collect` agent if new work appears after that point; manually stop only an active agent that the user cancels or no longer needs.
+From an empty editor, press Down to open agent navigation. Use Up/Down to select an agent, `l` to expand logs, `m` to message, `i` to interrupt its running tool, `x` to stop the agent, and Escape to return. Page Up/Page Down scroll the transcript; End resumes following output.
+
+Send relevant scope or evidence changes to the active owner with `send_message`. In-process agents receive a steering turn; legacy terminal-backed agents receive inbox delivery.
+
+Reports arrive automatically. Do unrelated work, then end the turn to wait. One `get_agent_status` snapshot is allowed when current status is needed. Never sleep, busy-wait, or repeatedly query status or inboxes. Use `check_teammate` only after status indicates a suspected lifecycle failure; it may clean up an agent classified as dead.
+
+Finished agents self-exit. Once a final report is accepted, message admission closes while teardown finishes. Do not call `stop_teammate` after normal completion or try to revive the closing session. If new work appears, give a fresh bounded agent the relevant evidence.

@@ -1,4 +1,5 @@
 import type { AgentRuntimeStatus } from "../utils/runtime";
+import type { ActiveAgentPhase, projectAgentStatus } from "./status-projection";
 import type { QueuedWriteSpawn } from "../utils/write-queue";
 import type { FileClaim } from "../utils/claims";
 import type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel } from "../utils/models";
@@ -12,7 +13,7 @@ export interface OrchestrationOperationMetadata {
   metadata?: Record<string, any>;
 }
 
-export type TeammateHealth = "lead" | "healthy" | "idle" | "starting" | "stalled" | "dead" | "unknown";
+export type TeammateHealth = "lead" | ReturnType<typeof projectAgentStatus>["health"];
 
 export interface TeammateObservation {
   teamName: string;
@@ -21,6 +22,8 @@ export interface TeammateObservation {
   role: string;
   alive: boolean | null;
   health: TeammateHealth;
+  phase?: ActiveAgentPhase | "lead";
+  error?: string;
   unreadCount: number;
   agentLoopReady: boolean;
   hasRecentHeartbeat: boolean;

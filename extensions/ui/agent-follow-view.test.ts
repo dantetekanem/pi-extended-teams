@@ -395,6 +395,61 @@ describe("agent follow component", () => {
     expect(terminal.write).toHaveBeenLastCalledWith("\x1b[?1000l");
   });
 
+  it.each([
+    ["legacy", "\x1b[M`!!", "\x1b[Ma!!"],
+    ["SGR", "\x1b[<64;1;1M", "\x1b[<65;1;1M"],
+    ["modified SGR", "\x1b[<68;1;1M", "\x1b[<69;1;1M"],
+  ])("scrolls %s wheel input within the transcript and returns to following", (_protocol, up, down) => {
+    vi.stubEnv("HERDR_ENV", "1");
+    const tui = { mode: "regular", terminal: { rows: 18, write: vi.fn() }, requestRender: vi.fn() };
+    const messages = Array.from({ length: 20 }, (_, index) => ({ role: "assistant", content: [{ type: "text", text: `entry-${index + 1}-text` }] }));
+    const agent = makeAgent({ session: { messages } as any });
+    const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [agent] });
+    const render = () => stripAnsi(component.render(80).join("\n"));
+    expect(render()).toContain("entry-20-text");
+    component.handleInput(up);
+    expect(render()).not.toContain("entry-20-text");
+    for (let i = 0; i < 30; i++) component.handleInput(up);
+    expect(render()).toContain("entry-1-text");
+    for (let i = 0; i < 30; i++) component.handleInput(down);
+    expect(render()).toContain("entry-20-text");
+    messages.push({ role: "assistant", content: [{ type: "text", text: "entry-21-text" }] });
+    expect(render()).toContain("entry-21-text");
+    component.dispose();
+  });
+
+  it("handles normalized fullscreen wheels without taking over terminal mouse mode", () => {
+    vi.stubEnv("HERDR_ENV", "1");
+    const tui = { mode: "fullscreen", terminal: { rows: 18, write: vi.fn() }, requestRender: vi.fn() };
+    const messages = Array.from({ length: 20 }, (_, index) => ({ role: "assistant", content: [{ type: "text", text: `entry-${index + 1}-text` }] }));
+    const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [makeAgent({ session: { messages } as any })] });
+    component.render(80);
+    expect(component.handleMouse({ type: "wheel", wheelDelta: -3 })).toEqual({ handled: true });
+    expect(stripAnsi(component.render(80).join("\n"))).not.toContain("entry-20-text");
+    expect(component.handleMouse({ type: "wheel", wheelDelta: 3 })).toEqual({ handled: true });
+    expect(stripAnsi(component.render(80).join("\n"))).toContain("entry-20-text");
+    component.dispose();
+    expect(tui.terminal.write).not.toHaveBeenCalled();
+  });
+
+  it("does not insert mouse sequences into a message or change agent selection", async () => {
+    const sendMessage = vi.fn();
+    const agents = [makeAgent({ name: "a" }), makeAgent({ name: "b" })];
+    const component = createAgentFollowComponent({ terminal: { rows: 24 }, requestRender: vi.fn() }, vi.fn(), {
+      getAgents: () => agents, sendMessage,
+    });
+    component.render(80);
+    component.handleInput("m");
+    component.handleInput("hello");
+    component.handleInput("\x1b[<64;1;1M");
+    component.handleInput("\x1b[<0;1;1M");
+    component.handleInput("\x1b[<64;1;1m");
+    component.handleInput("\r");
+    await Promise.resolve();
+    expect(sendMessage).toHaveBeenCalledWith("a", "hello");
+    component.dispose();
+  });
+
   it("starts at zero instead of showing the pre-response message estimate", () => {
     const tui = { terminal: { rows: 24 }, requestRender: vi.fn() };
     const agent = makeAgent({

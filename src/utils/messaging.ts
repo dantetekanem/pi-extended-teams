@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { writeJsonAtomic } from "./atomic-json";
+import { syncPathAndParents, writeJsonDurably } from "../results/durable-json";
 import { InboxMessage, TeamConfig } from "./models";
 import { withLock } from "./lock";
 import { configPath, inboxPath } from "./paths";
@@ -53,10 +54,13 @@ async function appendRunningMessage(
       const messages = readInboxRaw(p);
       if (options.operationId) {
         const existing = messages.find(item => messageOperationMatches(item, options.operationId!, options.workflowRunId));
-        if (existing) return { message: existing, delivered: false };
+        if (existing) {
+          resyncGroupedInbox(p, messages);
+          return { message: existing, delivered: false };
+        }
       }
       messages.push(message);
-      writeJsonAtomic(p, messages);
+      writeInboxRaw(p, messages);
       return { message, delivered: true };
     });
   };
@@ -132,6 +136,22 @@ function readInboxRaw(p: string): InboxMessage[] {
   return Array.isArray(parsed) ? parsed : [];
 }
 
+const hasGroupDeliveryMarker = (messages: InboxMessage[]) => messages.some(message => !!message.metadata?.completionGroup);
+function ensureInboxDurability(p: string, ...snapshots: InboxMessage[][]): boolean {
+  const marker = `${p}.durable`;
+  if (fs.existsSync(marker)) return true;
+  if (!snapshots.some(hasGroupDeliveryMarker)) return false;
+  writeJsonDurably(marker, { version: 1 });
+  return true;
+}
+function writeInboxRaw(p: string, messages: InboxMessage[], previous = messages): void {
+  if (ensureInboxDurability(p, messages, previous)) writeJsonDurably(p, messages);
+  else writeJsonAtomic(p, messages);
+}
+function resyncGroupedInbox(p: string, messages: InboxMessage[]): void {
+  if (ensureInboxDurability(p, messages)) syncPathAndParents(p);
+}
+
 export function messageOperationMatches(message: InboxMessage, operationId: string, workflowRunId?: string): boolean {
   const messageOperationId = message.operationId || message.metadata?.operationId;
   const messageWorkflowRunId = message.workflowRunId || message.metadata?.workflowRunId;
@@ -192,7 +212,7 @@ export async function appendMessage(teamName: string, agentName: string, message
   await withLock(p, async () => {
     const msgs = readInboxRaw(p);
     msgs.push(message);
-    writeJsonAtomic(p, msgs);
+    writeInboxRaw(p, msgs);
   });
 }
 
@@ -206,10 +226,13 @@ export async function appendMessageOnce(
   return await withLock(p, async () => {
     const msgs = readInboxRaw(p);
     const existing = msgs.find((item) => messageOperationMatches(item, message.operationId, message.workflowRunId));
-    if (existing) return { message: existing, delivered: false };
+    if (existing) {
+      resyncGroupedInbox(p, msgs);
+      return { message: existing, delivered: false };
+    }
 
     msgs.push(message);
-    writeJsonAtomic(p, msgs);
+    writeInboxRaw(p, msgs);
     return { message, delivered: true };
   });
 }
@@ -240,11 +263,23 @@ export async function readInbox(
     const allMsgs = readInboxRaw(p);
     const result = selectInboxMessages(allMsgs, unreadOnly);
 
-    if (markAsRead && result.length > 0 && markMessagesRead(result)) {
-      writeJsonAtomic(p, allMsgs);
+    if (markAsRead) {
+      if (markMessagesRead(result)) writeInboxRaw(p, allMsgs);
+      else resyncGroupedInbox(p, allMsgs);
     }
 
     return cloneInboxMessages(result);
+  });
+}
+
+export async function markInboxMessagesRead(teamName: string, agentName: string, ids: string[]): Promise<void> {
+  const p = inboxPath(teamName, agentName);
+  if (!fs.existsSync(p)) throw new Error("Referenced inbox is unavailable.");
+  await withLock(p, async () => {
+    const messages = readInboxRaw(p);
+    const selected = messages.filter(message => message.id && ids.includes(message.id));
+    if (markMessagesRead(selected)) writeInboxRaw(p, messages);
+    else resyncGroupedInbox(p, messages);
   });
 }
 
@@ -262,8 +297,9 @@ export async function readInboxTail(
     const allMsgs = readInboxRaw(p);
     const result = selectInboxMessages(allMsgs, options.unreadOnly === true, normalizedLimit);
 
-    if (options.markAsRead === true && result.length > 0 && markMessagesRead(result)) {
-      writeJsonAtomic(p, allMsgs);
+    if (options.markAsRead === true) {
+      if (markMessagesRead(result)) writeInboxRaw(p, allMsgs);
+      else resyncGroupedInbox(p, allMsgs);
     }
 
     return cloneInboxMessages(result);
@@ -284,7 +320,8 @@ export async function removeInboxMessagesByOperationUnderLifecycleLock(
     const messages = readInboxRaw(p);
     const remaining = messages.filter((message) => !messageOperationMatches(message, operationId, workflowRunId));
     const removed = messages.length - remaining.length;
-    if (removed > 0) writeJsonAtomic(p, remaining);
+    if (removed > 0) writeInboxRaw(p, remaining, messages);
+    else resyncGroupedInbox(p, messages);
     return removed;
   });
 }

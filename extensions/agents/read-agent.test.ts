@@ -6,6 +6,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { CheckJournal } from "../../src/results/check-journal";
 import { createReportResult, effectiveTaskOutcome, type ReportResult } from "../../src/results/report-result";
 import { VerificationController } from "../../src/results/verification-controller";
+import { CompletionGroup } from "../../src/results/completion-group";
+import * as messaging from "../../src/utils/messaging";
 vi.mock("node:child_process", async (original) => ({
   ...await original<typeof import("node:child_process")>(), spawnSync: vi.fn(),
 }));
@@ -256,6 +258,51 @@ describe("in-process read agent tool wiring", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["complete", "suppressed", "runtime-failure", "delivery-failure"])("preserves native events and independent grouped reports: %s", async mode => {
+    const suppressed = mode === "suppressed";
+    const group = await CompletionGroup.create({ teamName: "team", sessionId: "session", submissionId: mode,
+      policy: { delivery: "all-settled" }, members: [{ name: "reader", suppressed }, { name: "writer", suppressed }] });
+    if (!group) throw new Error("Expected a group");
+    await group.seal();
+    const options = { ...makeRunOptions(), renderLeadInboxStatus: vi.fn(async () => {}), notifyLeadOfInboxReports: vi.fn(async () => {}) };
+    if (mode === "delivery-failure") vi.spyOn(messaging, "sendPlainMessageOnce").mockRejectedValue(new Error("index unavailable"));
+    const count = mode.endsWith("failure") ? 1 : 2;
+    for (let index = 0; index < count; index++) {
+      const member = { ...fixtureMember(index ? "writer" : "reader", index ? "write" : "read"), lifecycleRunId: `run-${index}`,
+        completionGroup: group.binding(index), ...(suppressed ? { metadata: { piPromptPlanning: { version: 1 } } } : {}) };
+      writeTeamConfig("team", member);
+      await group.apply({ type: "running", ...member.completionGroup, runId: member.lifecycleRunId });
+      const session = makeSession();
+      let transcript = "";
+      session.prompt.mockImplementation(async () => {
+        const created = piMocks.createAgentSession.mock.calls.at(-1)![0];
+        transcript = created.sessionManager.getSessionFile();
+        fs.writeFileSync(transcript, `${JSON.stringify({ type: "session", id: `fixture-${index}` })}\n`);
+        if (mode === "runtime-failure") throw new Error("model unavailable");
+        const tool = created.customTools.find((item: any) => item.name === "report_and_exit");
+        await tool.execute(`report-${index}`, { content: `Independent report ${index}`, outcome: mode === "delivery-failure" ? "blocked" : "succeeded" });
+      });
+      piMocks.createAgentSession.mockResolvedValue({ session });
+      await runReadAgentInProcess("team", member, "Work", { modelRegistry: { find: () => ({ provider: "provider", id: "model" }) } }, options);
+      expect(session.dispose).toHaveBeenCalledOnce();
+      if (mode === "complete" || suppressed) expect(fs.existsSync(transcript)).toBe(false);
+    }
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(count);
+    for (const report of reports) {
+      expect(report.completionGroup?.groupId).toBe(group.groupId);
+      expect(fs.readFileSync(report.reportPath!, "utf8")).toBe(report.report);
+    }
+    expect(options.emitAgentReport).toHaveBeenCalledTimes(count);
+    for (const call of options.emitAgentReport.mock.calls) expect(call[6]).toBe(true);
+    const inbox = await readInbox("team", "team-lead", false, false);
+    expect(inbox).toHaveLength(suppressed || mode === "delivery-failure" ? 0 : 1);
+    if (inbox.length) expect(JSON.parse(inbox[0].text).kind).toBe(mode === "runtime-failure" ? "urgent" : "settled");
+    if (suppressed) expect(options.notifyLeadOfInboxReports).not.toHaveBeenCalled();
+    if (mode === "delivery-failure") expect(options.releaseAllClaimsForAgent).not.toHaveBeenCalled();
+    else expect(options.runningReadAgents.size).toBe(0);
   });
 
   it.each(["read", "write"] as const)("keeps a blocked %s task distinct from clean completion and duplicate submission", async role => {

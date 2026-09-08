@@ -11,6 +11,7 @@ import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails,
 import { canonicalPersistedModelSlot } from "../../src/utils/settings";
 import { normalizeCheckPolicy } from "../../src/results/check-policy";
 import { VerificationController } from "../../src/results/verification-controller";
+import { deliverCompletionGroupReport } from "../../src/results/completion-group-delivery";
 import { formatRepairRequest } from "./agent-communication-tools";
 import type { CheckRunnerOptions } from "../../src/results/check-runner";
 import { loadNativeCheckOperations } from "../internal/pi-check-operations";
@@ -253,6 +254,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       try {
         const persistedReport = await reportEvents.appendTeamReportEvent(targetTeamName, {
           agentName: options.agentName,
+          completionGroup: member.completionGroup,
           role: member?.role || "write",
           status: "completed",
           result,
@@ -274,7 +276,11 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         const leadReport = checks?.length
           ? `${params.content}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}${result.repair ? `; repair: ${result.repair.state}; effective task: ${effectiveTaskOutcome(result) ?? "unspecified"}` : ""}. Evidence: ${result.reportId}.`
           : params.content;
-        await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", leadReport, params.summary || "Final report", undefined, { metadata: reportMetadata });
+        const grouped = await deliverCompletionGroupReport(persistedReport);
+        if (member.completionGroup && !grouped) throw new Error("Grouped report provenance is unavailable.");
+        if (!grouped) {
+          await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", leadReport, params.summary || "Final report", undefined, { metadata: reportMetadata });
+        }
         releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);
       } catch (error) {
         pendingWriterFinalization.delete(`${targetTeamName}:${options.agentName}`);
@@ -291,7 +297,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         try { ctx.shutdown(); } catch { process.exit(0); }
       }, 250);
 
-      return { content: [{ type: "text", text: `Final report sent. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { accepted: true, session: targetTeamName, releasedClaims, reportPath, result } };
+      return { content: [{ type: "text", text: `Final report ${member.completionGroup ? "saved to its completion group" : "sent"}. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { accepted: true, session: targetTeamName, releasedClaims, reportPath, result } };
     },
   });
 

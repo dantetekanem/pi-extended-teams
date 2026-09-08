@@ -174,6 +174,12 @@ Edit-agent coordination tools:
 
 Assigned `checks` and optional `repair: { maxAttempts: 1 }` require explicit lead or trusted-integration authorization. Repair is disabled by default and permits at most five additional attempts. An unaccepted `repairRequest` from `report_and_exit` asks the agent to remain active and resubmit, without expanding its scope or permissions. Keep or reacquire claims before repair edits; report blocked or failed if repair is unsafe. Do not interpret passed verification as lead acceptance or ignore an effective repair blocker because the agent reported success. Pending execution or persistence keeps cleanup fenced. See README.md for policy inheritance and evidence recovery.
 
+### Optional grouped delivery
+
+For a lead batch, add `completion_group: { delivery: "all-settled" }` to wait for compact grouped results, or use `"immediate"` for compact member indexes. Omit the option for immediate full reports. Queued work remains outstanding; rejected, cancelled and interrupted assignments retain explicit states. Blockers and failures may wake early. Nested helpers cannot enable grouping, and suppression still excludes lead-facing evidence and wakes.
+
+Use each index's full-report reference when synthesis needs more detail. Group settlement and stored verification do not grant task success or lead acceptance. A reserved wake stays unconfirmed until exact SDK history is observed, which is not provider success. Errors/reload do not automatically repeat ambiguous requests; use `read_inbox` for the saved index rather than polling or recreating the batch. Recovery preserves unknown running ownership without restarting work or transferring claims. See README.md for the journal location and measured comparison limits.
+
 ## Context handoff contract
 
 Agents start in isolated sessions and know only what their mission tells them. A short prompt is not automatically a good prompt: omit irrelevant history, but include the intent and prior state needed to avoid repeating work or violating a decision.

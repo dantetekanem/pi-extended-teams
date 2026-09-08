@@ -27,6 +27,8 @@ import { createActiveAgentSleepController, runWithActiveAgentSleepAssertion } fr
 import { createTeammateInterrupter } from "./runtime/teammate-interrupt.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
 import * as messaging from "../src/utils/messaging";
+import { requestCompletionGroupWake, observeCompletionGroupWakes } from "../src/results/completion-group-wake";
+import { recoverCompletionGroups } from "../src/results/completion-group-recovery";
 import * as teams from "../src/utils/teams";
 import * as runtime from "../src/utils/runtime";
 import * as teamPaths from "../src/utils/paths";
@@ -339,11 +341,11 @@ export default function (pi: ExtensionAPI) {
   // message with display:false still reaches the model as a user turn (see
   // convertToLlm) but is never rendered, so team coordination stays silent.
   // Falls back to a visible user message on older pi builds without sendMessage.
-  function quietTrigger(content: string): void {
+  function quietTrigger(content: string, details?: Record<string, unknown>): void {
     const api = pi as any;
     if (typeof api.sendMessage === "function") {
       api.sendMessage(
-        { customType: "pi-extended-teams-wake", content, display: false },
+        { customType: "pi-extended-teams-wake", content, display: false, ...(details ? { details } : {}) },
         { triggerTurn: true, deliverAs: "followUp" }
       );
     } else {
@@ -380,9 +382,46 @@ export default function (pi: ExtensionAPI) {
     pi.events?.emit?.("pi-extended-teams:agent-progress", { teamName: progressTeamName, name, status, updatedAt });
   }
 
-  function wakeLeadForInboxReports(unread: any[]): void {
-    if (!teamName) return;
-    const keyedUnread = unread.map((message) => ({
+  const currentCompletionGroups = new Set<string>();
+  const observedWakeEntries = new Set<string>();
+  const groupWarnings = new Set<string>();
+  const sessionEntries = (ctx: any) => ctx?.sessionManager?.getEntries?.() ?? ctx?.sessionManager?.getBranch?.() ?? [];
+  function warnGroup(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!groupWarnings.has(message)) {
+      groupWarnings.add(message);
+      sessionCtx?.ui?.notify?.(message, "warning");
+    }
+  }
+  async function observeGroupHistory(ctx: any): Promise<void> {
+    if (!teamName || extensionShuttingDown) return;
+    const target = teamName;
+    const entries = sessionEntries(ctx).filter((entry: any) => !observedWakeEntries.has(`${target}:${entry.id}`));
+    const result = await observeCompletionGroupWakes(target, getPiSessionId(ctx) ?? "", entries);
+    for (const id of result.observed) observedWakeEntries.add(`${target}:${id}`);
+    for (const error of result.errors) warnGroup(error);
+  }
+  async function requestGroupInboxWakes(unread: any[]): Promise<void> {
+    if (!teamName || !sessionCtx || extensionShuttingDown) return;
+    const target = teamName;
+    const ctx = sessionCtx;
+    for (const message of unread.filter(item => item.metadata?.completionGroup)) {
+      try {
+        if (typeof (pi as any).sendMessage !== "function") throw new Error("Grouped wakes require Pi custom messages; use read_inbox for the saved index.");
+        await requestCompletionGroupWake(target, getPiSessionId(ctx) ?? "", message, (content, details) => {
+          if (extensionShuttingDown || ctx !== sessionCtx) throw new Error("Group wake unconfirmed: the lead session is closing.");
+          quietTrigger(content, details);
+        });
+      } catch (error) { warnGroup(error); }
+    }
+  }
+  async function wakeLeadForInboxReports(unread: any[]): Promise<void> {
+    if (!teamName || extensionShuttingDown) return;
+    const target = teamName;
+    const ctx = sessionCtx;
+    await requestGroupInboxWakes(unread);
+    if (extensionShuttingDown || target !== teamName || ctx !== sessionCtx) return;
+    const keyedUnread = unread.filter(message => !message.metadata?.completionGroup).map((message) => ({
       message,
       key: String(message?.id || `${message?.from || "unknown"}:${message?.timestamp || ""}:${message?.text || ""}`),
     }));
@@ -414,7 +453,7 @@ export default function (pi: ExtensionAPI) {
     if (isTeammate) return;
     const unread = await messaging.peekInbox(targetTeamName, agentName, true);
     await renderLeadInboxStatus();
-    wakeLeadForInboxReports(unread);
+    await wakeLeadForInboxReports(unread);
   }
 
   function getIdleReadAgentNudgeMessage(agent: RunningReadAgent, status: ReadAgentStatusDescription): string | null {
@@ -984,7 +1023,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const unread = await messaging.readInbox(teamName, agentName, true, false);
         await renderLeadInboxStatus();
-        wakeLeadForInboxReports(unread);
+        await wakeLeadForInboxReports(unread);
       } catch {
         // Ignore errors for lead polling
       }
@@ -1156,7 +1195,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   if (!isTeammate) {
+    pi.on("context", async (_event: any, ctx: any) => { await observeGroupHistory(ctx); });
     pi.on("session_start", async (_event: any, ctx: any) => {
+      await observeGroupHistory(ctx);
+      if (teamName) {
+        try {
+          const config = await teams.readConfig(teamName);
+          for (const error of await recoverCompletionGroups(teamName, getPiSessionId(ctx) ?? "", config.members, sessionEntries(ctx), currentCompletionGroups)) warnGroup(error);
+          await requestGroupInboxWakes(await messaging.peekInbox(teamName, agentName, true));
+        } catch (error) { warnGroup(error); }
+      }
       installAgentNavigation(ctx, {
         getAgents: () => {
           const readers = Array.from(runningReadAgents.values())
@@ -1272,6 +1320,7 @@ export default function (pi: ExtensionAPI) {
     startWriteAgent,
     shutdownTeammate,
     adoptTeamAsLead,
+    onCompletionGroupUse: groupId => { currentCompletionGroups.add(groupId); },
     buildRoster,
     isTeammate,
     agentName,

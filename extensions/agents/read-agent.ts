@@ -8,6 +8,8 @@ import * as runtime from "../../src/utils/runtime";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
+import { checkpointReference, saveReportCheckpoint } from "../../src/results/checkpoint-report";
+import { checkpointReportPayload } from "../../src/results/specialist-checkpoint";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
 import { deliverCompletionGroupReport } from "../../src/results/completion-group-delivery";
 import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails, type ReportResult, type ReportedTaskDetails } from "../../src/results/report-result";
@@ -429,6 +431,8 @@ function reportPersistenceBlockReason(
 }
 
 async function recordReadAgentReportEvent(
+  state: RunningReadAgent,
+  isCurrent: () => boolean,
   teamName: string,
   member: Member,
   status: "completed" | "failed",
@@ -443,9 +447,18 @@ async function recordReadAgentReportEvent(
 ): Promise<{ persisted: true; event: TeamReportEvent } | { persisted: false; error: unknown }> {
   const operation = operationMetadataFromMember(member);
   const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
+  let checkpointOperation: RunningReadAgent["checkpointOperation"];
+  let settle = () => {};
   try {
+    if (member.checkpointAssignment) {
+      if (state.stopRequested || !isCurrent()) throw new Error("Checkpoint publication cancelled: agent run is closing.");
+      if (state.checkpointOperation) throw new Error("Checkpoint publication is already active for this run.");
+      checkpointOperation = { controller: new AbortController(), settled: new Promise<void>(resolve => { settle = resolve; }) };
+      state.checkpointOperation = checkpointOperation;
+    }
     const event = await reportEvents.appendTeamReportEvent(teamName, {
       agentName: member.name,
+      checkpoint: checkpointReference(teamName, member),
       completionGroup: member.completionGroup,
       role: member.role || "read",
       status,
@@ -471,9 +484,16 @@ async function recordReadAgentReportEvent(
         ...reportMetadata,
       },
     });
+    await saveReportCheckpoint(teamName, member, event, checkpointOperation?.controller.signal);
+    if (checkpointOperation && (checkpointOperation.controller.signal.aborted || state.stopRequested || !isCurrent())) throw new Error("Checkpoint publication cancelled: agent run is closing.");
+    if (event.checkpoint) result.checkpointId = event.checkpoint.id;
     return { persisted: true, event };
   } catch (error) {
+    if (member.checkpointAssignment) state.finalizationBlockedReason ||= `Checkpoint publication failed: ${String(error)}`;
     return { persisted: false, error };
+  } finally {
+    if (checkpointOperation && state.checkpointOperation === checkpointOperation) state.checkpointOperation = undefined;
+    settle();
   }
 }
 
@@ -805,9 +825,11 @@ export async function runReadAgentInProcess(
     const report = resolution.report!;
     const result = resolvedTaskResult ?? createReportResult(readTeamName, member.name, state.runId, resolution);
     resolvedTaskResult = result;
-    const leadReport = assignedChecks?.length
+    const checkpoint = checkpointReference(readTeamName, member);
+    if (checkpoint) result.checkpointId = checkpoint.id;
+    const leadReport = (assignedChecks?.length
       ? `${report}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}${result.repair ? `; repair: ${result.repair.state}; effective task: ${effectiveTaskOutcome(result) ?? "unspecified"}` : ""}. Evidence: ${result.reportId}.`
-      : report;
+      : report) + (checkpoint ? `\n\nCheckpoint reference: ${checkpoint.id}.` : "");
     const completionStats = session.getSessionStats();
     // Private child transcripts are deleted after teardown; never publish pointers
     // that would outlive a successful run's recovery artifact.
@@ -857,6 +879,8 @@ export async function runReadAgentInProcess(
       ...reportMetadata,
     };
     const reportEventPersistence = await recordReadAgentReportEvent(
+      state,
+      () => options.isCurrentReadAgentRun(key, state),
       readTeamName,
       member,
       "completed",
@@ -877,6 +901,7 @@ export async function runReadAgentInProcess(
       );
       throw new Error(state.finalizationBlockedReason);
     }
+    if (checkpoint && (state.stopRequested || !options.isCurrentReadAgentRun(key, state))) return;
     completedReportPersisted = true;
     // The lifecycle finalizer consumes this flag only after session disposal and
     // successful lifecycle finalization, so every successful private run is removed.
@@ -1044,6 +1069,7 @@ export async function runReadAgentInProcess(
         if (submittedFinalReport || finalReportSubmissionInProgress) return { accepted: false };
         finalReportSubmissionInProgress = true;
         try {
+          if (member.checkpointAssignment) checkpointReportPayload(createReportResult(readTeamName, member.name, state.runId, report));
           const decision = await verifyTaskResult(report, signal, submissionId ? `tool:${submissionId}` : undefined);
           if (decision.request) {
             deliveredRepairRequests.add(decision.request.id);
@@ -1490,6 +1516,8 @@ export async function runReadAgentInProcess(
         result.verification = { state: "pending", checkIds: assignedCheckIds(result, assignedChecks) };
       }
       const failureEventPersistence = await recordReadAgentReportEvent(
+        state,
+        () => options.isCurrentReadAgentRun(key, state),
         readTeamName,
         member,
         "failed",
@@ -1514,6 +1542,7 @@ export async function runReadAgentInProcess(
           failureReport = `${failureReport}\n\n${state.finalizationBlockedReason}`;
         }
       }
+      if (member.checkpointAssignment && (state.stopRequested || !options.isCurrentReadAgentRun(key, state))) return;
       options.rememberCompletedAgentReport(readTeamName, {
         name: member.name,
         role,

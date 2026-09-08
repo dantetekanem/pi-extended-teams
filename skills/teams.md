@@ -180,6 +180,14 @@ For a lead batch, add `completion_group: { delivery: "all-settled" }` to wait fo
 
 Use each index's full-report reference when synthesis needs more detail. Group settlement and stored verification do not grant task success or lead acceptance. A reserved wake stays unconfirmed until exact SDK history is observed, which is not provider success. Errors/reload do not automatically repeat ambiguous requests; use `read_inbox` for the saved index rather than polling or recreating the batch. Recovery preserves unknown running ownership without restarting work or transferring claims. See README.md for the journal location and measured comparison limits.
 
+### Optional specialist continuation
+
+For a later follow-up, explicitly set `checkpoint: { inputs: ["auth", "config"] }` on a lead spawn, swarm defaults or an individual agent. Ask for stable finding IDs, concrete evidence and reported `inspectedEvidence`. Once the report is saved, use the checkpoint ID from that report as `continue_from` on a new spawn or individual swarm agent, with a precise current prompt and current tier. Do not enable this through metadata or nested helpers; legacy terminal startup and queues reject it.
+
+The requested name is a prefix for a fresh recipient/run. Current cwd, instructions, permissions, checks and repair govern; acquire claims normally. Saved findings, lead decisions, verification and acceptance are historical data, not current proof or authority. Revalidate affected assumptions and dependency scopes at launch, including unchanged callers when dependencies changed. A checkpoint carries bounded knowledge, not the old mailbox, private transcript, process or repair budget.
+
+Scope and retention are inherited unless overridden; old decisions are not reauthorized. Retention defaults to 30 days (1 to 365). Lead-only `/agents-checkpoints list` and `/agents-checkpoints delete <id>` manage exact records; deletion/expiry prevents future loading without erasing independent reports or context already delivered. Request a fresh investigation when the selected checkpoint is unavailable. See README.md for storage, failure handling and the controlled comparison, which showed no read or input-token savings.
+
 ## Context handoff contract
 
 Agents start in isolated sessions and know only what their mission tells them. A short prompt is not automatically a good prompt: omit irrelevant history, but include the intent and prior state needed to avoid repeating work or violating a decision.

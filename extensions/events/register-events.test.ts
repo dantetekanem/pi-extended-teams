@@ -6,6 +6,10 @@ import { isInboxFileWatchEvent, registerExtensionEvents } from "./register-event
 import * as paths from "../../src/utils/paths.js";
 import * as runtime from "../../src/utils/runtime.js";
 import { readInbox, sendPlainMessage } from "../../src/utils/messaging.js";
+import * as retention from "../../src/results/checkpoint-retention";
+import * as sessionFiles from "../internal/session-files";
+import * as privateSessions from "../internal/agent-session-files";
+import * as sessionReferences from "../internal/session-context-reference";
 
 let root: string;
 let teamsRoot: string;
@@ -53,6 +57,7 @@ function setupEvents(
     ...overrides,
   });
   const ctx = {
+    cwd: root,
     ui: { notify: vi.fn(), setTitle: vi.fn() },
     isIdle,
   };
@@ -83,6 +88,13 @@ describe("extension teammate inbox wake", () => {
     teamsRoot = path.join(root, "teams");
     fs.mkdirSync(teamsRoot, { recursive: true });
     installPathSpies();
+    vi.spyOn(os, "homedir").mockReturnValue(root);
+    vi.spyOn(paths, "checkpointFilesDir").mockReturnValue(path.join(fs.realpathSync(root), "checkpoints"));
+    vi.spyOn(paths, "ensureDirs").mockImplementation(() => {});
+    vi.spyOn(sessionFiles, "cleanupOrphanedTeams").mockImplementation(vi.fn());
+    vi.spyOn(sessionFiles, "cleanupAgentSessionFolders").mockImplementation(vi.fn());
+    vi.spyOn(privateSessions, "cleanupStalePrivateAgentSessions").mockReturnValue(0);
+    vi.spyOn(sessionReferences, "cleanupStaleSessionContextReferences").mockReturnValue(0);
   });
 
   afterEach(() => {
@@ -122,6 +134,21 @@ describe("extension teammate inbox wake", () => {
     expect(output).toContain("reader reported");
     expect(output).toContain("full report body");
     expect(output).not.toContain("ctrl+o");
+  });
+
+  it.each(["lead", "teammate", "unsafe-root"])("runs checkpoint expiry only at lead startup and isolates diagnostics: %s", async mode => {
+    const expire = vi.spyOn(retention, "expireCheckpoints").mockResolvedValue(["Retained corrupt checkpoint"]);
+    if (mode === "unsafe-root") expire.mockRejectedValue(new Error("Unsafe checkpoint root"));
+    const startLeadInboxPolling = vi.fn(); const startLeadWatchdog = vi.fn();
+    const { handlers, ctx } = setupEvents(() => true, { isTeammate: mode === "teammate", startLeadInboxPolling, startLeadWatchdog });
+    for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+    expect(expire).toHaveBeenCalledTimes(mode === "teammate" ? 0 : 1);
+    if (mode !== "teammate") {
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining(mode === "unsafe-root" ? "Unsafe checkpoint root" : "Retained corrupt checkpoint"), "warning");
+      expect(startLeadInboxPolling).toHaveBeenCalledOnce(); expect(startLeadWatchdog).toHaveBeenCalledOnce();
+    }
+    for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
+    expect(expire).toHaveBeenCalledTimes(mode === "teammate" ? 0 : 1);
   });
 
   it("globally cleans stale session references and private agent sessions without an adopted team", async () => {

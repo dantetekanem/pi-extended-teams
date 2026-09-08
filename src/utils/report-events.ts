@@ -8,6 +8,7 @@ import { writeJsonAtomic } from "./atomic-json";
 import { syncPathAndParents, writeJsonDurably } from "../results/durable-json";
 import { VerificationController } from "../results/verification-controller";
 import type { CheckRecord } from "../results/check-journal";
+import { isSpecialistCheckpoint, type SpecialistCheckpoint } from "../results/specialist-checkpoint";
 
 export type ObservedTeamReportEvent = TeamReportEvent & { checks?: CheckRecord[] };
 
@@ -119,7 +120,7 @@ function readEventsCache(p: string): ReportEventsCache {
 }
 
 function writeEventsRaw(p: string, events: TeamReportEvent[], options: { sorted?: boolean } = {}): void {
-  if (events.some(event => event.completionGroup)) writeJsonDurably(p, events);
+  if (events.some(event => event.completionGroup || event.checkpoint)) writeJsonDurably(p, events);
   else writeJsonAtomic(p, events);
   buildCache(p, events, reportEventsStatKey(p), options);
 }
@@ -209,11 +210,12 @@ export async function appendTeamReportEvent(teamName: string, event: NewTeamRepo
     if (normalized.result && normalized.result.reportId !== normalized.id) {
       throw new Error("Structured report identity does not match its event ID.");
     }
+    if (normalized.checkpoint && normalized.result) normalized.result.checkpointId = normalized.checkpoint.id;
     const existing = cache.byId.get(normalized.id);
-    if (existing) return existing.completionGroup ? resyncEvent(p, existing) : cloneTeamReportEvent(existing);
+    if (existing) return existing.completionGroup || existing.checkpoint ? resyncEvent(p, existing) : cloneTeamReportEvent(existing);
 
     normalized.reportPath = writeStandaloneReport(teamName, normalized.agentName, normalized.report);
-    if (normalized.completionGroup) syncPathAndParents(normalized.reportPath);
+    if (normalized.completionGroup || normalized.checkpoint) syncPathAndParents(normalized.reportPath);
     writeEventsRaw(p, insertEvent(cache.events, normalized), { sorted: true });
     return cloneTeamReportEvent(normalized);
   });
@@ -229,6 +231,23 @@ function resyncEvent(p: string, event: TeamReportEvent | undefined): TeamReportE
 export async function resyncStoredTeamReportEvent(teamName: string, reportId: string): Promise<TeamReportEvent> {
   const p = ensureReportEventsFile(teamName);
   return withLock(p, async () => resyncEvent(p, readEventsCache(p).byId.get(reportId)));
+}
+
+export async function recordReportCheckpoint(teamName: string, reportId: string, draft: SpecialistCheckpoint): Promise<TeamReportEvent> {
+  if (!isSpecialistCheckpoint(draft)) throw new Error("Invalid specialist checkpoint.");
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => {
+    const cache = readEventsCache(p);
+    const existing = cache.byId.get(reportId);
+    if (!existing?.checkpoint || existing.checkpoint.id !== draft.id || draft.reportId !== reportId
+      || draft.author.teamName !== teamName || draft.author.agentName !== existing.agentName || draft.author.runId !== existing.result?.runId
+      || draft.reports.find(report => report.id === reportId)?.path !== existing.reportPath) throw new Error("Checkpoint report binding changed.");
+    resyncEvent(p, existing);
+    if (existing.checkpoint.draft) return cloneTeamReportEvent(existing);
+    const updated = cloneTeamReportEvent({ ...existing, checkpoint: { id: draft.id, draft } });
+    writeEventsRaw(p, cache.events.map(event => event.id === reportId ? updated : event), { sorted: true });
+    return cloneTeamReportEvent(updated);
+  });
 }
 
 export async function recordReportAcceptance(

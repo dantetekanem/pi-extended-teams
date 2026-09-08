@@ -14,6 +14,10 @@ import { ACCEPTED_FAVORITE_MODEL_SLOTS, FAVORITE_MODEL_SLOTS, canonicalPersisted
 import type { Member } from "../../src/utils/models";
 import { CheckPolicySchema, normalizeCheckPolicy } from "../../src/results/check-policy";
 import { RepairPolicySchema, normalizeRepairPolicy } from "../../src/results/repair-policy";
+import { CheckpointPolicySchema } from "../../src/results/checkpoint-policy";
+import { createCheckpointAssignment, captureCheckpointAssignment, continuationPrompt } from "../../src/results/checkpoint-assignment";
+import { assertUnusedContinuationRecipient, freshContinuationName } from "../../src/results/continuation-recipient";
+import { readCheckpoint } from "../../src/results/specialist-checkpoint";
 import { CompletionGroup, CompletionGroupPolicySchema, completionGroupIdentity, normalizeCompletionGroupPolicy, type CompletionGroupBinding } from "../../src/results/completion-group";
 import { listStoredTeamReportEvents } from "../../src/utils/report-events";
 import { enqueueCompletionGroupDeliveries } from "../../src/results/completion-group-delivery";
@@ -92,6 +96,7 @@ export interface TeamToolsRuntime {
 
 interface SpawnTeammateOptions {
   once?: boolean;
+  signal?: AbortSignal;
   completionGroup?: CompletionGroupBinding;
   nestedParent?: {
     teamName: string;
@@ -112,6 +117,7 @@ interface QueuedReadSpawn {
   ctx: any;
   requestedAt: number;
   nameReservationId?: string;
+  signal?: AbortSignal;
   pendingChildAcceptance?: PendingChildAcceptance;
   admissionError?: string;
   quarantineError?: string;
@@ -376,12 +382,22 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       queued: readQueue(activeTeamName).length,
     });
   });
+  const checkpointAdmissions = new Map<string, { controller: AbortController; settled: Promise<void> }>();
+  function cancelCheckpointAdmission(teamName: string, name: string): Promise<void> | undefined {
+    const pending = checkpointAdmissions.get(options.readAgentKey(teamName, name));
+    pending?.controller.abort(new Error("Checkpoint preparation cancelled."));
+    return pending?.settled;
+  }
   let lifecycleProbeCleanedUp = false;
   let pendingChildCancelUnsubscribe = (): void => {};
   pi.on?.("session_shutdown", async () => {
     if (lifecycleProbeCleanedUp) return;
     lifecycleProbeCleanedUp = true;
     const settlements: Promise<void>[] = [];
+    for (const pending of checkpointAdmissions.values()) {
+      pending.controller.abort(new Error("Checkpoint preparation cancelled: session is closing."));
+      settlements.push(pending.settled);
+    }
     for (const [teamName, queue] of queuedReadSpawnsByTeam) {
       for (const queued of queue) {
         const removed = removeQueuedReadSpawnById(teamName, queued.id);
@@ -438,7 +454,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     if (settlePendingAcceptance && removed.pendingChildAcceptance) {
       pendingChildController.settleAcceptance(removed.pendingChildAcceptance);
     }
-    if (settlePendingAcceptance) removed.groupSettlement = settleQueuedGroup(removed);
+    if (settlePendingAcceptance) {
+      cancelCheckpointAdmission(teamName, removed.member.name);
+      removed.groupSettlement = settleQueuedGroup(removed);
+    }
     return removed;
   }
 
@@ -450,7 +469,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     for (const queued of removed) {
       releaseNestedReadName(teamName, queued.member.name, queued.nameReservationId);
       if (queued.pendingChildAcceptance) pendingChildController.settleAcceptance(queued.pendingChildAcceptance);
-      queued.groupSettlement = settleQueuedGroup(queued);
+      const pending = cancelCheckpointAdmission(teamName, queued.member.name);
+      const group = settleQueuedGroup(queued);
+      queued.groupSettlement = pending ? Promise.all([pending, group]).then(() => {}) : group;
     }
     return removed;
   }
@@ -668,9 +689,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
           sessionContextReference = null;
         }
       }
+      const continuedPrompt = continuationPrompt(member.checkpointAssignment, prompt);
       const launchPrompt = sessionContextReference
-        ? `${prompt}${sessionContextReference.promptSuffix}`
-        : prompt;
+        ? `${continuedPrompt}${sessionContextReference.promptSuffix}`
+        : continuedPrompt;
       const removeReference = () => {
         try {
           removeSessionContextReference(sessionContextReference);
@@ -682,6 +704,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       try {
         if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
         assertPending?.();
+        if (member.checkpointAssignment?.parent) readCheckpoint(member.checkpointAssignment.parent.id);
         commitLaunch?.();
         const launch = options.runReadAgentInProcess(teamName, member, launchPrompt, ctx, options.readAgentOptions());
         return {
@@ -714,10 +737,21 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     releaseNameOnFailure = true,
     queuedAcceptance?: PendingChildAcceptance,
     assertPending?: () => void,
+    signal?: AbortSignal,
     commitLaunch?: () => void,
   ): Promise<boolean> {
     const key = options.readAgentKey(teamName, member.name);
+    if (checkpointAdmissions.has(key)) throw new Error(`Checkpoint admission for ${member.name} is already in progress.`);
     reserveReadAdmission(teamName, key, member.role || "read");
+    const controller = member.checkpointAssignment ? new AbortController() : undefined;
+    let settleCheckpoint = () => {};
+    if (controller) checkpointAdmissions.set(key, { controller, settled: new Promise<void>(resolve => { settleCheckpoint = resolve; }) });
+    const checkpointSignal = controller ? AbortSignal.any([controller.signal, AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]) : undefined;
+    const finishCheckpoint = () => {
+      if (controller && checkpointAdmissions.get(key)?.controller === controller) checkpointAdmissions.delete(key);
+      settleCheckpoint();
+    };
+    const assertAdmissionPending = () => { checkpointSignal?.throwIfAborted(); assertPending?.(); };
 
     const releaseNameReservation = () => {
       releaseNestedReadName(teamName, member.name, nameReservationId);
@@ -748,7 +782,15 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     };
 
     try {
-      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance, assertPending, commitLaunch);
+      if (member.checkpointAssignment && checkpointSignal) {
+        if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
+        assertAdmissionPending();
+        member.checkpointAssignment = await captureCheckpointAssignment(member.checkpointAssignment, member.cwd, checkpointSignal);
+      }
+      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance, assertAdmissionPending, () => {
+        finishCheckpoint();
+        commitLaunch?.();
+      });
       releaseNameReservation();
       void Promise.resolve(admitted.launch).then(
         () => drainAfterRun(admitted.pendingChildRun),
@@ -759,7 +801,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       settlePendingChild(queuedAcceptance);
       releaseReservationAndDrain();
       throw error;
-    }
+    } finally { finishCheckpoint(); }
   }
 
   async function enqueueReadSpawn(
@@ -769,7 +811,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     params: any,
     resolved: ReturnType<typeof resolveModel>,
     ctx: any,
-    nameReservationId?: string
+    nameReservationId?: string,
+    signal?: AbortSignal,
   ): Promise<QueuedReadSpawn> {
     const append = async (pendingChildAcceptance?: PendingChildAcceptance): Promise<QueuedReadSpawn> => {
       const queued: QueuedReadSpawn = {
@@ -782,6 +825,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         ctx,
         requestedAt: Date.now(),
         nameReservationId,
+        signal,
         pendingChildAcceptance,
       };
       if (member.completionGroup) {
@@ -852,7 +896,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
             if (activeAgentCount(teamName, role, true) >= capacity.maxConcurrent) continue;
             queued.member.joinedAt = Date.now();
             await startReadAgentMember(teamName, queued.member, queued.prompt, queued.ctx,
-              queued.nameReservationId, false, queued.pendingChildAcceptance, assertPending,
+              queued.nameReservationId, false, queued.pendingChildAcceptance, assertPending, queued.signal,
               () => { queued.launchCommitted = true; });
             removeQueuedReadSpawnById(teamName, queued.id, false);
             progressed = true;
@@ -941,6 +985,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   async function spawnTeammate(params: any, ctx: any, spawnOptions: SpawnTeammateOptions = {}): Promise<{ content: any[]; details: any }> {
+    const checkpointAssignment = createCheckpointAssignment(params.checkpoint, params.prompt, params.continue_from);
     const assignedChecks = normalizeCheckPolicy(params.checks);
     const repairPolicy = normalizeRepairPolicy(params.repair);
     if (repairPolicy && !assignedChecks?.length) throw new Error("Repair policy requires explicitly assigned checks.");
@@ -948,6 +993,15 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const safeTeamName = paths.sanitizeName(params.team_name);
     const cwd = params.cwd || ctx.cwd;
     const teamConfig = await teams.readConfig(safeTeamName);
+    if (checkpointAssignment?.parent) {
+      requireSpawnLevel(params, `Continuation ${safeName}`);
+      if (safeName.toLowerCase() === checkpointAssignment.parent.author.agentName.toLowerCase()
+        || teamConfig.members.some(member => member.name.toLowerCase() === safeName.toLowerCase())
+        || options.runningReadAgents.has(options.readAgentKey(safeTeamName, safeName)) || findQueuedReadSpawn(safeTeamName, { name: safeName })) {
+        throw new Error(`Continuation recipient ${safeName} is not unused; choose a new prefix and retry.`);
+      }
+      assertUnusedContinuationRecipient(safeTeamName, safeName);
+    }
     failedAdmissionsByTeam.set(safeTeamName, (failedAdmissionsByTeam.get(safeTeamName) ?? []).filter(item => item.member.name !== safeName));
     let nestedNameReservationId: string | undefined;
     let nestedNameReservationTransferred = false;
@@ -978,7 +1032,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     }
 
     try {
-    if (spawnOptions.once) {
+    if (spawnOptions.once && !checkpointAssignment?.parent) {
       const existingOnceMember = teamConfig.members.find(m => m.agentType === "teammate" && (m.name === safeName || memberMatchesOperation(m, params)));
       if (existingOnceMember) {
         return {
@@ -1017,6 +1071,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       }
     }
 
+    if (checkpointAdmissions.has(options.readAgentKey(safeTeamName, safeName)) && !findQueuedReadSpawn(safeTeamName, { name: safeName })) {
+      throw new Error(`Checkpoint admission for ${safeName} is already in progress.`);
+    }
     const existingMember = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
     if (existingMember) {
       const key = options.readAgentKey(safeTeamName, existingMember.name);
@@ -1089,6 +1146,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       planModeRequired: params.plan_mode_required,
       assignedChecks,
       repairPolicy,
+      checkpointAssignment,
       completionGroup: spawnOptions.completionGroup,
       metadata: operationMetadataFromParams(params),
       delegationDepth: spawnOptions.nestedParent ? 1 : 0,
@@ -1112,7 +1170,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       if (!capacity.queueOverflow) {
         throw new Error(`${role === "write" ? "Edit" : "Read"}-agent capacity reached (${activeCount}/${capacity.maxConcurrent}) and queueOverflow is disabled.`);
       }
-      const queued = await enqueueReadSpawn(safeTeamName, member, params.prompt, params, resolved, ctx, nestedNameReservationId);
+      const queued = await enqueueReadSpawn(safeTeamName, member, params.prompt, params, resolved, ctx, nestedNameReservationId, spawnOptions.signal);
       nestedNameReservationTransferred = !!nestedNameReservationId;
       const queuePosition = readQueue(safeTeamName).findIndex(item => item.id === queued.id) + 1;
       return {
@@ -1121,7 +1179,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       };
     }
 
-    const sessionContextAvailable = await startReadAgentMember(safeTeamName, member, params.prompt, ctx, nestedNameReservationId);
+    const sessionContextAvailable = await startReadAgentMember(safeTeamName, member, params.prompt, ctx, nestedNameReservationId, true, undefined, undefined, spawnOptions.signal);
     if (role === "write") {
       await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.success", {
         agentName: safeName, cwd, requestedRole: role, model: chosenModel,
@@ -1194,7 +1252,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         const safeTeamName = paths.sanitizeName(params.team_name);
         if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
         options.adoptTeamAsLead(safeTeamName, ctx);
-        const result = await spawnTeammate(params, ctx, {
+        const prepared = params.continue_from === undefined ? params : { ...params, name: freshContinuationName(params.name || "agent") };
+        const result = await spawnTeammate(prepared, ctx, {
           once: true,
           allowNestedReadAgents: params.allow_nested_read_agents === true,
         });
@@ -1226,6 +1285,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead session cwd." })),
     checks: Type.Optional(CheckPolicySchema),
     repair: Type.Optional(RepairPolicySchema),
+    checkpoint: Type.Optional(CheckpointPolicySchema),
+    continue_from: Type.Optional(Type.String({ description: "Continue this checkpoint as a fresh recipient/run with the current assignment and tier. name is a prefix, not a recipient to reuse." })),
     session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Optional filtered snapshot of the lead's active session branch. Use lazy only when omitted session history may materially affect the lane; the child reads it on demand rather than receiving transcript content in its prompt.", default: "none" })),
     metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
     allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Opt in eligible depth-0 write-feature/write-critical agents to restricted read-only child spawning.", default: false })),
@@ -1244,22 +1305,23 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     return `agent-${Date.now().toString(36)}${position}-${crypto.randomUUID().slice(0, 8)}`;
   }
 
-  function spawnPublicAgent(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
-    return withPublicScope(currentSessionAgentGroupName(ctx), () => spawnPublicAgentInScope(params, ctx));
+  function spawnPublicAgent(params: any, ctx: any, signal?: AbortSignal): Promise<{ content: any[]; details: any }> {
+    return withPublicScope(currentSessionAgentGroupName(ctx), () => spawnPublicAgentInScope(params, ctx, signal));
   }
 
-  async function spawnPublicAgentInScope(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
+  async function spawnPublicAgentInScope(params: any, ctx: any, signal?: AbortSignal): Promise<{ content: any[]; details: any }> {
     if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
     if (!ctx) throw new Error("No active Pi session context is available for spawn_agent.");
 
+    params = { ...params, checkpoint: createCheckpointAssignment(params.checkpoint, params.prompt, params.continue_from)?.policy };
+    const name = params.continue_from === undefined ? params.name || generatedAgentName() : freshContinuationName(params.name || "agent");
     const sessionDefaultModel = configuredFavoriteModelForSpawn(params, ctx);
     const sessionName = await ensureCurrentSessionAgentGroup(ctx, sessionDefaultModel);
-    const name = params.name || generatedAgentName();
     const result = await spawnTeammate({
       ...params,
       name,
       team_name: sessionName,
-    }, ctx, { allowNestedReadAgents: params.allow_nested_read_agents === true });
+    }, ctx, { allowNestedReadAgents: params.allow_nested_read_agents === true, signal });
 
     const outcome = result.details.queued
       ? `Agent ${name} queued at position ${result.details.queuePosition}.`
@@ -1389,7 +1451,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     description: "Spawn one agent by intent tier only. Configured favorites take priority; an unconfigured tier inherits the current lead model and thinking. Give it the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta rather than a context-free task. Use session_context=lazy only as an on-demand fallback when omitted session history may materially matter; it never replaces a good mission prompt. read-review is the normal read default; use read-collect for bounded fact gathering, read-analyze for connected explanation/root cause, and read-critical only for irreducible high-stakes reasoning. For edits, choose write-patch, write-feature, write-system, or the rare high-risk write-critical by scope and risk. After spawning, do not duplicate or take over its lane; work only on unrelated work, then end the turn so the automatic report can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
     parameters: Type.Object(publicAgentParams),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
-      return spawnPublicAgent(params, ctx);
+      return spawnPublicAgent(params, ctx, _signal);
     },
   });
 
@@ -1402,6 +1464,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         cwd: Type.Optional(Type.String()),
         checks: Type.Optional(CheckPolicySchema),
         repair: Type.Optional(RepairPolicySchema),
+        checkpoint: Type.Optional(CheckpointPolicySchema),
         model_slot: Type.Optional(StringEnum(ACCEPTED_FAVORITE_MODEL_SLOTS, { description: levelDescription })),
         metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
         session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Shared lazy session-reference policy.", default: "none" })),
@@ -1418,7 +1481,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       const groupPolicy = normalizeCompletionGroupPolicy(params.completion_group);
       const sessionId = getPiSessionId(ctx);
       if (groupPolicy && (!sessionId || !_toolCallId?.trim())) throw new Error("Completion groups require a bound session and runtime submission identity.");
-      const mergedAgents = params.agents.map((agent: any) => mergeSwarmAgentParams(params.defaults || {}, agent));
+      const mergedAgents = params.agents.map((agent: any, index: number) => {
+        const merged = mergeSwarmAgentParams(params.defaults || {}, agent);
+        merged.checkpoint = createCheckpointAssignment(merged.checkpoint, merged.prompt, merged.continue_from)?.policy;
+        if (merged.continue_from !== undefined) merged.name = freshContinuationName(merged.name || "agent", JSON.stringify([sessionId, _toolCallId, index, merged.continue_from]));
+        return merged;
+      });
       const defaultModel = configuredFavoriteModelForSpawn(mergedAgents[0], ctx, "spawn_swarm_agents");
       for (let index = 0; index < mergedAgents.length; index += 1) {
         configuredFavoriteModelForSpawn(mergedAgents[index], ctx, `spawn_swarm_agents agent ${mergedAgents[index].name || index + 1}`);
@@ -1460,7 +1528,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
             ...merged,
             name,
             team_name: sessionName,
-          }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index) });
+          }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index), signal: _signal });
           spawned.push({ ...result.details, name });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -1488,9 +1556,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     cancelQueuedAgent: (teamName, agentName) => {
       // Retain the entry for admission bookkeeping, but let active teardown own cancellation after launch commits.
       if (readQueue(teamName).some(queued => queued.member.name === agentName && queued.launchCommitted)) return false;
+      const pending = cancelCheckpointAdmission(teamName, agentName);
       const removed = removeQueuedReadSpawnsByName(teamName, agentName);
-      return removed.some(item => item.groupSettlement)
-        ? Promise.all(removed.map(item => item.groupSettlement)).then(() => removed.length > 0)
+      return pending || removed.some(item => item.groupSettlement)
+        ? Promise.all([pending, ...removed.map(item => item.groupSettlement)]).then(() => !!pending || removed.length > 0)
         : removed.length > 0;
     },
   };

@@ -97,6 +97,9 @@ export function createWriteAgentRuntime(options: WriteAgentRuntimeOptions) {
   }
 
   async function startWriteAgent(teamName: string, member: Member, prompt: string): Promise<string> {
+    if (["checkpoint", "checkpointAssignment", "continueFrom", "continue_from"].some(field => Reflect.get(member, field) !== undefined)) {
+      throw new Error("Checkpoint-enabled agents require in-process lead admission; legacy terminal startup is unsupported.");
+    }
     assertWriterUsesConfiguredLevel(member);
     if (!options.terminal) {
       throw new Error("pi-extended-teams requires running inside tmux for write agents.");

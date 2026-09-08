@@ -9,6 +9,7 @@ export const ReportedTaskDetailsSchema = Type.Object({
     Type.Literal("succeeded"), Type.Literal("blocked"), Type.Literal("failed"), Type.Literal("cancelled"),
   ], { description: "Reported task outcome, separate from clean exit, verification, and lead acceptance. Omit when unspecified." })),
   changedPaths: Type.Optional(Type.Array(reference)),
+  inspectedEvidence: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 2048, pattern: "\\S" }), { maxItems: 128 })),
   artifacts: Type.Optional(Type.Array(Type.Object({
     path: reference,
     label: Type.Optional(Type.String()),
@@ -30,6 +31,7 @@ export interface ReportResult extends ReportedTaskDetails {
   taskId: string;
   runId: string;
   reportId: string;
+  checkpointId?: string;
   verification: { state: VerificationState; checkIds?: string[]; error?: string };
   acceptance: { state: "pending" | "accepted" | "rejected"; decidedAt?: number; reason?: string };
   repair?: RepairResult;

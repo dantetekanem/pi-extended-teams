@@ -6,6 +6,7 @@ import type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, Think
 import type { FavoriteModelSlot } from "../utils/settings";
 import type { CheckDefinition } from "../results/check-policy";
 import type { RepairPolicy } from "../results/repair-policy";
+import type { CheckpointPolicyInput } from "../results/checkpoint-policy";
 import type { ObservedTeamReportEvent } from "../utils/report-events";
 
 export type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel, FavoriteModelSlot };
@@ -76,6 +77,8 @@ export interface SpawnTeammateOnceRequest extends OrchestrationOperationMetadata
   modelSlot: FavoriteModelSlot;
   checks?: CheckDefinition[];
   repair?: RepairPolicy;
+  checkpoint?: CheckpointPolicyInput;
+  continueFrom?: string;
   planModeRequired?: boolean;
   color?: string;
 }

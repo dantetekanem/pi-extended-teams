@@ -16,6 +16,8 @@ import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 import { VerificationController } from "../../src/results/verification-controller.js";
 import { CompletionGroup } from "../../src/results/completion-group.js";
 import { createReportResult } from "../../src/results/report-result.js";
+import * as checkpointSource from "../../src/results/source-identity";
+import * as checkpointStore from "../../src/results/specialist-checkpoint";
 
 let root: string;
 let teamsRoot: string;
@@ -35,6 +37,7 @@ function installPathSpies() {
   if (typeof (paths as any).reportFilesDir === "function") {
     vi.spyOn(paths as any, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
   }
+  vi.spyOn(paths, "checkpointFilesDir").mockReturnValue(path.join(fs.realpathSync(root), "checkpoints"));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: string, agentName: string) => {
     return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`);
   });
@@ -77,6 +80,46 @@ describe("coordination tools", () => {
     vi.restoreAllMocks();
     syncBuiltinESMExports();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["success", "storage-failure", "shutdown", "missing-before-shutdown"])("preserves legacy checkpoint reporting before claim release: %s", async mode => {
+    const failure = mode === "storage-failure";
+    vi.useFakeTimers(); vi.stubEnv("PI_LIFECYCLE_RUN_ID", "checkpoint-run");
+    const observed: checkpointSource.SourceIdentity = { version: 1, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fingerprint: "a".repeat(64), fileCount: 1 };
+    vi.spyOn(checkpointSource, "captureSourceIdentity").mockResolvedValue(observed);
+    const writer = member("writer", { lifecycleRunId: "checkpoint-run", modelSlot: "write-feature", prompt: "Review",
+      checkpointAssignment: { originalPrompt: "Review", policy: { inputs: ["src"], retentionDays: 30, decisions: [] }, sourceBefore: observed } });
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [member("team-lead"), writer] });
+    const tools = new Map<string, any>(); const handlers = new Map<string, () => Promise<void>>();
+    const release = vi.fn(async () => {
+      if (mode === "shutdown") {
+        await handlers.get("session_shutdown")!();
+        expect((await teams.readConfig("team")).members.some(item => item.lifecycleRunId === "checkpoint-run")).toBe(true);
+      }
+      return [] as string[];
+    });
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool), on: (event: string, handler: any) => handlers.set(event, handler) }, {
+      agentName: "writer", isTeammate: true, terminal: null, getTeamName: () => "team", requireWriteAgentTeam: async () => "team",
+      requireTeamContext: () => "team", releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+    });
+    if (failure) vi.spyOn(checkpointStore, "saveCheckpoint").mockRejectedValue(new Error("checkpoint failed"));
+    const execution = tools.get("report_and_exit").execute("report", { content: "Full legacy report", inspectedEvidence: ["src/auth.ts:4"] },
+      new AbortController().signal, undefined, { cwd: root, shutdown: vi.fn(), sessionManager: { getBranch: () => [] } });
+    if (failure) await expect(execution).rejects.toThrow("checkpoint failed"); else expect((await execution).details.accepted).toBe(true);
+    const [event] = await reportEvents.listTeamReportEvents("team");
+    expect(event.checkpoint?.draft).toBeDefined();
+    expect(fs.readFileSync(event.reportPath!, "utf8")).toBe("Full legacy report");
+    expect(release).toHaveBeenCalledTimes(failure ? 0 : 1);
+    if (!failure) {
+      expect(checkpointStore.readCheckpoint(event.checkpoint!.id).reportId).toBe(event.id);
+      if (mode === "missing-before-shutdown") fs.unlinkSync(event.reportPath!);
+      vi.mocked(checkpointSource.captureSourceIdentity).mockClear().mockRejectedValue(new Error("Source must not execute during cleanup"));
+      await handlers.get("session_shutdown")!();
+      expect(checkpointSource.captureSourceIdentity).not.toHaveBeenCalled();
+      expect((await teams.readConfig("team")).members.some(item => item.lifecycleRunId === "checkpoint-run")).toBe(mode === "missing-before-shutdown");
+    }
+    await vi.advanceTimersByTimeAsync(250);
   });
 
   it.each(["pending", "blocked", "suppressed", "delivery-failure", "missing-provenance"])("persists legacy group reports before compact delivery: %s", async mode => {

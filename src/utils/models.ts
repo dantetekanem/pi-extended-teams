@@ -3,6 +3,8 @@ import type { ReportResult } from "../results/report-result";
 import type { CheckDefinition } from "../results/check-policy";
 import type { RepairPolicy } from "../results/repair-policy";
 import type { CompletionGroupBinding } from "../results/completion-group";
+import type { CheckpointAssignment } from "../results/checkpoint-assignment";
+import type { SpecialistCheckpoint } from "../results/specialist-checkpoint";
 
 export const THINKING_LEVELS = THINKING_LEVEL_NAMES;
 export type ThinkingLevel = ThinkingLevelName;
@@ -24,6 +26,7 @@ export interface Member {
   planModeRequired?: boolean;
   assignedChecks?: CheckDefinition[];
   repairPolicy?: RepairPolicy;
+  checkpointAssignment?: CheckpointAssignment;
   completionGroup?: CompletionGroupBinding;
   backendType?: string;
   isActive?: boolean;
@@ -103,6 +106,7 @@ export interface TeamReportEvent {
   agentName: string;
   role?: string;
   status: "completed" | "failed";
+  checkpoint?: { id: string; draft?: SpecialistCheckpoint };
   completionGroup?: CompletionGroupBinding;
   result?: ReportResult;
   report: string;

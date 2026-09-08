@@ -65,8 +65,8 @@ describe("nested read-agent delivery lifecycle", () => {
 
 describe("nested selected-extension session shutdown", () => {
   it.each([
-    [true, "check"], [false, "check"], [true, "operation"], [false, "operation"],
-  ] as const)("keeps verification work quarantined until raw settlement (session=%s, kind=%s)", async (hasSession, kind) => {
+    [true, "check"], [false, "check"], [true, "operation"], [false, "operation"], [true, "checkpoint"], [false, "checkpoint"],
+  ] as const)("keeps owned work quarantined until raw settlement (session=%s, kind=%s)", async (hasSession, kind) => {
     vi.useFakeTimers();
     const { session } = makeSession();
     const command = deferred();
@@ -74,11 +74,11 @@ describe("nested selected-extension session shutdown", () => {
     const finalize = vi.fn(async () => {});
     const state: ManagedReadAgentLifecycleState = {
       session: hasSession ? session : undefined,
-      ...(kind === "check" ? { checkOperation: { controller, settled: command.promise } } : { activeOperationSettlementPromise: command.promise }),
+      ...(kind === "operation" ? { activeOperationSettlementPromise: command.promise } : { [kind === "check" ? "checkOperation" : "checkpointOperation"]: { controller, settled: command.promise } }),
     };
     const shutdown = requestReadAgentTeardown(state, { closePersistence: async () => {}, finalize });
     await vi.advanceTimersByTimeAsync(NESTED_SESSION_TEARDOWN_TIMEOUT_MS);
-    expect(controller.signal.aborted).toBe(kind === "check");
+    expect(controller.signal.aborted).toBe(kind !== "operation");
     await expect(shutdown).resolves.toMatchObject({ status: "timed_out", finalized: false, dispose: "deferred" });
     expect(finalize).not.toHaveBeenCalled();
     expect(session.dispose).not.toHaveBeenCalled();

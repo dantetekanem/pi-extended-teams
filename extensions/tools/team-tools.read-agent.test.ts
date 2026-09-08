@@ -21,6 +21,10 @@ import { CompletionGroup, type CompletionGroupState } from "../../src/results/co
 import { appendTeamReportEvent } from "../../src/utils/report-events.js";
 import * as locks from "../../src/utils/lock.js";
 import { createReportResult } from "../../src/results/report-result.js";
+import * as sourceIdentity from "../../src/results/source-identity.js";
+import { checkpointId, checkpointPath, retireCheckpoint, saveCheckpoint, type SpecialistCheckpoint } from "../../src/results/specialist-checkpoint";
+import { claimFiles } from "../../src/utils/claims";
+import * as continuationRecipients from "../../src/results/continuation-recipient";
 
 type RegisteredTool = {
   name: string;
@@ -41,9 +45,11 @@ function installPathSpies() {
   vi.spyOn(paths, "claimsPath").mockImplementation(teamName => path.join(teamsRoot, paths.sanitizeName(teamName), "claims.json"));
   vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName, agentName) => path.join(teamsRoot, paths.sanitizeName(teamName), "runtime", `${paths.sanitizeName(agentName)}.json`));
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "write-queue.json"));
+  vi.spyOn(paths, "readHelperQueuePath").mockImplementation(teamName => path.join(teamsRoot, paths.sanitizeName(teamName), "read-queue.json"));
   vi.spyOn(paths, "leadSessionPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lead-session.json"));
   vi.spyOn(paths, "reportEventsPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "reports.json"));
   vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "reports"));
+  vi.spyOn(paths, "checkpointFilesDir").mockReturnValue(path.join(fs.realpathSync(root), "checkpoints"));
   vi.spyOn(paths, "sessionContextReferencePath").mockImplementation((teamName: unknown, agentName: unknown, lifecycleRunId: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "session-context", `${paths.sanitizeName(String(agentName))}--${paths.sanitizeName(String(lifecycleRunId))}.md`));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`));
 }
@@ -87,6 +93,20 @@ function makeCtx() {
       find: vi.fn(() => ({ provider: "provider", id: "model" })),
     },
   };
+}
+
+function checkpointSource(fingerprint = "a".repeat(64)): sourceIdentity.SourceIdentity {
+  return { version: 1, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fingerprint, fileCount: 2 };
+}
+
+async function savedContinuation(): Promise<SpecialistCheckpoint> {
+  const author = { teamName: "past-team", agentName: "original", runId: "previous-run", modelSlot: "read-review" as const };
+  const now = Date.now(); const reportId = "report:past-team:original:previous-run";
+  const saved: SpecialistCheckpoint = { version: 1, state: "ready", id: checkpointId(author), author, createdAt: now, expiresAt: now + 30 * 86_400_000,
+    assignment: { original: "Review authentication", current: "Earlier task" }, policy: { inputs: ["src"], retentionDays: 30, decisions: ["Old choice"] },
+    reportId, reports: [{ id: reportId, path: path.join(root, "old-report.md"), source: { before: checkpointSource(), after: checkpointSource() }, verification: "passed", acceptance: "accepted" }],
+    findings: [{ id: "F1", text: "Tenant boundary", evidence: ["src/auth.ts:4"], reportId }], questions: [], inspectedEvidence: [] };
+  await saveCheckpoint(saved); return saved;
 }
 
 function makeRunningAgent(teamName: string, member: Member): RunningReadAgent {
@@ -225,6 +245,97 @@ async function admitNestedReadParent(
 }
 
 describe("public agent spawn tools", () => {
+  it.each(["single", "single-writer", "swarm", "trusted"])("continues with fresh identity and current authority through %s", async mode => {
+    writeFavoriteLevels(); const saved = await savedContinuation();
+    vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(checkpointSource());
+    const harness = registerTools(); const ctx = makeCtx(); const team = "session-test-session";
+    await harness.tools.get("spawn_agent")!.execute("original", { name: "original", model_slot: "write-feature", prompt: "Other active work", metadata: { operationId: "same-operation" } }, new AbortController().signal, undefined, ctx);
+    const old = (await teams.readConfig(team)).members.find(member => member.name === "original")!;
+    const inbox = paths.inboxPath(team, old.name); fs.mkdirSync(path.dirname(inbox), { recursive: true }); fs.writeFileSync(inbox, "old mailbox");
+    fs.writeFileSync(paths.claimsPath(team), JSON.stringify({ "src/auth.ts": { agent: old.name, path: "src/auth.ts", since: 1 } }));
+    const params = { name: "original", model_slot: mode === "single-writer" ? "write-feature" : "read-analyze", prompt: "Recheck my fixes", continue_from: saved.id,
+      checks: [{ name: "current", command: "current check", timeoutSeconds: 1 }], repair: { maxAttempts: 0 }, operation_id: "same-operation" };
+    if (mode === "trusted") await harness.emitAsync("pi-extended-teams:orchestration-request", { requestId: "continue", type: "spawn_teammate_once", params: { ...params, team_name: team }, ctx });
+    else await harness.tools.get(mode === "swarm" ? "spawn_swarm_agents" : "spawn_agent")!.execute("continue", mode === "swarm" ? { completion_group: { delivery: "all-settled" }, agents: [params] } : params, new AbortController().signal, undefined, ctx);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2);
+    const [, next, prompt] = harness.runReadAgentInProcess.mock.calls[1];
+    expect(next.name).toMatch(/^original-[a-f0-9-]+$/); expect(next.name).not.toBe(old.name);
+    expect(next.lifecycleRunId).not.toBe(old.lifecycleRunId);
+    expect(next).toMatchObject({ modelSlot: params.model_slot, role: mode === "single-writer" ? "write" : "read", prompt: params.prompt, assignedChecks: params.checks, repairPolicy: undefined,
+      checkpointAssignment: { originalPrompt: saved.assignment.original, parent: saved, policy: { inputs: ["src"], retentionDays: 30, decisions: [] } } });
+    expect(prompt).toContain(saved.id); expect(prompt.endsWith(params.prompt)).toBe(true);
+    expect(fs.readFileSync(inbox, "utf8")).toBe("old mailbox");
+    expect(JSON.parse(fs.readFileSync(paths.claimsPath(team), "utf8"))["src/auth.ts"].agent).toBe(old.name);
+    expect(await claimFiles(team, next.name, ["src/auth.ts"])).toEqual({ granted: [], conflicts: [{ path: "src/auth.ts", heldBy: old.name }] });
+    await claimFiles(team, next.name, ["src/fix.ts"]);
+    expect(JSON.parse(fs.readFileSync(paths.claimsPath(team), "utf8"))["src/fix.ts"].agent).toBe(next.name);
+    expect(harness.shutdownTeammate).not.toHaveBeenCalled();
+    if (mode === "swarm") {
+      await harness.tools.get("spawn_swarm_agents")!.execute("continue", { completion_group: { delivery: "all-settled" }, agents: [params] }, new AbortController().signal, undefined, ctx);
+      expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it.each(["before", "during-capture"])("rejects continuation mailbox collisions %s admission", async timing => {
+    writeFavoriteLevels(); const saved = await savedContinuation(); const harness = registerTools(); const ctx = makeCtx();
+    await harness.tools.get("spawn_agent")!.execute("blocker", { name: "blocker", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, ctx);
+    vi.spyOn(continuationRecipients, "freshContinuationName").mockReturnValue("collision");
+    const inbox = paths.inboxPath("session-test-session", "collision");
+    const retain = () => { fs.mkdirSync(path.dirname(inbox), { recursive: true }); fs.writeFileSync(inbox, "retained"); };
+    if (timing === "before") retain();
+    vi.spyOn(sourceIdentity, "captureSourceIdentity").mockImplementation(async () => { retain(); return checkpointSource(); });
+    await expect(harness.tools.get("spawn_agent")!.execute("continue", { name: "original", prompt: "Recheck", model_slot: "read-review", continue_from: saved.id }, new AbortController().signal, undefined, ctx)).rejects.toThrow(/unused|continuation/i);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledOnce(); expect(harness.shutdownTeammate).not.toHaveBeenCalled();
+    expect(fs.readFileSync(inbox, "utf8")).toBe("retained");
+  });
+
+  it.each(["missing", "deleted", "expired", "corrupt", "incompatible"])("isolates %s continuation records from ordinary admission", async mode => {
+    writeFavoriteLevels(); const saved = await savedContinuation(); const file = checkpointPath(saved.id);
+    if (mode === "missing") fs.unlinkSync(file);
+    if (mode === "deleted") await retireCheckpoint(saved.id, "deleted");
+    if (mode === "expired") fs.writeFileSync(file, JSON.stringify({ ...saved, createdAt: saved.createdAt - 31 * 86_400_000, expiresAt: saved.expiresAt - 31 * 86_400_000 }));
+    if (mode === "corrupt") fs.writeFileSync(file, "{corrupt");
+    if (mode === "incompatible") fs.writeFileSync(file, JSON.stringify({ ...saved, version: 2 }));
+    const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity"); const harness = registerTools(); const ctx = makeCtx(); const tool = harness.tools.get("spawn_agent")!;
+    await expect(tool.execute("continue", { name: "original", prompt: "Recheck", model_slot: "read-review", continue_from: saved.id }, new AbortController().signal, undefined, ctx)).rejects.toThrow(/checkpoint.*(unavailable|deleted|expired|corrupt|incompatible)/i);
+    expect(teams.teamExists("session-test-session")).toBe(false); expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+    await tool.execute("ordinary", { name: "ordinary", prompt: "Work", model_slot: "read-review", metadata: { continue_from: saved.id } }, new AbortController().signal, undefined, ctx);
+    const [, member, prompt] = harness.runReadAgentInProcess.mock.calls[0];
+    expect(member.checkpointAssignment).toBeUndefined(); expect(prompt).toBe("Work");
+    expect(capture).not.toHaveBeenCalled(); expect(ctx.sessionManager.buildContextEntries).not.toHaveBeenCalled();
+  });
+
+  it.each(["deleted", "cancelled"])("drains past a %s queued continuation without source work or execution", async mode => {
+    writeFavoriteLevels(); writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const saved = await savedContinuation(); const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(checkpointSource());
+    const harness = registerTools(); const ctx = makeCtx(); const tool = harness.tools.get("spawn_agent")!; const controller = new AbortController();
+    await tool.execute("blocker", { name: "blocker", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, ctx);
+    vi.spyOn(continuationRecipients, "freshContinuationName").mockReturnValue("successor");
+    await tool.execute("continue", { name: "original", prompt: "Recheck", model_slot: "read-review", continue_from: saved.id }, controller.signal, undefined, ctx);
+    if (mode === "deleted") await retireCheckpoint(saved.id, "deleted"); else controller.abort();
+    await tool.execute("next", { name: "next", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, ctx);
+    let launched!: (member: Member) => void; const started = new Promise<Member>(resolve => { launched = resolve; });
+    harness.runReadAgentInProcess.mockImplementationOnce((_team, member) => { launched(member); return new Promise<void>(() => {}); });
+    harness.completions.get("blocker")!(); expect((await started).name).toBe("next");
+    expect(capture).not.toHaveBeenCalled(); expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2);
+    expect((await teams.readConfig("session-test-session")).members.some(member => member.name === "successor")).toBe(false);
+  });
+
+  it("revalidates continuation source after queue delay", async () => {
+    writeFavoriteLevels(); writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const saved = await savedContinuation(); const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(checkpointSource());
+    const harness = registerTools(); const ctx = makeCtx(); const tool = harness.tools.get("spawn_agent")!;
+    await tool.execute("blocker", { name: "blocker", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, ctx);
+    const queued = await tool.execute("continue", { name: "original", prompt: "Recheck", model_slot: "read-review", continue_from: saved.id }, new AbortController().signal, undefined, ctx);
+    expect(queued.details.queued).toBe(true); expect(capture).not.toHaveBeenCalled();
+    capture.mockResolvedValue(checkpointSource("b".repeat(64)));
+    let launched!: (member: Member) => void; const started = new Promise<Member>(resolve => { launched = resolve; });
+    harness.runReadAgentInProcess.mockImplementationOnce((_team, member) => { launched(member); return new Promise<void>(() => {}); });
+    harness.completions.get("blocker")!(); const next = await started;
+    expect(next.checkpointAssignment?.sourceBefore?.fingerprint).toBe("b".repeat(64));
+    expect(next.checkpointAssignment?.revalidation).toEqual([expect.objectContaining({ reportId: saved.reportId, required: true })]);
+  });
+
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-public-agents-"));
     teamsRoot = path.join(root, "teams");
@@ -532,6 +643,191 @@ describe("public agent spawn tools", () => {
     expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["read-review", "write-feature"])("captures checkpoint assignments for an admitted %s run", async model_slot => {
+    writeFavoriteLevels();
+    const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(checkpointSource());
+    const { tools, runReadAgentInProcess } = registerTools();
+    const checkpoint = { inputs: ["src"], decisions: ["Keep anonymous requests denied."] };
+    const result = await tools.get("spawn_agent")!.execute("checkpoint", {
+      name: "specialist", prompt: "Review authentication.", model_slot, checkpoint,
+    }, new AbortController().signal, undefined, makeCtx());
+    checkpoint.inputs.push("other");
+    expect(capture).toHaveBeenCalledWith(root, ["src"], expect.any(AbortSignal));
+    const member = runReadAgentInProcess.mock.calls[0][1];
+    expect(member.lifecycleRunId).toBeTruthy();
+    expect(member.checkpointAssignment).toEqual({ originalPrompt: "Review authentication.",
+      policy: { inputs: ["src"], decisions: ["Keep anonymous requests denied."], retentionDays: 30 }, sourceBefore: checkpointSource() });
+    const stored = (await teams.readConfig(result.details.session)).members.find(item => item.name === "specialist");
+    expect(stored?.lifecycleRunId).toBe(member.lifecycleRunId);
+    expect(stored?.checkpointAssignment).toEqual(member.checkpointAssignment);
+  });
+
+  it("does not infer checkpoint authority from metadata or create default checkpoint storage", async () => {
+    writeFavoriteLevels();
+    const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity");
+    const { tools, runReadAgentInProcess } = registerTools();
+    await tools.get("spawn_agent")!.execute("ordinary", {
+      name: "ordinary", prompt: "Work", model_slot: "read-review", metadata: { checkpointAssignment: { policy: { inputs: ["src"] } } },
+    }, new AbortController().signal, undefined, makeCtx());
+    expect(runReadAgentInProcess.mock.calls[0][1].checkpointAssignment).toBeUndefined();
+    expect(capture).not.toHaveBeenCalled();
+    expect(fs.existsSync(paths.checkpointFilesDir())).toBe(false);
+  });
+
+  it.each([{ inputs: [] }, { inputs: ["../outside"] }])("rejects invalid checkpoint policy before replacing a run: %j", async checkpoint => {
+    writeFavoriteLevels();
+    const { tools, shutdownTeammate, runReadAgentInProcess } = registerTools();
+    const spawn = tools.get("spawn_agent")!;
+    await spawn.execute("original", { name: "same", prompt: "Original", model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+    await expect(spawn.execute("invalid", { name: "same", prompt: "New", model_slot: "read-review", checkpoint },
+      new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/checkpoint/i);
+    expect(shutdownTeammate).not.toHaveBeenCalled();
+    expect(runReadAgentInProcess).toHaveBeenCalledOnce();
+  });
+
+  it.each(["blank", "oversized"])("rejects a %s checkpoint assignment before creating a team", async condition => {
+    writeFavoriteLevels();
+    const { tools } = registerTools();
+    await expect(tools.get("spawn_agent")!.execute("invalid-assignment", { name: "invalid", model_slot: "read-review",
+      prompt: condition === "blank" ? " " : "x".repeat(16_385), checkpoint: { inputs: ["src"] } },
+    new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/checkpoint assignment/i);
+    expect(teams.teamExists("session-test-session")).toBe(false);
+  });
+
+  it("inherits isolated checkpoint policies across a swarm with explicit overrides", async () => {
+    writeFavoriteLevels();
+    vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(checkpointSource());
+    const { tools, runReadAgentInProcess } = registerTools();
+    const checkpoint = { inputs: ["src"], retentionDays: 7 };
+    await tools.get("spawn_swarm_agents")!.execute("checkpoint-swarm", {
+      defaults: { model_slot: "read-review", checkpoint }, agents: [
+        { name: "one", prompt: "First" }, { name: "two", prompt: "Second", checkpoint: { inputs: ["src"], retentionDays: 2 } },
+      ],
+    }, new AbortController().signal, undefined, makeCtx());
+    checkpoint.retentionDays = 365;
+    expect(runReadAgentInProcess.mock.calls.map(([, member]) => member.checkpointAssignment?.policy.retentionDays)).toEqual([7, 2]);
+    expect(runReadAgentInProcess.mock.calls.map(([, member]) => member.checkpointAssignment?.originalPrompt)).toEqual(["First", "Second"]);
+  });
+
+  it("captures checkpoint source when queued work launches, not when it is queued", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(checkpointSource());
+    const harness = registerTools();
+    const spawn = harness.tools.get("spawn_agent")!;
+    await spawn.execute("busy", { name: "busy", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+    const checkpoint = { inputs: ["src"] };
+    const queued = await spawn.execute("queued", { name: "queued", prompt: "Review", model_slot: "read-review", checkpoint },
+      new AbortController().signal, undefined, makeCtx());
+    expect(queued.details.queued).toBe(true);
+    expect(capture).not.toHaveBeenCalled();
+    checkpoint.inputs.push("other");
+    capture.mockResolvedValue(checkpointSource("b".repeat(64)));
+    harness.completions.get("busy")!();
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    await harness.shutdown();
+    expect(capture).toHaveBeenCalledWith(root, ["src"], expect.any(AbortSignal));
+    expect(harness.runReadAgentInProcess.mock.calls[1][1].checkpointAssignment?.sourceBefore?.fingerprint).toBe("b".repeat(64));
+  });
+
+  it.each(["shutdown", "tool", "stop"])("cancels checkpoint preparation on %s without a late launch", async reason => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    const controller = new AbortController();
+    let entered!: () => void;
+    let release = () => {};
+    let sourceSignal: AbortSignal | undefined;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(sourceIdentity, "captureSourceIdentity").mockImplementation((_cwd, _inputs, signal) => {
+      sourceSignal = signal;
+      entered();
+      return new Promise((resolve, reject) => {
+        release = () => resolve(checkpointSource());
+        signal?.addEventListener("abort", () => reject(new Error("Checkpoint preparation cancelled")), { once: true });
+      });
+    });
+    const pending = harness.tools.get("spawn_agent")!.execute("preparing", {
+      name: "preparing", prompt: "Review", model_slot: "read-review", checkpoint: { inputs: ["src"] },
+    }, controller.signal, undefined, makeCtx()).then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+    try {
+      expect(await Promise.race([started.then(() => true), pending.then(() => false)])).toBe(true);
+      if (reason === "shutdown") await harness.shutdown();
+      else if (reason === "tool") controller.abort();
+      else expect(await harness.teamToolsRuntime.cancelQueuedAgent("session-test-session", "preparing")).toBe(true);
+      expect(sourceSignal?.aborted).toBe(true);
+      expect((await pending).error).toBeDefined();
+      expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+      expect((await teams.readConfig("session-test-session")).members.map(member => member.name)).toEqual(["team-lead"]);
+    } finally { release(); await pending; await harness.shutdown(); }
+  });
+
+  it("keeps queued checkpoint cancellation authoritative after a late source result", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    let entered!: () => void;
+    let release!: (source: sourceIdentity.SourceIdentity) => void;
+    let signal: AbortSignal | undefined;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(sourceIdentity, "captureSourceIdentity").mockImplementation((_cwd, _inputs, capturedSignal) => {
+      signal = capturedSignal; entered(); return new Promise(resolve => { release = resolve; });
+    });
+    const spawn = harness.tools.get("spawn_agent")!;
+    await spawn.execute("busy", { name: "busy", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+    await spawn.execute("queued", { name: "queued", prompt: "Review", model_slot: "read-review", checkpoint: { inputs: ["src"] } },
+      new AbortController().signal, undefined, makeCtx());
+    harness.completions.get("busy")!();
+    await started;
+    const cancelled = harness.teamToolsRuntime.cancelQueuedAgent("session-test-session", "queued");
+    expect(signal?.aborted).toBe(true);
+    release(checkpointSource());
+    expect(await cancelled).toBe(true);
+    await harness.shutdown();
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledOnce();
+    expect((await teams.readConfig("session-test-session")).members.map(member => member.name)).toEqual(["team-lead"]);
+  });
+
+  it("releases checkpoint admission capacity when source capture fails", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: false } });
+    vi.spyOn(sourceIdentity, "captureSourceIdentity").mockRejectedValue(new Error("source moved"));
+    const { tools, runReadAgentInProcess } = registerTools();
+    const spawn = tools.get("spawn_agent")!;
+    const request = { name: "same", prompt: "Review", model_slot: "read-review" };
+    await expect(spawn.execute("failed", { ...request, checkpoint: { inputs: ["src"] } }, new AbortController().signal, undefined, makeCtx()))
+      .rejects.toThrow("source moved");
+    const result = await spawn.execute("retry", request, new AbortController().signal, undefined, makeCtx());
+    expect(result.details.queued).toBe(false);
+    expect(runReadAgentInProcess).toHaveBeenCalledOnce();
+  });
+
+  it("reserves the recipient while its checkpoint source is being captured", async () => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess, shutdownTeammate } = registerTools();
+    const spawn = tools.get("spawn_agent")!;
+    const request = { name: "same", prompt: "Review", model_slot: "read-review" };
+    vi.spyOn(sourceIdentity, "captureSourceIdentity").mockImplementation(async () => {
+      await expect(spawn.execute("collision", request, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/admission.*in progress/i);
+      return checkpointSource();
+    });
+    await spawn.execute("first", { ...request, checkpoint: { inputs: ["src"] } }, new AbortController().signal, undefined, makeCtx());
+    expect(runReadAgentInProcess).toHaveBeenCalledOnce();
+    expect(shutdownTeammate).not.toHaveBeenCalled();
+  });
+
+  it("routes trusted checkpoint admission through the same in-process assignment owner", async () => {
+    writeFavoriteLevels();
+    vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(checkpointSource());
+    teams.createTeam("session-test-session", "test-session", "lead", "", "provider/model");
+    const harness = registerTools();
+    await harness.emitAsync("pi-extended-teams:orchestration-request", { requestId: "trusted", type: "spawn_teammate_once",
+      params: { team_name: "session-test-session", name: "trusted", prompt: "Review", model_slot: "reading-default",
+        checkpoint: { inputs: ["src"] }, checks: [{ name: "tests", command: "check", timeoutSeconds: 2 }], repair: { maxAttempts: 1 } } });
+    expect(harness.piEventEmit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response", expect.objectContaining({ ok: true }));
+    expect(harness.runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ modelSlot: "read-review", assignedChecks: [{ name: "tests" }],
+      repairPolicy: { maxAttempts: 1 }, checkpointAssignment: { originalPrompt: "Review", sourceBefore: checkpointSource() } });
+  });
+
   it("binds only explicit lead check and repair policies to the admitted run", async () => {
     writeFavoriteLevels();
     const { tools, runReadAgentInProcess } = registerTools();
@@ -605,6 +901,7 @@ describe("public agent spawn tools", () => {
   it.each([
     { checks: [{ name: "tests", command: "unauthorized command", timeoutSeconds: 2 }] },
     { repair: { maxAttempts: 1 } },
+    { checkpoint: { inputs: ["src"] } },
   ])("refuses verification authority through a nested child's spawn tool: %j", async forbidden => {
     writeFavoriteLevels();
     const harness = registerTools();
@@ -614,7 +911,7 @@ describe("public agent spawn tools", () => {
     }).find(tool => tool.name === "spawn_agent")!;
     await expect(nested.execute("child", {
       name: "child", prompt: "Inspect", model_slot: "read-review", ...forbidden,
-    })).rejects.toThrow(/checks|repair/);
+    })).rejects.toThrow(/checks|repair|checkpoint/);
     expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
   });
 

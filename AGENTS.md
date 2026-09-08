@@ -59,6 +59,8 @@ For independent checks, use a batch with a bounded question per agent. For a pla
 
 Edit agents claim paths before changes and release their own claims when finished. Claims coordinate cooperative agents; they are not access control. Report changed paths and the exact checks run, including failures and unverified limits. The lead verifies acceptance before marking work complete.
 
+Only the lead or a trusted integration can assign `checks` and an optional `repair: { maxAttempts: 1 }` policy. Repair allows at most five additional attempts and is disabled by default. If `report_and_exit` returns an unaccepted `repairRequest`, remain active and resubmit after addressing the observed failure within the same scope and permissions. Keep or reacquire claims before repair edits; report blocked or failed when repair is unsafe. Verification, effective repair blockers, reported outcomes, and lead acceptance remain separate. Unresolved execution or persistence keeps cleanup fenced.
+
 ## Status, queues, and recovery
 
 `get_agent_status` is read-only. It distinguishes current-run activity from lifecycle health and retains persisted quarantine even when the process is gone. Old-run heartbeats do not establish replacement-run health. Observation does not clean up agents.

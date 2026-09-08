@@ -6,6 +6,7 @@ import { Value } from "@sinclair/typebox/value";
 import * as paths from "../utils/paths";
 import { withLock } from "../utils/lock";
 import { sameTestedSource, SourceIdentitySchema } from "./source-identity";
+import { syncPathAndParents, writeJsonDurably } from "./durable-json";
 
 const text = Type.String({ minLength: 1, pattern: "\\S" });
 export const AssignedCheckSchema = Type.Object({
@@ -46,7 +47,7 @@ export function checkIdentity(assignment: Pick<AssignedCheck, "reportId" | "name
   ])).digest("hex")}`;
 }
 
-function assignmentBinding(assignment: AssignedCheck): string {
+export function assignmentBinding(assignment: AssignedCheck): string {
   return JSON.stringify([
     assignment.taskId, assignment.runId, assignment.reportId, assignment.name, assignment.command,
     assignment.cwd, assignment.timeoutSeconds, assignment.attempt, assignment.inputs ?? null,
@@ -69,32 +70,6 @@ function parseRecord(value: unknown): CheckRecord {
     throw new Error("A passed check requires successful execution and matching source evidence.");
   }
   return structuredClone(value);
-}
-
-function syncPath(file: string): void {
-  const descriptor = fs.openSync(file, "r");
-  try { fs.fsyncSync(descriptor); }
-  finally { fs.closeSync(descriptor); }
-}
-
-function syncPathAndParents(file: string): void {
-  for (let current = file; ; current = path.dirname(current)) {
-    syncPath(current);
-    if (path.dirname(current) === current) return;
-  }
-}
-
-function writeRecordDurably(file: string, record: CheckRecord): void {
-  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomUUID()}.tmp`);
-  try {
-    fs.writeFileSync(temporary, JSON.stringify(record, null, 2), { flag: "wx", mode: 0o600 });
-    syncPath(temporary);
-    fs.renameSync(temporary, file);
-    syncPathAndParents(path.dirname(file));
-  } catch (error) {
-    try { fs.unlinkSync(temporary); } catch {}
-    throw error;
-  }
 }
 
 export class CheckJournal {
@@ -144,7 +119,7 @@ export class CheckJournal {
         version: 1, checkId, claimToken: crypto.randomUUID(), assignment, state: "claimed",
         startedAt: Date.now(), logPath: file.replace(/\.json$/, ".log"), logBytes: 0,
       });
-      writeRecordDurably(file, record);
+      writeJsonDurably(file, record);
       return { claimed: true, record: structuredClone(record) };
     });
   }
@@ -167,7 +142,7 @@ export class CheckJournal {
         claimToken: existing.claimToken, assignment: existing.assignment,
         startedAt: existing.startedAt, logPath: existing.logPath,
       });
-      writeRecordDurably(file, record);
+      writeJsonDurably(file, record);
       return structuredClone(record);
     });
   }

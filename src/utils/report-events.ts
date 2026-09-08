@@ -5,7 +5,7 @@ import { TeamReportEvent } from "./models";
 import * as paths from "./paths";
 import { withLock } from "./lock";
 import { writeJsonAtomic } from "./atomic-json";
-import { readCheckEvidence } from "../results/check-policy";
+import { VerificationController } from "../results/verification-controller";
 import type { CheckRecord } from "../results/check-journal";
 
 export type ObservedTeamReportEvent = TeamReportEvent & { checks?: CheckRecord[] };
@@ -237,6 +237,14 @@ export async function recordReportAcceptance(
   });
 }
 
+export async function readStoredTeamReportEvent(teamName: string, reportId: string): Promise<TeamReportEvent | undefined> {
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => {
+    const event = readEventsCache(p).byId.get(reportId);
+    return event ? cloneTeamReportEvent(event) : undefined;
+  });
+}
+
 export async function listTeamReportEvents(
   teamName: string,
   options: ListTeamReportEventsOptions = {}
@@ -244,10 +252,11 @@ export async function listTeamReportEvents(
   const p = ensureReportEventsFile(teamName);
   const events = await withLock(p, async () => selectEvents(readEventsCache(p), options));
   return Promise.all(events.map(async event => {
-    if (!event.result || event.result.verification?.state === "not-requested") return event;
+    if (!event.result) return event;
     try {
-      const evidence = await readCheckEvidence(teamName, event.result);
-      return { ...event, result: { ...event.result, verification: evidence.verification }, checks: evidence.checks };
+      const observed = await VerificationController.observe(teamName, event.result);
+      return { ...event, result: observed.result,
+        ...(observed.result.verification.state !== "not-requested" ? { checks: observed.checks } : {}) };
     } catch (error) {
       return { ...event, result: { ...event.result, verification: {
         state: "failed" as const, error: error instanceof Error ? error.message : String(error),

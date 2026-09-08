@@ -8,10 +8,12 @@ import { registerCoordinationTools } from "./coordination-tools.js";
 import { registerExtensionEvents } from "../events/register-events.js";
 import * as paths from "../../src/utils/paths.js";
 import * as runtime from "../../src/utils/runtime.js";
+import * as teams from "../../src/utils/teams.js";
 import * as messaging from "../../src/utils/messaging.js";
 import * as reportEvents from "../../src/utils/report-events.js";
 import type { Member, TeamConfig } from "../../src/utils/models.js";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
+import { VerificationController } from "../../src/results/verification-controller.js";
 
 let root: string;
 let teamsRoot: string;
@@ -135,6 +137,190 @@ describe("coordination tools", () => {
     await expect(tools.get("report_and_exit").execute("blank", { content: "   " }, undefined, undefined, { shutdown: vi.fn() }))
       .rejects.toThrow("must not be empty");
     expect(await readLifecycleTombstone(teamName, "reader")).toEqual({ status: "absent" });
+  });
+
+  function setupLegacyRepair() {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", "repair-run");
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    const input = path.join(cwd, "input.ts");
+    fs.writeFileSync(input, "broken");
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [
+      member("team-lead"), member("writer", { cwd, lifecycleRunId: "repair-run",
+        assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }], repairPolicy: { maxAttempts: 1 } }),
+    ] });
+    const tools = new Map<string, any>();
+    const events = new Map<string, (...args: any[]) => Promise<void>>();
+    const release = vi.fn(async () => [] as string[]);
+    const exec = vi.fn(async () => ({ exitCode: fs.readFileSync(input, "utf8") === "fixed" ? 0 : 1 }));
+    const send = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool),
+      on: (name: string, handler: (...args: any[]) => Promise<void>) => events.set(name, handler) }, {
+      agentName: "writer", isTeammate: true, terminal: null, getTeamName: () => "team",
+      requireWriteAgentTeam: async () => "team", requireTeamContext: () => "team",
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+      loadCheckOperations: async () => ({ exec }),
+    });
+    const ctx = { cwd, shutdown: vi.fn(), sessionManager: { getBranch: () => [] } };
+    const report = (id: string, outcome = "succeeded", signal = new AbortController().signal) =>
+      tools.get("report_and_exit").execute(id, { content: "Observed work", outcome, submissionId: "agent-controlled" }, signal, undefined, ctx);
+    return { input, events, release, exec, send, ctx, report };
+  }
+
+  it.each(["repaired", "exhausted", "declined"] as const)("keeps legacy repair open until %s", async ending => {
+    const fixture = setupLegacyRepair();
+    const first = await fixture.report("initial");
+    expect(first.details).toMatchObject({ accepted: false, repairRequest: { attempt: 1 }, result: {
+      outcome: "succeeded", verification: { state: "failed" }, repair: { state: "requested" },
+    } });
+    expect(await readLifecycleTombstone("team", "writer")).toEqual({ status: "absent" });
+    expect(fixture.release).not.toHaveBeenCalled();
+    expect(fixture.send).not.toHaveBeenCalled();
+    expect(await reportEvents.listTeamReportEvents("team")).toEqual([]);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(fixture.ctx.shutdown).not.toHaveBeenCalled();
+    expect((await fixture.report("initial")).details).toEqual(first.details);
+    expect(fixture.exec).toHaveBeenCalledOnce();
+    if (ending === "repaired") fs.writeFileSync(fixture.input, "fixed");
+    const final = await fixture.report("next", ending === "declined" ? "blocked" : "succeeded");
+    expect(final.details).toMatchObject({ accepted: true, result: {
+      outcome: ending === "declined" ? "blocked" : "succeeded",
+      repair: { state: ending, attemptsUsed: 1 }, acceptance: { state: "pending" },
+      verification: { state: ending === "repaired" ? "passed" : "failed" },
+    } });
+    expect(fixture.exec).toHaveBeenCalledTimes(ending === "declined" ? 1 : 2);
+    expect(fixture.release).toHaveBeenCalledOnce();
+    expect(fixture.send).toHaveBeenCalledOnce();
+    expect(fixture.send.mock.calls[0][3]).toContain(`repair: ${ending}; effective task: ${ending === "repaired" ? "succeeded" : "blocked"}`);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(fixture.ctx.shutdown).toHaveBeenCalledOnce();
+  });
+
+  it("continues legacy repair after a low-level agent_end before Pi settles", async () => {
+    const fixture = setupLegacyRepair();
+    await fixture.report("initial");
+    await fixture.events.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "error", errorMessage: "503 Service Unavailable" }] });
+    expect(fixture.release).not.toHaveBeenCalled();
+    expect(fixture.ctx.shutdown).not.toHaveBeenCalled();
+    fs.writeFileSync(fixture.input, "fixed");
+    const repaired = await fixture.report("retry-continuation");
+    expect(repaired.details.result).toMatchObject({
+      verification: { state: "passed" }, repair: { state: "repaired", attemptsUsed: 1 }, acceptance: { state: "pending" },
+    });
+    expect(fixture.exec).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(250);
+  });
+
+  it.each(["agent_settled", "session_shutdown", "tool-abort"])("cancels legacy repair on %s before a later report", async ending => {
+    const fixture = setupLegacyRepair();
+    await fixture.report("initial");
+    if (ending === "tool-abort") {
+      const abort = new AbortController();
+      abort.abort();
+      await expect(fixture.report("aborted", "succeeded", abort.signal)).rejects.toThrow("cancelled");
+    } else await fixture.events.get(ending)?.({ messages: [] });
+    const final = await fixture.report("later");
+    expect(final.details.result).toMatchObject({ repair: { state: "cancelled", outcome: "blocked" }, verification: { state: "failed" } });
+    expect(fixture.exec).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(250);
+  });
+
+  it("waits for legacy repair cancellation before verifying a follow-up", async () => {
+    const fixture = setupLegacyRepair();
+    await fixture.report("initial");
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const cancel = VerificationController.prototype.cancel;
+    vi.spyOn(VerificationController.prototype, "cancel").mockImplementationOnce(async function (this: VerificationController) {
+      await held;
+      await cancel.call(this);
+    });
+    const config = await teams.readConfig("team");
+    const configRead = vi.spyOn(teams, "readConfig").mockResolvedValue(config);
+    const runRead = vi.spyOn(teams, "ensureMemberLifecycleRunId").mockResolvedValue("repair-run");
+    const runtimeRead = vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue(null);
+    const verify = vi.spyOn(VerificationController.prototype, "verify");
+    const ending = fixture.events.get("agent_settled")?.();
+    const later = fixture.report("later");
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const startedBeforeCancellation = verify.mock.calls.length;
+    configRead.mockRestore();
+    runRead.mockRestore();
+    runtimeRead.mockRestore();
+    release();
+    const [, result] = await Promise.all([ending, later]);
+    expect(startedBeforeCancellation).toBe(0);
+    expect(result.details.result.repair.state).toBe("cancelled");
+    expect(fixture.exec).toHaveBeenCalledOnce();
+  });
+
+  it("persists cancellation when the tool aborts after the repair decision", async () => {
+    const fixture = setupLegacyRepair();
+    const abort = new AbortController();
+    const verify = VerificationController.prototype.verify;
+    vi.spyOn(VerificationController.prototype, "verify").mockImplementationOnce(async function (this: VerificationController, ...args) {
+      const decision = await verify.apply(this, args);
+      abort.abort();
+      return decision;
+    });
+    await expect(fixture.report("initial", "succeeded", abort.signal)).rejects.toThrow("cancelled");
+    expect((await fixture.report("later")).details.result.repair.state).toBe("cancelled");
+    expect(fixture.exec).toHaveBeenCalledOnce();
+  });
+
+  it("retains known legacy repair ownership when the ledger and native rows disappear", async () => {
+    const fixture = setupLegacyRepair();
+    const first = await fixture.report("initial");
+    fs.unlinkSync(first.details.result.repair.journalPath);
+    for (const check of first.details.repairRequest.checks) fs.unlinkSync(check.logPath.replace(/\.log$/, ".json"));
+    await expect(fixture.report("later")).rejects.toThrow(/ledger.*unavailable/i);
+    expect(fixture.exec).toHaveBeenCalledOnce();
+    expect(fixture.release).not.toHaveBeenCalled();
+    expect(fs.existsSync(first.details.result.repair.journalPath)).toBe(false);
+  });
+
+  it("retains the repaired legacy result when lead delivery fails", async () => {
+    const fixture = setupLegacyRepair();
+    await fixture.report("initial");
+    fs.writeFileSync(fixture.input, "fixed");
+    fixture.send.mockRejectedValueOnce(new Error("lead unavailable"));
+    await expect(fixture.report("repaired")).rejects.toThrow("lead unavailable");
+    expect((await reportEvents.listTeamReportEvents("team"))[0]).toMatchObject({ result: {
+      verification: { state: "passed" }, repair: { state: "repaired" }, acceptance: { state: "pending" },
+    } });
+    expect(fixture.release).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(fixture.ctx.shutdown).not.toHaveBeenCalled();
+  });
+
+  it("fences legacy verification after uncertain repair persistence", async () => {
+    const fixture = setupLegacyRepair();
+    const rename = fs.renameSync;
+    let publications = 0;
+    let feedback = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to).includes(`${path.sep}repairs${path.sep}`)) feedback = ++publications === 2;
+    });
+    const sync = fs.fsyncSync;
+    const fault = vi.spyOn(fs, "fsyncSync").mockImplementation(descriptor => {
+      if (feedback && fs.fstatSync(descriptor).isDirectory()) throw new Error("uncertain repair reservation");
+      sync(descriptor);
+    });
+    syncBuiltinESMExports();
+    await expect(fixture.report("initial")).rejects.toThrow("uncertain repair reservation");
+    fault.mockRestore();
+    syncBuiltinESMExports();
+    await expect(fixture.report("retry")).rejects.toThrow();
+    expect(fixture.exec).toHaveBeenCalledOnce();
+    expect(fixture.release).not.toHaveBeenCalled();
+    expect(fixture.send).not.toHaveBeenCalled();
   });
 
   it("read_inbox defaults to returning only unread messages", async () => {

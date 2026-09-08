@@ -6,7 +6,10 @@ import { execFileSync } from "node:child_process";
 import { verifyAssignedChecks } from "../../src/results/check-policy";
 import { createAgentStatusTool } from "./agent-status-tool";
 import * as paths from "../../src/utils/paths.js";
-import { registerTaskRuntimeTools } from "./task-runtime-tools.js";
+import { registerTaskRuntimeTools, type TaskRuntimeToolsOptions } from "./task-runtime-tools.js";
+import { VerificationController } from "../../src/results/verification-controller";
+import * as lifecycleTombstones from "../../src/utils/lifecycle-tombstone";
+import { createLifecycleRuntime } from "../team/lifecycle";
 import * as teams from "../../src/utils/teams.js";
 import * as runtime from "../../src/utils/runtime.js";
 import * as messaging from "../../src/utils/messaging.js";
@@ -17,7 +20,7 @@ import type { RunningReadAgent } from "../runtime/types.js";
 
 let root = "";
 
-function registerTools(isTeammate: boolean) {
+function registerTools(isTeammate: boolean, shutdownTeammate?: TaskRuntimeToolsOptions["shutdownTeammate"]) {
   const tools = new Map<string, any>();
   registerTaskRuntimeTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
     isTeammate,
@@ -29,7 +32,7 @@ function registerTools(isTeammate: boolean) {
       agentName,
       message: `Agent ${agentName} has no running tool command to interrupt.`,
     })),
-    shutdownTeammate: vi.fn(async () => ({
+    shutdownTeammate: shutdownTeammate ?? vi.fn(async () => ({
       status: "settled" as const,
       reason: "quit" as const,
       extensionShutdown: "no_handlers" as const,
@@ -51,6 +54,8 @@ describe("task runtime tools", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "task-runtime-tools-"));
     vi.spyOn(paths, "teamDir").mockImplementation(teamName => path.join(root, String(teamName)));
+    vi.spyOn(paths, "configPath").mockImplementation(teamName => path.join(root, String(teamName), "config.json"));
+    vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName, agentName) => path.join(root, String(teamName), "runtime", `${agentName}.json`));
     vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName, agentName) => {
       return path.join(root, String(teamName), "lifecycle", "quarantine", `${String(agentName)}.json`);
     });
@@ -106,6 +111,102 @@ describe("task runtime tools", () => {
     expect(fs.readFileSync(check.logPath, "utf8")).toBe("full observed output");
     expect(JSON.parse(fs.readFileSync(paths.reportEventsPath("team"), "utf8"))[0].result.verification.state).toBe("passed");
     expect(exec).toHaveBeenCalledOnce();
+  });
+
+  async function repairFixture(state: "running" | "exhausted" | "uncertain") {
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "tested");
+    const result = createReportResult("team", "reader", "run", { outcome: "succeeded" });
+    const member: Member = { agentId: "reader@team", name: "reader", agentType: "teammate", role: "write", cwd,
+      lifecycleRunId: "run", joinedAt: 0, tmuxPaneId: "", subscriptions: [], isActive: false,
+      assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }], repairPolicy: { maxAttempts: 1 } };
+    const controller = new VerificationController({ teamName: "team", result, cwd, checks: member.assignedChecks, repair: member.repairPolicy });
+    const exec = vi.fn(async (_command: string, _cwd: string, options: { onData(data: Buffer): void }) => {
+      options.onData(Buffer.from("observed check output")); return { exitCode: state === "running" ? 0 : 1 };
+    });
+    const operations = { loadOperations: async () => ({ exec }) };
+    let decision = await controller.verify("initial", operations);
+    if (state === "exhausted") decision = await controller.verify("repair", operations);
+    else if (state === "uncertain") {
+      const unresolved = { ...result, verification: { ...decision.result.verification, error: "Repair reservation was not durable" } };
+      await reportEvents.appendTeamReportEvent("team", { agentName: "reader", status: "failed", source: "read-agent", report: "Recovery report", result: unresolved });
+    } else {
+      const ledger = JSON.parse(fs.readFileSync(controller.journalPath, "utf8"));
+      ledger.stages[0].state = "running";
+      fs.writeFileSync(controller.journalPath, JSON.stringify(ledger));
+    }
+    return { member, decision, controller, exec };
+  }
+
+  it("exposes an effective repair blocker and recovers full evidence with or without the roster", async () => {
+    const fixture = await repairFixture("exhausted");
+    const config = { name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [] as Member[] };
+    const roster = vi.spyOn(teams, "readConfig").mockResolvedValue(config);
+    vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue(null);
+    await reportEvents.appendTeamReportEvent("team", { agentName: "reader", status: "completed", source: "read-agent", report: "Full report", result: fixture.decision.result });
+    const status = createAgentStatusTool({ getTeamName: () => "team", runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, terminal: null, listQueuedAgents: () => [] });
+    for (const members of [[], [fixture.member]]) {
+      roster.mockResolvedValue({ ...config, members });
+      const observed = await status.execute("status", {});
+      expect(observed.details.statuses[0]).toMatchObject({ outcome: "succeeded", effectiveOutcome: "blocked", verification: "failed",
+        repair: { state: "exhausted", attemptsUsed: 1, maxAttempts: 1, journalPath: fixture.controller.journalPath }, acceptance: "pending" });
+      expect(observed.content[0].text).toContain("effective task: blocked");
+    }
+    roster.mockResolvedValue(config);
+    const recovered = await registerTools(false).get("check_teammate").execute("recover", { agent_name: "reader" });
+    expect(recovered.details.completedReport.result).toMatchObject({ outcome: "succeeded", repair: { state: "exhausted", outcome: "blocked" } });
+    expect(recovered.content[0].text).toContain("effective task: blocked");
+    expect(recovered.content[0].text).toContain(fixture.decision.checks[0].logPath);
+    expect(fixture.exec).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["check_teammate", "running"], ["stop_teammate", "running"],
+    ["check_teammate", "uncertain"], ["stop_teammate", "uncertain"],
+  ] as const)("keeps orphaned repair fenced during %s with %s ownership", async (toolName, ownership) => {
+    const fixture = await repairFixture(ownership);
+    fs.writeFileSync(paths.configPath("team"), JSON.stringify({ name: "team", description: "", createdAt: 0,
+      leadAgentId: "lead", leadSessionId: "session", members: [fixture.member] }));
+    vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue(null);
+    vi.spyOn(messaging, "readInbox").mockResolvedValue([]);
+    const release = vi.fn(async () => [] as string[]);
+    const lifecycle = createLifecycleRuntime({ isTeammate: false, terminal: null, runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, isCurrentReadAgentRun: () => true, renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, getSessionCwd: () => fixture.member.cwd, getTeamName: () => "team" });
+    const shutdown = vi.fn(lifecycle.shutdownTeammate);
+    const status = createAgentStatusTool({ getTeamName: () => "team", runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, terminal: null, listQueuedAgents: () => [] });
+    const snapshot = await status.execute("status", {});
+    expect(snapshot.details.statuses[0]).toMatchObject({ verification: "pending", effectiveOutcome: "blocked", repair: { state: "pending" } });
+    const diagnosed = await registerTools(false, shutdown).get(toolName).execute("diagnose", { agent_name: "reader" });
+    expect(diagnosed.details.teardown).toMatchObject({ status: "cleanup_failed", finalized: false, removedMember: false, releasedClaims: [] });
+    expect(diagnosed.content[0].text).toContain(fixture.controller.journalPath);
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(release).not.toHaveBeenCalled();
+    expect(fixture.exec).toHaveBeenCalledOnce();
+  });
+
+  it.each(["run", "replacement"])("recovers only repair evidence belonging to the remaining %s fence", async runId => {
+    const fixture = await repairFixture("uncertain");
+    vi.spyOn(teams, "readConfig").mockResolvedValue({ name: "team", description: "", createdAt: 0,
+      leadAgentId: "lead", leadSessionId: "session", members: [] });
+    vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue(null);
+    vi.spyOn(lifecycleTombstones, "readLifecycleTombstone").mockResolvedValue({ status: "occupied", tombstone: {
+      version: 1, team: "team", agent: "reader", runId, role: "write", reason: "quit", phase: "cleanup_failed",
+      ownerPid: 123, extensionInstanceId: "extension", timestamps: { createdAt: 0, updatedAt: 0 },
+    } });
+    const recovered = await registerTools(false).get("check_teammate").execute("recover", { agent_name: "reader" });
+    expect(recovered.details).toMatchObject({ health: "quarantined", removedMember: false, tombstone: { runId } });
+    if (runId === "run") {
+      expect(recovered.details.completedReport.result).toMatchObject({ runId, repair: { state: "pending" } });
+      expect(recovered.content[0].text).toContain(fixture.controller.journalPath);
+      expect(recovered.content[0].text).toContain(fixture.decision.checks[0].logPath);
+      expect(recovered.content[0].text).toContain(recovered.details.completedReport.reportPath);
+    } else expect(recovered.details.completedReport).toBeUndefined();
+    expect(fixture.exec).toHaveBeenCalledOnce();
   });
 
   it("cancels accepted queued work before looking for an active process", async () => {

@@ -235,33 +235,80 @@ describe("public agent spawn tools", () => {
     expect(Array.from(tools.keys()).sort()).toEqual(["get_agent_status", "spawn_agent", "spawn_swarm_agents"]);
   });
 
-  it("binds only explicit lead check policy to the admitted run", async () => {
+  it("binds only explicit lead check and repair policies to the admitted run", async () => {
     writeFavoriteLevels();
     const { tools, runReadAgentInProcess } = registerTools();
     const checks = [{ name: "tests", command: "authorized command", timeoutSeconds: 2 }];
+    const repair = { maxAttempts: 1 };
     const spawn = tools.get("spawn_agent")!;
-    await spawn.execute("checked", { name: "checked", prompt: "Work", model_slot: "read-review", checks }, new AbortController().signal, undefined, makeCtx());
-    await spawn.execute("ordinary", { name: "ordinary", prompt: "Work", model_slot: "read-review", metadata: { assignedChecks: checks } }, new AbortController().signal, undefined, makeCtx());
+    await spawn.execute("checked", { name: "checked", prompt: "Work", model_slot: "read-review", checks, repair }, new AbortController().signal, undefined, makeCtx());
+    await spawn.execute("ordinary", { name: "ordinary", prompt: "Work", model_slot: "read-review", metadata: { assignedChecks: checks, repairPolicy: repair } }, new AbortController().signal, undefined, makeCtx());
     checks[0].command = "changed after admission";
+    repair.maxAttempts = 5;
     expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({
-      assignedChecks: [{ name: "tests", command: "authorized command", timeoutSeconds: 2 }],
+      assignedChecks: [{ name: "tests", command: "authorized command", timeoutSeconds: 2 }], repairPolicy: { maxAttempts: 1 },
     });
     expect(runReadAgentInProcess.mock.calls[1][1].assignedChecks).toBeUndefined();
+    expect(runReadAgentInProcess.mock.calls[1][1].repairPolicy).toBeUndefined();
+    expect((await teams.readConfig("session-test-session")).members.find(member => member.name === "checked")?.repairPolicy)
+      .toEqual({ maxAttempts: 1 });
+    expect(spawn.parameters.properties.repair.properties.maxAttempts.maximum).toBe(5);
   });
 
-  it("inherits swarm check policy while allowing an explicit empty override", async () => {
+  it("inherits swarm check and repair policies with explicit disable overrides", async () => {
     writeFavoriteLevels();
     const { tools, runReadAgentInProcess } = registerTools();
     const checks = [{ name: "tests", command: "authorized command", timeoutSeconds: 2 }];
-    await tools.get("spawn_swarm_agents")!.execute("swarm", {
-      defaults: { model_slot: "read-review", checks },
-      agents: [{ name: "checked", prompt: "Work" }, { name: "ordinary", prompt: "Work", checks: [] }],
+    const result = await tools.get("spawn_swarm_agents")!.execute("swarm", {
+      defaults: { model_slot: "read-review", checks, repair: { maxAttempts: 1 } },
+      agents: [
+        { name: "checked", prompt: "Work" },
+        { name: "ordinary", prompt: "Work", checks: [], repair: { maxAttempts: 0 } },
+        { name: "incompatible", prompt: "Work", checks: [] },
+      ],
     }, new AbortController().signal, undefined, makeCtx());
-    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ assignedChecks: checks });
+    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ assignedChecks: checks, repairPolicy: { maxAttempts: 1 } });
     expect(runReadAgentInProcess.mock.calls[1][1].assignedChecks).toBeUndefined();
+    expect(runReadAgentInProcess.mock.calls[1][1].repairPolicy).toBeUndefined();
+    expect(result.details.failed).toEqual([{ name: "incompatible", error: expect.stringMatching(/repair.*checks/i) }]);
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(2);
   });
 
-  it("refuses check assignment through a nested child's spawn tool", async () => {
+  it.each([
+    { repair: { maxAttempts: 1 } },
+    { checks: [{ name: "tests", command: "check", timeoutSeconds: 2 }], repair: { maxAttempts: 6 } },
+  ])("rejects invalid repair admission before launching: %j", async policy => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess } = registerTools();
+    await expect(tools.get("spawn_agent")!.execute("invalid", {
+      name: "invalid", prompt: "Work", model_slot: "read-review", ...policy,
+    }, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/repair/i);
+    expect(runReadAgentInProcess).not.toHaveBeenCalled();
+  });
+
+  it("retains an isolated repair policy through queued admission", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const spawn = harness.tools.get("spawn_agent")!;
+    const signal = new AbortController().signal;
+    await spawn.execute("busy", { name: "busy", prompt: "Work", model_slot: "read-review" }, signal, undefined, makeCtx());
+    const repair = { maxAttempts: 1 };
+    const queued = await spawn.execute("queued", {
+      name: "queued", prompt: "Work", model_slot: "read-review", repair,
+      checks: [{ name: "tests", command: "check", timeoutSeconds: 2 }],
+    }, signal, undefined, makeCtx());
+    expect(queued.details.queued).toBe(true);
+    repair.maxAttempts = 5;
+    harness.completions.get("busy")!();
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    expect(harness.runReadAgentInProcess.mock.calls[1][1]).toMatchObject({ name: "queued", repairPolicy: { maxAttempts: 1 } });
+  });
+
+  it.each([
+    { checks: [{ name: "tests", command: "unauthorized command", timeoutSeconds: 2 }] },
+    { repair: { maxAttempts: 1 } },
+  ])("refuses verification authority through a nested child's spawn tool: %j", async forbidden => {
     writeFavoriteLevels();
     const harness = registerTools();
     const parent = await admitNestedReadParent(harness);
@@ -269,9 +316,8 @@ describe("public agent spawn tools", () => {
       teamName: "session-test-session", parent, parentRunId: parent.lifecycleRunId!, outerCtx: makeCtx(),
     }).find(tool => tool.name === "spawn_agent")!;
     await expect(nested.execute("child", {
-      name: "child", prompt: "Inspect", model_slot: "read-review",
-      checks: [{ name: "tests", command: "unauthorized command", timeoutSeconds: 2 }],
-    })).rejects.toThrow(/checks/);
+      name: "child", prompt: "Inspect", model_slot: "read-review", ...forbidden,
+    })).rejects.toThrow(/checks|repair/);
     expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
   });
 

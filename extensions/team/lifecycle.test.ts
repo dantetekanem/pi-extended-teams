@@ -2,12 +2,17 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { VerificationController } from "../../src/results/verification-controller";
+import { createReportResult } from "../../src/results/report-result";
+import * as sourceIdentity from "../../src/results/source-identity";
 import { createLifecycleRuntime } from "./lifecycle.js";
 import * as paths from "../../src/utils/paths.js";
 import * as runtime from "../../src/utils/runtime.js";
 import * as messaging from "../../src/utils/messaging.js";
 import * as teams from "../../src/utils/teams.js";
 import * as claims from "../../src/utils/claims.js";
+import * as reportEvents from "../../src/utils/report-events.js";
 import type { Member, TeamConfig } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 import { enqueueReadAgentMessageDelivery, NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "../agents/read-agent-session-lifecycle.js";
@@ -23,6 +28,8 @@ function installPathSpies() {
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName))));
   vi.spyOn(paths, "configPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "config.json"));
   vi.spyOn(paths, "claimsPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "claims.json"));
+  vi.spyOn(paths, "reportEventsPath").mockImplementation(teamName => path.join(teamsRoot, paths.sanitizeName(teamName), "reports.json"));
+  vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "reports"));
   vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName: unknown, agentName: unknown) => {
     return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "runtime", `${paths.sanitizeName(String(agentName))}.json`);
   });
@@ -61,6 +68,94 @@ describe("team lifecycle performance", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["running", "requested", "corrupt"])("preserves repair ownership through direct shared shutdown: %s", async state => {
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "tested");
+    const writer = member("writer", { cwd, lifecycleRunId: "repair-run",
+      assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }], repairPolicy: { maxAttempts: 1 } });
+    writeConfig({ name: "repair-team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session",
+      members: [member("team-lead"), writer] });
+    const result = createReportResult("repair-team", "writer", "repair-run", { outcome: "succeeded" });
+    const controller = new VerificationController({ teamName: "repair-team", result, cwd, checks: writer.assignedChecks, repair: writer.repairPolicy });
+    let started!: () => void;
+    let finish!: () => void;
+    const began = new Promise<void>(resolve => { started = resolve; });
+    const held = new Promise<void>(resolve => { finish = resolve; });
+    const exec = vi.fn(async () => { started(); if (state === "running") await held; return { exitCode: 1 }; });
+    const operations = { loadOperations: async () => ({ exec }) };
+    const verification = controller.verify("initial", operations);
+    await began;
+    if (state !== "running") await verification;
+    if (state === "corrupt") fs.writeFileSync(controller.journalPath, "{");
+    const release = vi.fn(async () => ["input.ts"]);
+    const terminal = { kill: vi.fn() };
+    const lifecycle = createLifecycleRuntime({ isTeammate: false, terminal, runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, isCurrentReadAgentRun: () => true, renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, getSessionCwd: () => cwd, getTeamName: () => "repair-team" });
+    const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity");
+    let stopped: Awaited<ReturnType<typeof lifecycle.shutdownTeammate>>;
+    let sourceObservations = 0;
+    try {
+      stopped = await lifecycle.shutdownTeammate("repair-team", writer);
+      sourceObservations = capture.mock.calls.length;
+    } finally { finish(); await verification; }
+    expect(sourceObservations).toBe(0);
+    if (state === "requested") {
+      expect(stopped).toMatchObject({ status: "settled", finalized: true, removedMember: true });
+      expect(release).toHaveBeenCalledOnce();
+      expect(terminal.kill).toHaveBeenCalledOnce();
+    } else {
+      expect(stopped).toMatchObject({ status: "cleanup_failed", finalized: false, removedMember: false, releasedClaims: [] });
+      expect(release).not.toHaveBeenCalled();
+      expect(terminal.kill).not.toHaveBeenCalled();
+      expect((await teams.readConfig("repair-team")).members).toContainEqual(expect.objectContaining({ name: "writer", isActive: false }));
+      expect(await readLifecycleTombstone("repair-team", "writer")).toMatchObject({ status: "occupied", tombstone: { phase: "cleanup_failed" } });
+    }
+    if (state !== "corrupt") expect((await controller.verify("after-stop", operations)).result.repair?.state).toBe("cancelled");
+    expect(exec).toHaveBeenCalledOnce();
+  });
+
+  it.each(["policy-retained", "policy-removed", "persistence-error"])("fences missing repair history after memory loss: %s", async condition => {
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "tested");
+    const writer = member("writer", { cwd, lifecycleRunId: "repair-run",
+      assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }], repairPolicy: { maxAttempts: 1 } });
+    const result = createReportResult("repair-team", "writer", "repair-run", { outcome: "succeeded" });
+    const controller = new VerificationController({ teamName: "repair-team", result, cwd, checks: writer.assignedChecks, repair: writer.repairPolicy });
+    const exec = vi.fn(async () => ({ exitCode: 1 }));
+    const initial = await controller.verify("initial", { loadOperations: async () => ({ exec }) });
+    fs.unlinkSync(controller.journalPath);
+    if (condition === "policy-removed") writer.repairPolicy = undefined;
+    if (condition === "persistence-error") {
+      delete initial.result.repair;
+      initial.result.verification = { state: "pending", error: "reservation publication uncertain" };
+      for (const check of initial.checks) fs.unlinkSync(check.logPath.replace(/\.log$/, ".json"));
+    }
+    writeConfig({ name: "repair-team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session",
+      members: [member("team-lead"), writer] });
+    await reportEvents.appendTeamReportEvent("repair-team", { agentName: "writer", role: "write", status: "failed", source: "write-agent", report: "Recover this run", result: initial.result });
+    const stored = fs.readFileSync(paths.reportEventsPath("repair-team"), "utf8");
+    const release = vi.fn(async () => ["input.ts"]);
+    const terminal = { kill: vi.fn() };
+    const lifecycle = createLifecycleRuntime({ isTeammate: false, terminal, runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, isCurrentReadAgentRun: () => true, renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, getSessionCwd: () => cwd, getTeamName: () => "repair-team" });
+    const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity");
+    expect(await lifecycle.shutdownTeammate("repair-team", writer)).toMatchObject({ status: "cleanup_failed", finalized: false, removedMember: false, releasedClaims: [] });
+    expect(release).not.toHaveBeenCalled();
+    expect(terminal.kill).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+    expect(fs.existsSync(controller.journalPath)).toBe(false);
+    expect(fs.readFileSync(paths.reportEventsPath("repair-team"), "utf8")).toBe(stored);
+    expect((await teams.readConfig("repair-team")).members).toContainEqual(expect.objectContaining({ name: "writer", isActive: false }));
+    expect(await readLifecycleTombstone("repair-team", "writer")).toMatchObject({ status: "occupied", tombstone: { phase: "cleanup_failed", error: expect.stringMatching(/ledger.*unavailable/i) } });
+    expect(exec).toHaveBeenCalledOnce();
   });
 
   it("stops and restarts the lead watchdog without leaking intervals", async () => {

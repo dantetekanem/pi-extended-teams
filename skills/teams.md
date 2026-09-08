@@ -172,6 +172,8 @@ Edit-agent coordination tools:
 - `list_file_claims` — inspect active claims.
 - `report_and_exit` — send the final report, release claims, and shut down.
 
+Assigned `checks` and optional `repair: { maxAttempts: 1 }` require explicit lead or trusted-integration authorization. Repair is disabled by default and permits at most five additional attempts. An unaccepted `repairRequest` from `report_and_exit` asks the agent to remain active and resubmit, without expanding its scope or permissions. Keep or reacquire claims before repair edits; report blocked or failed if repair is unsafe. Do not interpret passed verification as lead acceptance or ignore an effective repair blocker because the agent reported success. Pending execution or persistence keeps cleanup fenced. See README.md for policy inheritance and evidence recovery.
+
 ## Context handoff contract
 
 Agents start in isolated sessions and know only what their mission tells them. A short prompt is not automatically a good prompt: omit irrelevant history, but include the intent and prior state needed to avoid repeating work or violating a decision.

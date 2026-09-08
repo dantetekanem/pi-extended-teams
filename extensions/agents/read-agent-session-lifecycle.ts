@@ -26,6 +26,7 @@ export interface ReadAgentDeliveryState {
 export interface ManagedReadAgentLifecycleState extends ReadAgentDeliveryState {
   session?: AgentSession;
   checkOperation?: { controller: AbortController; settled: Promise<void> };
+  activeOperationSettlementPromise?: Promise<void>;
   startupState?: ReadAgentStartupState;
   sessionCreation?: Promise<AgentSession | undefined>;
   stopRequested?: boolean;
@@ -79,7 +80,7 @@ interface NestedSessionLifecycle {
     reason: unknown,
     rawDeliverySettlement: Promise<void>,
     timeoutMs?: number,
-    checkSettlement?: Promise<void>
+    operationSettlement?: Promise<void>
   ): Promise<NestedSessionTeardownResult>;
   finalized: Promise<void>;
 }
@@ -245,7 +246,7 @@ function installNestedSessionLifecycle(session: AgentSession): NestedSessionLife
 
   const lifecycle: NestedSessionLifecycle = {
     finalized: finalized.promise,
-    requestShutdown(reasonInput, rawDeliverySettlement, timeoutMs = NESTED_SESSION_TEARDOWN_TIMEOUT_MS, checkSettlement = Promise.resolve()) {
+    requestShutdown(reasonInput, rawDeliverySettlement, timeoutMs = NESTED_SESSION_TEARDOWN_TIMEOUT_MS, operationSettlement = Promise.resolve()) {
       if (shutdownPromise) return shutdownPromise;
       const reason = normalizeShutdownReason(reasonInput);
 
@@ -311,7 +312,7 @@ function installNestedSessionLifecycle(session: AgentSession): NestedSessionLife
           observedExtensionShutdown,
           observedDelivery,
           observedAbort,
-          checkSettlement.catch(() => {}),
+          operationSettlement.catch(() => {}),
         ]).then(() => {});
         void rawOperations.then(disposeOnce);
 
@@ -362,7 +363,9 @@ export function requestReadAgentTeardown(
   state.stopRequested = true;
   const checkOperation = state.checkOperation;
   checkOperation?.controller.abort();
-  const checkSettlement = checkOperation?.settled.catch(() => {}) ?? Promise.resolve();
+  const operationSettlement = Promise.all([
+    checkOperation?.settled.catch(() => {}), state.activeOperationSettlementPromise?.catch(() => {}),
+  ]).then(() => {});
   if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
   state.heartbeatTimer = undefined;
   const deliveryClose = closeReadAgentMessageDelivery(state);
@@ -480,7 +483,7 @@ export function requestReadAgentTeardown(
       }
     );
 
-    const observedOperations = Promise.all([observedDelivery, checkSettlement]).then(() => {});
+    const observedOperations = Promise.all([observedDelivery, operationSettlement]).then(() => {});
     let session = state.session;
     if (state.startupState === "pending" && state.sessionCreation) {
       let startupSettled = false;
@@ -504,7 +507,7 @@ export function requestReadAgentTeardown(
         const lateRawOperations = observedStartup.then(async () => {
           if (session) {
             const sessionLifecycle = installNestedSessionLifecycle(session);
-            await sessionLifecycle.requestShutdown(reason, deliveryClose.rawDeliverySettlement, 0, checkSettlement);
+            await sessionLifecycle.requestShutdown(reason, deliveryClose.rawDeliverySettlement, 0, operationSettlement);
             await sessionLifecycle.finalized;
           } else {
             await observedOperations;
@@ -556,7 +559,7 @@ export function requestReadAgentTeardown(
       reason,
       deliveryClose.rawDeliverySettlement,
       Math.max(0, deadline - Date.now()),
-      checkSettlement
+      operationSettlement
     );
     if (sessionResult.status === "timed_out") {
       const timedOutResult = unfinishedResult("timed_out", sessionResult.reason, {

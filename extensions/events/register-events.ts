@@ -10,6 +10,7 @@ import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
 import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
 import { globalSettingsPath, projectSettingsPath } from "../../src/utils/settings";
+import { normalizeRepairPolicy } from "../../src/results/repair-policy";
 import { generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
 import { cleanupStaleSessionContextReferences } from "../internal/session-context-reference";
 import { cleanupStalePrivateAgentSessions } from "../internal/agent-session-files";
@@ -401,13 +402,16 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             if (member.thinking) modelInfo += ` with thinking level: ${member.thinking}`;
             modelInfo += `. When reporting your model or thinking level, use these exact values.`;
           }
+          const repairGuidance = normalizeRepairPolicy(member?.repairPolicy)
+            ? "Call report_and_exit when finished. If it returns an unaccepted repair request, remain active, repair only the assigned scope, and resubmit. Report blocked or failed if repair is unsafe. Claims and shutdown wait for an accepted final report."
+            : undefined;
           if ((member?.role ?? "write") === "write") {
             const workflowGuard = member && isWorkflowSpawnedMember(member)
               ? "\n- Workflow mode: do not create helper fanout yourself. Ask team-lead with send_message for an explicit workflow assignment."
               : "\n- If you need read-only help, ask team-lead with send_message. The lead decides whether to spawn another agent.";
-            roleSpecificGuidance = `\n\nEdit-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.${workflowGuard}\n- Release claims with release_file as soon as you are done editing those paths.\n- When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you.`;
+            roleSpecificGuidance = `\n\nEdit-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.${workflowGuard}\n- Release claims with release_file as soon as you are done editing those paths.\n- ${repairGuidance ?? "When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you."}`;
           } else {
-            roleSpecificGuidance = `\n\nRead-agent rules:\n- You are read-only: investigate and report. Do not edit files or make any mutating changes.\n- When finished, produce your final report and stop. Do not wait for the lead to kill you.`;
+            roleSpecificGuidance = `\n\nRead-agent rules:\n- You are read-only: investigate and report. Do not edit files or make any mutating changes.\n- ${repairGuidance ?? "When finished, produce your final report and stop. Do not wait for the lead to kill you."}`;
           }
           rosterInfo = `\n\n${options.formatRosterForPrompt(await options.buildRoster(teamName))}\nUse this roster as a snapshot. If you need updated roster or liveness details, ask team-lead with send_message. Do not poll.`;
         } catch {

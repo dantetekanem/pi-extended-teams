@@ -5,6 +5,10 @@ import { TeamReportEvent } from "./models";
 import * as paths from "./paths";
 import { withLock } from "./lock";
 import { writeJsonAtomic } from "./atomic-json";
+import { readCheckEvidence } from "../results/check-policy";
+import type { CheckRecord } from "../results/check-journal";
+
+export type ObservedTeamReportEvent = TeamReportEvent & { checks?: CheckRecord[] };
 
 export type NewTeamReportEvent = Omit<TeamReportEvent, "id" | "teamName" | "createdAt"> & Partial<Pick<TeamReportEvent, "id" | "teamName" | "createdAt">>;
 
@@ -236,10 +240,18 @@ export async function recordReportAcceptance(
 export async function listTeamReportEvents(
   teamName: string,
   options: ListTeamReportEventsOptions = {}
-): Promise<TeamReportEvent[]> {
+): Promise<ObservedTeamReportEvent[]> {
   const p = ensureReportEventsFile(teamName);
-
-  return await withLock(p, async () => {
-    return selectEvents(readEventsCache(p), options);
-  });
+  const events = await withLock(p, async () => selectEvents(readEventsCache(p), options));
+  return Promise.all(events.map(async event => {
+    if (!event.result || event.result.verification?.state === "not-requested") return event;
+    try {
+      const evidence = await readCheckEvidence(teamName, event.result);
+      return { ...event, result: { ...event.result, verification: evidence.verification }, checks: evidence.checks };
+    } catch (error) {
+      return { ...event, result: { ...event.result, verification: {
+        state: "failed" as const, error: error instanceof Error ? error.message : String(error),
+      } }, checks: [] };
+    }
+  }));
 }

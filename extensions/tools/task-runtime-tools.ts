@@ -180,6 +180,8 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
             latestReport.result
               ? `Task: ${latestReport.result.outcome ?? "unspecified"}; verification: ${latestReport.result.verification.state}; acceptance: ${latestReport.result.acceptance.state}. Report ID: ${latestReport.result.reportId}.`
               : undefined,
+            latestReport.checks?.map(check => `Check ${check.checkId}: ${check.state}; exit ${check.exitCode ?? "unknown"}; full log: ${check.logPath}`).join("\n"),
+            latestReport.result?.verification.error,
             recoverySessionFile
               ? `Its durable child transcript is available at ${recoverySessionFile}. Use the read tool on that path if the report is incomplete.`
               : undefined,

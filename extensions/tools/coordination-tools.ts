@@ -9,6 +9,9 @@ import * as claims from "../../src/utils/claims";
 import * as reportEvents from "../../src/utils/report-events";
 import { createReportResult, normalizeReportedTaskDetails, ReportedTaskDetailsSchema } from "../../src/results/report-result";
 import { canonicalPersistedModelSlot } from "../../src/utils/settings";
+import { normalizeCheckPolicy, verifyAssignedChecks } from "../../src/results/check-policy";
+import type { CheckRunnerOptions } from "../../src/results/check-runner";
+import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import { createFileClaimTools } from "./file-claim-tools";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
 import { unlinkPidFile } from "../internal/session-files";
@@ -34,6 +37,7 @@ export interface CoordinationToolsOptions {
   resetLeadWakeNotifiedCount(): void;
   deliverMessageToActiveAgent?(teamName: string, recipient: string, content: string): Promise<boolean>;
   extensionInstanceId?: string;
+  loadCheckOperations?: CheckRunnerOptions["loadOperations"];
 }
 
 export function buildReadHelperPrompt(teamName: string, requester: string, prompt: string): string {
@@ -55,6 +59,7 @@ function requireCurrentSession(options: CoordinationToolsOptions): string {
 export function registerCoordinationTools(pi: any, options: CoordinationToolsOptions): void {
   const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
   const pendingWriterFinalization = new Map<string, { teamName: string; agentName: string; runId: string }>();
+  const verifyingReports = new Set<string>();
 
   pi.on?.("session_shutdown", async () => {
     const pending = Array.from(pendingWriterFinalization.values());
@@ -168,6 +173,20 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       if (runtimeStatus && !runtimeStatus.lifecycleRunId) {
         runtimeStatus = await runtime.writeRuntimeStatus(targetTeamName, options.agentName, runId, {});
       }
+      const checks = normalizeCheckPolicy(member.assignedChecks);
+      if (checks?.length) {
+        if (verifyingReports.has(result.reportId)) throw new Error("Final report verification is already in progress for this run.");
+        verifyingReports.add(result.reportId);
+        try {
+          result.verification = (await verifyAssignedChecks(targetTeamName, result, member.cwd, checks, {
+            loadOperations: options.loadCheckOperations ?? loadNativeCheckOperations, signal: _signal,
+          })).verification;
+          if (_signal?.aborted) throw new Error("Assigned check verification was cancelled.");
+          if (result.verification.state === "pending") throw new Error("Assigned checks have an unresolved execution claim; inspect the durable journal before finalizing this run.");
+        } finally {
+          verifyingReports.delete(result.reportId);
+        }
+      }
       await closePersistedRecipient(targetTeamName, options.agentName, runId, {
         removeOnFailure: true,
         role: (member.role ?? "write") === "read" ? "read" : "write",
@@ -219,7 +238,10 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         });
         reportPath = persistedReport.reportPath || "";
         if (!reportPath) throw new Error("The persisted report did not provide its standalone file path.");
-        await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", params.content, params.summary || "Final report", undefined, { metadata: reportMetadata });
+        const leadReport = checks?.length
+          ? `${params.content}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}. Evidence: ${result.reportId}.`
+          : params.content;
+        await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", leadReport, params.summary || "Final report", undefined, { metadata: reportMetadata });
         releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);
       } catch (error) {
         pendingWriterFinalization.delete(`${targetTeamName}:${options.agentName}`);

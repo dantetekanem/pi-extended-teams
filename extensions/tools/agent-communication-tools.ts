@@ -4,7 +4,7 @@ import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import { formatInboxMessagesForModel, sanitizePlainTuiLine } from "../ui/renderers";
 import { createFileClaimTools } from "./file-claim-tools";
-import { normalizeReportedTaskDetails, ReportedTaskDetailsSchema, type ReportedTaskDetails } from "../../src/results/report-result";
+import { normalizeReportedTaskDetails, ReportedTaskDetailsSchema, type ReportedTaskDetails, type ReportResult } from "../../src/results/report-result";
 
 export interface SubmittedAgentReport extends ReportedTaskDetails {
   content: string;
@@ -13,6 +13,7 @@ export interface SubmittedAgentReport extends ReportedTaskDetails {
 
 export interface AgentReportSubmissionResult {
   accepted: boolean;
+  verification?: ReportResult["verification"];
   cancelledDeliveries?: number;
   deliveryOutcome?: "cancelled" | "none";
 }
@@ -25,7 +26,7 @@ export interface AgentCommunicationToolsOptions {
   getLifecycleRunId(): string | undefined;
   authorizeWriteMember(teamName: string, agentName: string): Promise<void>;
   onProgress?(status: string, updatedAt: number): void;
-  onReportAndExit(report: SubmittedAgentReport): Promise<AgentReportSubmissionResult>;
+  onReportAndExit(report: SubmittedAgentReport, signal?: AbortSignal): Promise<AgentReportSubmissionResult>;
 }
 
 function requireCurrentSession(options: Pick<AgentCommunicationToolsOptions, "getTeamName">): string {
@@ -146,11 +147,11 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
       summary: Type.Optional(Type.String({ description: "Short report summary." })),
       ...ReportedTaskDetailsSchema.properties,
     }),
-    async execute(_toolCallId: string, params: SubmittedAgentReport) {
+    async execute(_toolCallId: string, params: SubmittedAgentReport, signal?: AbortSignal) {
       const teamName = requireCurrentSession(options);
       const content = normalizeFinalReportContent(params.content);
       const summary = typeof params.summary === "string" && params.summary.trim() ? params.summary.trim() : undefined;
-      const result = await options.onReportAndExit({ content, summary, ...normalizeReportedTaskDetails(params) });
+      const result = await options.onReportAndExit({ content, summary, ...normalizeReportedTaskDetails(params) }, signal);
       const text = result.accepted
         ? "Final report accepted. Finish immediately; the outer runner will release claims and stop this nested session."
         : "A final report was already accepted for this run. This duplicate was ignored; finish immediately.";
@@ -159,6 +160,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         details: {
           session: teamName,
           accepted: result.accepted,
+          ...(result.verification ? { verification: result.verification } : {}),
           ...(result.cancelledDeliveries === undefined ? {} : {
             cancelledDeliveries: result.cancelledDeliveries,
             deliveryOutcome: result.deliveryOutcome,

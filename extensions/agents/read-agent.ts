@@ -4,7 +4,10 @@ import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
-import { createReportResult, normalizeReportedTaskDetails, type ReportResult } from "../../src/results/report-result";
+import { createReportResult, normalizeReportedTaskDetails, type ReportResult, type ReportedTaskDetails } from "../../src/results/report-result";
+import { assignedCheckIds, normalizeCheckPolicy, verifyAssignedChecks, type CheckDefinition } from "../../src/results/check-policy";
+import type { CheckRunnerOptions } from "../../src/results/check-runner";
+import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
@@ -28,6 +31,7 @@ import {
   closeReadAgentMessageDelivery,
   enqueueReadAgentMessageDelivery,
   installReadAgentSessionLifecycle,
+  ReadAgentDeliveryCancelledError,
   type ReadAgentDeliveryCloseResult,
   type ReadAgentTeardownResult,
 } from "./read-agent-session-lifecycle";
@@ -115,6 +119,7 @@ export interface RunReadAgentOptions {
   extensionInstanceId?: string;
   createNestedReadAgentTools?(binding: NestedReadAgentToolBinding): any[];
   pendingChildController?: PendingChildController;
+  loadCheckOperations?: CheckRunnerOptions["loadOperations"];
 }
 
 function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
@@ -355,8 +360,11 @@ export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | un
     agent,
     agent.name,
     async () => {
+      const check = agent.checkOperation;
+      if (check) await (agent.activeOperationSettlementPromise ?? check.settled);
       const pendingInterrupt = agent.operationInterruptPromise;
       if (pendingInterrupt) await pendingInterrupt.catch(() => {});
+      if (agent.messageDeliveryClosed || agent.stopRequested) throw new ReadAgentDeliveryCancelledError(agent.name);
       if (session.isStreaming) {
         await session.sendUserMessage(content, { deliverAs: "steer" as const });
         return;
@@ -367,7 +375,7 @@ export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | un
   signalReadAgentWake(agent);
   pendingParentWakeSignals.get(agent)?.();
   await deliveryResult;
-  markReadAgentActivity(agent, "received lead message", "thinking");
+  if (!agent.checkOperation) markReadAgentActivity(agent, "received lead message", "thinking");
   return true;
 }
 
@@ -642,6 +650,7 @@ export async function runReadAgentInProcess(
   let privateSessionDirectory: string | undefined;
   let completedReportPersisted = false;
   let resolvedTaskResult: ReportResult | undefined;
+  let assignedChecks: CheckDefinition[] | undefined;
   const pendingChildController = options.pendingChildController;
   const pendingChildParent: ParentRunIdentity | undefined = isEligibleNestedReadParent(member)
     ? {
@@ -675,6 +684,54 @@ export async function runReadAgentInProcess(
     return deliveryClose;
   };
 
+  const verifyTaskResult = async (reported: ReportedTaskDetails, signal?: AbortSignal): Promise<ReportResult> => {
+    if (state.checkOperation) throw new Error("Check verification is already active for this run.");
+    if (assignedChecks?.length && (state.stopRequested || !options.isCurrentReadAgentRun(key, state))) {
+      throw new Error("Check verification cancelled: agent run is closing.");
+    }
+    const result = createReportResult(readTeamName, member.name, state.runId, reported);
+    resolvedTaskResult = result;
+    if (!assignedChecks?.length) return result;
+    result.verification = { state: "pending", checkIds: assignedCheckIds(result, assignedChecks) };
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    let settle!: () => void;
+    const operation = { controller, settled: new Promise<void>(resolve => { settle = resolve; }) };
+    state.checkOperation = operation;
+    markReadAgentActivity(state, "running assigned checks", "working", "assigned-check");
+    options.renderReadAgentStatus();
+    try {
+      try {
+        const evidence = await verifyAssignedChecks(readTeamName, result, member.cwd, assignedChecks, {
+          loadOperations: options.loadCheckOperations ?? loadNativeCheckOperations,
+          signal: controller.signal,
+        });
+        result.verification = evidence.verification;
+      } catch (error) {
+        state.finalizationBlockedReason = `Assigned check evidence could not be persisted: ${error instanceof Error ? error.message : String(error)}`;
+        result.verification.error = state.finalizationBlockedReason;
+        throw error;
+      }
+      if (result.verification.state === "pending") {
+        state.finalizationBlockedReason = "Assigned checks have an unresolved execution claim; inspect the durable journal before finalizing this run.";
+        throw new Error(state.finalizationBlockedReason);
+      }
+      if (controller.signal.aborted || state.stopRequested || !options.isCurrentReadAgentRun(key, state)) {
+        throw new Error("Assigned check verification was cancelled.");
+      }
+      return result;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      if (state.checkOperation === operation) state.checkOperation = undefined;
+      if (controller.signal.aborted && !state.messageDeliveryClosed && !state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
+        state.acceptingMessages = true;
+      }
+      settle();
+    }
+  };
+
   const deliverCompletion = async (
     resolution: ResolvedReadAgentReport,
     completionSummary: string,
@@ -684,8 +741,11 @@ export async function runReadAgentInProcess(
     const session = state.session;
     if (!session) throw new Error(`Agent ${member.name} completed without a nested session.`);
     const report = resolution.report!;
-    const result = createReportResult(readTeamName, member.name, state.runId, resolution);
+    const result = resolvedTaskResult ?? createReportResult(readTeamName, member.name, state.runId, resolution);
     resolvedTaskResult = result;
+    const leadReport = assignedChecks?.length
+      ? `${report}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}. Evidence: ${result.reportId}.`
+      : report;
     const completionStats = session.getSessionStats();
     // Private child transcripts are deleted after teardown; never publish pointers
     // that would outlive a successful run's recovery artifact.
@@ -782,13 +842,14 @@ export async function runReadAgentInProcess(
       // Workflow orchestrators consume full reports from TeamReportEvent storage.
       // Pi Prompt consumes its writer report through the private event without a lead turn.
     } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
-      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
+      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, leadReport, true);
     } else {
-      await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, report, completionSummary, member.color, completionMetadata);
+      await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, leadReport, completionSummary, member.color, completionMetadata);
     }
   };
 
   try {
+    assignedChecks = normalizeCheckPolicy(member.assignedChecks);
     if (pendingChildParent && !pendingChildController) {
       throw new Error(`Eligible nested read parent ${member.name} requires a pending child controller.`);
     }
@@ -899,12 +960,13 @@ export async function runReadAgentInProcess(
         pushReadAgentEvent(state, status);
         options.renderReadAgentStatus();
       },
-      onReportAndExit: async report => {
+      onReportAndExit: async (report, signal) => {
         const content = nonEmptyReportText(report.content);
         if (!content) throw new Error("Final report content must not be empty.");
         if (submittedFinalReport || finalReportSubmissionInProgress) return { accepted: false };
         finalReportSubmissionInProgress = true;
         try {
+          const result = await verifyTaskResult(report, signal);
           const deliveryClose = await closeRecipient();
           submittedFinalReport = {
             ...normalizeReportedTaskDetails(report),
@@ -913,6 +975,7 @@ export async function runReadAgentInProcess(
           };
           return {
             accepted: true,
+            ...(assignedChecks?.length ? { verification: result.verification } : {}),
             cancelledDeliveries: deliveryClose.cancelledDeliveries,
             deliveryOutcome: deliveryClose.cancelledDeliveries > 0 ? "cancelled" : "none",
           };
@@ -1121,6 +1184,35 @@ export async function runReadAgentInProcess(
           }
         }
       }
+      while (assignedChecks?.length && !submittedFinalReport && !pendingChildParent
+        && !state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
+        completionResolution = resolveCurrentReport();
+        if (completionResolution.terminalFailure || !completionResolution.report) {
+          throw unavailableReportError(completionResolution.terminalFailure ?? "No usable report is available for verification.");
+        }
+        const wakeGeneration = readAgentWakeGeneration(state);
+        const verification = await runReadAgentSessionOperation(state, async () => {
+          await verifyTaskResult(completionResolution!);
+        });
+        if (verification.interrupted) {
+          if (!await waitForPostInterruptOperation(verification.generation, wakeGeneration)) return;
+        } else {
+          let deliveryTail: Promise<void> | undefined;
+          do {
+            deliveryTail = state.messageDeliveryTail;
+            if (deliveryTail) await deliveryTail.catch(() => {});
+          } while (deliveryTail !== state.messageDeliveryTail);
+          state.acceptingMessages = false;
+          const latestGeneration = state.completedOperationGeneration ?? verification.generation;
+          if (latestGeneration === verification.generation) break;
+          if (state.completedOperationError) throw state.completedOperationError;
+          if (state.completedOperationInterrupted) {
+            state.acceptingMessages = !state.messageDeliveryClosed && !state.stopRequested && options.isCurrentReadAgentRun(key, state);
+            if (!await waitForPostInterruptOperation(latestGeneration, wakeGeneration)) return;
+          }
+        }
+        completionResolution = resolveCurrentReport();
+      }
     } finally {
       state.acceptingMessages = false;
     }
@@ -1172,6 +1264,9 @@ export async function runReadAgentInProcess(
       };
       const failureSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`;
       const result = resolvedTaskResult ?? createReportResult(readTeamName, member.name, state.runId, {});
+      if (!resolvedTaskResult && assignedChecks?.length) {
+        result.verification = { state: "pending", checkIds: assignedCheckIds(result, assignedChecks) };
+      }
       const failureEventPersistence = await recordReadAgentReportEvent(
         readTeamName,
         member,

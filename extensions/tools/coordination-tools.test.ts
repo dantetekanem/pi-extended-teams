@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { registerCoordinationTools } from "./coordination-tools.js";
 import { registerExtensionEvents } from "../events/register-events.js";
 import * as paths from "../../src/utils/paths.js";
@@ -72,6 +73,46 @@ describe("coordination tools", () => {
     vi.restoreAllMocks();
     syncBuiltinESMExports();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each([0, 1])("observes assigned legacy-writer checks before closure (exit=%s)", async exitCode => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", "checked-run");
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "input");
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [
+      member("team-lead"), member("writer", { cwd, lifecycleRunId: "checked-run",
+        assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }] }),
+    ] });
+    const tools = new Map<string, any>();
+    const seen: unknown[] = [];
+    const release = vi.fn(async () => [] as string[]);
+    const exec = vi.fn(async () => {
+      const concurrent = await tools.get("report_and_exit").execute("concurrent", { content: "Duplicate" }, new AbortController().signal)
+        .then(() => "accepted", () => "rejected");
+      seen.push({ fence: await readLifecycleTombstone("team", "writer"), concurrent, released: release.mock.calls.length });
+      return { exitCode };
+    });
+    const send = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      agentName: "writer", isTeammate: true, terminal: null, getTeamName: () => "team",
+      requireWriteAgentTeam: async () => "team", requireTeamContext: () => "team",
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+      loadCheckOperations: async () => ({ exec }),
+    });
+    const ctx = { cwd, shutdown: vi.fn(), sessionManager: { getBranch: () => [] } };
+    const tool = tools.get("report_and_exit");
+    const first = await tool.execute("first", { content: "Agent claims success", outcome: "succeeded" }, new AbortController().signal, undefined, ctx);
+    expect(first.details.result).toMatchObject({ outcome: "succeeded", verification: { state: exitCode ? "failed" : "passed" }, acceptance: { state: "pending" } });
+    expect(seen).toEqual([{ fence: { status: "absent" }, concurrent: "rejected", released: 0 }]);
+    await tool.execute("duplicate", { content: "Agent claims success", outcome: "succeeded" }, new AbortController().signal, undefined, ctx);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][3]).toContain(`Harness verification: ${exitCode ? "failed" : "passed"}`);
+    expect((await reportEvents.listTeamReportEvents("team"))[0].checks).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(250);
   });
 
   it("read_inbox defaults to returning only unread messages", async () => {

@@ -4,6 +4,8 @@ import type { QueuedWriteSpawn } from "../utils/write-queue";
 import type { FileClaim } from "../utils/claims";
 import type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel } from "../utils/models";
 import type { FavoriteModelSlot } from "../utils/settings";
+import type { CheckDefinition } from "../results/check-policy";
+import type { ObservedTeamReportEvent } from "../utils/report-events";
 
 export type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel, FavoriteModelSlot };
 
@@ -38,7 +40,7 @@ export interface TeamObservation {
   tasks: TaskFile[];
   claims: FileClaim[];
   writeQueue: QueuedWriteSpawn[];
-  reports: TeamReportEvent[];
+  reports: ObservedTeamReportEvent[];
 }
 
 export interface ObserveRuntimeOptions {
@@ -71,6 +73,7 @@ export interface SpawnTeammateOnceRequest extends OrchestrationOperationMetadata
   cwd: string;
   /** Required intent tier; selects read/write behavior, configured model, and thinking. */
   modelSlot: FavoriteModelSlot;
+  checks?: CheckDefinition[];
   planModeRequired?: boolean;
   color?: string;
 }

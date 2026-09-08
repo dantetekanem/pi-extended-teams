@@ -89,7 +89,7 @@ describe("read-agent communication tools", () => {
     await expect(tools.get("report_and_exit")!.execute("report", { content, summary: "Complete plan result ready" })).resolves.toMatchObject({
       details: { accepted: true, cancelledDeliveries: 2, deliveryOutcome: "cancelled" },
     });
-    expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" });
+    expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" }, undefined);
   });
 
   it("passes validated task details to final submission without trusting claimed verification", async () => {
@@ -99,13 +99,15 @@ describe("read-agent communication tools", () => {
       getLifecycleRunId: () => "reader-run", authorizeWriteMember: vi.fn(async () => {}), onReportAndExit,
     });
     const tool = tools.find(tool => tool.name === "report_and_exit")!;
+    const signal = new AbortController().signal;
     await tool.execute("report", {
       content: "Waiting for a decision", outcome: "blocked", questions: ["Which API should be used?"],
       verification: { state: "passed" }, acceptance: { state: "accepted" },
-    });
+      checks: [{ name: "evil", command: "unassigned", timeoutSeconds: 1 }],
+    }, signal);
     expect(onReportAndExit).toHaveBeenCalledWith({
       content: "Waiting for a decision", summary: undefined, outcome: "blocked", questions: ["Which API should be used?"],
-    });
+    }, signal);
     await expect(tool.execute("invalid", { content: "Done", outcome: "completed" })).rejects.toThrow(/reported task/i);
     expect(onReportAndExit).toHaveBeenCalledOnce();
   });

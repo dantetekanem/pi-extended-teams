@@ -60,6 +60,29 @@ describe("teammate command interruption", () => {
     expect(terminal.kill).not.toHaveBeenCalled();
   });
 
+  it("cancels an assigned check outside streaming and waits for its raw settlement", async () => {
+    vi.useFakeTimers();
+    let settle!: () => void;
+    const settled = new Promise<void>(resolve => { settle = resolve; });
+    const controller = new AbortController();
+    const session = { isStreaming: false, abort: vi.fn(async () => {}) };
+    const state = readState(session, {
+      activeToolName: "assigned-check", checkOperation: { controller, settled },
+    });
+    vi.spyOn(teams, "readConfig").mockResolvedValue(team([member()]));
+    const interrupt = createInterrupt(state, null, 25);
+    const pending = interrupt("reader");
+    await vi.advanceTimersByTimeAsync(25);
+    expect(controller.signal.aborted).toBe(true);
+    await expect(pending).resolves.toMatchObject({ status: "pending" });
+    expect(session.abort).not.toHaveBeenCalled();
+    expect(state.acceptingMessages).toBe(true);
+    expect(state.stopRequested).not.toBe(true);
+    settle();
+    await state.operationInterruptPromise;
+    expect(state.operationInterruptPromise).toBeUndefined();
+  });
+
   it("requires command proof and bounds cooperative read cancellation", async () => {
     const idleSession = { isStreaming: true, abort: vi.fn(async () => {}) };
     vi.spyOn(teams, "readConfig").mockResolvedValue(team([member()]));

@@ -29,7 +29,7 @@ export interface ReportResult extends ReportedTaskDetails {
   taskId: string;
   runId: string;
   reportId: string;
-  verification: { state: VerificationState; checkIds?: string[] };
+  verification: { state: VerificationState; checkIds?: string[]; error?: string };
   acceptance: { state: "pending" | "accepted" | "rejected"; decidedAt?: number; reason?: string };
 }
 

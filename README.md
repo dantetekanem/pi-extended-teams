@@ -80,9 +80,36 @@ Optional outcomes are `succeeded`, `blocked`, `failed`, and `cancelled`. Reports
 
 New reports store a versioned `result` with runtime-assigned task, run, and report IDs in `reports.json`; the full Markdown report remains unchanged. Repeating the same run's report preserves the first stored report. Plain reports remain supported, and omitted outcomes stay unspecified.
 
-Verification starts as `not-requested`; lead acceptance starts as `pending`. Neither a submitted report nor a claimed outcome changes those states. Trusted integrations can record an explicit decision through `recordReportAcceptance(teamName, reportId, "accepted" | "rejected", reason?)` in `src/utils/report-events.ts`. Final-report tools cannot assign identities, verification, or acceptance.
+Without assigned checks, verification is `not-requested`. Lead acceptance starts as `pending`. Agent-reported claims cannot change either state. Trusted integrations can record an explicit decision through `recordReportAcceptance(teamName, reportId, "accepted" | "rejected", reason?)` in `src/utils/report-events.ts`. Final-report tools cannot assign identities, verification, or acceptance.
 
 `get_agent_status` shows task outcome separately from lifecycle status. The lead can recover the full persisted result through `check_teammate` after the agent leaves the roster.
+
+## Assigned checks
+
+The lead can attach explicit checks to `spawn_agent`, individual swarm agents, or swarm defaults:
+
+```text
+spawn_agent({
+  name: "result-review",
+  model_slot: "read-review",
+  prompt: "Review task outcomes without editing files.",
+  checks: [{
+    name: "result-contract",
+    command: "pnpm --config.verify-deps-before-run=false exec vitest run src/results/report-result.test.ts",
+    timeoutSeconds: 60
+  }]
+})
+```
+
+Each check needs a unique name, a command, and a finite positive per-command timeout in seconds. Commands run through Pi's native local BashOperations in the agent's cwd, before its final report closes the recipient. Swarm agents inherit defaults; `checks: []` disables that inheritance. Nested helpers cannot assign checks, and report fields or metadata cannot authorize commands. Trusted spawn integrations receive `checks` on the orchestration request and must bind them as the admitted member's `assignedChecks`.
+
+Verification records the actual exit, full output, and source before and after execution. Fingerprints include Git HEAD/index metadata, tracked working-file bytes, and nonignored untracked files. Optional `inputs` are literal paths relative to the agent's cwd, contained within its repository; omitting them covers the repository. Unsupported source inputs or Pi runtimes fail visibly rather than falling back to another command runner.
+
+Check records and private full logs live under `~/.pi/teams/<team>/checks/`. Report IDs reference their check IDs. `listTeamReportEvents` and orchestration/status reads recheck current source and expose stale verification without rewriting historical evidence. After roster removal, `check_teammate` retrieves the report, observed check records, and full-log paths. Ordinary lead notifications include verification state, not full logs.
+
+Repeated reports do not rerun commands. An unresolved execution claim is not replayed and prevents clean finalization. In-process interruption and shutdown cancel assigned checks and wait for raw settlement; nonsettling operations remain quarantined without releasing claims. Failed checks do not imply a failed lifecycle, overwrite the reported task outcome, or grant lead acceptance. There is no automatic repair or retry in this feature.
+
+These fingerprints are observations, not snapshots or workspace isolation. They do not capture ignored/external inputs, external services, or edits restored between observations. Checks and agents share the host's permissions; this is not a sandbox against other same-user processes.
 
 ## Intent tiers
 

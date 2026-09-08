@@ -38,6 +38,20 @@ describe("report events", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("keeps unrelated reports available when referenced check evidence is corrupt", async () => {
+    const bad = createReportResult("team", "bad", "run", {});
+    bad.verification = { state: "pending", checkIds: ["invalid-check-id"] };
+    const good = createReportResult("team", "good", "run", { outcome: "blocked" });
+    await appendTeamReportEvent("team", { agentName: "bad", status: "completed", report: "Bad evidence", result: bad, source: "read-agent" });
+    await appendTeamReportEvent("team", { agentName: "good", status: "completed", report: "Good report", result: good, source: "read-agent" });
+    const before = fs.readFileSync(reportsPath(), "utf8");
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(2);
+    expect(reports[0].result?.verification).toMatchObject({ state: "failed", error: expect.stringContaining("Invalid check identity") });
+    expect(reports[1].result).toEqual(good);
+    expect(fs.readFileSync(reportsPath(), "utf8")).toBe(before);
+  });
+
   it("filters before applying latest-limit pagination", async () => {
     await appendTeamReportEvent("team", event({ id: "a-100", agentName: "agent-a", createdAt: 100, summary: "a100" }));
     await appendTeamReportEvent("team", event({ id: "b-200", agentName: "agent-b", createdAt: 200, summary: "b200" }));

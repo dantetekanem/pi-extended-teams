@@ -12,6 +12,7 @@ import * as messaging from "../../src/utils/messaging";
 import * as writeQueue from "../../src/utils/write-queue";
 import { ACCEPTED_FAVORITE_MODEL_SLOTS, FAVORITE_MODEL_SLOTS, canonicalPersistedModelSlot, isFavoriteModelSlot, loadSettings, normalizeFavoriteModelSlot, requireFavoriteModelLevel, resolveModel, roleForFavoriteModelSlot, type AgentRole, type CanonicalFavoriteModelSlot } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
+import { CheckPolicySchema, normalizeCheckPolicy } from "../../src/results/check-policy";
 
 import type { RunningReadAgent } from "../runtime/types";
 import type { ReadAgentTeardownResult } from "../agents/read-agent-session-lifecycle";
@@ -831,6 +832,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   async function spawnTeammate(params: any, ctx: any, spawnOptions: SpawnTeammateOptions = {}): Promise<{ content: any[]; details: any }> {
+    const assignedChecks = normalizeCheckPolicy(params.checks);
     const safeName = paths.sanitizeName(params.name);
     const safeTeamName = paths.sanitizeName(params.team_name);
     const cwd = params.cwd || ctx.cwd;
@@ -974,6 +976,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       color: role === "read" ? "cyan" : "blue",
       thinking: chosenThinking,
       planModeRequired: params.plan_mode_required,
+      assignedChecks,
       metadata: operationMetadataFromParams(params),
       delegationDepth: spawnOptions.nestedParent ? 1 : 0,
       allowNestedReadAgents: !spawnOptions.nestedParent && spawnOptions.allowNestedReadAgents === true,
@@ -1088,6 +1091,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     name: Type.Optional(Type.String({ description: "Stable display name. Defaults to a generated agent name." })),
     prompt: Type.String({ description: "The agent's assignment, relevant prior context, evidence already gathered, constraints, and report shape." }),
     cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead session cwd." })),
+    checks: Type.Optional(CheckPolicySchema),
     session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Optional filtered snapshot of the lead's active session branch. Use lazy only when omitted session history may materially affect the lane; the child reads it on demand rather than receiving transcript content in its prompt.", default: "none" })),
     metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
     allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Opt in eligible depth-0 write-feature/write-critical agents to restricted read-only child spawning.", default: false })),
@@ -1258,6 +1262,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     parameters: Type.Object({
       defaults: Type.Optional(Type.Object({
         cwd: Type.Optional(Type.String()),
+        checks: Type.Optional(CheckPolicySchema),
         model_slot: Type.Optional(StringEnum(ACCEPTED_FAVORITE_MODEL_SLOTS, { description: levelDescription })),
         metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
         session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Shared lazy session-reference policy.", default: "none" })),

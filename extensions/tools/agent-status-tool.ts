@@ -141,6 +141,7 @@ function completedStatus(report: TeamReportEvent, now: number): AgentStatusSnaps
     ...(report.result && {
       taskId: report.result.taskId, runId: report.result.runId, reportId: report.result.reportId,
       outcome: report.result.outcome, verification: report.result.verification.state, acceptance: report.result.acceptance.state,
+      error: report.result.verification.error,
     }),
     completedAgeMs: age(now, report.createdAt),
     summary: report.summary,

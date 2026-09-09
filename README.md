@@ -55,6 +55,8 @@ This works well for multi-angle code review, root-cause investigation, parallel 
 
 With the editor empty, press Down to open agent navigation. Use Down/Up to move, `l` to expand large tool logs, `m` to message an agent, `i` to interrupt its currently running tool command, `x` to stop the whole agent, and Escape to return.
 
+Scroll the transcript with Page Up/Page Down or the mouse wheel, including under Herdr. Press End or scroll back to the bottom to follow new output.
+
 The lead can invoke the same command-only behavior with `interrupt_teammate({ agent_name: "agent" })`. It keeps the agent's session, task context, and file claims intact so you can send follow-up work. In-process cancellation is cooperative and may report that it is still pending; for tmux-backed agents, success means Pi's Escape key was delivered, not that command settlement was independently confirmed.
 
 [![Inspecting and messaging a running agent](https://raw.githubusercontent.com/dantetekanem/pi-extended-teams/main/assets/pi-extended-teams-agent-navigation.png)](https://raw.githubusercontent.com/dantetekanem/pi-extended-teams/main/assets/pi-extended-teams-agent-navigation.png)

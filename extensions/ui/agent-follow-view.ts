@@ -466,6 +466,13 @@ export function createAgentFollowComponent(
 
   const sortedAgents = () => options.getAgents().slice().sort((a, b) => a.name.localeCompare(b.name));
 
+  const scrollTranscript = (delta: number) => {
+    if (!Number.isFinite(delta)) return;
+    const maxOffset = Math.max(0, lastTranscriptRows - lastBodyHeight);
+    offsetFromBottom = Math.max(0, Math.min(maxOffset, offsetFromBottom - Math.trunc(delta)));
+    tui.requestRender();
+  };
+
   const selectRelative = (delta: number) => {
     const agents = sortedAgents();
     if (agents.length === 0) return;
@@ -713,7 +720,22 @@ export function createAgentFollowComponent(
       clearInterval(refreshTimer);
       if (forwardHerdrPageKeys) tui.terminal.write("\x1b[?1000l");
     },
+    handleMouse(event: { type: string; wheelDelta?: number }) {
+      if (event.type !== "wheel") return;
+      scrollTranscript(event.wheelDelta ?? 0);
+      return { handled: true };
+    },
     handleInput(data: string) {
+      const sgrMouse = /^\x1b\[<(\d+);\d+;\d+([Mm])$/.exec(data);
+      const mouseButton = sgrMouse ? Number(sgrMouse[1])
+        : data.length === 6 && data.startsWith("\x1b[M") ? data.charCodeAt(3) - 32 : undefined;
+      if (mouseButton !== undefined) {
+        if (sgrMouse?.[2] !== "m" && mouseButton >= 64 && mouseButton <= 93) {
+          const wheelButton = mouseButton & ~28;
+          if (wheelButton === 64 || wheelButton === 65) scrollTranscript(wheelButton === 64 ? -3 : 3);
+        }
+        return;
+      }
       if (composingMessage) {
         if (matchesKey(data, Key.ctrl("c"))) {
           done();

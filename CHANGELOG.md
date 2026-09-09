@@ -10,6 +10,11 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.4] - 2026-09-09
+
+### Fixed
+- Preserve slashes in model IDs when starting read agents and queued read helpers, fixing failed lookups for models such as Fireworks router IDs. Thanks to @luisrudge ([#33](https://github.com/dantetekanem/pi-extended-teams/pull/33)).
+
 ## [2.2.1] - 2026-09-01
 
 ### Changed

@@ -18,6 +18,7 @@ import { createReportProgressTool } from "./tools/agent-communication-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools, type TeamToolsRuntime } from "./tools/team-tools.js";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
+import { parseQualifiedModel } from "../src/utils/model-resolution";
 import { formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 import { createPendingChildController } from "./runtime/pending-child-controller.js";
@@ -808,7 +809,9 @@ export default function (pi: ExtensionAPI) {
           }
           const level = requireFavoriteModelLevel(loadSettings({ projectDir: queued.cwd }), queued.modelSlot);
           if (level.role !== "read") throw new Error(`Read helper ${queued.name} requires a read-* intent tier configured via /agents-favorite-models, got ${level.slot}.`);
-          const [provider, modelId] = level.model.split("/", 2);
+          const parsedModel = parseQualifiedModel(level.model);
+          const provider = parsedModel?.provider;
+          const modelId = parsedModel?.model;
           const model = provider && modelId ? sessionCtx.modelRegistry?.find?.(provider, modelId) : undefined;
           if (!model) throw new Error(`Read helper model \"${level.model}\" from intent tier ${level.slot} is not available in the lead session.`);
 

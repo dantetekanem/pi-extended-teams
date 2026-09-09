@@ -10,6 +10,7 @@ import { createAgentCommunicationTools, type SubmittedAgentReport } from "../too
 import { requireWriteAgentTeam } from "../team/roster";
 import { isPiPromptPlanningMember, shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
+import { parseQualifiedModel } from "../../src/utils/model-resolution";
 import { closePersistedRecipient } from "../team/recipient-closure";
 import { generateExtensionInstanceId, generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
 import { createLifecycleRuntime, type ShutdownTeammateOptions } from "../team/lifecycle";
@@ -784,7 +785,9 @@ export async function runReadAgentInProcess(
     if (pendingChildParent && !pendingChildController) {
       throw new Error(`Eligible nested read parent ${member.name} requires a pending child controller.`);
     }
-    const [provider, modelId] = (member.model || "").split("/", 2);
+    const parsedModel = parseQualifiedModel(member.model || "");
+    const provider = parsedModel?.provider;
+    const modelId = parsedModel?.model;
     const model = provider && modelId ? ctx.modelRegistry.find(provider, modelId) : undefined;
     if (!model) {
       throw new Error(`Read agent model "${member.model}" is not available.`);

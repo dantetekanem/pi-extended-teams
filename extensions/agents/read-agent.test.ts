@@ -366,6 +366,40 @@ describe("in-process read agent tool wiring", () => {
     expect(runningReadAgents.size).toBe(0);
   });
 
+  it("resolves models whose qualified key contains slashes in the model id", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const slashModelKey = "fireworks/fireworks:accounts/fireworks/routers/glm-5p3-fast";
+    const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
+    fs.writeFileSync(settingsPath, JSON.stringify({
+      favoriteModels: {
+        "reading-default": { model: slashModelKey, thinking: "high" },
+        "writing-basic": { model: "provider/model", thinking: "high" },
+        "writing-hard": { model: "provider/model", thinking: "xhigh" },
+        "write-feature": { model: "provider/model", thinking: "medium" },
+        "write-critical": { model: "provider/model", thinking: "xhigh" },
+      },
+    }));
+    const member = { ...fixtureMember("reader"), model: slashModelKey, prompt: "investigate" };
+    writeTeamConfig("team", member);
+    const find = vi.fn((provider: string, modelId: string) =>
+      provider === "fireworks" && modelId === "fireworks:accounts/fireworks/routers/glm-5p3-fast"
+        ? { provider: "fireworks", id: "fireworks:accounts/fireworks/routers/glm-5p3-fast" }
+        : undefined);
+    const releaseAllClaimsForAgent = vi.fn(async () => [] as string[]);
+
+    const run = runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find },
+    }, {
+      ...makeRunOptions(),
+      releaseAllClaimsForAgent,
+    });
+
+    await vi.waitFor(() => expect(releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader"));
+    expect(find).toHaveBeenCalledWith("fireworks", "fireworks:accounts/fireworks/routers/glm-5p3-fast");
+    await run;
+  });
+
   it("stops heartbeating when lifecycle teardown is refused by an unreadable fence", async () => {
     const session = makeSession();
     session.prompt.mockImplementation(async () => {

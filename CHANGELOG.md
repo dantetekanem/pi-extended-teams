@@ -10,6 +10,11 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.5] - 2026-09-10
+
+### Fixed
+- Fix mouse-wheel scrolling in the live agent view, including under Herdr ([#25](https://github.com/dantetekanem/pi-extended-teams/pull/25)).
+
 ## [2.2.4] - 2026-09-09
 
 ### Fixed

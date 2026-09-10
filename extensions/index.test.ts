@@ -1455,7 +1455,7 @@ describe("extension integration", () => {
     }
   });
 
-  it("lists a runtime-only reader in live navigation whenever the activity card counts it", async () => {
+  it.each([false, true])("keeps runtime-only reader activity and navigation lifecycle-aligned (replaced: %s)", async (replaced) => {
     const setup = await setupExtension();
     try {
       const runtime = await import("../src/utils/runtime.js");
@@ -1482,14 +1482,18 @@ describe("extension integration", () => {
       await runtime.writeRuntimeStatus(teamName, "runtime-reader", runtimeReaderRunId, {
         pid: process.pid, ready: true, startedAt: now, lastHeartbeatAt: now, currentAction: "thinking", latestProgress: "Reading CI logs",
       });
+      if (replaced) {
+        await setup.teams.updateMember(teamName, "runtime-reader", { lifecycleRunId: "replacement-run" });
+      }
       await vi.advanceTimersByTimeAsync(1_200);
 
       const widgetCall = [...ctx.ui.setWidget.mock.calls]
         .reverse()
         .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
       const card = widgetCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
-      expect(card).toContain("2 active · 2 read");
-      expect(card).toContain("runtime-reader");
+      expect(card).toContain(replaced ? "1 active · 1 read" : "2 active · 2 read");
+      if (replaced) expect(card).not.toContain("runtime-reader");
+      else expect(card).toContain("runtime-reader");
 
       const editorFactory = ctx.ui.setEditorComponent.mock.calls.at(-1)?.[0];
       const editor = editorFactory({}, {}, {});
@@ -1497,8 +1501,13 @@ describe("extension integration", () => {
       expect(followedComponent.render(120).join("\n")).toContain("(in-process-reader)");
       followedComponent.handleInput("\x1b[B");
       const runtimeReaderView = followedComponent.render(120).join("\n");
-      expect(runtimeReaderView).toContain("(runtime-reader)");
-      expect(runtimeReaderView).toContain("Reading CI logs");
+      if (replaced) {
+        expect(runtimeReaderView).toContain("(in-process-reader)");
+        expect(runtimeReaderView).not.toContain("(runtime-reader)");
+      } else {
+        expect(runtimeReaderView).toContain("(runtime-reader)");
+        expect(runtimeReaderView).toContain("Reading CI logs");
+      }
       followedComponent.dispose();
     } finally {
       setup.restoreEnv();

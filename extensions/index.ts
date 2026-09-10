@@ -588,6 +588,7 @@ export default function (pi: ExtensionAPI) {
           runtimeStatus: await runtime.readRuntimeStatus(activityTeamName, member.name).catch(() => null),
         }))))
         .filter((entry): entry is { member: Member; runtimeStatus: runtime.AgentRuntimeStatus } => isVisibleRuntimeOnlyMember(entry.member, entry.runtimeStatus, now))
+        .filter(({ member, runtimeStatus }) => member.lifecycleRunId === runtimeStatus.lifecycleRunId)
       : [];
     const runtimeOnlyMemberNames = new Set(runtimeOnlyMembers.map(({ member }) => member.name));
     const runtimeOnlyReadMembers = runtimeOnlyMembers.filter(({ member }) => memberActivityRole(member) === "read");

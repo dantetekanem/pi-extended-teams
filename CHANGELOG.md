@@ -10,6 +10,9 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+### Fixed
+- Show runtime-only read agents in Down-key live navigation whenever the activity card counts them as active.
+
 ## [2.2.5] - 2026-09-10
 
 ### Fixed

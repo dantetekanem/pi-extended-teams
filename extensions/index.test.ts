@@ -1455,6 +1455,56 @@ describe("extension integration", () => {
     }
   });
 
+  it("lists a runtime-only reader in live navigation whenever the activity card counts it", async () => {
+    const setup = await setupExtension();
+    try {
+      const runtime = await import("../src/utils/runtime.js");
+      const ctx = makeCtx(setup.root, "follow-runtime-reader-session");
+      let followedComponent: any;
+      ctx.ui.custom.mockImplementation(async (factory: any) => { followedComponent = factory({ terminal: { rows: 30 }, requestRender: vi.fn() }, {}, {}, vi.fn()); });
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        if (member.name !== "in-process-reader") return;
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), { runId: member.lifecycleRunId, name: member.name, teamName, startedAt: Date.now(), tokensUsed: 0, status: "working", recentEvents: [], lastActivityAt: Date.now(), role: "read" });
+      });
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      for (const name of ["in-process-reader", "runtime-reader"]) {
+        await setup.tools.get("spawn_agent")!.execute("spawn", {
+          name,
+          prompt: "Inspect this",
+          cwd: setup.root,
+          model_slot: "read-review",
+        }, new AbortController().signal, undefined, ctx);
+      }
+      const teamName = "session-follow-runtime-reader-session";
+      const now = Date.now();
+      const runtimeReaderRunId = (await setup.teams.readConfig(teamName)).members.find((member: any) => member.name === "runtime-reader")!.lifecycleRunId!;
+      await runtime.writeRuntimeStatus(teamName, "runtime-reader", runtimeReaderRunId, {
+        pid: process.pid, ready: true, startedAt: now, lastHeartbeatAt: now, currentAction: "thinking", latestProgress: "Reading CI logs",
+      });
+      await vi.advanceTimersByTimeAsync(1_200);
+
+      const widgetCall = [...ctx.ui.setWidget.mock.calls]
+        .reverse()
+        .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      const card = widgetCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
+      expect(card).toContain("2 active · 2 read");
+      expect(card).toContain("runtime-reader");
+
+      const editorFactory = ctx.ui.setEditorComponent.mock.calls.at(-1)?.[0];
+      const editor = editorFactory({}, {}, {});
+      editor.handleInput("\x1b[B");
+      expect(followedComponent.render(120).join("\n")).toContain("(in-process-reader)");
+      followedComponent.handleInput("\x1b[B");
+      const runtimeReaderView = followedComponent.render(120).join("\n");
+      expect(runtimeReaderView).toContain("(runtime-reader)");
+      expect(runtimeReaderView).toContain("Reading CI logs");
+      followedComponent.dispose();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("clears the activity card instead of showing stale ready runtime JSON", async () => {
     const setup = await setupExtension();
     try {

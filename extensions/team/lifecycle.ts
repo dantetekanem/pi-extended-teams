@@ -20,7 +20,8 @@ import {
   type ReadAgentTeardownResult,
 } from "../agents/read-agent-session-lifecycle";
 import { releaseAllClaimsForAgent } from "./roster";
-import { cleanupPidFileProcess } from "../internal/session-files";
+import { cleanupPidFileProcess, unlinkPidFile } from "../internal/session-files";
+import { herdrCommand } from "../runtime/herdr";
 import { closePersistedRecipient } from "./recipient-closure";
 import { cleanupPrivateAgentSessionDirectory } from "../internal/agent-session-files";
 
@@ -65,7 +66,10 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
   async function finalizeTeammateRuntime(teamName: string, member: Member, expectedRunId: string): Promise<void> {
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
     const pidFileExisted = fs.existsSync(pidFile);
-    const pidCleanup = cleanupPidFileProcess(pidFile, { skipPid: process.pid });
+    if (member.herdrPaneId) herdrCommand("pane", "close", member.herdrPaneId);
+    const pidCleanup = member.herdrPaneId
+      ? { pid: undefined, killError: undefined, unlinked: !pidFileExisted || unlinkPidFile(pidFile) }
+      : cleanupPidFileProcess(pidFile, { skipPid: process.pid });
     if (pidFileExisted && !pidCleanup.unlinked) {
       throw new Error(`Could not remove pid file for ${member.name}.`);
     }

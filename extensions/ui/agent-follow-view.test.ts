@@ -622,6 +622,26 @@ describe("agent follow component", () => {
     component.dispose();
   });
 
+  it.each(["1", undefined])("moves only the selected agent with h inside Herdr (%s)", async (herdr) => {
+    vi.stubEnv("HERDR_ENV", herdr);
+    const done = vi.fn();
+    const alpha = Object.assign(makeAgent({ name: "alpha" }), { moveToHerdr: vi.fn() });
+    const beta = Object.assign(makeAgent({ name: "beta" }), { moveToHerdr: vi.fn(async () => {}) });
+    const component = createAgentFollowComponent({ terminal: { rows: 24, write: vi.fn() }, requestRender: vi.fn() }, done, {
+      getAgents: () => [alpha, beta], initialAgentName: "beta",
+    });
+    try {
+      component.handleInput("h");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(beta.moveToHerdr).toHaveBeenCalledTimes(herdr ? 1 : 0);
+      expect(alpha.moveToHerdr).not.toHaveBeenCalled();
+      expect(done).toHaveBeenCalledTimes(herdr ? 1 : 0);
+    } finally {
+      component.dispose();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("shows a direct-message input and sends to the selected agent", async () => {
     const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
     const sendMessage = vi.fn(async () => {});

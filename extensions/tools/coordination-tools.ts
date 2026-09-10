@@ -147,6 +147,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       const targetTeamName = requireCurrentSession(options);
       if (!options.isTeammate) throw new Error("report_and_exit is only available to spawned agents.");
+      if (process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1" && !params.content.trim()) throw new Error("Final report content must not be empty.");
 
       const config = await teams.readConfig(targetTeamName);
       const member = config.members.find(m => m.name === options.agentName);
@@ -271,6 +272,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, _ctx: any) {
       const targetTeamName = requireCurrentSession(options);
       const targetAgent = params.agent_name || options.agentName;
+      if (process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1" && targetAgent !== options.agentName) throw new Error("A resumed subagent can only read its own inbox.");
       const markAsRead = params.mark_as_read !== false;
       const unreadOnly = params.unread_only !== false;
       const msgs = await messaging.readInbox(targetTeamName, targetAgent, unreadOnly, markAsRead);

@@ -605,11 +605,12 @@ export function createAgentFollowComponent(
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";
       const messageAction = options.sendMessage ? " · m message" : "";
       const interruptAction = options.interruptAgent ? " · i interrupt" : "";
-      const help = composingMessage
+      const herdrAction = process.env.HERDR_ENV === "1" && agent.moveToHerdr ? " · h Herdr" : "";
+      const help = messageStatus && !options.sendMessage ? messageStatus : composingMessage
         ? `message ${agent.name} · enter send · esc cancel`
         : agents.length > 1
-          ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction}${interruptAction} · x stop · pgup/pgdn scroll · esc main`
-          : `↑/esc main · ${logAction}${messageAction}${interruptAction} · x stop · pgup/pgdn scroll · end follow`;
+          ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction}${interruptAction}${herdrAction} · x stop · pgup/pgdn scroll · esc main`
+          : `↑/esc main · ${logAction}${messageAction}${interruptAction}${herdrAction} · x stop · pgup/pgdn scroll · end follow`;
 
       const currentTranscriptWidth = Math.max(20, innerWidth);
       if (transcriptAgent !== agent
@@ -764,6 +765,14 @@ export function createAgentFollowComponent(
         messageStatus = "";
         syncInputFocus();
         tui.requestRender();
+        return;
+      }
+      if (data.toLowerCase() === "h" && process.env.HERDR_ENV === "1") {
+        const agent = currentAgent(sortedAgents(), selectedName);
+        if (agent?.moveToHerdr) void agent.moveToHerdr().then(done).catch(error => {
+          messageStatus = sanitizePlainTuiLine(error instanceof Error ? error.message : String(error));
+          tui.requestRender();
+        });
         return;
       }
       if (data.toLowerCase() === "i" && options.interruptAgent) {

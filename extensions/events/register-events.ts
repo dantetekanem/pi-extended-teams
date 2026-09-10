@@ -220,7 +220,9 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       }
 
       scheduleTeammateOneShot(() => {
-        options.quietTrigger("read_inbox to get your instructions, then begin your work.");
+        options.quietTrigger(process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1"
+          ? "Continue your existing assignment. Read any new inbox messages, then finish and report_and_exit from this pane."
+          : "read_inbox to get your instructions, then begin your work.");
       }, 1000);
 
       if (teamName) {

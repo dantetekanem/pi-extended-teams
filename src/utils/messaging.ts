@@ -40,6 +40,7 @@ interface AppendRunningMessageOptions {
   operationId?: string;
   workflowRunId?: string;
   expectedRecipientRunId?: string;
+  rearmRead?: boolean;
 }
 
 async function appendRunningMessage(
@@ -54,7 +55,14 @@ async function appendRunningMessage(
       const messages = readInboxRaw(p);
       if (options.operationId) {
         const existing = messages.find(item => messageOperationMatches(item, options.operationId!, options.workflowRunId));
-        if (existing) return { message: existing, delivered: false };
+        if (existing) {
+          if (options.rearmRead && existing.read) {
+            existing.read = false;
+            writeJsonAtomic(p, messages);
+            return { message: existing, delivered: true };
+          }
+          return { message: existing, delivered: false };
+        }
       }
       messages.push(message);
       writeJsonAtomic(p, messages);
@@ -229,12 +237,13 @@ export async function appendMessageOnceIfRunning(
   teamName: string,
   agentName: string,
   message: InboxMessage & { operationId: string },
-  options: Pick<MessageMetadataOptions, "expectedRecipientRunId"> = {}
+  options: Pick<MessageMetadataOptions, "expectedRecipientRunId"> & { rearmRead?: boolean } = {}
 ): Promise<SendPlainMessageOnceResult> {
   return appendRunningMessage(teamName, agentName, message, {
     operationId: message.operationId,
     workflowRunId: message.workflowRunId,
     expectedRecipientRunId: options.expectedRecipientRunId,
+    rearmRead: options.rearmRead,
   });
 }
 
@@ -367,17 +376,19 @@ export async function sendPlainMessageOnce(
   return await appendMessageOnce(teamName, toName, msg);
 }
 
+// Opt into rearmRead only after the previous consumer is conclusively stopped.
 export async function sendPlainMessageOnceIfRunning(
   teamName: string,
   fromName: string,
   toName: string,
   text: string,
   summary: string,
-  options: SendPlainMessageOptions & { operationId: string }
+  options: SendPlainMessageOptions & { operationId: string; rearmRead?: boolean }
 ): Promise<SendPlainMessageOnceResult> {
   const msg = buildInboxMessage(fromName, text, summary, options) as InboxMessage & { operationId: string };
   return appendMessageOnceIfRunning(teamName, toName, msg, {
     expectedRecipientRunId: options.expectedRecipientRunId,
+    rearmRead: options.rearmRead,
   });
 }
 

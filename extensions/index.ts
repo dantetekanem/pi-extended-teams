@@ -237,6 +237,7 @@ export default function (pi: ExtensionAPI) {
             {
               operationId: `herdr-handoff:${state.runId}`,
               expectedRecipientRunId: state.runId,
+              rearmRead: true,
             },
           );
         },

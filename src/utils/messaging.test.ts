@@ -13,6 +13,7 @@ import {
   sendPlainMessage,
   sendPlainMessageIfRunning,
   sendPlainMessageOnce,
+  sendPlainMessageOnceIfRunning,
 } from "./messaging";
 import type { InboxMessage } from "./models";
 import * as paths from "./paths";
@@ -213,6 +214,49 @@ describe("Messaging Utilities", () => {
 
     const inbox = await readInbox("test-team", "receiver", false, false);
     expect(inbox.length).toBe(1);
+  });
+
+  it("rearms one consumed continuation without changing ordinary send-once behavior", async () => {
+    fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({
+      members: [{ name: "receiver", lifecycleRunId: "run-a", isActive: true }],
+    }));
+    const send = (rearmRead = false) => sendPlainMessageOnceIfRunning(
+      "test-team", "team-lead", "receiver", "Continue", "Herdr handoff",
+      { operationId: "herdr-handoff:run-a", expectedRecipientRunId: "run-a", rearmRead },
+    );
+    const first = await send();
+    await readInbox("test-team", "receiver", true, true);
+    expect(await send()).toMatchObject({ delivered: false, message: { id: first.message.id, read: true } });
+
+    const retries = await Promise.all([send(true), send(true)]);
+    expect(retries.filter(result => result.delivered)).toHaveLength(1);
+    expect(await readInbox("test-team", "receiver", true, false)).toEqual([
+      { ...first.message, read: false },
+    ]);
+    expect(await send(true)).toMatchObject({ delivered: false, message: { id: first.message.id, read: false } });
+    expect(await readInbox("test-team", "receiver", false, false)).toHaveLength(1);
+  });
+
+  it.each(["closed", "replaced"])("refuses to rearm a %s recipient", async recipientState => {
+    const configFile = path.join(testDir, "config.json");
+    fs.writeFileSync(configFile, JSON.stringify({
+      members: [{ name: "receiver", lifecycleRunId: "run-a", isActive: true }],
+    }));
+    const options = { operationId: "herdr-handoff:run-a", expectedRecipientRunId: "run-a" };
+    await sendPlainMessageOnceIfRunning("test-team", "team-lead", "receiver", "Continue", "Herdr handoff", options);
+    const before = await readInbox("test-team", "receiver", true, true);
+    if (recipientState === "closed") {
+      await closePersistedRecipient("test-team", "receiver", "run-a");
+    } else {
+      fs.writeFileSync(configFile, JSON.stringify({
+        members: [{ name: "receiver", lifecycleRunId: "run-b", isActive: true }],
+      }));
+    }
+
+    await expect(sendPlainMessageOnceIfRunning(
+      "test-team", "team-lead", "receiver", "Continue", "Herdr handoff", { ...options, rearmRead: true },
+    )).rejects.toThrow(/not running|lifecycle-quarantined/);
+    expect(await readInbox("test-team", "receiver", false, false)).toEqual(before);
   });
 
   it("should find operation messages in top-level and metadata fields", async () => {

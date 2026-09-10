@@ -1206,6 +1206,7 @@ describe("team lifecycle performance", () => {
       tmuxPaneId: "w1:p10",
       backendType: "herdr",
       lifecycleRunId: "stale-herdr-run",
+      processIdentity: "stale-herdr-owner",
       isActive: true,
     });
     writeConfig({
@@ -1217,6 +1218,8 @@ describe("team lifecycle performance", () => {
       members: [member("team-lead"), herdrAgent],
     });
     await runtime.writeRuntimeStatus("watchdog-herdr-stale", herdrAgent.name, "stale-herdr-run", {
+      paneId: herdrAgent.tmuxPaneId,
+      processIdentity: herdrAgent.processIdentity,
       pid: 99_999_999,
       ready: true,
       startedAt: Date.now() - 600_000,
@@ -1250,6 +1253,7 @@ describe("team lifecycle performance", () => {
       tmuxPaneId: "w1:p13",
       backendType,
       lifecycleRunId: "cleanup-run",
+      processIdentity: "cleanup-owner",
       isActive: true,
     });
     writeConfig({
@@ -1261,6 +1265,8 @@ describe("team lifecycle performance", () => {
       members: [member("team-lead"), herdrAgent],
     });
     await runtime.writeRuntimeStatus("herdr-cleanup-team", herdrAgent.name, "cleanup-run", {
+      paneId: herdrAgent.tmuxPaneId,
+      processIdentity: herdrAgent.processIdentity,
       pid: 4242,
       ready: true,
       startedAt: Date.now(),

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { Key } from "@mariozechner/pi-tui";
 import { LEGACY_FAVORITE_MODEL_SLOT_ALIASES } from "../src/utils/settings";
+import type { HerdrPaneController } from "./runtime/herdr-handoff";
 
 type RegisteredTool = {
   name: string;
@@ -39,7 +40,7 @@ function makeCtx(cwd: string, sessionId = "test-session") {
 
 async function setupExtension(
   env: Record<string, string | undefined> = {},
-  options: { withSendMessage?: boolean } = {}
+  options: { withSendMessage?: boolean; herdrController?: HerdrPaneController } = {}
 ) {
   vi.resetModules();
   const originalEnv = { ...process.env };
@@ -73,6 +74,7 @@ async function setupExtension(
       return state.messageDeliveryTail ?? Promise.resolve();
     }),
     shutdownReadAgentSession: vi.fn(async () => {}),
+    requestReadAgentHandoff: vi.fn(),
   };
   vi.doMock("./agents/read-agent.js", () => readAgentMock);
 
@@ -102,6 +104,10 @@ async function setupExtension(
   const extension = extensionModule.default;
   const paths = await import("../src/utils/paths.js");
   const teams = await import("../src/utils/teams.js");
+  if (options.herdrController) {
+    const handoff = await import("./runtime/herdr-handoff.js");
+    vi.spyOn(handoff, "createHerdrPaneController").mockReturnValue(options.herdrController);
+  }
 
   fs.mkdirSync(testRoot, { recursive: true });
   const root = fs.mkdtempSync(path.join(testRoot, "case-"));
@@ -512,7 +518,7 @@ describe("extension integration", () => {
       const plan = spawnOptions.createResourcePlan({ cwd: setup.root, projectTrusted: true });
       expect(plan.selfExtensionPath).toBe(selfPath);
       expect(plan.extensionPaths).toEqual([externalPath]);
-      expect(plan.extensions.map((extension: any) => extension.name)).toEqual(["pi-extended-teams", "external"]);
+      expect(plan.extensions.map((extension: any) => extension.name)).toEqual([path.basename(process.cwd()), "external"]);
     } finally {
       setup.restoreEnv();
     }
@@ -1330,6 +1336,75 @@ describe("extension integration", () => {
       expect(emitShutdown).not.toHaveBeenCalled();
       expect(abortAgent).not.toHaveBeenCalled();
       expect(disposeAgent).not.toHaveBeenCalled();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it.each([true, false])("retries Herdr with one continuation after confirmed closure (consumed=%s)", async consumed => {
+    const controller = {
+      isAvailable: () => true,
+      createAgentPane: vi.fn().mockReturnValueOnce("w1:p9").mockReturnValue("w1:p10"),
+      startAgent: vi.fn(),
+      isPaneAlive: () => true,
+      closePane: vi.fn()
+        .mockImplementationOnce(() => { throw new Error("closure unconfirmed"); })
+        .mockImplementationOnce(() => { throw new Error("closure unconfirmed"); }),
+    };
+    const setup = await setupExtension({}, { herdrController: controller });
+    try {
+      const messaging = await import("../src/utils/messaging.js");
+      const handoffRuntime = await import("./runtime/herdr-handoff.js");
+      const navigation = await import("./ui/agent-navigation.js");
+      const teamName = "session-handoff-retry";
+      let handoff!: () => Promise<void>;
+      vi.spyOn(navigation, "installAgentNavigation").mockImplementation((_ctx, options) => {
+        handoff = async () => { await options.handoffAgent!("reader"); };
+      });
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((team: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        options.runningReadAgents.set(options.readAgentKey(team, member.name), {
+          runId: member.lifecycleRunId, name: member.name, teamName: team, role: "read",
+          startedAt: Date.now(), status: "working", teardownState: "active", recentEvents: [],
+        });
+      });
+      setup.readAgentMock.requestReadAgentHandoff.mockResolvedValue({
+        status: "ready", resumeCommand: "pi --session reader.jsonl",
+      });
+      const received: number[] = [];
+      vi.spyOn(handoffRuntime, "waitForExternalAgentReady").mockImplementation(async input => {
+        const messages = await messaging.readInbox(teamName, "reader", true, received.length > 0 || consumed);
+        received.push(messages.length);
+        if (received.length === 1) throw new Error("external readiness failed");
+        return { ...input, pid: 222, startedAt: Date.now(), ready: true };
+      });
+      const ctx = makeCtx(setup.root, "handoff-retry");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader", prompt: "Inspect this", cwd: setup.root, model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+
+      await expect(handoff()).rejects.toThrow("closure unconfirmed");
+      const afterFailure = await messaging.readInbox(teamName, "reader", false, false);
+      expect(afterFailure).toEqual([expect.objectContaining({ read: consumed })]);
+      await expect(handoff()).rejects.toThrow("closure unconfirmed");
+      expect(await messaging.readInbox(teamName, "reader", false, false)).toEqual(afterFailure);
+      expect(controller.startAgent).toHaveBeenCalledTimes(1);
+
+      await handoff();
+      expect(received).toEqual([1, 1]);
+      expect(controller.createAgentPane).toHaveBeenCalledTimes(2);
+      expect(controller.startAgent).toHaveBeenCalledTimes(2);
+      expect(controller.closePane).toHaveBeenNthCalledWith(3, "w1:p9");
+      expect(controller.closePane.mock.invocationCallOrder[2])
+        .toBeLessThan(controller.startAgent.mock.invocationCallOrder[1]);
+      expect(await messaging.readInbox(teamName, "reader", false, false)).toEqual([
+        { ...afterFailure[0], read: true },
+      ]);
+      const owner = (await setup.teams.readConfig(teamName)).members.find(member => member.name === "reader");
+      expect(owner).toMatchObject({
+        backendType: "herdr", tmuxPaneId: "w1:p10", lifecycleRunId: afterFailure[0].recipientLifecycleRunId,
+      });
     } finally {
       setup.restoreEnv();
     }

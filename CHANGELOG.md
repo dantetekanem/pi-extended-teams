@@ -10,8 +10,10 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.6] - 2026-09-10
+
 ### Fixed
-- Show runtime-only read agents in Down-key live navigation whenever the activity card counts them as active.
+- Show runtime-only read agents in Down-key live navigation whenever the activity card counts them as active, excluding status from replaced lifecycles ([#35](https://github.com/dantetekanem/pi-extended-teams/pull/35)).
 
 ## [2.2.5] - 2026-09-10
 

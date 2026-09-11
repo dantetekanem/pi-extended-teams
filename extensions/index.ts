@@ -64,9 +64,10 @@ export default function (pi: ExtensionAPI) {
     if (clearedTeamName === teamName) void drainReadHelperQueueOnce();
   });
   const runningReadAgents = new Map<string, RunningReadAgent>();
-  // Tmux writers have no nested AgentSession, but status rendering already
-  // maintains a lifecycle-fenced view of their active roster/runtime state.
-  const navigationWriterAgents = new Map<string, RunningReadAgent>();
+  // Runtime-only members have no nested AgentSession in this process, but
+  // status rendering already maintains a lifecycle-fenced view of their
+  // active roster/runtime state that live navigation must share.
+  const navigationRuntimeAgents = new Map<string, RunningReadAgent>();
   const completedAgentReports = new Map<string, CompletedAgentReport[]>();
   const TEAM_ACTIVITY_RENDER_DEBOUNCE_MS = 75;
   let readAgentStatusTimer: NodeJS.Timeout | null = null;
@@ -245,12 +246,12 @@ export default function (pi: ExtensionAPI) {
       && runtimeHeartbeatIsRecent(runtimeStatus, now);
   }
 
-  function navigationWriterAgent(teamName: string, member: Member, status: runtime.AgentRuntimeStatus): RunningReadAgent {
+  function navigationRuntimeAgent(teamName: string, member: Member, status: runtime.AgentRuntimeStatus): RunningReadAgent {
     return {
       runId: member.lifecycleRunId!, name: member.name, teamName,
       startedAt: status.startedAt || member.joinedAt, tokensUsed: 0, contextUsage: status.contextUsage,
       status: status.currentAction === "thinking" ? "thinking" : status.currentAction === "starting" ? "starting" : "working",
-      recentEvents: [], lastActivityAt: status.lastHeartbeatAt || member.joinedAt, role: "write",
+      recentEvents: [], lastActivityAt: status.lastHeartbeatAt || member.joinedAt, role: memberActivityRole(member),
       model: member.model, thinking: member.thinking, modelSlot: canonicalPersistedModelSlot(member.modelSlot),
       latestProgress: status.latestProgress,
     };
@@ -587,6 +588,7 @@ export default function (pi: ExtensionAPI) {
           runtimeStatus: await runtime.readRuntimeStatus(activityTeamName, member.name).catch(() => null),
         }))))
         .filter((entry): entry is { member: Member; runtimeStatus: runtime.AgentRuntimeStatus } => isVisibleRuntimeOnlyMember(entry.member, entry.runtimeStatus, now))
+        .filter(({ member, runtimeStatus }) => member.lifecycleRunId === runtimeStatus.lifecycleRunId)
       : [];
     const runtimeOnlyMemberNames = new Set(runtimeOnlyMembers.map(({ member }) => member.name));
     const runtimeOnlyReadMembers = runtimeOnlyMembers.filter(({ member }) => memberActivityRole(member) === "read");
@@ -616,10 +618,15 @@ export default function (pi: ExtensionAPI) {
         .filter(member => member.name !== "team-lead" && member.isActive !== false && memberActivityRole(member) === "write")
         .filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId)) && !runningReadAgents.has(readAgentKey(activityTeamName, member.name)) && !runtimeOnlyMemberNames.has(member.name)) ?? []
       : [];
-    navigationWriterAgents.clear();
+    navigationRuntimeAgents.clear();
+    for (const { member, runtimeStatus } of runtimeOnlyReadMembers) {
+      if (member.lifecycleRunId === runtimeStatus.lifecycleRunId) {
+        navigationRuntimeAgents.set(member.name, navigationRuntimeAgent(activityTeamName!, member, runtimeStatus));
+      }
+    }
     for (const { member, runtimeStatus } of runtimeOnlyWriteMembers) {
       if (member.tmuxPaneId && member.lifecycleRunId === runtimeStatus.lifecycleRunId) {
-        navigationWriterAgents.set(member.name, navigationWriterAgent(activityTeamName!, member, runtimeStatus));
+        navigationRuntimeAgents.set(member.name, navigationRuntimeAgent(activityTeamName!, member, runtimeStatus));
       }
     }
     const unreadLeadMessages = activityTeamName ? await messaging.readInbox(activityTeamName, agentName, true, false).catch(() => []) : [];
@@ -1119,7 +1126,7 @@ export default function (pi: ExtensionAPI) {
         getAgents: () => {
           const readers = Array.from(runningReadAgents.values())
             .filter(agent => !teamName || agent.teamName === teamName);
-          return [...readers, ...Array.from(navigationWriterAgents.values())
+          return [...readers, ...Array.from(navigationRuntimeAgents.values())
             .filter(agent => !teamName || agent.teamName === teamName)]
             .filter((agent, index, agents) => agents.findIndex(candidate => candidate.name === agent.name) === index);
         },

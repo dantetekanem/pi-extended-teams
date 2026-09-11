@@ -10,6 +10,13 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.6] - 2026-09-11
+
+### Fixed
+- Keep long Herdr handoff commands intact by launching them from a private script.
+- Focus the new pane without waiting for Herdr to detect the resumed Pi agent.
+- Deliver inbox notices while a Herdr-resumed agent is working, without repeating notices for an unchanged inbox.
+
 ## [2.2.5] - 2026-09-10
 
 ### Fixed

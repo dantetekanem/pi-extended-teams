@@ -1025,8 +1025,12 @@ export async function runReadAgentInProcess(
             "env", ...Object.entries(identity).map(([name, value]) => `${name}=${shellQuote(value)}`), launch,
             "--session", shellQuote(sessionFile), "--tools", shellQuote(tools), "--system-prompt", shellQuote(promptFile),
           ].join(" ");
+          // Keep fresh-shell input below the PTY line limit without shortening the launch arguments.
+          const launchFile = path.join(promptDir, "herdr-launch.sh");
+          fs.writeFileSync(launchFile, `exec ${command}\n`, { mode: 0o600 });
+          command = `/bin/sh ${shellQuote(launchFile)}`;
         }
-        paneId = JSON.parse(herdrCommand("pane", "split", "--current", "--direction", "right", "--cwd", member.cwd, "--no-focus")).result?.pane?.pane_id;
+        paneId = JSON.parse(herdrCommand("pane", "split", "--current", "--direction", "right", "--cwd", member.cwd, "--focus")).result?.pane?.pane_id;
         if (typeof paneId !== "string" || !paneId) throw new Error("Herdr did not return a pane ID.");
         try {
           if (!handoffRequested) {
@@ -1056,7 +1060,6 @@ export async function runReadAgentInProcess(
             if (Date.now() >= deadline) throw new Error("Pi did not resume. The saved session is retained; h can retry.");
             await new Promise(resolve => setTimeout(resolve, 50));
           }
-          herdrCommand("agent", "focus", paneId);
           if (options.isCurrentReadAgentRun(key, state)) options.runningReadAgents.delete(key);
           options.renderReadAgentStatus();
         } catch (error) {

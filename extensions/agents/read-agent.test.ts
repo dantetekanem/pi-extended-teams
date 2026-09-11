@@ -241,7 +241,8 @@ describe("in-process read agent tool wiring", () => {
     const member = fixtureMember(role === "read" ? "reader" : "writer", role);
     const session = Object.assign(makeSession(), {
       model: { provider: "host", id: "current/model" }, thinkingLevel: "high",
-      agent: { state: { systemPrompt: `scoped ${role} authority`, tools: [{ name: "read" }, { name: "read_inbox" }] } },
+      agent: { state: { systemPrompt: `scoped ${role} authority`, tools: ["read", "read_inbox",
+        ...Array.from({ length: 20 }, (_, i) => `allowed_extension_tool_${i}`)].map(name => ({ name })) } },
     });
     let finish!: () => void;
     let releaseAbort!: () => void;
@@ -268,16 +269,26 @@ describe("in-process read agent tool wiring", () => {
       let paneGone = false;
       vi.mocked(spawnSync).mockImplementation((_command, argv) => {
         const args = argv as string[];
+        // Pi can resume before Herdr's agent detection catches up.
+        if (args[0] === "agent" && args[1] === "focus") return { pid: 0, output: [], signal: null, status: 1,
+          stdout: "", stderr: "agent_not_found" };
         if (args[1] === "close" && refuseClose) return { pid: 0, output: [], signal: null, status: 1, stderr: "closure unconfirmed", stdout: "" };
         if (args[1] === "close" && paneGone) return { pid: 0, output: [], signal: null, status: 1, stdout: "",
           stderr: JSON.stringify({ error: { code: "pane_not_found" } }) };
         if (args[1] === "run") {
           expect(session.dispose).toHaveBeenCalledOnce();
-          expect(args[3]).toContain(sessionFile);
-          expect(args[3]).toContain(state.runId);
-          expect(args[3]).toContain("--tools 'read,read_inbox'");
-          expect(args[3]).toContain("--model 'host/current/model:high'");
-          expect(args[3]).toContain(`HOME='${root}'`);
+          // A fresh macOS PTY can truncate a long line before the shell is ready.
+          expect(Buffer.byteLength(args[3])).toBeLessThan(1024);
+          const launchFile = path.join(path.dirname(sessionFile), "herdr-launch.sh");
+          expect(args[3]).toBe(`/bin/sh '${launchFile}'`);
+          const launch = fs.readFileSync(launchFile, "utf8");
+          expect(fs.statSync(launchFile).mode & 0o777).toBe(0o600);
+          expect(launch.startsWith("exec env ")).toBe(true);
+          expect(launch).toContain(sessionFile);
+          expect(launch).toContain(state.runId);
+          expect(launch).toContain(`--tools '${session.agent.state.tools.map(tool => tool.name).join(",")}'`);
+          expect(launch).toContain("--model 'host/current/model:high'");
+          expect(launch).toContain(`HOME='${root}'`);
           if (++launches > 1) void runtime.writeRuntimeStatus("team", member.name, state.runId, { pid: process.pid + 1 });
         }
         return { pid: 0, output: [], signal: null, status: args[1] === "run" && launches === 1 ? 1 : 0,
@@ -299,8 +310,8 @@ describe("in-process read agent tool wiring", () => {
       expect(fs.readFileSync(path.join(path.dirname(sessionFile), "herdr-system-prompt.txt"), "utf8")).toBe(`scoped ${role} authority`);
       await sendPlainMessageIfRunning("team", "team-lead", member.name, "follow-up", "follow-up");
       await state.moveToHerdr!();
-      const focusCalls = vi.mocked(spawnSync).mock.calls.filter(([, args]) => (args as string[])[1] === "focus");
-      expect(focusCalls.map(([, args]) => args)).toEqual([["agent", "focus", "owned-pane"]]);
+      expect(spawnSync).toHaveBeenCalledWith("herdr",
+        ["pane", "split", "--current", "--direction", "right", "--cwd", member.cwd, "--focus"], expect.any(Object));
       expect(options.runningReadAgents.has(`team:${member.name}`)).toBe(false);
       expect(append).toHaveBeenCalledExactlyOnceWith({ role: "user", content: "queued guidance", timestamp: expect.any(Number) });
       expect(fs.readFileSync(sessionFile, "utf8")).toContain("queued guidance");

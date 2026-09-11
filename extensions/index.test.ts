@@ -484,7 +484,7 @@ describe("extension integration", () => {
     const setup = await setupExtension();
     try {
       writeFavoriteLevels(setup.root);
-      const selfPath = path.join(process.cwd(), "extensions", "index.ts");
+      const selfPath = path.join(setup.root, "pi-extended-teams", "extensions", "index.ts");
       const externalPath = path.join(setup.root, "extensions", "external.ts");
       setup.pi.getCommands.mockReturnValue([
         {

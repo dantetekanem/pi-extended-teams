@@ -220,10 +220,14 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       }
 
       scheduleTeammateOneShot(() => {
-        options.quietTrigger("read_inbox to get your instructions, then begin your work.");
+        options.quietTrigger(process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1"
+          ? "Continue your existing assignment. Read any new inbox messages, then finish and report_and_exit from this pane."
+          : "read_inbox to get your instructions, then begin your work.");
       }, 1000);
 
       if (teamName) {
+        const herdrResume = process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1";
+        let notifiedInbox: string | undefined;
         let wakeInFlight = false;
         const wakeIfUnread = async () => {
           if (teammateInboxDisposed) return;
@@ -232,7 +236,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             scheduleTeammateInboxWake(250);
             return;
           }
-          if (!ctx.isIdle()) {
+          if (!ctx.isIdle() && !herdrResume) {
             teammatePendingInboxWake = true;
             scheduleTeammateInboxWake(250);
             return;
@@ -246,7 +250,15 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
               lastHeartbeatAt: Date.now(),
             });
             if (unread.length > 0) {
-              options.quietTrigger(`You have ${unread.length} new inbox message(s). Read them with read_inbox and act.`);
+              const content = `You have ${unread.length} new inbox message(s). Read them with read_inbox and act.`;
+              if (herdrResume) {
+                const inboxVersion = JSON.stringify(unread);
+                if (inboxVersion !== notifiedInbox) {
+                  pi.sendMessage({ customType: "pi-extended-teams-wake", content, display: false },
+                    { triggerTurn: true, deliverAs: "steer" });
+                  notifiedInbox = inboxVersion;
+                }
+              } else options.quietTrigger(content);
             }
           } catch (e) {
             if (!teammateInboxDisposed) {

@@ -10,6 +10,7 @@ export interface Member {
   model?: string;
   joinedAt: number;
   tmuxPaneId: string;
+  herdrPaneId?: string;
   windowId?: string;
   cwd: string;
   subscriptions: any[];
@@ -33,7 +34,7 @@ export interface Member {
   parentAgentName?: string;
   /** Runtime-owned parent lifecycle identity for a restricted nested read child. */
   parentLifecycleRunId?: string;
-  /** "read" agents run in-process (no pane); "write" agents spawn in tmux. */
+  /** Tool role; execution may be in-process or in a terminal pane. */
   role?: "read" | "write";
   /** Optional category preset name from settings.json. */
   category?: string;

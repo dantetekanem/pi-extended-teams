@@ -8,13 +8,13 @@
 - Write teammates start a separate Pi process in a tmux pane. The extension builds and runs the local Pi launch command with the teammate's working directory, model and thinking configuration, selected extensions, and `PI_TEAM_NAME`, `PI_AGENT_NAME`, and `PI_LIFECYCLE_RUN_ID` environment variables.
 - Before launching a write teammate, the extension runs a bounded local `pi models --all` preflight through `sh -c` to determine whether the configured model is available.
 - On macOS, while at least one write teammate is active, the extension may run `/usr/bin/caffeinate -i -w <lead-pid>` to prevent idle system sleep. It terminates that helper when no write teammates remain or the extension is disposed.
-- In a Herdr session, the extension can invoke the configured `herdr` binary to split, start, and close panes when moving an agent. The binary path defaults to `herdr` and can be set with `HERDR_BIN_PATH`.
+- Inside Herdr, pressing `h` can move an eligible in-process agent into a sibling Pi pane. The extension calls the `herdr` executable to split, run, focus, or close that pane.
 
 ## Files and local state
 
 The extension reads settings from `~/.pi/agent/pi-extended-teams/settings.json` and `<project>/.pi/pi-extended-teams.json`. Model-provider compatibility also reads the legacy `~/.pi/pi-extended-teams.json` path. Predefined agents can be read from `~/.pi/agent/agents/` and `<project>/.pi/agents/`; team templates can be read or written at `~/.pi/teams.yaml`, `~/.pi/agent/teams.yaml`, and `<project>/.pi/teams.yaml`.
 
-For a team named `<team>`, coordination state is stored under `~/.pi/teams/<team>/`. This includes `config.json`, inboxes, runtime status, session-context references, lifecycle quarantine and tombstones, file claims, write and read-helper queues, shared memory, report events, lead-session metadata, debug logs, and private child transcripts under `agent-sessions/`. Task records are stored under `~/.pi/tasks/<team>/`, and agent reports may also be written under `~/.pi/agent/reports/`. Cleanup removes lifecycle and queue files when they are no longer needed.
+For a team named `<team>`, coordination state is stored under `~/.pi/teams/<team>/`. This includes `config.json`, inboxes, runtime status, session-context references, lifecycle quarantine and tombstones, file claims, write and read-helper queues, shared memory, report events, lead-session metadata, debug logs, and private child transcripts and handoff prompt snapshots under `agent-sessions/`. Task records are stored under `~/.pi/tasks/<team>/`, and agent reports may also be written under `~/.pi/agent/reports/`. Cleanup removes lifecycle and queue files when they are no longer needed.
 
 The extension reads project extension sources only when Pi marks the same working directory trusted. Teammates receive the working directory supplied at spawn time. A write teammate can use any filesystem access granted to its child Pi process and enabled tools. A read teammate's tools are restricted by the extension, but it still receives prompt and project context supplied by the lead.
 

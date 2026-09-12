@@ -3027,11 +3027,12 @@ describe("in-process read agent tool wiring", () => {
     expect(firstRunId).toEqual(expect.any(String));
     await readInbox("team", "team-lead", true, true);
 
-    await teams.addMember("team", { ...helper, joinedAt: Date.now(), isActive: true });
+    const secondHelper = { ...helper, joinedAt: Date.now(), isActive: true };
+    await teams.addMember("team", secondHelper);
     const secondSession = makeSession();
     secondSession.prompt.mockRejectedValue(new Error("second run failed"));
     piMocks.createAgentSession.mockResolvedValueOnce({ session: secondSession });
-    await runReadAgentInProcess("team", { ...helper, joinedAt: Date.now(), isActive: true }, "investigate", {
+    await runReadAgentInProcess("team", secondHelper, "investigate", {
       modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
     }, options);
 

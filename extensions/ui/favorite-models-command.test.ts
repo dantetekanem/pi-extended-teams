@@ -23,7 +23,9 @@ function setupCommand() {
 function testTheme() {
   return {
     fg: (_name: string, value: string) => value,
+    bg: (_name: string, value: string) => value,
     bold: (value: string) => value,
+    inverse: (value: string) => value,
   };
 }
 
@@ -59,7 +61,7 @@ describe("/agents-favorite-models", () => {
       });
 
       expect(component.render(120).join("\n")).toContain("provider/model");
-      component.handleInput("l"); // focus scoped models
+      component.handleInput("\x1b[C"); // focus scoped models
       component.handleInput("\x1b[B"); // select first scoped model for read-collect
       component.handleInput("\r"); // save
       return doneValue;
@@ -80,6 +82,58 @@ describe("/agents-favorite-models", () => {
     expect(notify).toHaveBeenCalledWith("Agent favorite models saved.", "info");
   });
 
+  it.each(["claude", "HIGH", "llama", "jkq"])("filters model names with %s without navigating or matching providers", async query => {
+    const { commands, ctx } = setupCommand();
+    const modelName = query.toLowerCase();
+    ctx.modelRegistry.getAvailable.mockResolvedValue([
+      { provider: modelName, id: "unrelated", reasoning: true },
+      { provider: "z-provider", id: modelName, reasoning: true },
+    ]);
+    const closed = vi.fn();
+    const custom = async (factory: any) => {
+      const component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, testTheme(), {}, closed);
+      component.handleInput("\x1b[C");
+      for (const character of `${query}x`) component.handleInput(character);
+      component.handleInput("\x7f");
+      component.handleInput("\x1b[B");
+      component.handleInput("\r");
+      return closed.mock.lastCall?.[0];
+    };
+    await commands.get("agents-favorite-models").handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
+    expect(closed).toHaveBeenCalledExactlyOnceWith("saved");
+    const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.favoriteModels).toEqual({ "read-collect": { model: `z-provider/${modelName}`, thinking: "high" } });
+  });
+
+  it("uses only arrows to navigate blocks and selections before saving", async () => {
+    const { commands, ctx } = setupCommand();
+    const closed = vi.fn();
+    const custom = async (factory: any) => {
+      const component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, testTheme(), {}, closed);
+      for (const key of ["j", "l", "q", "k", "h", "Q", "J", "K", "L", "H", "\t"]) component.handleInput(key);
+      component.handleInput("\x1b[C"); // models
+      component.handleInput("\x1b[B"); // first model
+      component.handleInput("\x1b[Z"); // shift-tab does not move focus
+      component.handleInput("\x1b[C"); // thinking
+      component.handleInput("\x1b[A"); // high -> medium
+      for (const key of ["j", "k", "h", "l", "q", "Q"]) component.handleInput(key);
+      component.handleInput("\x1b[D"); // models
+      component.handleInput("\x1b[D"); // slots
+      component.handleInput("\x1b[B"); // read-review
+      component.handleInput("\x1b[C"); // models
+      component.handleInput("\x1b[B");
+      component.handleInput("\r");
+      return closed.mock.lastCall?.[0];
+    };
+    await commands.get("agents-favorite-models").handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
+    expect(closed).toHaveBeenCalledExactlyOnceWith("saved");
+    const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
+    expect(raw.favoriteModels).toEqual({
+      "read-collect": { model: "provider/model", thinking: "medium" },
+      "read-review": { model: "provider/model", thinking: "high" },
+    });
+  });
+
   it("applies the calibrated thinking default for all eight canonical tiers", async () => {
     const { commands } = setupCommand();
     const custom = vi.fn(async (factory: any) => {
@@ -91,13 +145,13 @@ describe("/agents-favorite-models", () => {
         (value: "saved" | "cancelled") => { doneValue = value; },
       );
 
-      component.handleInput("l");
+      component.handleInput("\x1b[C");
       for (let index = 0; index < 8; index += 1) {
         component.handleInput("\x1b[B");
         if (index < 7) {
-          component.handleInput("h");
+          component.handleInput("\x1b[D");
           component.handleInput("\x1b[B");
-          component.handleInput("l");
+          component.handleInput("\x1b[C");
         }
       }
       component.handleInput("\r");
@@ -141,9 +195,9 @@ describe("/agents-favorite-models", () => {
         vi.fn(),
       );
 
-      component.handleInput("l");
+      component.handleInput("\x1b[C");
       component.handleInput("\x1b[B");
-      component.handleInput("l");
+      component.handleInput("\x1b[C");
       const rendered = component.render(120).join("\n");
       expect(rendered).toContain("  max");
       expect(rendered).not.toContain("  xhigh");
@@ -175,9 +229,9 @@ describe("/agents-favorite-models", () => {
         vi.fn(),
       );
 
-      component.handleInput("l");
+      component.handleInput("\x1b[C");
       component.handleInput("\x1b[B");
-      component.handleInput("l");
+      component.handleInput("\x1b[C");
       const rendered = component.render(120).join("\n");
       expect(rendered).not.toContain("  max");
       expect(rendered).not.toContain("  xhigh");
@@ -203,8 +257,8 @@ describe("/agents-favorite-models", () => {
         doneValue = value;
       });
 
-      component.handleInput("l");
-      component.handleInput("l"); // focus thinking with no model selected
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[C"); // focus thinking with no model selected
       component.handleInput("\x1b[B");
       expect(component.render(120).join("\n")).toContain("Pick a scoped model for read-collect before choosing thinking.");
       component.handleInput("\r");

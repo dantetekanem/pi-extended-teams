@@ -1,4 +1,4 @@
-import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { Box, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import {
   clearGlobalFavoriteModels,
   FAVORITE_MODEL_SLOTS,
@@ -116,7 +116,7 @@ function padToWidth(value: string, width: number): string {
 
 function styledTitle(theme: any, label: string, active: boolean): string {
   const title = active ? `▶ ${label}` : `  ${label}`;
-  return active ? theme.fg("accent", theme.bold(title)) : theme.fg("muted", title);
+  return active ? theme.inverse(theme.fg("accent", theme.bold(title))) : theme.fg("muted", title);
 }
 
 function defaultTheme(theme: any) {
@@ -157,7 +157,7 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
     const filteredModels = () => {
       const filter = modelFilter.trim().toLowerCase();
       if (!filter) return availableModels;
-      return availableModels.filter((model) => model.qualified.toLowerCase().includes(filter));
+      return availableModels.filter((model) => model.model.toLowerCase().includes(filter));
     };
 
     const ensureModelVisible = (modelRows: number) => {
@@ -276,8 +276,8 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
       return levels.map((thinking) => `${thinking === config.thinking ? "›" : " "} ${thinking}`);
     };
 
-    const columnRows = (title: string, rows: string[], width: number, active: boolean): string[] => {
-      return [styledTitle(theme, title, active), ...rows].map((row) => padToWidth(row, width));
+    const columnRows = (title: string, rows: string[], active: boolean): string[] => {
+      return [styledTitle(theme, title, active), ...rows];
     };
 
     const render = (width: number): string[] => {
@@ -286,25 +286,30 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
       const slotWidth = Math.max(28, Math.floor(innerWidth * 0.38));
       const modelWidth = Math.max(28, innerWidth - slotWidth - thinkingWidth - 6);
       const modelRowCount = modelRowsForTerminal();
-      const slotRows = columnRows("slots", buildSlotRows(), slotWidth, activeColumn() === "slots");
+      const slotRows = columnRows("slots", buildSlotRows(), activeColumn() === "slots");
       const modelRows = columnRows(
         `scoped models${modelFilter ? ` /${modelFilter}` : ""}`,
         buildModelRows(modelRowCount),
-        modelWidth,
         activeColumn() === "models",
       );
-      const thinkingRows = columnRows("thinking", buildThinkingRows(), thinkingWidth, activeColumn() === "thinking");
+      const thinkingRows = columnRows("thinking", buildThinkingRows(), activeColumn() === "thinking");
       const bodyRows = Math.max(slotRows.length, modelRows.length, thinkingRows.length);
       const lines = [
         colors.accent(colors.bold("Agent favorite models")),
         colors.dim(`${availableModels.length} scoped model(s) available from this Pi session · saves to ${globalSettingsPath()}`),
-        colors.dim("←/→ or tab: move columns · ↑/↓: change selection · type while in scoped models to filter"),
+        colors.dim("←/→: move columns · ↑/↓: change selection · type in scoped models to filter model names"),
         colors.dim("enter: save · esc: cancel · delete: clear selected slot · ctrl+a: clear all"),
         "",
       ];
 
+      const columns = [slotRows, modelRows, thinkingRows];
+      const widths = [slotWidth, modelWidth, thinkingWidth];
       for (let index = 0; index < bodyRows; index += 1) {
-        lines.push(`${slotRows[index] ?? " ".repeat(slotWidth)} │ ${modelRows[index] ?? " ".repeat(modelWidth)} │ ${thinkingRows[index] ?? ""}`);
+        const cells = columns.map((rows, column) => {
+          const cell = padToWidth(rows[index] ?? "", widths[column] - 2);
+          return column === activeColumnIndex ? `${colors.accent("▌ ")}${cell}` : `  ${cell}`;
+        });
+        lines.push(cells.join(" │ "));
       }
 
       const config = selectedConfig();
@@ -332,17 +337,13 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
         saveAndClose();
         return;
       }
-      if (activeColumn() !== "models" && (data === "q" || data === "Q")) {
-        done("cancelled");
-        return;
-      }
-      if (matchesKey(data, Key.right) || data === "l" || data === "L" || matchesKey(data, Key.tab)) {
+      if (matchesKey(data, Key.right)) {
         moveColumn(1);
-      } else if (matchesKey(data, Key.left) || data === "h" || data === "H" || matchesKey(data, Key.shift("tab"))) {
+      } else if (matchesKey(data, Key.left)) {
         moveColumn(-1);
-      } else if (matchesKey(data, Key.down) || (activeColumn() !== "models" && (data === "j" || data === "J"))) {
+      } else if (matchesKey(data, Key.down)) {
         moveActiveSelection(1);
-      } else if (matchesKey(data, Key.up) || (activeColumn() !== "models" && (data === "k" || data === "K"))) {
+      } else if (matchesKey(data, Key.up)) {
         moveActiveSelection(-1);
       } else if (matchesKey(data, Key.delete)) {
         clearSelectedSlot();
@@ -358,7 +359,11 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
       tui.requestRender();
     };
 
-    return { render, invalidate() {}, handleInput };
+    // Truncation emits full ANSI resets; repaint the background after each one.
+    const box = new Box(0, 0, (text: string) => text.split("\x1b[0m")
+      .map(part => theme.bg("customMessageBg", part)).join("\x1b[0m"));
+    box.addChild({ render, invalidate() {} });
+    return { render: (width: number) => box.render(width), invalidate: () => box.invalidate(), handleInput };
   }, {
     overlay: true,
     overlayOptions: { width: "94%", maxHeight: "86%", anchor: "center" },

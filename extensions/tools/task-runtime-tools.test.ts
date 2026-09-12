@@ -74,6 +74,25 @@ describe("task runtime tools", () => {
     expect(leadTools.get("check_teammate").description).toContain("may clean up");
   });
 
+  it("cancels accepted queued work before looking for an active process", async () => {
+    const tools = new Map<string, any>();
+    const cancelQueuedAgent = vi.fn(() => true);
+    const shutdownTeammate = vi.fn();
+    const readConfig = vi.spyOn(teams, "readConfig").mockResolvedValue({
+      name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [],
+    });
+    registerTaskRuntimeTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      isTeammate: false, terminal: null, runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, cancelQueuedAgent, shutdownTeammate,
+      getTeamName: () => "team",
+    });
+    const result = await tools.get("stop_teammate").execute("stop", { agent_name: "queued" });
+    expect(result.details).toMatchObject({ stopped: true, queued: true });
+    expect(cancelQueuedAgent).toHaveBeenCalledWith("team", "queued");
+    expect(shutdownTeammate).not.toHaveBeenCalled();
+    expect(readConfig).not.toHaveBeenCalled();
+  });
+
   it("renders the shared interruption result without invoking whole-agent teardown", async () => {
     const tools = new Map<string, any>();
     const shutdownTeammate = vi.fn();

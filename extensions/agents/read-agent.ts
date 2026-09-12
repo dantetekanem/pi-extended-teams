@@ -590,7 +590,9 @@ export async function runReadAgentInProcess(
     resolveSessionCreation = resolve;
   });
   let lifecycleRunId = member.lifecycleRunId ?? generateLifecycleRunId();
-  if (teams.teamExists(readTeamName)) {
+  // Admitted runs can publish startup ownership without awaiting the compatibility lookup.
+  // writeRuntimeStatus validates their identity under lifecycle/config locks before work starts.
+  if (!member.lifecycleRunId && teams.teamExists(readTeamName)) {
     lifecycleRunId = await teams.ensureMemberLifecycleRunId(readTeamName, member.name, lifecycleRunId);
   }
   member.lifecycleRunId = lifecycleRunId;

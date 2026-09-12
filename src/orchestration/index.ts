@@ -6,6 +6,8 @@ import * as runtime from "../utils/runtime";
 import * as writeQueue from "../utils/write-queue";
 import * as reports from "../utils/report-events";
 import type { Member } from "../utils/models";
+import { readLifecycleTombstone } from "../utils/lifecycle-tombstone";
+import { isAgentActivity, projectAgentStatus } from "./status-projection";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel, roleForFavoriteModelSlot } from "../utils/settings";
 import type {
   BroadcastMessageOnceRequest,
@@ -19,7 +21,6 @@ import type {
   SpawnTeammatesOnceResponse,
   TeamObservation,
   TeammateResolutionDetails,
-  TeammateHealth,
   TeammateObservation,
 } from "./types";
 
@@ -39,11 +40,6 @@ export async function appendTeamReportEvent(teamName: string, event: reports.New
   });
   reportAppendQueues.set(teamName, queued);
   return await next;
-}
-
-function readAgentIsKnownRunning(teamName: string, agentName: string, options: ObserveRuntimeOptions): boolean {
-  const key = options.readAgentKey?.(teamName, agentName) || `${teamName}:${agentName}`;
-  return !!options.runningReadAgents?.has(key);
 }
 
 function operationValue(source: { operationId?: string; workflowRunId?: string; metadata?: Record<string, any> }, key: "operationId" | "workflowRunId"): string | undefined {
@@ -268,40 +264,32 @@ async function observeKnownTeammate(
   const unreadCount = (await messaging.peekInbox(teamName, member.name, true).catch(() => [])).length;
   const runtimeStatus = member.name === "team-lead" ? null : await runtime.readRuntimeStatus(teamName, member.name).catch(() => null);
   const now = options.now ?? Date.now();
-  const hasRecentHeartbeat = runtime.isHeartbeatFresh(runtimeStatus, now);
-
-  let alive: boolean | null;
-  if (member.name === "team-lead") {
-    alive = true;
-  } else if (role === "read") {
-    alive = readAgentIsKnownRunning(teamName, member.name, options) || (!!runtimeStatus && hasRecentHeartbeat && member.isActive !== false);
-  } else if (member.tmuxPaneId && options.terminal?.isAlive) {
-    alive = options.terminal.isAlive(member.tmuxPaneId);
-  } else {
-    alive = null;
-  }
-
-  const startupStalled = alive === true && unreadCount > 0 && (now - member.joinedAt) > runtime.STARTUP_STALL_MS && !(runtimeStatus?.ready);
-  let health: TeammateHealth;
-  if (member.name === "team-lead") health = "lead";
-  else if (alive === null) health = "unknown";
-  else if (!alive) health = "dead";
-  else if (startupStalled) health = "stalled";
-  else if (runtimeStatus?.ready) health = hasRecentHeartbeat ? "healthy" : "idle";
-  else health = "starting";
+  const key = options.readAgentKey?.(teamName, member.name) || `${teamName}:${member.name}`;
+  const candidate = options.runningReadAgents?.get(key);
+  const fence = member.name === "team-lead" ? { status: "absent" as const }
+    : await readLifecycleTombstone(teamName, member.name).catch(error => ({
+      status: "corrupt" as const, error: error instanceof Error ? error.message : String(error),
+    }));
+  const projected = projectAgentStatus({
+    member, activity: isAgentActivity(candidate) ? candidate : undefined,
+    runtime: runtimeStatus, fence, now, unreadCount,
+    terminalAlive: member.tmuxPaneId && options.terminal?.isAlive ? options.terminal.isAlive(member.tmuxPaneId) : null,
+  });
 
   return {
     teamName,
     agentName: member.name,
     member,
     role,
-    alive,
-    health,
+    alive: member.name === "team-lead" ? true : projected.alive,
+    health: member.name === "team-lead" ? "lead" : projected.health,
+    phase: member.name === "team-lead" ? "lead" : projected.phase,
+    error: projected.error,
     unreadCount,
-    agentLoopReady: !!runtimeStatus?.ready,
-    hasRecentHeartbeat,
-    startupStalled,
-    runtime: runtimeStatus,
+    agentLoopReady: projected.agentLoopReady,
+    hasRecentHeartbeat: projected.hasRecentHeartbeat,
+    startupStalled: projected.startupStalled,
+    runtime: projected.runtime,
   };
 }
 

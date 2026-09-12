@@ -10,6 +10,9 @@ import * as writeQueue from "../utils/write-queue";
 import { appendTeamReportEvent, broadcastMessageOnce, ensureTeam, listTeamReportEvents, observeTeam, observeTeammate, sendMessageOnce, spawnTeammateOnce, spawnTeammatesOnce } from "./index";
 import { roleForFavoriteModelSlot } from "../utils/settings";
 import type { SpawnTeammateOnceRequest } from "./types";
+import type { Member } from "../utils/models";
+import { createAgentStatusTool } from "../../extensions/tools/agent-status-tool";
+import type { RunningReadAgent } from "../../extensions/runtime/types";
 
 let root: string;
 
@@ -75,13 +78,72 @@ describe("orchestration primitives", () => {
     await runtime.writeRuntimeStatus("team", "writer", writerRunId, { ready: true, lastHeartbeatAt: Date.now() });
 
     const observed = await observeTeammate("team", "writer", { terminal: { isAlive: () => false } });
-    expect(observed.health).toBe("dead");
+    expect(observed.health).toBe("healthy");
     expect(observed.unreadCount).toBe(1);
 
     const inbox = await messaging.readInbox("team", "writer", false, false);
     expect(inbox[0].read).toBe(false);
     expect(await runtime.readRuntimeStatus("team", "writer")).not.toBeNull();
     expect((await teams.readConfig("team")).members.some(member => member.name === "writer")).toBe(true);
+  });
+
+  it.each(["current", "no-telemetry", "old-run", "quarantined", "mismatched-fence", "mismatched-fence-no-state", "corrupt", "hung", "detached"] as const)("shares fenced status for an in-process writer: %s", async (scenario) => {
+    const now = Date.now();
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    const member: Member = {
+      agentId: "writer@team", name: "writer", agentType: "teammate", role: "write",
+      joinedAt: now - 120_000, tmuxPaneId: "", cwd: root, subscriptions: [],
+    };
+    await teams.addMember("team", member);
+    const runId = member.lifecycleRunId!;
+    const candidateRun = scenario === "old-run" ? "previous-run" : runId;
+    const mismatchedFence = scenario === "mismatched-fence" || scenario === "mismatched-fence-no-state";
+    const state: RunningReadAgent & { handoffDetached: boolean } = {
+      runId: candidateRun, name: member.name, teamName: "team", role: "write",
+      startedAt: member.joinedAt, status: "thinking", tokensUsed: 0, recentEvents: [],
+      lastActivityAt: scenario === "hung" ? now - 20 * 60_000 : now,
+      latestProgress: "current investigation", activeToolName: "read", handoffDetached: scenario === "detached",
+    };
+    const runningReadAgents = new Map([["team:writer", state]]);
+    if (scenario !== "no-telemetry" && scenario !== "detached") await runtime.writeRuntimeStatus("team", "writer", runId, { ready: true, lastHeartbeatAt: now });
+    if (scenario === "old-run") {
+      const telemetry = await runtime.readRuntimeStatus("team", "writer");
+      fs.writeFileSync(paths.runtimeStatusPath("team", "writer"), JSON.stringify({ ...telemetry, lifecycleRunId: candidateRun }));
+    }
+    if (scenario === "quarantined" || scenario === "corrupt" || mismatchedFence) {
+      if (scenario !== "mismatched-fence") runningReadAgents.clear();
+      const fencePath = paths.lifecycleTombstonePath("team", "writer");
+      fs.mkdirSync(path.dirname(fencePath), { recursive: true });
+      fs.writeFileSync(fencePath, scenario === "corrupt" ? "{broken" : JSON.stringify({
+        version: 1, team: "team", agent: "writer", runId: mismatchedFence ? "previous-run" : runId, role: "write", reason: "quit",
+        phase: "cleanup_failed", ownerPid: process.pid, extensionInstanceId: "test",
+        timestamps: { createdAt: now, updatedAt: now }, error: "cleanup failed",
+      }));
+    }
+    const files = [paths.configPath("team"), paths.runtimeStatusPath("team", "writer"), paths.lifecycleTombstonePath("team", "writer")];
+    const before = files.map(file => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null);
+    const removeMember = vi.spyOn(teams, "removeMember");
+    const observed = await observeTeammate("team", "writer", { runningReadAgents, now });
+    const publicResult = await createAgentStatusTool({
+      getTeamName: () => "team", runningReadAgents,
+      readAgentKey: (team, name) => `${team}:${name}`, terminal: null, listQueuedAgents: () => [],
+    }).execute("status", { agent_name: "writer" });
+    const expectedPhase = scenario === "current" || scenario === "no-telemetry" ? "thinking"
+      : scenario === "old-run" || scenario === "hung" || scenario === "detached" ? "stalled" : "quarantined";
+    expect(observed.phase).toBe(expectedPhase);
+    expect(publicResult.details.statuses[0].phase).toBe(expectedPhase);
+    if (scenario === "current" || scenario === "no-telemetry") expect(observed).toMatchObject({ alive: true, health: "healthy", agentLoopReady: true });
+    if (scenario === "old-run") {
+      expect(observed).toMatchObject({ hasRecentHeartbeat: false, runtime: null, agentLoopReady: false });
+      expect(publicResult.details.statuses[0].progress).toBeUndefined();
+    }
+    if (scenario === "detached") expect(observed).toMatchObject({ alive: null, health: "unknown", agentLoopReady: false });
+    if (scenario === "quarantined" || scenario === "corrupt" || mismatchedFence) {
+      expect(observed).toMatchObject({ health: "quarantined", agentLoopReady: false });
+      expect(observed.error).toBeTruthy();
+    }
+    expect(files.map(file => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null)).toEqual(before);
+    expect(removeMember).not.toHaveBeenCalled();
   });
 
   it("observes high-volume teams without rereading config per member", async () => {

@@ -512,7 +512,7 @@ describe("extension integration", () => {
       const plan = spawnOptions.createResourcePlan({ cwd: setup.root, projectTrusted: true });
       expect(plan.selfExtensionPath).toBe(selfPath);
       expect(plan.extensionPaths).toEqual([externalPath]);
-      expect(plan.extensions.map((extension: any) => extension.name)).toEqual(["pi-extended-teams", "external"]);
+      expect(plan.extensions.map((extension: any) => extension.name)).toEqual([path.basename(process.cwd()), "external"]);
     } finally {
       setup.restoreEnv();
     }

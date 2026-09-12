@@ -73,6 +73,7 @@ export interface NestedReadAgentToolBinding {
 
 export interface TeamToolsRuntime {
   createNestedReadAgentTools(binding: NestedReadAgentToolBinding): any[];
+  cancelQueuedAgent(teamName: string, agentName: string): boolean;
 }
 
 interface SpawnTeammateOptions {
@@ -97,11 +98,14 @@ interface QueuedReadSpawn {
   requestedAt: number;
   nameReservationId?: string;
   pendingChildAcceptance?: PendingChildAcceptance;
+  admissionError?: string;
+  quarantineError?: string;
+  launchCommitted?: boolean;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamToolsRuntime {
   if (options.isTeammate) {
-    return { createNestedReadAgentTools: () => [] };
+    return { createNestedReadAgentTools: () => [], cancelQueuedAgent: () => false };
   }
 
   function emitOrchestrationResponse(requestId: string | undefined, type: string, payload: Record<string, any>): void {
@@ -234,39 +238,38 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   const pendingChildController = options.pendingChildController ?? createPendingChildController();
   const queuedReadSpawnsByTeam = new Map<string, QueuedReadSpawn[]>();
+  const failedAdmissionsByTeam = new Map<string, QueuedReadSpawn[]>();
   const readQueueDrainingTeams = new Set<string>();
-  const readAdmissionReservationsByTeam = new Map<string, Map<string, number>>();
+  const pendingQueueDrains = new Set<string>();
+  const readAdmissionReservationsByTeam = new Map<string, Map<string, { count: number; role: string }>>();
   const nestedReadNameReservationsByTeam = new Map<string, Map<string, string>>();
 
-  function activeAgentCount(teamName: string, role?: string): number {
-    let count = 0;
-    for (const agent of options.runningReadAgents.values()) {
-      if (agent.teamName !== teamName) continue;
-      if (role && (agent.role || "read") !== role) continue;
-      count += 1;
+  function activeAgentCount(teamName: string, role?: string, includeReservations = false): number {
+    const activeKeys = new Set<string>();
+    if (includeReservations) {
+      for (const [key, reservation] of readAdmissionReservationsByTeam.get(teamName) ?? []) {
+        if (!role || reservation.role === role) activeKeys.add(key);
+      }
     }
-    return count;
-  }
-
-  function activeReadCount(teamName: string): number {
-    const activeKeys = new Set(readAdmissionReservationsByTeam.get(teamName)?.keys() ?? []);
     for (const [key, agent] of options.runningReadAgents) {
-      if (agent.teamName === teamName && (agent.role || "read") === "read") activeKeys.add(key);
+      if (agent.teamName === teamName && (!role || (agent.role || "read") === role)) activeKeys.add(key);
     }
     return activeKeys.size;
   }
 
-  function reserveReadAdmission(teamName: string, key: string): void {
-    const reservations = readAdmissionReservationsByTeam.get(teamName) ?? new Map<string, number>();
-    reservations.set(key, (reservations.get(key) ?? 0) + 1);
+  function reserveReadAdmission(teamName: string, key: string, role: string): void {
+    const reservations = readAdmissionReservationsByTeam.get(teamName) ?? new Map<string, { count: number; role: string }>();
+    const pending = reservations.get(key);
+    if (pending && pending.role !== role) throw new Error(`Agent ${key} already has a ${pending.role} admission in progress.`);
+    reservations.set(key, { count: (pending?.count ?? 0) + 1, role });
     readAdmissionReservationsByTeam.set(teamName, reservations);
   }
 
   function releaseReadAdmission(teamName: string, key: string): void {
     const reservations = readAdmissionReservationsByTeam.get(teamName);
     if (!reservations) return;
-    const count = reservations.get(key) ?? 0;
-    if (count > 1) reservations.set(key, count - 1);
+    const reservation = reservations.get(key);
+    if (reservation && reservation.count > 1) reservation.count -= 1;
     else reservations.delete(key);
     if (reservations.size === 0) readAdmissionReservationsByTeam.delete(teamName);
   }
@@ -295,13 +298,15 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   async function listQueuedAgentStatuses(teamName: string): Promise<QueuedAgentStatus[]> {
-    const readers = readQueue(teamName).map((queued, index) => ({
+    const readers = [...readQueue(teamName), ...(failedAdmissionsByTeam.get(teamName) ?? [])].map((queued, index) => ({
       name: queued.member.name,
       role: queued.member.role || "read",
       queuedAt: queued.requestedAt,
       queuePosition: index + 1,
       parentAgentName: queued.member.parentAgentName,
       parentLifecycleRunId: queued.member.parentLifecycleRunId,
+      error: queued.admissionError || queued.quarantineError,
+      failed: !!queued.admissionError,
     }));
     const writers = (await writeQueue.listWriteQueue(teamName)).map((queued, index) => ({
       name: queued.name,
@@ -342,6 +347,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   pi.on?.("session_shutdown", () => {
     if (lifecycleProbeCleanedUp) return;
     lifecycleProbeCleanedUp = true;
+    for (const [teamName, queue] of queuedReadSpawnsByTeam) {
+      for (const queued of queue) removeQueuedReadSpawnById(teamName, queued.id);
+    }
     if (typeof lifecycleProbeUnsubscribe === "function") lifecycleProbeUnsubscribe();
     pendingChildCancelUnsubscribe();
     lifecycleFenceUnsubscribe();
@@ -495,7 +503,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     else pendingChildController.settleAcceptance(identity);
   }
 
-  async function rollbackNestedChildAdmission(
+  async function rollbackAgentAdmission(
     teamName: string,
     member: Member,
     cause: unknown,
@@ -508,11 +516,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     }
     try {
       const removed = await teams.removeMemberMatchingRun(teamName, member.name, runId);
-      if (!removed) throw new Error(`matching child run ${runId} was not present`);
+      if (!removed) throw new Error(`matching agent run ${runId} was not present`);
     } catch (rollbackError) {
       const causeMessage = cause instanceof Error ? cause.message : String(cause);
       const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
-      throw new Error(`${causeMessage} Exact-run rollback for nested read agent ${member.name} failed: ${rollbackMessage}`);
+      throw new Error(`${causeMessage} Exact-run rollback for agent ${member.name} failed: ${rollbackMessage}`);
     } finally {
       settlePendingChild(pendingChild);
     }
@@ -530,7 +538,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     member: Member,
     prompt: string,
     ctx: any,
-    queuedAcceptance?: PendingChildAcceptance
+    queuedAcceptance?: PendingChildAcceptance,
+    assertPending?: () => void,
+    commitLaunch?: () => void,
   ): Promise<AdmittedReadAgentLaunch> {
     const addValidateAndLaunch = async (parentLifecycleLock?: LifecycleTombstoneLock): Promise<AdmittedReadAgentLaunch> => {
       let pendingAcceptance = queuedAcceptance;
@@ -542,17 +552,25 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       }
 
       try {
+        if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
+        assertPending?.();
         await teams.addMember(teamName, member);
       } catch (error) {
         settlePendingChild(pendingAcceptance);
         throw error;
       }
 
+      try {
+        if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
+        assertPending?.();
+      } catch (error) {
+        return rollbackAgentAdmission(teamName, member, error, pendingAcceptance);
+      }
       let pendingChildRun: PendingChildRun | undefined;
       if (member.delegationDepth === 1) {
         const runId = member.lifecycleRunId;
         if (!pendingAcceptance || !runId) {
-          return rollbackNestedChildAdmission(
+          return rollbackAgentAdmission(
             teamName,
             member,
             new Error(`Nested read agent ${member.name} did not receive an exact lifecycle run identity.`),
@@ -561,7 +579,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         }
         pendingChildRun = pendingChildController.bindAcceptedChild(pendingAcceptance, member.name, runId);
         if (!pendingChildRun) {
-          return rollbackNestedChildAdmission(
+          return rollbackAgentAdmission(
             teamName,
             member,
             new Error(`Nested read agent ${member.name} lost its parent acceptance before launch.`),
@@ -572,7 +590,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         try {
           await assertNestedChildAdmission(teamName, member, parentLifecycleLock);
         } catch (error) {
-          return rollbackNestedChildAdmission(teamName, member, error, pendingChildRun);
+          return rollbackAgentAdmission(teamName, member, error, pendingChildRun);
         }
       }
 
@@ -602,6 +620,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       };
 
       try {
+        if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
+        assertPending?.();
+        commitLaunch?.();
         const launch = options.runReadAgentInProcess(teamName, member, launchPrompt, ctx, options.readAgentOptions());
         return {
           launch: sessionContextReference
@@ -612,10 +633,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         };
       } catch (error) {
         removeReference();
-        if (member.delegationDepth === 1) {
-          return rollbackNestedChildAdmission(teamName, member, error, pendingChildRun);
-        }
-        throw error;
+        return rollbackAgentAdmission(teamName, member, error, pendingChildRun);
       }
     };
 
@@ -634,23 +652,24 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     ctx: any,
     nameReservationId?: string,
     releaseNameOnFailure = true,
-    queuedAcceptance?: PendingChildAcceptance
+    queuedAcceptance?: PendingChildAcceptance,
+    assertPending?: () => void,
+    commitLaunch?: () => void,
   ): Promise<boolean> {
     const key = options.readAgentKey(teamName, member.name);
-    const reservesReadCapacity = (member.role || "read") === "read";
-    if (reservesReadCapacity) reserveReadAdmission(teamName, key);
+    reserveReadAdmission(teamName, key, member.role || "read");
 
     const releaseNameReservation = () => {
       releaseNestedReadName(teamName, member.name, nameReservationId);
     };
     const releaseReservationAndDrain = () => {
       if (releaseNameOnFailure) releaseNameReservation();
-      if (reservesReadCapacity) releaseReadAdmission(teamName, key);
+      releaseReadAdmission(teamName, key);
       void drainQueuedReadSpawns(teamName);
     };
     const finishRun = (pendingChildRun: PendingChildRun | undefined) => {
       settlePendingChild(pendingChildRun);
-      if (reservesReadCapacity) releaseReadAdmission(teamName, key);
+      releaseReadAdmission(teamName, key);
       void drainQueuedReadSpawns(teamName);
     };
     const drainAfterRun = (pendingChildRun: PendingChildRun | undefined) => {
@@ -669,7 +688,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     };
 
     try {
-      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance);
+      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance, assertPending, commitLaunch);
       releaseNameReservation();
       void Promise.resolve(admitted.launch).then(
         () => drainAfterRun(admitted.pendingChildRun),
@@ -710,6 +729,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         pendingChildAcceptance,
       };
       setReadQueue(teamName, [...queue, queued]);
+      void drainQueuedReadSpawns(teamName);
       return queued;
     };
 
@@ -733,55 +753,62 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   async function drainQueuedReadSpawns(teamName: string): Promise<void> {
-    if (readQueueDrainingTeams.has(teamName)) return;
+    if (lifecycleProbeCleanedUp) return;
+    if (readQueueDrainingTeams.has(teamName)) {
+      pendingQueueDrains.add(teamName);
+      return;
+    }
     readQueueDrainingTeams.add(teamName);
     try {
-      while (true) {
-        const next = readQueue(teamName)[0];
-        if (!next) return;
-        const settings = loadSettings({ projectDir: next.member.cwd });
-        if (activeReadCount(teamName) >= settings.readAgents.maxConcurrent) return;
-
-        const queued = readQueue(teamName)[0];
-        if (!queued) return;
-        const fence = await readLifecycleTombstone(teamName, queued.member.name);
-        if (fence.status !== "absent") return;
-        try {
-          const config = await teams.readConfig(teamName);
-          if (config.members.some((member) => member.name === queued.member.name)) {
+      let progressed = true;
+      while (progressed && !lifecycleProbeCleanedUp) {
+        progressed = false;
+        for (const queued of readQueue(teamName)) {
+          if (queued.admissionError) continue;
+          const role = queued.member.role || "read";
+          const settings = loadSettings({ projectDir: queued.member.cwd });
+          const capacity = role === "write" ? settings.writeAgents : settings.readAgents;
+          if (activeAgentCount(teamName, role, true) >= capacity.maxConcurrent) continue;
+          const assertPending = () => {
+            if (!readQueue(teamName).some(item => item.id === queued.id)) throw new Error(`Queued agent ${queued.member.name} was cancelled.`);
+          };
+          try {
+            const fence = await readLifecycleTombstone(teamName, queued.member.name);
+            if (fence.status !== "absent") {
+              queued.quarantineError = fence.status === "corrupt" ? fence.error : `Lifecycle run ${fence.tombstone.runId} is quarantined.`;
+              continue;
+            }
+            queued.quarantineError = undefined;
+            const config = await teams.readConfig(teamName);
+            assertPending();
+            if (config.members.some(member => member.name === queued.member.name)) throw new Error(`A teammate named ${queued.member.name} already exists.`);
+            if (activeAgentCount(teamName, role, true) >= capacity.maxConcurrent) continue;
+            queued.member.joinedAt = Date.now();
+            await startReadAgentMember(teamName, queued.member, queued.prompt, queued.ctx,
+              queued.nameReservationId, false, queued.pendingChildAcceptance, assertPending,
+              () => { queued.launchCommitted = true; });
+            removeQueuedReadSpawnById(teamName, queued.id, false);
+            progressed = true;
+          } catch (error) {
+            if (!readQueue(teamName).some(item => item.id === queued.id)) continue;
+            queued.launchCommitted = false;
+            const latestFence = await readLifecycleTombstone(teamName, queued.member.name).catch(() => null);
+            if (latestFence && latestFence.status !== "absent") {
+              queued.quarantineError = "Lifecycle quarantine appeared before admission.";
+              continue;
+            }
+            queued.admissionError = error instanceof Error ? error.message : String(error);
+            failedAdmissionsByTeam.set(teamName, [...(failedAdmissionsByTeam.get(teamName) ?? []), queued].slice(-20));
             removeQueuedReadSpawnById(teamName, queued.id);
-            continue;
+            await messaging.sendPlainMessage(teamName, "system", queued.member.parentAgentName || "team-lead",
+              `Queued agent ${queued.member.name} failed admission: ${queued.admissionError}`,
+              `Queued agent ${queued.member.name} failed`, "red").catch(() => {});
           }
-          queued.member.joinedAt = Date.now();
-          await startReadAgentMember(
-            teamName,
-            queued.member,
-            queued.prompt,
-            queued.ctx,
-            queued.nameReservationId,
-            false,
-            queued.pendingChildAcceptance
-          );
-          removeQueuedReadSpawnById(teamName, queued.id, false);
-        } catch (error) {
-          const latestFence = await readLifecycleTombstone(teamName, queued.member.name);
-          if (latestFence.status !== "absent") {
-            await messaging.sendPlainMessage(
-              teamName,
-              "system",
-              "team-lead",
-              `Retained queued agent ${queued.member.name}: lifecycle quarantine appeared before admission.`,
-              `Queued agent ${queued.member.name} retained by quarantine`,
-              "yellow"
-            ).catch(() => {});
-            return;
-          }
-          // Invalid non-lifecycle requests may be dropped so later work can run.
-          removeQueuedReadSpawnById(teamName, queued.id);
         }
       }
     } finally {
       readQueueDrainingTeams.delete(teamName);
+      if (pendingQueueDrains.delete(teamName)) void drainQueuedReadSpawns(teamName);
     }
   }
 
@@ -800,7 +827,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [explicitDefaultModel]);
     const defaultModel = requireQualifiedKnownModel(explicitDefaultModel, availableModels, "model_slot");
     if (!defaultModel) throw new Error("Agent sessions require a configured model_slot level before spawning.");
-    teams.createTeam(sessionName, getPiSessionId(ctx) || "local-session", "lead-agent", "Pi session agents", defaultModel);
+    try {
+      teams.createTeamIfAbsent(sessionName, getPiSessionId(ctx) || "local-session", "lead-agent", "Pi session agents", defaultModel);
+    } catch (error) {
+      if (!(error instanceof teams.TeamAlreadyExistsError)) throw error;
+    }
     options.adoptTeamAsLead(sessionName, ctx);
     return sessionName;
   }
@@ -810,6 +841,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const safeTeamName = paths.sanitizeName(params.team_name);
     const cwd = params.cwd || ctx.cwd;
     const teamConfig = await teams.readConfig(safeTeamName);
+    failedAdmissionsByTeam.set(safeTeamName, (failedAdmissionsByTeam.get(safeTeamName) ?? []).filter(item => item.member.name !== safeName));
     let nestedNameReservationId: string | undefined;
     let nestedNameReservationTransferred = false;
 
@@ -958,90 +990,40 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       helperKind: spawnOptions.nestedParent ? "read_helper" : undefined,
     };
 
-    if (role === "read") {
-      if (!spawnOptions.nestedParent) removeQueuedReadSpawnsByName(safeTeamName, safeName);
-      const currentReadCount = activeReadCount(safeTeamName);
-      if (currentReadCount >= settings.readAgents.maxConcurrent) {
-        if (!settings.readAgents.queueOverflow) {
-          throw new Error(`Read-agent capacity reached (${currentReadCount}/${settings.readAgents.maxConcurrent}) and queueOverflow is disabled.`);
-        }
-        const queued = await enqueueReadSpawn(
-          safeTeamName,
-          member,
-          params.prompt,
-          params,
-          resolved,
-          ctx,
-          nestedNameReservationId
-        );
-        nestedNameReservationTransferred = !!nestedNameReservationId;
-        const queuePosition = readQueue(safeTeamName).findIndex((item) => item.id === queued.id) + 1;
-        return {
-          content: [{ type: "text", text: `Read teammate ${params.name} queued at position ${queuePosition}; capacity is ${currentReadCount}/${settings.readAgents.maxConcurrent}.` }],
-          details: queuedReadResolutionDetails(queued, params, { queuePosition }),
-        };
+    if (role === "write") await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
+    if (!spawnOptions.nestedParent) removeQueuedReadSpawnsByName(safeTeamName, safeName);
+    if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
+    const capacity = role === "write" ? settings.writeAgents : settings.readAgents;
+    const activeCount = activeAgentCount(safeTeamName, role, true);
+    if (activeCount >= capacity.maxConcurrent) {
+      if (!capacity.queueOverflow) {
+        throw new Error(`${role === "write" ? "Edit" : "Read"}-agent capacity reached (${activeCount}/${capacity.maxConcurrent}) and queueOverflow is disabled.`);
       }
-
-      const sessionContextAvailable = await startReadAgentMember(safeTeamName, member, params.prompt, ctx, nestedNameReservationId);
+      const queued = await enqueueReadSpawn(safeTeamName, member, params.prompt, params, resolved, ctx, nestedNameReservationId);
+      nestedNameReservationTransferred = !!nestedNameReservationId;
+      const queuePosition = readQueue(safeTeamName).findIndex(item => item.id === queued.id) + 1;
       return {
-        content: [{ type: "text", text: `Read teammate ${params.name} started in-process.` }],
-        details: spawnResolutionDetails(member, params, resolved, {
-          mode: "in-process",
-          terminalId: null,
-          queued: false,
-          sessionContextAvailable,
-        }),
+        content: [{ type: "text", text: `Agent ${params.name} queued at position ${queuePosition}; capacity is ${activeCount}/${capacity.maxConcurrent}.` }],
+        details: queuedReadResolutionDetails(queued, params, { queuePosition }),
       };
     }
 
-    await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
-    const activeWriteCount = activeAgentCount(safeTeamName, "write");
-    await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.request", {
-      agentName: safeName,
-      cwd,
-      category: params.category ?? null,
-      requestedRole: role,
-      resolvedRole: role,
-      model: chosenModel,
-      modelSource: resolved.modelSource,
-      thinking: chosenThinking ?? null,
-      activeWriteCount,
-      maxConcurrent: settings.writeAgents.maxConcurrent,
-      queueOverflow: false,
-      mode: "in-process",
-      debugLogPath: debugLogPath ?? null,
-    }, settings);
-
-    if (activeWriteCount >= settings.writeAgents.maxConcurrent) {
-      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.failure", {
-        agentName: safeName,
-        reason: "capacity-reached",
-        activeWriteCount,
-        maxConcurrent: settings.writeAgents.maxConcurrent,
-        mode: "in-process",
+    const sessionContextAvailable = await startReadAgentMember(safeTeamName, member, params.prompt, ctx, nestedNameReservationId);
+    if (role === "write") {
+      await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.success", {
+        agentName: safeName, cwd, requestedRole: role, model: chosenModel,
+        modelSource: resolved.modelSource, thinking: chosenThinking ?? null,
+        activeWriteCount: activeCount, maxConcurrent: capacity.maxConcurrent,
+        queueOverflow: capacity.queueOverflow, terminalId: null, mode: "in-process",
         debugLogPath: debugLogPath ?? null,
       }, settings);
-      throw new Error(`Edit-agent capacity reached (${activeWriteCount}/${settings.writeAgents.maxConcurrent}). Wait for an active edit agent to finish before spawning another.`);
     }
-
-    await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.success", {
-      agentName: safeName,
-      terminalId: null,
-      windowId: null,
-      mode: "in-process",
-      debugLogPath: debugLogPath ?? null,
-    }, settings);
-    const sessionContextAvailable = await startReadAgentMember(safeTeamName, member, params.prompt, ctx);
     options.renderReadAgentStatus();
     const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
     return {
-      content: [{ type: "text", text: `Edit agent ${params.name} started in-process and is followable from Pi.${debugSuffix}` }],
+      content: [{ type: "text", text: `${role === "write" ? "Edit agent" : "Read teammate"} ${params.name} started in-process and is followable from Pi.${debugSuffix}` }],
       details: spawnResolutionDetails(member, params, resolved, {
-        mode: "in-process",
-        terminalId: null,
-        queued: false,
-        debugLogPath,
-        sessionContextAvailable,
+        mode: "in-process", terminalId: null, queued: false, debugLogPath, sessionContextAvailable,
       }),
     };
     } finally {
@@ -1326,5 +1308,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     },
   });
 
-  return { createNestedReadAgentTools };
+  return {
+    createNestedReadAgentTools,
+    cancelQueuedAgent: (teamName, agentName) => {
+      // Retain the entry for admission bookkeeping, but let active teardown own cancellation after launch commits.
+      if (readQueue(teamName).some(queued => queued.member.name === agentName && queued.launchCommitted)) return false;
+      return removeQueuedReadSpawnsByName(teamName, agentName).length > 0;
+    },
+  };
 }

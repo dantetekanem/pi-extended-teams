@@ -1,8 +1,9 @@
 import type { RunningReadAgent } from "../runtime/types";
+import { AGENT_HANGING_MS } from "../../src/orchestration/status-projection";
 import { formatElapsed } from "./renderers.js";
 
 export const READ_AGENT_IDLE_NUDGE_MS = 5 * 60_000;
-export const READ_AGENT_HANGING_NUDGE_MS = 15 * 60_000;
+export const READ_AGENT_HANGING_NUDGE_MS = AGENT_HANGING_MS;
 
 export type ReadAgentStatusLabel = RunningReadAgent["status"] | "idle" | "hanging";
 export type ReadAgentIdleLevel = "none" | "soft" | "hard";

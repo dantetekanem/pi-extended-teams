@@ -69,7 +69,7 @@ Inspect only the concurrent rotation path and focused tests. Report gaps, covera
 
 Then:
 
-1. Read agents run in-process; edit agents run in separate Pi sessions through the configured terminal adapter. Both report back to the lead.
+1. Public read and edit agents run in separate in-process Pi sessions and report back to the lead. A write tier grants edit tools, not a terminal pane. The terminal runtime remains available for existing integrations.
 2. The lead synthesizes the reports for the user.
 3. Finished agents leave the active status list; completed reports remain available in the session UI.
 
@@ -138,7 +138,7 @@ When the user says "agents", "use agents", "spawn agents", "send agents", "agent
 - When no unrelated work remains, end the turn. The extension resumes the lead when reports arrive.
 - One `get_agent_status` snapshot is allowed when current status is needed. Never call it repeatedly, sleep, busy-wait, or loop on inbox/status.
 - Trust quiet agents. Do not ping, message, or check an agent just because it has been quiet for less than several minutes; active status remains visible in the activity card and Down-key live view.
-- When new, changed, or previously omitted evidence affects an active owner, use `send_message` with an **Evidence delta** as defined below instead of replacing or stopping it. Active in-process read agents receive the message as a steering turn and can continue intelligently; active tmux writers wake through their inbox.
+- When new, changed, or previously omitted evidence affects an active owner, use `send_message` with an **Evidence delta** as defined below instead of replacing or stopping it. Active in-process agents receive the message as a steering turn; legacy terminal-backed agents receive inbox delivery.
 - Once a final report is accepted, new message admission is closed and the agent is self-exiting; teardown may still be finishing. Do not call `stop_teammate` after normal completion. If genuinely new work appears after the report, spawn a fresh bounded `read-collect` lane rather than trying to revive that closing session.
 - Do not wake the lead just to ping idle agents.
 - Use `check_teammate` only when `get_agent_status` shows a suspected stall or failure. It is a lifecycle diagnostic and may clean up an agent classified as dead.

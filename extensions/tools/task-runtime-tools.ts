@@ -18,6 +18,7 @@ export interface TaskRuntimeToolsOptions {
   runningReadAgents: Map<string, RunningReadAgent>;
   readAgentKey(teamName: string, agentName: string): string;
   interruptTeammate?(agentName: string): Promise<TeammateInterruptResult>;
+  cancelQueuedAgent?(teamName: string, agentName: string): boolean;
   shutdownTeammate(teamName: string, member: Member, options?: ShutdownTeammateOptions): Promise<ReadAgentTeardownResult>;
   getTeamName(): string | null | undefined;
 }
@@ -55,6 +56,12 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
         const teamName = options.getTeamName();
         if (!teamName) throw new Error("No active agent session. Spawn an agent first.");
 
+        if (options.cancelQueuedAgent?.(teamName, params.agent_name)) {
+          return {
+            content: [{ type: "text", text: `Cancelled queued agent ${params.agent_name}.` }],
+            details: { session: teamName, agentName: params.agent_name, stopped: true, queued: true, reason: params.reason },
+          };
+        }
         const config = await teams.readConfig(teamName);
         let member = config.members.find(m => m.name === params.agent_name);
         const runningState = options.runningReadAgents.get(options.readAgentKey(teamName, params.agent_name));

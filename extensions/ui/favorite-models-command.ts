@@ -1,4 +1,4 @@
-import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { Box, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import {
   clearGlobalFavoriteModels,
   FAVORITE_MODEL_SLOTS,
@@ -116,7 +116,7 @@ function padToWidth(value: string, width: number): string {
 
 function styledTitle(theme: any, label: string, active: boolean): string {
   const title = active ? `▶ ${label}` : `  ${label}`;
-  return active ? theme.fg("accent", theme.bold(title)) : theme.fg("muted", title);
+  return active ? theme.inverse(theme.fg("accent", theme.bold(title))) : theme.fg("muted", title);
 }
 
 function defaultTheme(theme: any) {
@@ -133,12 +133,12 @@ async function loadScopedModels(ctx: any): Promise<AvailableModelOption[]> {
   return sortAvailableModels(await getAvailableModels(ctx));
 }
 
-async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled" | undefined> {
+async function showFavoriteModelsPicker(ctx: any): Promise<void> {
   const availableModels = await loadScopedModels(ctx);
   const availableSet = new Set(availableModels.map((model) => model.qualified));
-  const draft = cloneFavoriteModels(loadSettings().favoriteModels);
+  let draft = cloneFavoriteModels(loadSettings().favoriteModels);
 
-  return ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: (value: "saved" | "cancelled") => void) => {
+  return ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: () => void) => {
     const colors = defaultTheme(theme);
     let selectedSlotIndex = 0;
     let activeColumnIndex = 0;
@@ -216,11 +216,6 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
       notice = undefined;
     };
 
-    const saveAndClose = () => {
-      replaceGlobalFavoriteModels(draft);
-      done("saved");
-    };
-
     const moveColumn = (delta: number) => {
       activeColumnIndex = Math.max(0, Math.min(COLUMNS.length - 1, activeColumnIndex + delta));
     };
@@ -276,35 +271,41 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
       return levels.map((thinking) => `${thinking === config.thinking ? "›" : " "} ${thinking}`);
     };
 
-    const columnRows = (title: string, rows: string[], width: number, active: boolean): string[] => {
-      return [styledTitle(theme, title, active), ...rows].map((row) => padToWidth(row, width));
+    const columnRows = (title: string, rows: string[], active: boolean): string[] => {
+      return [styledTitle(theme, title, active), ...rows];
     };
 
     const render = (width: number): string[] => {
-      const innerWidth = Math.max(1, width);
+      const margin = Math.floor(width * 0.1);
+      const innerWidth = Math.max(1, width - margin * 2);
       const thinkingWidth = 16;
       const slotWidth = Math.max(28, Math.floor(innerWidth * 0.38));
       const modelWidth = Math.max(28, innerWidth - slotWidth - thinkingWidth - 6);
       const modelRowCount = modelRowsForTerminal();
-      const slotRows = columnRows("slots", buildSlotRows(), slotWidth, activeColumn() === "slots");
+      const slotRows = columnRows("slots", buildSlotRows(), activeColumn() === "slots");
       const modelRows = columnRows(
-        `scoped models${modelFilter ? ` /${modelFilter}` : ""}`,
+        "scoped models",
         buildModelRows(modelRowCount),
-        modelWidth,
         activeColumn() === "models",
       );
-      const thinkingRows = columnRows("thinking", buildThinkingRows(), thinkingWidth, activeColumn() === "thinking");
+      const thinkingRows = columnRows("thinking", buildThinkingRows(), activeColumn() === "thinking");
       const bodyRows = Math.max(slotRows.length, modelRows.length, thinkingRows.length);
       const lines = [
         colors.accent(colors.bold("Agent favorite models")),
         colors.dim(`${availableModels.length} scoped model(s) available from this Pi session · saves to ${globalSettingsPath()}`),
-        colors.dim("←/→ or tab: move columns · ↑/↓: change selection · type while in scoped models to filter"),
-        colors.dim("enter: save · esc: cancel · delete: clear selected slot · ctrl+a: clear all"),
+        colors.dim("←/→: move columns · ↑/↓: change selection · type anywhere to filter model names"),
+        colors.success("Changes auto-save · esc/enter: leave · delete: clear slot · ctrl+a: clear all"),
         "",
       ];
 
+      const columns = [slotRows, modelRows, thinkingRows];
+      const widths = [slotWidth, modelWidth, thinkingWidth];
       for (let index = 0; index < bodyRows; index += 1) {
-        lines.push(`${slotRows[index] ?? " ".repeat(slotWidth)} │ ${modelRows[index] ?? " ".repeat(modelWidth)} │ ${thinkingRows[index] ?? ""}`);
+        const cells = columns.map((rows, column) => {
+          const cell = padToWidth(rows[index] ?? "", widths[column] - 2);
+          return column === activeColumnIndex ? `${colors.accent("▌ ")}${cell}` : `  ${cell}`;
+        });
+        lines.push(cells.join(" │ "));
       }
 
       const config = selectedConfig();
@@ -316,52 +317,60 @@ async function showFavoriteModelsPicker(ctx: any): Promise<"saved" | "cancelled"
       if (config?.model && !availableSet.has(config.model)) {
         lines.push(colors.warning("This saved model is not in the scoped model list for the current session."));
       }
-      if (activeColumn() === "models" && modelFilter) {
+      if (modelFilter) {
         lines.push(colors.dim(`Filter: ${modelFilter}  (backspace clears characters)`));
       }
 
-      return lines.flatMap((line) => wrapTextWithAnsi(line, innerWidth));
+      const content = lines.flatMap((line) => wrapTextWithAnsi(line, innerWidth));
+      const height = Math.max(1, tui.terminal?.rows ?? 24);
+      const top = Math.max(0, Math.floor((height - content.length) / 2));
+      return Array.from({ length: height }, (_, index) => `${" ".repeat(margin)}${content[index - top] ?? ""}`);
     };
 
     const handleInput = (data: string) => {
-      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-        done("cancelled");
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")) || matchesKey(data, Key.enter) || data === "\r" || data === "\n") {
+        done();
         return;
       }
-      if (matchesKey(data, Key.enter) || data === "\r" || data === "\n") {
-        saveAndClose();
-        return;
-      }
-      if (activeColumn() !== "models" && (data === "q" || data === "Q")) {
-        done("cancelled");
-        return;
-      }
-      if (matchesKey(data, Key.right) || data === "l" || data === "L" || matchesKey(data, Key.tab)) {
+      const previous = cloneFavoriteModels(draft);
+      if (matchesKey(data, Key.right)) {
         moveColumn(1);
-      } else if (matchesKey(data, Key.left) || data === "h" || data === "H" || matchesKey(data, Key.shift("tab"))) {
+      } else if (matchesKey(data, Key.left)) {
         moveColumn(-1);
-      } else if (matchesKey(data, Key.down) || (activeColumn() !== "models" && (data === "j" || data === "J"))) {
+      } else if (matchesKey(data, Key.down)) {
         moveActiveSelection(1);
-      } else if (matchesKey(data, Key.up) || (activeColumn() !== "models" && (data === "k" || data === "K"))) {
+      } else if (matchesKey(data, Key.up)) {
         moveActiveSelection(-1);
       } else if (matchesKey(data, Key.delete)) {
         clearSelectedSlot();
       } else if (matchesKey(data, Key.ctrl("a"))) {
         clearAllSlots();
-      } else if (activeColumn() === "models" && matchesKey(data, Key.backspace)) {
+      } else if (matchesKey(data, Key.backspace)) {
         modelFilter = modelFilter.slice(0, -1);
         modelScroll = 0;
-      } else if (activeColumn() === "models" && data.length === 1 && data.charCodeAt(0) >= 32) {
+      } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
         modelFilter += data;
         modelScroll = 0;
+      }
+      if (JSON.stringify(draft) !== JSON.stringify(previous)) {
+        try {
+          replaceGlobalFavoriteModels(draft);
+        } catch (error) {
+          draft = previous;
+          notice = `Could not save changes: ${error instanceof Error ? error.message : String(error)}`;
+        }
       }
       tui.requestRender();
     };
 
-    return { render, invalidate() {}, handleInput };
+    // Truncation emits full ANSI resets; repaint the background after each one.
+    const box = new Box(0, 0, (text: string) => text.split("\x1b[0m")
+      .map(part => theme.bg("toolPendingBg", part)).join("\x1b[0m"));
+    box.addChild({ render, invalidate() {} });
+    return { render: (width: number) => box.render(width), invalidate: () => box.invalidate(), handleInput };
   }, {
     overlay: true,
-    overlayOptions: { width: "94%", maxHeight: "86%", anchor: "center" },
+    overlayOptions: { width: "100%", maxHeight: "100%", anchor: "center", margin: 0 },
   });
 }
 
@@ -375,8 +384,7 @@ export function registerFavoriteModelsCommand(pi: any): void {
       try {
         if (!action) {
           if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
-            const result = await showFavoriteModelsPicker(ctx);
-            if (result === "saved") ctx.ui.notify("Agent favorite models saved.", "info");
+            await showFavoriteModelsPicker(ctx);
             return;
           }
           ctx.ui.notify(formatCurrentSettings(), "info");

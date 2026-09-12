@@ -10,6 +10,13 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.9] - 2026-09-12
+
+### Fixed
+- Let typed text filter full provider/model names from any favorite-picker column; reserve navigation for arrow keys.
+- Save favorite model, thinking and clear changes immediately, with retryable error feedback.
+- Fill the favorite picker background across the pane while keeping its controls centered.
+
 ## [2.2.8] - 2026-09-12
 
 ### Fixed

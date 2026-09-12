@@ -100,6 +100,7 @@ interface QueuedReadSpawn {
   pendingChildAcceptance?: PendingChildAcceptance;
   admissionError?: string;
   quarantineError?: string;
+  launchCommitted?: boolean;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamToolsRuntime {
@@ -539,6 +540,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     ctx: any,
     queuedAcceptance?: PendingChildAcceptance,
     assertPending?: () => void,
+    commitLaunch?: () => void,
   ): Promise<AdmittedReadAgentLaunch> {
     const addValidateAndLaunch = async (parentLifecycleLock?: LifecycleTombstoneLock): Promise<AdmittedReadAgentLaunch> => {
       let pendingAcceptance = queuedAcceptance;
@@ -620,6 +622,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       try {
         if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
         assertPending?.();
+        commitLaunch?.();
         const launch = options.runReadAgentInProcess(teamName, member, launchPrompt, ctx, options.readAgentOptions());
         return {
           launch: sessionContextReference
@@ -651,6 +654,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     releaseNameOnFailure = true,
     queuedAcceptance?: PendingChildAcceptance,
     assertPending?: () => void,
+    commitLaunch?: () => void,
   ): Promise<boolean> {
     const key = options.readAgentKey(teamName, member.name);
     reserveReadAdmission(teamName, key, member.role || "read");
@@ -684,7 +688,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     };
 
     try {
-      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance, assertPending);
+      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance, assertPending, commitLaunch);
       releaseNameReservation();
       void Promise.resolve(admitted.launch).then(
         () => drainAfterRun(admitted.pendingChildRun),
@@ -781,11 +785,13 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
             if (activeAgentCount(teamName, role, true) >= capacity.maxConcurrent) continue;
             queued.member.joinedAt = Date.now();
             await startReadAgentMember(teamName, queued.member, queued.prompt, queued.ctx,
-              queued.nameReservationId, false, queued.pendingChildAcceptance, assertPending);
+              queued.nameReservationId, false, queued.pendingChildAcceptance, assertPending,
+              () => { queued.launchCommitted = true; });
             removeQueuedReadSpawnById(teamName, queued.id, false);
             progressed = true;
           } catch (error) {
             if (!readQueue(teamName).some(item => item.id === queued.id)) continue;
+            queued.launchCommitted = false;
             const latestFence = await readLifecycleTombstone(teamName, queued.member.name).catch(() => null);
             if (latestFence && latestFence.status !== "absent") {
               queued.quarantineError = "Lifecycle quarantine appeared before admission.";
@@ -1304,6 +1310,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   return {
     createNestedReadAgentTools,
-    cancelQueuedAgent: (teamName, agentName) => removeQueuedReadSpawnsByName(teamName, agentName).length > 0,
+    cancelQueuedAgent: (teamName, agentName) => {
+      // Retain the entry for admission bookkeeping, but let active teardown own cancellation after launch commits.
+      if (readQueue(teamName).some(queued => queued.member.name === agentName && queued.launchCommitted)) return false;
+      return removeQueuedReadSpawnsByName(teamName, agentName).length > 0;
+    },
   };
 }

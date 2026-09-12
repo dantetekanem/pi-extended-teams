@@ -7,6 +7,7 @@ import * as claims from "../../src/utils/claims.js";
 import * as teams from "../../src/utils/teams.js";
 import * as runtime from "../../src/utils/runtime.js";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
+import * as lifecycleTombstones from "../../src/utils/lifecycle-tombstone.js";
 import { readInbox, requireRunningMessageRecipient, sendPlainMessage, sendPlainMessageIfRunning } from "../../src/utils/messaging.js";
 import { listTeamReportEvents } from "../../src/utils/report-events.js";
 import * as reportEvents from "../../src/utils/report-events.js";
@@ -65,6 +66,7 @@ vi.mock("../internal/pi-runtime-api", () => ({
 
 import { closeReadAgentMessageDelivery, handleReadAgentSessionEvent, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./read-agent.js";
 import { createLifecycleRuntime } from "../team/lifecycle.js";
+import { registerTaskRuntimeTools } from "../tools/task-runtime-tools.js";
 import { sanitizeTuiLine } from "../ui/renderers.js";
 import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "./read-agent-session-lifecycle.js";
 import type { RunningReadAgent } from "../runtime/types.js";
@@ -1905,6 +1907,77 @@ describe("in-process read agent tool wiring", () => {
       metadata: { initialPrompt: "edit an isolated file", modelSlot: "write-system" },
     });
     expect(JSON.stringify({ state: options.rememberCompletedAgentReport.mock.calls, leadInbox, reports })).not.toContain("writing-hard");
+  });
+
+  it.each(["read", "write"] as const)("runs an admitted %s after validating its identity", async (role) => {
+    const member = { ...fixtureMember("starting", role), lifecycleRunId: "starting-run" };
+    writeTeamConfig("team", member);
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    await runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+    expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
+    expect(options.runningReadAgents.size).toBe(0);
+  });
+
+  it("rejects a changed admitted identity before creating a session or touching the replacement", async () => {
+    const member = { ...fixtureMember("starting"), lifecycleRunId: "starting-run" };
+    const replacement = { ...member, lifecycleRunId: "replacement-run" };
+    writeTeamConfig("team", replacement);
+    piMocks.createAgentSession.mockResolvedValue({ session: makeSession() });
+    await expect(runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, makeRunOptions())).rejects.toThrow("expected run starting-run, found replacement-run");
+    expect(piMocks.createAgentSession).not.toHaveBeenCalled();
+    expect((await teams.readConfig("team")).members.find(item => item.name === member.name)).toEqual(replacement);
+  });
+
+  it.each([
+    ["read", false], ["write", false], ["read", true], ["write", true],
+  ] as const)("stops an admitted %s during startup persistence (failure: %s)", async (role, failPersistence) => {
+    const member = { ...fixtureMember("starting", role), lifecycleRunId: "starting-run" };
+    writeTeamConfig("team", member);
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    const lifecycle = createLifecycleRuntime({
+      ...options, terminal: null, drainWriteQueue: vi.fn(async () => {}), getSessionCwd: () => root,
+    });
+    const tools = new Map<string, any>();
+    registerTaskRuntimeTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      ...options, terminal: null, shutdownTeammate: lifecycle.shutdownTeammate,
+    });
+    let releasePersistence!: () => void;
+    const persistenceGate = new Promise<void>(resolve => { releasePersistence = resolve; });
+    let persistenceStarted!: () => void;
+    const started = new Promise<void>(resolve => { persistenceStarted = resolve; });
+    const withLifecycleLock = lifecycleTombstones.withLifecycleTombstoneLock;
+    vi.spyOn(lifecycleTombstones, "withLifecycleTombstoneLock").mockImplementationOnce(async (team, name, operation) => {
+      persistenceStarted();
+      await persistenceGate;
+      if (failPersistence) throw new Error("startup persistence failed");
+      return withLifecycleLock(team, name, operation);
+    });
+    const run = runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, { ...options, shutdownTeammate: lifecycle.shutdownTeammate });
+    await started;
+    const stopping = tools.get("stop_teammate").execute("stop", { agent_name: member.name });
+    try {
+      await vi.waitFor(() => expect(options.runningReadAgents.get("team:starting")?.stopRequested).toBe(true));
+      releasePersistence();
+      expect((await stopping).details.stopped).toBe(true);
+      await run;
+      expect(options.runningReadAgents.size).toBe(0);
+      expect((await teams.readConfig("team")).members.map(item => item.name)).toEqual(["team-lead"]);
+      expect(options.releaseAllClaimsForAgent).toHaveBeenCalledOnce();
+      expect(piMocks.createAgentSession).not.toHaveBeenCalled();
+    } finally {
+      releasePersistence();
+      await Promise.allSettled([run, stopping]);
+    }
   });
 
   it("keeps stop-before-create quarantined until the late started session finishes shutdown", async () => {

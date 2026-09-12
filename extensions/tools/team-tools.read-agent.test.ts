@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CHILD_AGENT_LIFECYCLE_PROBE, registerTeamTools } from "./team-tools.js";
+import { registerTaskRuntimeTools } from "./task-runtime-tools.js";
 import { createLifecycleRuntime } from "../team/lifecycle.js";
 import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "../agents/read-agent-session-lifecycle.js";
 import * as paths from "../../src/utils/paths.js";
@@ -859,6 +860,46 @@ describe("public agent spawn tools", () => {
     await harness.shutdown();
   });
 
+  it.each(["read-review", "write-feature"])("stops %s through active teardown during the queued launch handoff", async (model_slot) => {
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true }, writeAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const teamName = "session-test-session";
+    const ctx = makeCtx();
+    const signal = new AbortController().signal;
+    registerTaskRuntimeTools({ registerTool: (tool: RegisteredTool) => harness.tools.set(tool.name, tool) }, {
+      isTeammate: false, terminal: null, runningReadAgents: harness.runningReadAgents,
+      readAgentKey: (team, name) => `${team}:${name}`, getTeamName: () => teamName,
+      cancelQueuedAgent: harness.teamToolsRuntime.cancelQueuedAgent,
+      shutdownTeammate: harness.shutdownTeammate,
+    });
+    let stopAfterLaunch!: () => void;
+    const stopped = new Promise<any>((resolve, reject) => {
+      stopAfterLaunch = () => queueMicrotask(() => {
+        void harness.tools.get("stop_teammate")!.execute("stop", { agent_name: "queued" }, signal, undefined, ctx).then(resolve, reject);
+      });
+    });
+    const run = harness.runReadAgentInProcess.getMockImplementation()!;
+    harness.runReadAgentInProcess.mockImplementation((...args) => {
+      const launch = run(...args);
+      if (args[1].name === "queued") stopAfterLaunch();
+      return launch;
+    });
+    const spawn = (name: string) => harness.tools.get("spawn_agent")!.execute(name, { name, prompt: name, model_slot }, signal, undefined, ctx);
+    try {
+      await spawn("first");
+      expect((await spawn("queued")).details.queued).toBe(true);
+      harness.completions.get("first")!();
+      const result = await stopped;
+      expect(result.details.stopped).toBe(true);
+      expect(harness.shutdownTeammate).toHaveBeenCalledWith(teamName, harness.runReadAgentInProcess.mock.calls[1][1]);
+      expect(harness.runningReadAgents.has(`${teamName}:queued`)).toBe(false);
+    } finally {
+      await harness.shutdown();
+      harness.completions.get("first")?.();
+      harness.completions.get("queued")?.();
+    }
+  });
+
   it("drains capacity released while an unrelated admission is failing", async () => {
     writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true }, writeAgents: { maxConcurrent: 1, queueOverflow: true } });
     const harness = registerTools();
@@ -887,7 +928,7 @@ describe("public agent spawn tools", () => {
     await harness.shutdown();
   });
 
-  it("keeps a visible failed admission when notification delivery fails and continues other work", async () => {
+  it.each(["admission", "launch"])("keeps a visible failed %s when notification delivery fails and continues other work", async (failurePoint) => {
     writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
     const harness = registerTools();
     const spawn = (name: string) => harness.tools.get("spawn_agent")!.execute(name, { name, prompt: name, model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
@@ -896,16 +937,49 @@ describe("public agent spawn tools", () => {
     await spawn("eligible");
     const originalAdd = teams.addMember;
     vi.spyOn(teams, "addMember").mockImplementation(async (team, member) => {
-      if (member.name === "failed") throw new Error("admission unavailable");
+      if (member.name === "failed" && failurePoint === "admission") throw new Error("admission unavailable");
       return originalAdd(team, member);
+    });
+    const run = harness.runReadAgentInProcess.getMockImplementation()!;
+    harness.runReadAgentInProcess.mockImplementation((...args) => {
+      if (args[1].name === "failed" && failurePoint === "launch") throw new Error("admission unavailable");
+      return run(...args);
     });
     vi.spyOn(messaging, "sendPlainMessage").mockRejectedValue(new Error("inbox unavailable"));
     harness.completions.get("first")!();
-    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(failurePoint === "admission" ? 2 : 3));
     const status = await harness.tools.get("get_agent_status")!.execute("status", { agent_name: "failed" }, new AbortController().signal, undefined, makeCtx());
     expect(status.details.statuses[0]).toMatchObject({ phase: "failed", error: "admission unavailable" });
-    expect(harness.runReadAgentInProcess.mock.calls[1][1].name).toBe("eligible");
+    expect(harness.runReadAgentInProcess.mock.calls.at(-1)![1].name).toBe("eligible");
     await harness.shutdown();
+  });
+
+  it("can cancel a queued request retained after its launch fails into quarantine", async () => {
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const teamName = "session-test-session";
+    const spawn = (name: string) => harness.tools.get("spawn_agent")!.execute(name, { name, prompt: name, model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+    await spawn("first");
+    await spawn("failed");
+    await spawn("eligible");
+    const run = harness.runReadAgentInProcess.getMockImplementation()!;
+    harness.runReadAgentInProcess.mockImplementation((...args) => {
+      if (args[1].name === "failed") {
+        const fencePath = paths.lifecycleTombstonePath(teamName, "failed");
+        fs.mkdirSync(path.dirname(fencePath), { recursive: true });
+        fs.writeFileSync(fencePath, "{corrupt");
+        throw new Error("launch unavailable");
+      }
+      return run(...args);
+    });
+    try {
+      harness.completions.get("first")!();
+      await vi.waitFor(() => expect(harness.runningReadAgents.has(`${teamName}:eligible`)).toBe(true));
+      expect(harness.teamToolsRuntime.cancelQueuedAgent(teamName, "failed")).toBe(true);
+    } finally {
+      await harness.shutdown();
+      harness.completions.get("eligible")?.();
+    }
   });
 
   it("queues read agents at the configured cap behind spawn_agent", async () => {

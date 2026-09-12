@@ -10,6 +10,13 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.8] - 2026-09-11
+
+### Fixed
+- Use current-run state for in-process agent status ([#26](https://github.com/dantetekanem/pi-extended-teams/pull/26)).
+- Reserve reader and writer capacity during admission so concurrent spawns queue correctly.
+- Cancel agents during queue handoff and startup without falsely reporting that they stopped.
+
 ## [2.2.7] - 2026-09-11
 
 ### Fixed

@@ -50,21 +50,23 @@ describe("/agents-favorite-models", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Saved in:"), "info");
   });
 
-  it("opens a single-screen picker with scoped available models and saves a slot", async () => {
+  it.each(["\x1b", "\x03", "\r"])("autosaves model and thinking changes before closing with %j", async exitKey => {
     const { commands } = setupCommand();
     const notify = vi.fn();
     const requestRender = vi.fn();
     const custom = vi.fn(async (factory: any) => {
-      let doneValue: "saved" | "cancelled" | undefined;
-      const component = factory({ requestRender, terminal: { rows: 30 } }, testTheme(), {}, (value: "saved" | "cancelled") => {
-        doneValue = value;
-      });
+      const closed = vi.fn();
+      const component = factory({ requestRender, terminal: { rows: 30 } }, testTheme(), {}, closed);
+      const saved = () => JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8")).favoriteModels;
 
-      expect(component.render(120).join("\n")).toContain("provider/model");
-      component.handleInput("\x1b[C"); // focus scoped models
-      component.handleInput("\x1b[B"); // select first scoped model for read-collect
-      component.handleInput("\r"); // save
-      return doneValue;
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[B");
+      expect(saved()["read-collect"]).toEqual({ model: "provider/model", thinking: "high" });
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[A");
+      expect(saved()["read-collect"]).toEqual({ model: "provider/model", thinking: "medium" });
+      component.handleInput(exitKey);
+      expect(closed).toHaveBeenCalledTimes(1);
     });
     const ctx = {
       mode: "tui",
@@ -75,48 +77,97 @@ describe("/agents-favorite-models", () => {
     };
 
     await commands.get("agents-favorite-models").handler("", ctx);
+    await custom.mock.results[0].value;
 
     const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
-    expect(raw.favoriteModels["read-collect"]).toEqual({ model: "provider/model", thinking: "high" });
+    expect(raw.favoriteModels["read-collect"]).toEqual({ model: "provider/model", thinking: "medium" });
     expect(custom).toHaveBeenCalled();
-    expect(notify).toHaveBeenCalledWith("Agent favorite models saved.", "info");
   });
 
-  it.each(["claude", "HIGH", "llama", "jkq"])("filters model names with %s without navigating or matching providers", async query => {
+  it("autosaves clearing one slot and all slots without waiting for exit", async () => {
     const { commands, ctx } = setupCommand();
-    const modelName = query.toLowerCase();
+    const command = commands.get("agents-favorite-models");
+    await command.handler("set read-collect provider/model high", ctx);
+    await command.handler("set read-review provider/model medium", ctx);
+    const custom = vi.fn(async (factory: any) => {
+      const component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, testTheme(), {}, vi.fn());
+      const saved = () => JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8")).favoriteModels;
+      component.handleInput("\x1b[3~");
+      expect(saved()).toEqual({ "read-review": { model: "provider/model", thinking: "medium" } });
+      component.handleInput("\x01");
+      expect(saved()).toEqual({});
+      component.handleInput("\x1b");
+      expect(saved()).toEqual({});
+    });
+    await command.handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
+    await custom.mock.results[0].value;
+  });
+
+  it("keeps the saved state on autosave failure and allows retry", async () => {
+    const { commands, ctx } = setupCommand();
+    const custom = vi.fn(async (factory: any) => {
+      const component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, testTheme(), {}, vi.fn());
+      vi.spyOn(fs, "writeFileSync").mockImplementationOnce(() => { throw new Error("disk full"); });
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[B");
+      expect(component.render(120).join("\n")).toContain("Could not save changes: disk full");
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[A");
+      expect(component.render(120).join("\n")).toContain("Pick a scoped model for read-collect");
+      component.handleInput("\x1b[D");
+      component.handleInput("\x1b[B");
+      component.handleInput("\x1b");
+    });
+    await commands.get("agents-favorite-models").handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
+    await custom.mock.results[0].value;
+    expect(JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8")).favoriteModels).toEqual({
+      "read-collect": { model: "provider/model", thinking: "high" },
+    });
+  });
+
+  it.each(["slots", "models", "thinking"].flatMap(column =>
+    ["claude", "HIGH", "llama", "jkq", "openai", "OPENAI-CODEX/GPT"].map(query => ({ column, query })),
+  ))("filters displayed model names from $column with $query without moving focus", async ({ column, query }) => {
+    const { commands, ctx } = setupCommand();
+    const model = query.toLowerCase().startsWith("openai") ? "openai-codex/gpt-5.6" : `z-provider/${query.toLowerCase()}`;
+    const [provider, id] = model.split("/");
     ctx.modelRegistry.getAvailable.mockResolvedValue([
-      { provider: modelName, id: "unrelated", reasoning: true },
-      { provider: "z-provider", id: modelName, reasoning: true },
+      { provider: "a-provider", id: "unrelated", reasoning: true },
+      { provider, id, reasoning: true },
     ]);
     const closed = vi.fn();
     const custom = async (factory: any) => {
       const component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, testTheme(), {}, closed);
-      component.handleInput("\x1b[C");
+      if (column !== "slots") component.handleInput("\x1b[C");
+      if (column === "thinking") component.handleInput("\x1b[C");
       for (const character of `${query}x`) component.handleInput(character);
       component.handleInput("\x7f");
+      if (column === "slots") component.handleInput("\x1b[C");
+      if (column === "thinking") component.handleInput("\x1b[D");
       component.handleInput("\x1b[B");
       component.handleInput("\r");
       return closed.mock.lastCall?.[0];
     };
     await commands.get("agents-favorite-models").handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
-    expect(closed).toHaveBeenCalledExactlyOnceWith("saved");
+    expect(closed).toHaveBeenCalledTimes(1);
     const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
-    expect(raw.favoriteModels).toEqual({ "read-collect": { model: `z-provider/${modelName}`, thinking: "high" } });
+    expect(raw.favoriteModels).toEqual({ "read-collect": { model, thinking: "high" } });
   });
 
-  it("uses only arrows to navigate blocks and selections before saving", async () => {
+  it("uses only arrows to navigate blocks and selections before closing", async () => {
     const { commands, ctx } = setupCommand();
     const closed = vi.fn();
     const custom = async (factory: any) => {
       const component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, testTheme(), {}, closed);
       for (const key of ["j", "l", "q", "k", "h", "Q", "J", "K", "L", "H", "\t"]) component.handleInput(key);
+      for (let index = 0; index < 10; index += 1) component.handleInput("\x7f");
       component.handleInput("\x1b[C"); // models
       component.handleInput("\x1b[B"); // first model
       component.handleInput("\x1b[Z"); // shift-tab does not move focus
       component.handleInput("\x1b[C"); // thinking
       component.handleInput("\x1b[A"); // high -> medium
       for (const key of ["j", "k", "h", "l", "q", "Q"]) component.handleInput(key);
+      for (let index = 0; index < 6; index += 1) component.handleInput("\x7f");
       component.handleInput("\x1b[D"); // models
       component.handleInput("\x1b[D"); // slots
       component.handleInput("\x1b[B"); // read-review
@@ -126,7 +177,7 @@ describe("/agents-favorite-models", () => {
       return closed.mock.lastCall?.[0];
     };
     await commands.get("agents-favorite-models").handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
-    expect(closed).toHaveBeenCalledExactlyOnceWith("saved");
+    expect(closed).toHaveBeenCalledTimes(1);
     const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
     expect(raw.favoriteModels).toEqual({
       "read-collect": { model: "provider/model", thinking: "medium" },
@@ -137,12 +188,11 @@ describe("/agents-favorite-models", () => {
   it("applies the calibrated thinking default for all eight canonical tiers", async () => {
     const { commands } = setupCommand();
     const custom = vi.fn(async (factory: any) => {
-      let doneValue: "saved" | "cancelled" | undefined;
       const component = factory(
         { requestRender: vi.fn(), terminal: { rows: 30 } },
         testTheme(),
         {},
-        (value: "saved" | "cancelled") => { doneValue = value; },
+        vi.fn(),
       );
 
       component.handleInput("\x1b[C");
@@ -155,7 +205,6 @@ describe("/agents-favorite-models", () => {
         }
       }
       component.handleInput("\r");
-      return doneValue;
     });
     const ctx = {
       mode: "tui",
@@ -201,7 +250,6 @@ describe("/agents-favorite-models", () => {
       const rendered = component.render(120).join("\n");
       expect(rendered).toContain("  max");
       expect(rendered).not.toContain("  xhigh");
-      return "cancelled";
     });
     const ctx = {
       mode: "tui",
@@ -217,6 +265,7 @@ describe("/agents-favorite-models", () => {
     };
 
     await commands.get("agents-favorite-models").handler("", ctx);
+    await custom.mock.results[0].value;
   });
 
   it("hides opt-in levels that the selected Pi model does not advertise", async () => {
@@ -235,7 +284,6 @@ describe("/agents-favorite-models", () => {
       const rendered = component.render(120).join("\n");
       expect(rendered).not.toContain("  max");
       expect(rendered).not.toContain("  xhigh");
-      return "cancelled";
     });
     const ctx = {
       mode: "tui",
@@ -246,23 +294,21 @@ describe("/agents-favorite-models", () => {
     };
 
     await commands.get("agents-favorite-models").handler("", ctx);
+    await custom.mock.results[0].value;
   });
 
-  it("does not save a thinking-only empty slot from the picker", async () => {
-    const { commands } = setupCommand();
+  it("preserves saved favorites when changing thinking on an empty slot", async () => {
+    const { commands, ctx: cli } = setupCommand();
+    await commands.get("agents-favorite-models").handler("set read-review provider/model high", cli);
     const notify = vi.fn();
     const custom = vi.fn(async (factory: any) => {
-      let doneValue: "saved" | "cancelled" | undefined;
-      const component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, testTheme(), {}, (value: "saved" | "cancelled") => {
-        doneValue = value;
-      });
+      const component = factory({ requestRender: vi.fn(), terminal: { rows: 30 } }, testTheme(), {}, vi.fn());
 
       component.handleInput("\x1b[C");
       component.handleInput("\x1b[C"); // focus thinking with no model selected
       component.handleInput("\x1b[B");
       expect(component.render(120).join("\n")).toContain("Pick a scoped model for read-collect before choosing thinking.");
-      component.handleInput("\r");
-      return doneValue;
+      component.handleInput("\x1b");
     });
     const ctx = {
       mode: "tui",
@@ -273,9 +319,10 @@ describe("/agents-favorite-models", () => {
     };
 
     await commands.get("agents-favorite-models").handler("", ctx);
+    await custom.mock.results[0].value;
 
     const raw = JSON.parse(fs.readFileSync(globalSettingsPath(homeDir), "utf-8"));
-    expect(raw.favoriteModels).toEqual({});
+    expect(raw.favoriteModels).toEqual({ "read-review": { model: "provider/model", thinking: "high" } });
   });
 
   it("sets and clears canonical tiers while accepting legacy CLI aliases", async () => {

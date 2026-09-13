@@ -10,11 +10,17 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
-## [2.2.10] - 2026-09-12
+## [2.2.11] - 2026-09-12
 
 ### Fixed
 - Let orchestration requests spawn current-session agents and preserve nested-read opt-in for named-team one-shot spawns.
 - Expose parent-scoped running and queued helper counts to lifecycle probes on each child session's private event bus.
+
+## [2.2.10] - 2026-09-12
+
+### Fixed
+- Clear the agent-view message input while sending and restore the draft on failure if the composer remains open ([#37](https://github.com/dantetekanem/pi-extended-teams/pull/37)).
+- Show package directory names instead of generic `src` or `extensions` entrypoint labels.
 
 ## [2.2.9] - 2026-09-12
 

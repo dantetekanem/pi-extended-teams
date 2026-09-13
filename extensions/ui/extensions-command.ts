@@ -49,7 +49,11 @@ function displayLabel(extension: SpawnExtensionCandidate): string {
   const normalized = extension.path.replace(/\\/g, "/");
   const base = normalized.split("/").pop() || normalized;
   if (/^index\.(?:ts|js|mjs|cjs)$/.test(base)) {
-    return normalized.split("/").at(-2) || normalized;
+    const segments = normalized.split("/");
+    const parent = segments.at(-2);
+    return parent === "src" || parent === "extensions"
+      ? segments.at(-3) || normalized
+      : parent || normalized;
   }
   return base;
 }

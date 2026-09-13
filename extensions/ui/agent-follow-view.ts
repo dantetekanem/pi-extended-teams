@@ -446,6 +446,7 @@ export function createAgentFollowComponent(
 
     const recipient = agent.name;
     sendingMessage = true;
+    messageInput.setValue("");
     messageStatus = `Sending to ${recipient}…`;
     tui.requestRender();
     void Promise.resolve()
@@ -455,6 +456,7 @@ export function createAgentFollowComponent(
         stopComposingMessage();
       })
       .catch((error: unknown) => {
+        if (composingMessage) messageInput.setValue(value);
         messageStatus = error instanceof Error ? error.message : `Could not message ${recipient}.`;
         tui.requestRender();
       })
@@ -742,6 +744,10 @@ export function createAgentFollowComponent(
           done();
           return;
         }
+        if (sendingMessage) {
+          if (matchesKey(data, Key.escape)) stopComposingMessage();
+          return;
+        }
         messageInput.handleInput(data);
         tui.requestRender();
         return;
@@ -760,7 +766,7 @@ export function createAgentFollowComponent(
         tui.requestRender();
         return;
       }
-      if (data.toLowerCase() === "m" && options.sendMessage) {
+      if (data.toLowerCase() === "m" && options.sendMessage && !sendingMessage) {
         composingMessage = true;
         messageStatus = "";
         syncInputFocus();

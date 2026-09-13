@@ -666,6 +666,42 @@ describe("agent follow component", () => {
     component.dispose();
   });
 
+  it.each([true, false])("clears a pending send and restores the draft only on failure (%s)", async (succeeds) => {
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const sendMessage = vi.fn(() => new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
+    const component = createAgentFollowComponent({ terminal: { rows: 30 }, requestRender: vi.fn() }, vi.fn(), {
+      getAgents: () => [makeAgent()], sendMessage,
+    });
+    try {
+      component.handleInput("m");
+      component.handleInput("Please inspect the test");
+      component.handleInput("\r");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sendMessage).toHaveBeenCalledWith("reader", "Please inspect the test");
+      expect(component.render(120).join("\n")).not.toContain("Please inspect the test");
+      component.handleInput("extra text");
+      component.handleInput("\r");
+      expect(sendMessage).toHaveBeenCalledOnce();
+      if (succeeds) resolve();
+      else reject(new Error("Delivery failed"));
+      await vi.advanceTimersByTimeAsync(0);
+      if (succeeds) {
+        component.handleInput("m");
+        component.handleInput("Next message");
+        component.handleInput("\r");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(sendMessage).toHaveBeenLastCalledWith("reader", "Next message");
+        resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      } else {
+        expect(stripAnsi(component.render(120).join("\n"))).toContain("Please inspect the test");
+      }
+    } finally {
+      component.dispose();
+    }
+  });
+
   it("keeps the message draft open when delivery fails", async () => {
     const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
     const component = createAgentFollowComponent(tui, vi.fn(), {
@@ -680,7 +716,7 @@ describe("agent follow component", () => {
 
     const rendered = component.render(120).join("\n");
     expect(rendered).toContain("Cannot send message to reader: agent is not running.");
-    expect(rendered).toContain("Are you still there?");
+    expect(stripAnsi(rendered)).toContain("Are you still there?");
     component.dispose();
   });
 

@@ -100,6 +100,28 @@ spawn_swarm_agents({
 
 For an edit, choose a write tier and name the files it may claim. Never run overlapping writers against the same paths.
 
+### Programmatic event launch
+
+Another loaded extension can ask the lead session to launch one public agent through the orchestration event. Register the response listener and correlate it by `requestId` before emitting the request:
+
+```ts
+pi.events.emit("pi-extended-teams:orchestration-request", {
+  requestId,
+  type: "spawn_agent",
+  ctx, // pass the current Pi command context when needed
+  params: {
+    name: "implementation",
+    prompt: "Implement the claimed change and report the evidence.",
+    cwd,
+    model_slot: "write-critical",
+    allow_nested_read_agents: true,
+    metadata: { operationId },
+  },
+});
+```
+
+The correlated response is `{ requestId, type, ok: true, details, content }` on success or `{ requestId, type, ok: false, error }` on failure. `prompt` is always a direct string; it may tell the child where a packaged prompt file lives, but there is no `prompt_file` API. The configured extension allowlist still determines which tools are available inside the child session. Teammate sessions cannot satisfy these requests.
+
 ## Configuration
 
 Global settings live at `~/.pi/agent/pi-extended-teams/settings.json`. Project overrides live at `.pi/pi-extended-teams.json`. Favorite intent tiers are global so `/agents-favorite-models` and spawning use the same choices. Configuring favorites is optional; an unset tier falls back to the current lead-session model and thinking level.

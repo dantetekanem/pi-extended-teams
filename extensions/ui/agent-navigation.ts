@@ -14,6 +14,30 @@ type NavigationEditorFactory = ((tui: any, theme: any, keybindings: any) => any)
   piExtendedTeamsBaseFactory?: ((tui: any, theme: any, keybindings: any) => any) | null;
 };
 
+function uniqueAgentsByName(agents: RunningReadAgent[]): RunningReadAgent[] {
+  return agents.filter((agent, index) => agents.findIndex(candidate => candidate.name === agent.name) === index);
+}
+
+/** Mirrors the activity footer's order for the running and runtime-only populations. */
+export function orderAgentNavigationEntries(
+  runningAgents: RunningReadAgent[],
+  runtimeAgents: RunningReadAgent[],
+): RunningReadAgent[] {
+  const uniqueRunningAgents = uniqueAgentsByName(runningAgents);
+  const runningNames = new Set(uniqueRunningAgents.map(agent => agent.name));
+  const uniqueRuntimeAgents = uniqueAgentsByName(runtimeAgents)
+    .filter(agent => !runningNames.has(agent.name));
+  const byName = (a: RunningReadAgent, b: RunningReadAgent) => a.name.localeCompare(b.name);
+  const isWriteAgent = (agent: RunningReadAgent) => agent.role === "write";
+
+  return [
+    ...uniqueRunningAgents.filter(isWriteAgent).sort(byName),
+    ...uniqueRuntimeAgents.filter(isWriteAgent).sort(byName),
+    ...uniqueRuntimeAgents.filter(agent => !isWriteAgent(agent)).sort(byName),
+    ...uniqueRunningAgents.filter(agent => !isWriteAgent(agent)).sort(byName),
+  ];
+}
+
 export function wrapEditorForAgentNavigation(editor: any, openAgentView: () => boolean): any {
   const originalHandleInput = editor.handleInput.bind(editor);
   editor.handleInput = (data: string) => {
@@ -44,7 +68,7 @@ export function installAgentNavigation(ctx: any, options: AgentNavigationOptions
       opening = true;
       void openAgentFollowView(ctx, {
         getAgents: options.getAgents,
-        initialAgentName: agents.slice().sort((a, b) => a.name.localeCompare(b.name))[0]?.name,
+        initialAgentName: agents[0]?.name,
         interruptAgent: options.interruptAgent,
         stopAgent: options.stopAgent,
         sendMessage: options.sendMessage,

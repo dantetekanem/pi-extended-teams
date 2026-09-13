@@ -1719,11 +1719,20 @@ describe("extension integration", () => {
         ready: true, startedAt: now, lastHeartbeatAt: now, currentAction: "working", activeToolName: "edit",
       });
       await vi.advanceTimersByTimeAsync(1_200);
+      const widgetCall = [...ctx.ui.setWidget.mock.calls]
+        .reverse()
+        .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      const card = widgetCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
+      expect(card.indexOf("(writer)")).toBeLessThan(card.indexOf("(reader)"));
+
       const editorFactory = ctx.ui.setEditorComponent.mock.calls.at(-1)?.[0];
       const editor = editorFactory({}, {}, {});
       editor.handleInput("\x1b[B");
-      expect(followedComponent.render(120).join("\n")).toContain("(reader)");
+      expect(followedComponent.render(120).join("\n")).toContain("(writer)");
       followedComponent.handleInput("\x1b[B");
+      const readerView = followedComponent.render(120).join("\n");
+      expect(readerView).toContain("(reader)");
+      followedComponent.handleInput("\x1b[A");
       const writerView = followedComponent.render(120).join("\n");
       expect(writerView).toContain("(writer)");
       expect(writerView).toContain("Waiting for the agent's first transcript event…");
@@ -1781,16 +1790,17 @@ describe("extension integration", () => {
       const editorFactory = ctx.ui.setEditorComponent.mock.calls.at(-1)?.[0];
       const editor = editorFactory({}, {}, {});
       editor.handleInput("\x1b[B");
-      expect(followedComponent.render(120).join("\n")).toContain("(in-process-reader)");
-      followedComponent.handleInput("\x1b[B");
-      const runtimeReaderView = followedComponent.render(120).join("\n");
+      const firstReaderView = followedComponent.render(120).join("\n");
       if (replaced) {
-        expect(runtimeReaderView).toContain("(in-process-reader)");
-        expect(runtimeReaderView).not.toContain("(runtime-reader)");
+        expect(firstReaderView).toContain("(in-process-reader)");
+        expect(firstReaderView).not.toContain("(runtime-reader)");
       } else {
-        expect(runtimeReaderView).toContain("(runtime-reader)");
-        expect(runtimeReaderView).toContain("Reading CI logs");
+        expect(firstReaderView).toContain("(runtime-reader)");
+        expect(firstReaderView).toContain("Reading CI logs");
       }
+      followedComponent.handleInput("\x1b[B");
+      const secondReaderView = followedComponent.render(120).join("\n");
+      expect(secondReaderView).toContain("(in-process-reader)");
       followedComponent.dispose();
     } finally {
       setup.restoreEnv();

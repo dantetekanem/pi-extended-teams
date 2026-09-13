@@ -364,7 +364,7 @@ export function createAgentFollowComponent(
   let refreshMessageCount = -1;
   let refreshLastMessage: unknown;
   const refreshTimer = setInterval(() => {
-    const agents = options.getAgents().slice().sort((a, b) => a.name.localeCompare(b.name));
+    const agents = options.getAgents().slice();
     const agent = currentAgent(agents, selectedName);
     if (!agent) {
       const emptyKey = agents.map((item) => item.name).join("\0");
@@ -437,7 +437,7 @@ export function createAgentFollowComponent(
   messageInput.onEscape = stopComposingMessage;
   messageInput.onSubmit = (value: string) => {
     const content = value.trim();
-    const agent = currentAgent(sortedAgents(), selectedName);
+    const agent = currentAgent(navigationAgents(), selectedName);
     if (!content || !agent || !options.sendMessage || sendingMessage) {
       if (!content) messageStatus = "Write a message before sending.";
       tui.requestRender();
@@ -466,7 +466,8 @@ export function createAgentFollowComponent(
       });
   };
 
-  const sortedAgents = () => options.getAgents().slice().sort((a, b) => a.name.localeCompare(b.name));
+  // The caller supplies the activity footer's canonical teammate order.
+  const navigationAgents = () => options.getAgents().slice();
 
   const scrollTranscript = (delta: number) => {
     if (!Number.isFinite(delta)) return;
@@ -476,7 +477,7 @@ export function createAgentFollowComponent(
   };
 
   const selectRelative = (delta: number) => {
-    const agents = sortedAgents();
+    const agents = navigationAgents();
     if (agents.length === 0) return;
     const selected = currentAgent(agents, selectedName);
     const currentIndex = Math.max(0, agents.findIndex(agent => agent.name === selected?.name));
@@ -485,7 +486,7 @@ export function createAgentFollowComponent(
   };
 
   const selectPreviousOrMain = () => {
-    const agents = sortedAgents();
+    const agents = navigationAgents();
     const selected = currentAgent(agents, selectedName);
     const currentIndex = agents.findIndex(agent => agent.name === selected?.name);
     if (currentIndex <= 0) {
@@ -506,7 +507,7 @@ export function createAgentFollowComponent(
       syncInputFocus();
     },
     render(width: number): string[] {
-      const agents = sortedAgents();
+      const agents = navigationAgents();
       const agent = currentAgent(agents, selectedName);
       const innerWidth = Math.max(40, width - 4);
       const terminalRows = Math.max(12, tui.terminal?.rows ?? 24);
@@ -774,7 +775,7 @@ export function createAgentFollowComponent(
         return;
       }
       if (data.toLowerCase() === "h" && process.env.HERDR_ENV === "1") {
-        const agent = currentAgent(sortedAgents(), selectedName);
+        const agent = currentAgent(navigationAgents(), selectedName);
         if (agent?.moveToHerdr) void agent.moveToHerdr().then(done).catch(error => {
           messageStatus = sanitizePlainTuiLine(error instanceof Error ? error.message : String(error));
           tui.requestRender();
@@ -782,7 +783,7 @@ export function createAgentFollowComponent(
         return;
       }
       if (data.toLowerCase() === "i" && options.interruptAgent) {
-        const agent = currentAgent(sortedAgents(), selectedName);
+        const agent = currentAgent(navigationAgents(), selectedName);
         if (!agent || interruptingAgents.has(agent.name)) return;
         interruptingAgents.add(agent.name);
         tui.requestRender();
@@ -796,7 +797,7 @@ export function createAgentFollowComponent(
         return;
       }
       if (data.toLowerCase() === "x" && options.stopAgent) {
-        const agent = currentAgent(sortedAgents(), selectedName);
+        const agent = currentAgent(navigationAgents(), selectedName);
         if (!agent || stoppingAgents.has(agent.name)) return;
         stoppingAgents.add(agent.name);
         tui.requestRender();

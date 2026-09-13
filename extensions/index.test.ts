@@ -512,7 +512,7 @@ describe("extension integration", () => {
       const plan = spawnOptions.createResourcePlan({ cwd: setup.root, projectTrusted: true });
       expect(plan.selfExtensionPath).toBe(selfPath);
       expect(plan.extensionPaths).toEqual([externalPath]);
-      expect(plan.extensions.map((extension: any) => extension.name)).toEqual([path.basename(process.cwd()), "external"]);
+      expect(plan.extensions.map((extension: any) => extension.name)).toEqual(["pi-extended-teams", "external"]);
     } finally {
       setup.restoreEnv();
     }
@@ -1121,6 +1121,7 @@ describe("extension integration", () => {
       vi.doMock("./internal/pi-runtime-api.js", () => ({
         loadPiRuntimeApi: async () => ({
           createAgentSession: vi.fn(async () => ({ session })),
+          createEventBus: vi.fn(() => ({ on: vi.fn(() => vi.fn()), emit: vi.fn() })),
           DefaultResourceLoader: class {
             async reload() {}
             getExtensions() { return { extensions: [], errors: [], runtime: {} }; }

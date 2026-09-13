@@ -1186,11 +1186,25 @@ export async function runReadAgentInProcess(
       }
       while (assignedChecks?.length && !submittedFinalReport && !pendingChildParent
         && !state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
+        const wakeGeneration = readAgentWakeGeneration(state);
+        // A delivery may have started before checks owned the operation gate.
+        // Drain every admitted turn before capturing or verifying its final report.
+        let deliveryTail: Promise<void> | undefined;
+        do {
+          deliveryTail = state.messageDeliveryTail;
+          if (deliveryTail) await deliveryTail.catch(() => {});
+        } while (deliveryTail !== state.messageDeliveryTail);
+        if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) break;
         completionResolution = resolveCurrentReport();
+        if (submittedFinalReport) break;
+        if (state.completedOperationError) throw state.completedOperationError;
+        if (state.completedOperationInterrupted) {
+          if (!await waitForPostInterruptOperation(state.completedOperationGeneration!, wakeGeneration)) return;
+          continue;
+        }
         if (completionResolution.terminalFailure || !completionResolution.report) {
           throw unavailableReportError(completionResolution.terminalFailure ?? "No usable report is available for verification.");
         }
-        const wakeGeneration = readAgentWakeGeneration(state);
         const verification = await runReadAgentSessionOperation(state, async () => {
           await verifyTaskResult(completionResolution!);
         });

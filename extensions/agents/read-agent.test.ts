@@ -513,6 +513,104 @@ describe("in-process read agent tool wiring", () => {
     expect(options.runningReadAgents.size).toBe(0);
   });
 
+  it.each(["plaintext", "tool"])("preserves an admitted %s follow-up that finishes before fallback verification", async mode => {
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>(done => { resolve = done; });
+      return { promise, resolve };
+    };
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "input");
+    const member = { ...fixtureMember("checked"), cwd, lifecycleRunId: "run",
+      assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }] };
+    writeTeamConfig("team", member);
+    const options = makeRunOptions();
+    const session = makeSession();
+    const promptEnding = deferred();
+    const finishPrompt = deferred();
+    const followupStarted = deferred();
+    const finishFollowup = deferred();
+    const fallbackReached = deferred();
+    const checkStarted = deferred();
+    const finishCheck = deferred();
+    const exec = vi.fn(async () => {
+      checkStarted.resolve();
+      await finishCheck.promise;
+      return { exitCode: 0 };
+    });
+    session.prompt.mockImplementation(async () => {
+      session.isStreaming = false;
+      promptEnding.resolve();
+      await finishPrompt.promise;
+    });
+    let reportAccepted: boolean | undefined;
+    let reportError: unknown;
+    session.sendUserMessage.mockImplementation(async () => {
+      session.isStreaming = true;
+      followupStarted.resolve();
+      await finishFollowup.promise;
+      try {
+        if (mode === "plaintext") {
+          session.messages.push({ role: "assistant", content: "Latest follow-up report" });
+        } else {
+          const tool = piMocks.createAgentSession.mock.calls[0][0].customTools.find((tool: any) => tool.name === "report_and_exit");
+          const response = await tool.execute("followup", { content: "Latest follow-up report", outcome: "blocked" });
+          reportAccepted = response.details.accepted;
+        }
+      } catch (error) { reportError = error; }
+      finally { session.isStreaming = false; }
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const running = runReadAgentInProcess("team", member, "Work", {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, { ...options, loadCheckOperations: async () => ({ exec }) });
+    await promptEnding.promise;
+    const state = options.runningReadAgents.get("team:checked")!;
+    const delivery = sendMessageToRunningReadAgent(state, "Include the latest findings").catch(() => false);
+    await followupStarted.promise;
+    let tail = state.messageDeliveryTail;
+    Object.defineProperty(state, "messageDeliveryTail", {
+      get: () => { fallbackReached.resolve(); return tail; },
+      set: value => { tail = value; },
+    });
+    // Delivery is already running when the initial prompt unwinds. Reach either
+    // the drain (fixed) or the check (buggy), then finish delivery before the check.
+    finishPrompt.resolve();
+    await Promise.race([fallbackReached.promise, checkStarted.promise]);
+    const overlapped = state.checkOperation !== undefined;
+    finishFollowup.resolve();
+    if (mode === "plaintext" || overlapped) await delivery;
+    await checkStarted.promise;
+    expect(session.dispose).not.toHaveBeenCalled();
+    expect(options.releaseAllClaimsForAgent).not.toHaveBeenCalled();
+    finishCheck.resolve();
+    await delivery;
+    await running;
+
+    expect(reportError).toBeUndefined();
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ status: "completed", report: "Latest follow-up report", result: {
+      runId: "run", verification: { state: "passed" }, acceptance: { state: "pending" },
+    } });
+    expect(options.rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      report: "Latest follow-up report", result: reports[0].result,
+    }));
+    expect(options.emitAgentReport).toHaveBeenCalledOnce();
+    expect(options.emitAgentReport.mock.calls[0][4]).toContain("Latest follow-up report");
+    if (mode === "tool") {
+      expect(reportAccepted).toBe(true);
+      expect(reports[0].result?.outcome).toBe("blocked");
+    }
+    expect(overlapped).toBe(false);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(options.releaseAllClaimsForAgent).toHaveBeenCalledOnce();
+    expect(options.runningReadAgents.size).toBe(0);
+  });
+
   it("does not finalize a run with an unresolved durable check claim", async () => {
     const member = { ...fixtureMember("checked"), lifecycleRunId: "run",
       assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }] };

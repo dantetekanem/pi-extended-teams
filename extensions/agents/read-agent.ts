@@ -534,6 +534,8 @@ async function ensureReadHelperCompletionMessages(
   if (!member.requestedBy) return;
 
   let requesterReceivedReport = false;
+  // Direct session delivery has no inbox sender envelope. Keep identity outside the report body.
+  const attributedReport = `Read helper report ${JSON.stringify({ agentName: member.name, runId, runtimeStatus: outcome })}\n\n${report}`;
   try {
     const requester = (await teams.readConfig(teamName)).members.find(item => item.name === member.requestedBy);
     const expectedRequesterRunId = member.parentAgentName === member.requestedBy
@@ -552,8 +554,8 @@ async function ensureReadHelperCompletionMessages(
     // Durability, not the requester's complete idle model run, gates helper cleanup.
     // Even an already persisted report must wake its exact requester automatically.
     const wake = expectedRequesterRunId
-      ? options.deliverMessageToActiveAgent?.(teamName, member.requestedBy, report, expectedRequesterRunId)
-      : options.deliverMessageToActiveAgent?.(teamName, member.requestedBy, report);
+      ? options.deliverMessageToActiveAgent?.(teamName, member.requestedBy, attributedReport, expectedRequesterRunId)
+      : options.deliverMessageToActiveAgent?.(teamName, member.requestedBy, attributedReport);
     void wake?.catch(async () => {
       await messaging.sendPlainMessage(teamName, member.name, "team-lead",
         `Direct report delivery to ${member.requestedBy} was interrupted or failed; its model run may still be active. The durable helper report is retained.`,

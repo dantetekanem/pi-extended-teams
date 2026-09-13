@@ -1218,6 +1218,9 @@ export default function (pi: ExtensionAPI) {
       createNestedReadAgentTools: (binding: Parameters<TeamToolsRuntime["createNestedReadAgentTools"]>[0]) => {
         return teamToolsRuntime?.createNestedReadAgentTools(binding) ?? [];
       },
+      nestedChildSnapshot: (binding: Parameters<TeamToolsRuntime["nestedChildSnapshot"]>[0]) => {
+        return teamToolsRuntime?.nestedChildSnapshot(binding) ?? { running: 0, queued: 0 };
+      },
       pendingChildController,
     };
   }

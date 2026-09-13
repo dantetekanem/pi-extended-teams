@@ -27,7 +27,7 @@ import {
 import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
 import { preparePrivateAgentSessionDirectory } from "../internal/agent-session-files";
 import { isEligibleNestedReadParent, NESTED_DELEGATION_TOOL_NAMES } from "../runtime/nested-read-agents";
-import type { NestedReadAgentToolBinding } from "../tools/team-tools";
+import { CHILD_AGENT_LIFECYCLE_PROBE, type NestedReadAgentToolBinding } from "../tools/team-tools";
 import type { ParentRunIdentity, PendingChildController } from "../runtime/pending-child-controller";
 import {
   closeReadAgentMessageDelivery,
@@ -119,6 +119,7 @@ export interface RunReadAgentOptions {
   createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
   extensionInstanceId?: string;
   createNestedReadAgentTools?(binding: NestedReadAgentToolBinding): any[];
+  nestedChildSnapshot?(binding: NestedReadAgentToolBinding): { running: number; queued: number };
   pendingChildController?: PendingChildController;
 }
 
@@ -645,6 +646,7 @@ export async function runReadAgentInProcess(
   let submittedFinalReport: SubmittedAgentReport | undefined;
   let finalReportSubmissionInProgress = false;
   let childSessionManager: any;
+  let childLifecycleProbeUnsubscribe = (): void => {};
   let privateSessionDirectory: string | undefined;
   let privateCompletedReportPersisted = false;
   const pendingChildController = options.pendingChildController;
@@ -824,6 +826,7 @@ export async function runReadAgentInProcess(
 
     const {
       createAgentSession,
+      createEventBus,
       DefaultResourceLoader,
       getAgentDir,
       SessionManager,
@@ -843,16 +846,21 @@ export async function runReadAgentInProcess(
     const childSettingsManager = createSettingsManager(member.cwd, agentDir, {
       projectTrusted: resourcePlan.trust.projectTrusted,
     });
-    const nestedReadAgentTools = isEligibleNestedReadParent(member)
-      ? options.createNestedReadAgentTools?.({
+    const nestedReadBinding = isEligibleNestedReadParent(member)
+      ? {
           teamName: readTeamName,
           parent: member,
           parentRunId: state.runId,
           outerCtx: ctx,
-        }) ?? []
+        }
+      : undefined;
+    const nestedReadAgentTools = nestedReadBinding
+      ? options.createNestedReadAgentTools?.(nestedReadBinding) ?? []
       : [];
     const nestedReadDelegationEnabled = nestedReadAgentTools.length > 0;
+    const childEventBus = createEventBus();
     const loader = new DefaultResourceLoader({
+      eventBus: childEventBus,
       cwd: member.cwd,
       agentDir,
       settingsManager: childSettingsManager,
@@ -951,6 +959,13 @@ export async function runReadAgentInProcess(
     childSessionManager = privateSessionDirectory
       ? SessionManager.create(member.cwd, privateSessionDirectory)
       : SessionManager.create(member.cwd);
+    if (nestedReadBinding && options.nestedChildSnapshot) {
+      const childSessionId = childSessionManager.getSessionId();
+      childLifecycleProbeUnsubscribe = childEventBus.on(CHILD_AGENT_LIFECYCLE_PROBE, (payload: any) => {
+        if (payload?.sessionId !== childSessionId || typeof payload.respond !== "function") return;
+        payload.respond({ sessionId: childSessionId, ...options.nestedChildSnapshot!(nestedReadBinding) });
+      });
+    }
     const parentModelRuntime: unknown = Reflect.get(ctx.modelRegistry, "runtime");
     const { session } = await createAgentSession({
       cwd: member.cwd,
@@ -1354,6 +1369,7 @@ export async function runReadAgentInProcess(
       }
     }
   } finally {
+    childLifecycleProbeUnsubscribe();
     pendingParentWakeSignals.delete(state);
     disposeReadAgentWake(state);
     settleSessionCreation(state.session);

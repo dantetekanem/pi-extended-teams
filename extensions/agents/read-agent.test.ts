@@ -26,6 +26,7 @@ const piMocks = vi.hoisted(() => ({
   sessionManagerOpen: vi.fn(),
   persistedSessionEntries: new Map<string, any[]>(),
   sessionManagerCounter: 0,
+  eventBuses: [] as Array<{ on(name: string, handler: (payload: any) => void): () => void; emit(name: string, payload: any): void }>,
 }));
 
 function mockedPiRuntimeApi() {
@@ -59,6 +60,20 @@ function mockedPiRuntimeApi() {
   SessionManager: {
     create: piMocks.sessionManagerCreate,
     open: piMocks.sessionManagerOpen,
+  },
+  createEventBus: () => {
+    const handlers = new Map<string, Array<(payload: any) => void>>();
+    const eventBus = {
+      on(name: string, handler: (payload: any) => void) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        return () => handlers.set(name, (handlers.get(name) ?? []).filter(candidate => candidate !== handler));
+      },
+      emit(name: string, payload: any) {
+        for (const handler of handlers.get(name) ?? []) handler(payload);
+      },
+    };
+    piMocks.eventBuses.push(eventBus);
+    return eventBus;
   },
   };
 }
@@ -208,6 +223,7 @@ describe("in-process read agent tool wiring", () => {
     piMocks.sessionManagerOpen.mockReset();
     piMocks.persistedSessionEntries.clear();
     piMocks.sessionManagerCounter = 0;
+    piMocks.eventBuses.length = 0;
     piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
       const id = `child-session-${++piMocks.sessionManagerCounter}`;
       const sessionFile = path.join(sessionDir ?? path.join(root, "child-sessions"), `${id}.jsonl`);
@@ -354,6 +370,48 @@ describe("in-process read agent tool wiring", () => {
       expect(session.prompt).toHaveBeenCalledOnce();
       expect(registration.mock.calls[0][1].moveToHerdr).toBeUndefined();
     } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("answers the child task probe on its private event bus and removes it during teardown", async () => {
+    const member = eligibleNestedParent("writer");
+    writeTeamConfig("team", member);
+    const session = makeSession();
+    const nestedChildSnapshot = vi.fn(() => ({ running: 1, queued: 2 }));
+    const response = vi.fn();
+    let childSessionId = "";
+    session.bindExtensions.mockImplementation(async () => {
+      const childSessionManager = piMocks.sessionManagerCreate.mock.results.at(-1)?.value;
+      if (!childSessionManager) throw new Error("child session manager was not created");
+      childSessionId = childSessionManager.getSessionId();
+      piMocks.loaderOptions.at(-1)?.eventBus?.emit("pi-extended-teams:child-agent-lifecycle-probe", {
+        sessionId: childSessionId, respond: response,
+      });
+    });
+    session.prompt.mockImplementation(async () => {
+      const reportTool = piMocks.createAgentSession.mock.calls[0][0].customTools
+        .find((tool: any) => tool.name === "report_and_exit");
+      await reportTool.execute("report", { content: "Finished", summary: "Done" });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = {
+      ...makeRunOptions(),
+      nestedChildSnapshot,
+      pendingChildController: createPendingChildController(),
+    };
+
+    await runReadAgentInProcess("team", member, "finish", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+
+    expect(nestedChildSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+      teamName: "team", parent: member, parentRunId: expect.any(String),
+    }));
+    expect(response).toHaveBeenCalledWith({ sessionId: childSessionId, running: 1, queued: 2 });
+    const responseAfterTeardown = vi.fn();
+    piMocks.loaderOptions.at(-1).eventBus.emit("pi-extended-teams:child-agent-lifecycle-probe", {
+      sessionId: childSessionId, respond: responseAfterTeardown,
+    });
+    expect(responseAfterTeardown).not.toHaveBeenCalled();
   });
 
   it("isolates completed report persistence in the test temp directory", () => {

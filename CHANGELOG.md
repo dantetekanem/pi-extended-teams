@@ -10,6 +10,12 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.11] - 2026-09-12
+
+### Fixed
+- Let orchestration requests spawn current-session agents and preserve nested-read opt-in for named-team one-shot spawns.
+- Expose parent-scoped running and queued helper counts to lifecycle probes on each child session's private event bus.
+
 ## [2.2.10] - 2026-09-12
 
 ### Fixed

@@ -809,6 +809,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     for (const { agentName: quarantinedName, result } of activityTombstones) {
+      if (result.status === "occupied" && result.tombstone.phase === "persistence_closed"
+        && runningAgents.some(agent => agent.name === quarantinedName && agent.runId === result.tombstone.runId)) {
+        const entryIndex = entries.findIndex(entry => entry.name === quarantinedName);
+        footerStatuses[entryIndex] += " · Finishing cleanup";
+        continue;
+      }
       const persistedMember = activityMembers.find(member => member.name === quarantinedName);
       const role = result.status === "occupied"
         ? result.tombstone.role

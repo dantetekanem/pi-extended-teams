@@ -529,44 +529,38 @@ async function ensureReadHelperCompletionMessages(
   report: string,
   outcome: "completed" | "failed" = "completed",
   color = member.color,
-  deliverMessageToActiveAgent?: RunReadAgentOptions["deliverMessageToActiveAgent"]
+  options: Pick<RunReadAgentOptions, "deliverMessageToActiveAgent" | "notifyLeadOfInboxReports"> = {}
 ): Promise<void> {
   if (!member.requestedBy) return;
 
-  const expectedRequesterRunId = member.parentAgentName === member.requestedBy
-    ? member.parentLifecycleRunId
-    : undefined;
   let requesterReceivedReport = false;
   try {
-    const deliveredDirectly = expectedRequesterRunId
-      ? await deliverMessageToActiveAgent?.(teamName, member.requestedBy, report, expectedRequesterRunId) === true
-      : await deliverMessageToActiveAgent?.(teamName, member.requestedBy, report) === true;
-    if (deliveredDirectly) {
-      requesterReceivedReport = true;
-    } else {
-      requesterReceivedReport = await hasRecentMessageFrom(
-        teamName,
-        member.name,
-        member.requestedBy,
-        startedAt,
-        message => message?.metadata?.helperReport === true && message?.metadata?.runId === runId
-      );
-      if (!requesterReceivedReport) {
-        await messaging.sendPlainMessageIfRunning(
-          teamName,
-          member.name,
-          member.requestedBy,
-          report,
-          outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
-          color,
-          {
-            metadata: { helperReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy },
-            ...(expectedRequesterRunId ? { expectedRecipientRunId: expectedRequesterRunId } : {}),
-          }
-        );
-        requesterReceivedReport = true;
+    const requester = (await teams.readConfig(teamName)).members.find(item => item.name === member.requestedBy);
+    const expectedRequesterRunId = member.parentAgentName === member.requestedBy
+      ? member.parentLifecycleRunId : requester?.lifecycleRunId;
+    await messaging.sendPlainMessageOnceIfRunning(
+      teamName, member.name, member.requestedBy, report,
+      outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
+      {
+        color,
+        operationId: `helper-report:${runId}`,
+        expectedRecipientRunId: expectedRequesterRunId,
+        metadata: { helperReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy },
       }
-    }
+    );
+    requesterReceivedReport = true;
+    // Durability, not the requester's complete idle model run, gates helper cleanup.
+    // Even an already persisted report must wake its exact requester automatically.
+    const wake = expectedRequesterRunId
+      ? options.deliverMessageToActiveAgent?.(teamName, member.requestedBy, report, expectedRequesterRunId)
+      : options.deliverMessageToActiveAgent?.(teamName, member.requestedBy, report);
+    void wake?.catch(async () => {
+      await messaging.sendPlainMessage(teamName, member.name, "team-lead",
+        `Direct report delivery to ${member.requestedBy} was interrupted or failed; its model run may still be active. The durable helper report is retained.`,
+        `Read helper ${member.name} wake incomplete`, color,
+        { metadata: { helperWakeFailed: true, runId, requestedBy: member.requestedBy, expectedRecipientRunId: expectedRequesterRunId } });
+      await options.notifyLeadOfInboxReports?.(teamName);
+    }).catch(() => { console.warn(`Could not record helper wake outcome for ${member.name} (${runId}).`); });
   } catch {
     requesterReceivedReport = false;
   }
@@ -928,7 +922,7 @@ export async function runReadAgentInProcess(
         report,
         "completed",
         member.color,
-        options.deliverMessageToActiveAgent
+        options
       );
       await options.renderLeadInboxStatus?.().catch(() => {});
       await options.notifyLeadOfInboxReports?.(readTeamName).catch(() => {});
@@ -1153,6 +1147,18 @@ export async function runReadAgentInProcess(
     } as Parameters<typeof createAgentSession>[0] & { modelRuntime?: unknown });
 
     state.session = session;
+    // Current hosts capture this public hook when a prompt starts; legacy hosts
+    // retain their existing loop behavior. Never abort from the reporting tool.
+    if (session.agent && "shouldStopAfterTurn" in session.agent) {
+      const agent = session.agent as typeof session.agent & {
+        shouldStopAfterTurn?: (...args: unknown[]) => boolean | Promise<boolean>;
+      };
+      const previous = agent.shouldStopAfterTurn;
+      agent.shouldStopAfterTurn = async (...args) => {
+        const stopped = await previous?.(...args);
+        return submittedFinalReport !== undefined || stopped === true;
+      };
+    }
     const sessionLifecycle = installReadAgentSessionLifecycle(session, () => {
       if (handoffRequested) return;
       const own = recordedSessionCost(childSessionManager.getEntries());
@@ -1604,7 +1610,7 @@ export async function runReadAgentInProcess(
           failureReport,
           "failed",
           "red",
-          options.deliverMessageToActiveAgent
+          options
         );
         await options.renderLeadInboxStatus?.().catch(() => {});
         await options.notifyLeadOfInboxReports?.(readTeamName).catch(() => {});

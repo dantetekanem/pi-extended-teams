@@ -149,6 +149,30 @@ describe("nested selected-extension session shutdown", () => {
     expect(session.dispose).toHaveBeenCalledOnce();
   });
 
+  it("snapshots late raw work immediately before disposal, isolating observer failure", async () => {
+    const { session, order } = makeSession();
+    const handler = deferred();
+    const delivery = deferred();
+    const abort = deferred();
+    let cost = 0;
+    session.extensionRunner.emit.mockImplementation(() => handler.promise.then(() => { cost += 1; }));
+    session.abort.mockImplementation(() => abort.promise.then(() => { cost += 3; }));
+    const snapshot = vi.fn(() => { order.push(`snapshot:${cost}`); throw new Error("observer failed"); });
+    const lifecycle = installReadAgentSessionLifecycle(session, snapshot);
+    const result = await lifecycle.requestShutdown("quit", delivery.promise.then(() => { cost += 2; }), 0);
+    expect(result.status).toBe("timed_out");
+    expect(snapshot).not.toHaveBeenCalled();
+    handler.resolve();
+    delivery.resolve();
+    await Promise.resolve();
+    expect(snapshot).not.toHaveBeenCalled();
+    abort.resolve();
+    await lifecycle.finalized;
+    expect(order.slice(-2)).toEqual(["snapshot:6", "dispose"]);
+    expect(snapshot).toHaveBeenCalledOnce();
+    expect(session.dispose).toHaveBeenCalledOnce();
+  });
+
   it("continues through throwing and absent shutdown handlers", async () => {
     const throwing = makeSession();
     throwing.session.extensionRunner.emit.mockRejectedValue(new Error("handler failed"));

@@ -352,6 +352,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       if (drainQueue && (member.role ?? "write") === "write") {
         void options.drainWriteQueue(teamName).catch(() => {});
       }
+      try { expectedState?.onCostSettled?.(); } catch { /* Accounting cannot alter settlement. */ }
       try {
         options.onTeammateSettled?.(teamName, { ...member, lifecycleRunId: expectedRunId });
       } catch {

@@ -99,6 +99,7 @@ import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "./read-agent-session-lifecyc
 import type { RunningReadAgent } from "../runtime/types.js";
 import { createPendingChildController, type PendingChildRun } from "../runtime/pending-child-controller.js";
 import { createTeammateInterrupter } from "../runtime/teammate-interrupt.js";
+import { createCombinedSessionCost } from "../team/session-cost.js";
 
 let root: string;
 
@@ -1187,6 +1188,58 @@ describe("in-process read agent tool wiring", () => {
     expect(reports[0]).toMatchObject({ status: "failed", result: { verification: { state: "pending", checkIds: [record.checkId] } } });
   });
 
+  it.each(["completed", "failed", "cancelled", "pending-write-failed", "snapshot-failed", "startup-failed", "cleanup-blocked"] as const)("records %s own cost only after raw settlement and matching lifecycle cleanup", async (outcome) => {
+    const session = makeSession();
+    const entries: any[] = [];
+    const rootEntries: any[] = [];
+    const handlers = new Map<string, Function>();
+    const cost = createCombinedSessionCost({
+      on: (event: string, handler: Function) => handlers.set(event, handler),
+      appendEntry: (customType: string, data: any) => {
+        if (outcome === "pending-write-failed" && data.phase === "pending") throw new Error("disk unavailable");
+        rootEntries.push({ type: "custom", customType, data });
+      },
+    } as any);
+    const ctx = { sessionManager: { getSessionId: () => "root", getEntries: () => rootEntries },
+      ui: { setStatus: vi.fn() }, modelRegistry: { find: () => ({ provider: "provider", id: "model" }) } };
+    handlers.get("session_start")!({}, ctx);
+    const options = { ...makeRunOptions(), beginCostRun: cost.begin };
+    if (outcome === "cleanup-blocked") vi.spyOn(reportEvents, "appendTeamReportEvent").mockRejectedValue(new Error("report store unavailable"));
+    piMocks.createAgentSession.mockImplementation(async ({ sessionManager }) => {
+      if (outcome === "startup-failed") throw new Error("session creation failed");
+      sessionManager.getEntries = () => {
+        if (outcome === "snapshot-failed") throw new Error("snapshot unavailable");
+        return entries;
+      };
+      return { session };
+    });
+    session.prompt.mockImplementation(async () => {
+      expect(cost.total()).toEqual({ usd: 0, complete: false });
+      entries.push({ type: "message", message: { role: "assistant", usage: { cost: { total: 1 } } } });
+      if (outcome === "failed") throw new Error("provider failure");
+      if (outcome === "cancelled") options.runningReadAgents.get("team:reader")!.stopRequested = true;
+    });
+    session.abort.mockImplementation(async () => {
+      expect(cost.total()).toEqual({ usd: 0, complete: false });
+      entries.push({ type: "compaction", usage: { cost: { total: 2 } } });
+    });
+    session.dispose.mockImplementation(() => expect(cost.total().complete).toBe(false));
+    await runReadAgentInProcess("team", fixtureMember("reader"), "inspect", ctx, options);
+    if (outcome === "cleanup-blocked") {
+      expect(cost.total()).toEqual({ usd: 0, complete: false });
+      expect(rootEntries.at(-1).data.phase).toBe("pending");
+      expect(await readLifecycleTombstone("team", "reader")).toMatchObject({ status: "occupied" });
+    } else {
+      const unknown = outcome === "snapshot-failed" || outcome === "startup-failed";
+      expect(cost.total()).toEqual({ usd: unknown ? 0 : 3, complete: !unknown });
+      expect(rootEntries.at(-1).data).toMatchObject({
+        outcome: outcome === "failed" || outcome === "startup-failed" ? "failed" : outcome === "cancelled" ? "cancelled" : "completed",
+        childSessionId: "child-session-1", costUsd: unknown ? null : 3 });
+      expect(options.runningReadAgents.size).toBe(0);
+      expect(await readLifecycleTombstone("team", "reader")).toEqual({ status: "absent" });
+    }
+  });
+
   it.each(["read", "write"] as const)("moves a direct %s agent to Herdr without finalizing its session or mailbox", async (role) => {
     vi.stubEnv("HERDR_ENV", "1");
     const member = fixtureMember(role === "read" ? "reader" : "writer", role);
@@ -1210,8 +1263,11 @@ describe("in-process read agent tool wiring", () => {
       fs.writeFileSync(sessionFile, "existing conversation");
       return { session };
     });
-    const options = makeRunOptions();
-    const run = runReadAgentInProcess("team", member, "finish the assigned work", { modelRegistry: { find: () => ({ id: "model" }) } }, options);
+    const costRun = { settle: vi.fn(), exclude: vi.fn() };
+    const options = { ...makeRunOptions(), beginCostRun: vi.fn(() => costRun) };
+    const run = runReadAgentInProcess("team", member, "finish the assigned work", {
+      sessionManager: { getSessionId: () => "origin-root" }, modelRegistry: { find: () => ({ id: "model" }) },
+    }, options);
     try {
       await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledOnce());
       const state = options.runningReadAgents.get(`team:${member.name}`)!;
@@ -1272,6 +1328,8 @@ describe("in-process read agent tool wiring", () => {
       expect((await readInbox("team", member.name, true, false)).map(message => message.text)).toContain("follow-up");
       expect(options.emitAgentReport).not.toHaveBeenCalled();
       expect(options.releaseAllClaimsForAgent).not.toHaveBeenCalled();
+      expect(costRun.exclude).toHaveBeenCalledOnce();
+      expect(costRun.settle).not.toHaveBeenCalled();
       expect(await readLifecycleTombstone("team", member.name)).toEqual({ status: "absent" });
       const pidFile = path.join(paths.teamDir("team"), `${member.name}.pid`);
       fs.writeFileSync(pidFile, "424242");

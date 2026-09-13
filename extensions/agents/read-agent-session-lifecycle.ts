@@ -224,7 +224,7 @@ async function operationTimedOut(operation: Promise<void>, timeoutMs: number): P
   return timedOut;
 }
 
-function installNestedSessionLifecycle(session: AgentSession): NestedSessionLifecycle {
+function installNestedSessionLifecycle(session: AgentSession, beforeDispose?: () => void): NestedSessionLifecycle {
   const existing = sessionLifecycles.get(session);
   if (existing) return existing;
 
@@ -236,6 +236,7 @@ function installNestedSessionLifecycle(session: AgentSession): NestedSessionLife
   const disposeOnce = (): void => {
     if (disposed) return;
     disposed = true;
+    try { beforeDispose?.(); } catch { /* Accounting must not prevent disposal. */ }
     try {
       session.dispose();
       finalized.resolve();
@@ -353,8 +354,8 @@ function installNestedSessionLifecycle(session: AgentSession): NestedSessionLife
   return lifecycle;
 }
 
-export function installReadAgentSessionLifecycle(session: AgentSession): NestedSessionLifecycle {
-  return installNestedSessionLifecycle(session);
+export function installReadAgentSessionLifecycle(session: AgentSession, beforeDispose?: () => void): NestedSessionLifecycle {
+  return installNestedSessionLifecycle(session, beforeDispose);
 }
 
 export function requestReadAgentTeardown(

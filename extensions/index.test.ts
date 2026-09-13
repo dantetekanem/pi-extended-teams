@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Key } from "@mariozechner/pi-tui";
-import { LEGACY_FAVORITE_MODEL_SLOT_ALIASES } from "../src/utils/settings";
+import { globalSettingsPath, LEGACY_FAVORITE_MODEL_SLOT_ALIASES, projectSettingsPath } from "../src/utils/settings";
 
 type RegisteredTool = {
   name: string;
@@ -229,6 +229,7 @@ describe("extension integration", () => {
       expect(setup.commands.has("team")).toBe(false);
       expect(setup.commands.has("agents-favorite-models")).toBe(true);
       expect(setup.commands.has("agents-extensions")).toBe(true);
+      expect(setup.commands.has("pi-extended-teams-onboard")).toBe(true);
       expect(setup.pi.registerShortcut).toHaveBeenCalledWith(Key.alt("tab"), expect.objectContaining({ handler: expect.any(Function) }));
       expect(setup.tools.has("team_create")).toBe(false);
       expect(setup.tools.has("ensure_team")).toBe(false);
@@ -269,6 +270,7 @@ describe("extension integration", () => {
       expect(setup.tools.has("spawn_agent")).toBe(false);
       expect(setup.tools.has("spawn_swarm_agents")).toBe(false);
       expect(setup.tools.has("send_message")).toBe(true);
+      expect(setup.commands.has("pi-extended-teams-onboard")).toBe(false);
       const runtime = await import("../src/utils/runtime.js");
       const messaging = await import("../src/utils/messaging.js");
       const ctx = makeCtx(setup.root, "writer-session");
@@ -291,15 +293,68 @@ describe("extension integration", () => {
     }
   });
 
-  it("warns lead sessions at boot when no favorite levels are configured", async () => {
+  it("points first-time lead sessions to agent-led onboarding", async () => {
     const setup = await setupExtension();
     try {
       const ctx = makeCtx(setup.root, "boot-session");
       for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(
-        "No agent intent tiers are configured. Define them with /agents-favorite-models before spawning agents. See README.md for intent-tier examples.",
+        "pi-extended-teams is not configured yet. Run /pi-extended-teams-onboard for agent-led model and shared-extension setup.",
         "warning"
+      );
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("does not keep showing the onboarding notice after global settings exist", async () => {
+    const setup = await setupExtension();
+    try {
+      const settingsPath = globalSettingsPath(setup.root);
+      fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+      fs.writeFileSync(settingsPath, "{}\n");
+      const ctx = makeCtx(setup.root, "configured-boot-session");
+
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+
+      expect(ctx.ui.notify).not.toHaveBeenCalled();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("does not show the onboarding notice when trusted project settings exist", async () => {
+    const setup = await setupExtension();
+    try {
+      const settingsPath = projectSettingsPath(setup.root);
+      fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+      fs.writeFileSync(settingsPath, "{}\n");
+      const ctx = makeCtx(setup.root, "project-configured-boot-session");
+      ctx.isProjectTrusted.mockReturnValue(true);
+
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+
+      expect(ctx.ui.notify).not.toHaveBeenCalled();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("still shows the onboarding notice when only untrusted project settings exist", async () => {
+    const setup = await setupExtension();
+    try {
+      const settingsPath = projectSettingsPath(setup.root);
+      fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+      fs.writeFileSync(settingsPath, "{}\n");
+      const ctx = makeCtx(setup.root, "untrusted-project-boot-session");
+      ctx.isProjectTrusted.mockReturnValue(false);
+
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        "pi-extended-teams is not configured yet. Run /pi-extended-teams-onboard for agent-led model and shared-extension setup.",
+        "warning",
       );
     } finally {
       setup.restoreEnv();
@@ -512,7 +567,10 @@ describe("extension integration", () => {
       const plan = spawnOptions.createResourcePlan({ cwd: setup.root, projectTrusted: true });
       expect(plan.selfExtensionPath).toBe(selfPath);
       expect(plan.extensionPaths).toEqual([externalPath]);
-      expect(plan.extensions.map((extension: any) => extension.name)).toEqual(["pi-extended-teams", "external"]);
+      expect(plan.extensions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: selfPath, isSelf: true }),
+        expect.objectContaining({ name: "external", path: externalPath, isSelf: false }),
+      ]));
     } finally {
       setup.restoreEnv();
     }

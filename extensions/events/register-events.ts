@@ -9,7 +9,7 @@ import { cleanupAgentSessionFolders, cleanupOrphanedTeams } from "../internal/se
 import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
 import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
-import { FAVORITE_MODEL_SLOTS, loadSettings } from "../../src/utils/settings";
+import { globalSettingsPath, projectSettingsPath } from "../../src/utils/settings";
 import { generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
 import { cleanupStaleSessionContextReferences } from "../internal/session-context-reference";
 import { cleanupStalePrivateAgentSessions } from "../internal/agent-session-files";
@@ -40,6 +40,13 @@ export function isInboxFileWatchEvent(inboxFile: string, filename: string | Buff
   const inboxBase = path.basename(inboxFile);
   const changedName = filename?.toString();
   return !changedName || changedName === inboxBase || changedName === `${inboxBase}.lock`;
+}
+
+function hasPersistedTeamSettings(ctx: any): boolean {
+  if (fs.existsSync(globalSettingsPath())) return true;
+  return typeof ctx.cwd === "string"
+    && ctx.isProjectTrusted?.() === true
+    && fs.existsSync(projectSettingsPath(ctx.cwd));
 }
 
 export function registerExtensionEvents(pi: any, options: RegisterEventsOptions): void {
@@ -163,14 +170,9 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       } catch {
         // Session-start janitors are best-effort and must not block initialization.
       }
-      const settings = loadSettings({ projectDir: ctx.cwd });
-      const configuredTiers = FAVORITE_MODEL_SLOTS.filter((slot) => {
-        const config = settings.favoriteModels[slot];
-        return !!config?.model && !!config.thinking;
-      });
-      if (configuredTiers.length === 0) {
+      if (!hasPersistedTeamSettings(ctx)) {
         ctx.ui?.notify?.(
-          "No agent intent tiers are configured. Define them with /agents-favorite-models before spawning agents. See README.md for intent-tier examples.",
+          "pi-extended-teams is not configured yet. Run /pi-extended-teams-onboard for agent-led model and shared-extension setup.",
           "warning"
         );
       }

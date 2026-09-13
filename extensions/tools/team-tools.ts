@@ -71,8 +71,14 @@ export interface NestedReadAgentToolBinding {
   outerCtx: any;
 }
 
+export interface NestedChildSnapshot {
+  running: number;
+  queued: number;
+}
+
 export interface TeamToolsRuntime {
   createNestedReadAgentTools(binding: NestedReadAgentToolBinding): any[];
+  nestedChildSnapshot(binding: NestedReadAgentToolBinding): NestedChildSnapshot;
   cancelQueuedAgent(teamName: string, agentName: string): boolean;
 }
 
@@ -105,7 +111,11 @@ interface QueuedReadSpawn {
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamToolsRuntime {
   if (options.isTeammate) {
-    return { createNestedReadAgentTools: () => [], cancelQueuedAgent: () => false };
+    return {
+      createNestedReadAgentTools: () => [],
+      nestedChildSnapshot: () => ({ running: 0, queued: 0 }),
+      cancelQueuedAgent: () => false,
+    };
   }
 
   function emitOrchestrationResponse(requestId: string | undefined, type: string, payload: Record<string, any>): void {
@@ -295,6 +305,20 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   function readQueue(teamName: string): QueuedReadSpawn[] {
     return queuedReadSpawnsByTeam.get(teamName) ?? [];
+  }
+
+  function nestedChildSnapshot(binding: NestedReadAgentToolBinding): NestedChildSnapshot {
+    const parent = {
+      teamName: binding.teamName,
+      parentName: binding.parent.name,
+      parentRunId: binding.parentRunId,
+    };
+    const queued = readQueue(binding.teamName).filter((child) => {
+      const childParent = pendingParentForMember(binding.teamName, child.member);
+      return childParent?.parentName === parent.parentName && childParent.parentRunId === parent.parentRunId;
+    }).length;
+    const pending = pendingChildController.pendingCount(parent);
+    return { running: Math.max(0, pending - queued), queued };
   }
 
   async function listQueuedAgentStatuses(teamName: string): Promise<QueuedAgentStatus[]> {
@@ -1078,7 +1102,16 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         const safeTeamName = paths.sanitizeName(params.team_name);
         if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
         options.adoptTeamAsLead(safeTeamName, ctx);
-        const result = await spawnTeammate(params, ctx, { once: true });
+        const result = await spawnTeammate(params, ctx, {
+          once: true,
+          allowNestedReadAgents: params.allow_nested_read_agents === true,
+        });
+        emitOrchestrationResponse(requestId, type, { ok: true, details: result.details, content: result.content });
+        return;
+      }
+
+      if (type === "spawn_agent") {
+        const result = await spawnPublicAgent(params, ctx);
         emitOrchestrationResponse(requestId, type, { ok: true, details: result.details, content: result.content });
         return;
       }
@@ -1310,6 +1343,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   return {
     createNestedReadAgentTools,
+    nestedChildSnapshot,
     cancelQueuedAgent: (teamName, agentName) => {
       // Retain the entry for admission bookkeeping, but let active teardown own cancellation after launch commits.
       if (readQueue(teamName).some(queued => queued.member.name === agentName && queued.launchCommitted)) return false;

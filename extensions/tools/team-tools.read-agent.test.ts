@@ -467,6 +467,86 @@ describe("public agent spawn tools", () => {
     await vi.waitFor(() => expect(fs.existsSync(asynchronousPath)).toBe(false));
   });
 
+  it("launches current-session spawn_agent requests with fallback model and nested-read opt-in", async () => {
+    const harness = registerTools();
+    const ctx = makeCtx();
+
+    await harness.emitAsync("pi-extended-teams:orchestration-request", {
+      requestId: "current-session-writer",
+      type: "spawn_agent",
+      params: {
+        name: "current-session-writer",
+        prompt: "Implement the claimed change.",
+        cwd: root,
+        model_slot: "write-critical",
+        allow_nested_read_agents: true,
+      },
+      ctx,
+    });
+
+    expect(harness.piEventEmit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response", expect.objectContaining({
+      requestId: "current-session-writer",
+      type: "spawn_agent",
+      ok: true,
+      details: expect.objectContaining({
+        name: "current-session-writer",
+        role: "write",
+        model: "provider/model",
+        modelSource: "current",
+        session: "session-test-session",
+      }),
+      content: expect.any(Array),
+    }));
+    const member = harness.runReadAgentInProcess.mock.calls[0]![1];
+    expect(member).toMatchObject({
+      name: "current-session-writer",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+      modelSlot: "write-critical",
+    });
+    expect(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent: member,
+      parentRunId: member.lifecycleRunId!,
+      outerCtx: ctx,
+    })).not.toEqual([]);
+  });
+
+  it("forwards nested-read opt-in through named-team spawn_teammate_once requests", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    const ctx = makeCtx();
+    teams.createTeam("named-team", "test-session", "lead-agent", "Named team", "provider/model");
+
+    await harness.emitAsync("pi-extended-teams:orchestration-request", {
+      requestId: "named-team-writer",
+      type: "spawn_teammate_once",
+      params: {
+        team_name: "named-team",
+        name: "named-team-writer",
+        prompt: "Implement the claimed change.",
+        cwd: root,
+        model_slot: "write-critical",
+        allow_nested_read_agents: true,
+      },
+      ctx,
+    });
+
+    expect(harness.piEventEmit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response", expect.objectContaining({
+      requestId: "named-team-writer",
+      type: "spawn_teammate_once",
+      ok: true,
+      details: expect.objectContaining({ agentId: "named-team-writer@named-team", role: "write" }),
+      content: expect.any(Array),
+    }));
+    expect(harness.runReadAgentInProcess.mock.calls[0]![1]).toMatchObject({
+      name: "named-team-writer",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+      modelSlot: "write-critical",
+    });
+  });
+
   it("canonicalizes persisted legacy model slots when reusing an existing member", async () => {
     const { runReadAgentInProcess, emitAsync, piEventEmit } = registerTools();
     const ctx = makeCtx();
@@ -2196,6 +2276,38 @@ describe("public agent spawn tools", () => {
     harness.completions.get("queued-one")!();
     await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(3));
     expect(harness.runReadAgentInProcess.mock.calls[2][1].name).toBe("queued-two");
+  });
+
+  it("scopes nested child snapshots to the exact parent lifecycle run", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const sibling = await admitNestedReadParent(harness, { name: "writer-two" });
+    const ctx = makeCtx();
+    const nestedTools = (member: Member) => new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent: member,
+      parentRunId: member.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool]));
+
+    await nestedTools(parent).get("spawn_agent")!.execute("owned-running", {
+      name: "owned-running", prompt: "run", model_slot: "read-collect",
+    });
+    await nestedTools(parent).get("spawn_agent")!.execute("owned-queued", {
+      name: "owned-queued", prompt: "queue", model_slot: "read-review",
+    });
+    await nestedTools(sibling).get("spawn_agent")!.execute("sibling-queued", {
+      name: "sibling-queued", prompt: "queue", model_slot: "read-review",
+    });
+
+    expect(harness.teamToolsRuntime.nestedChildSnapshot({
+      teamName: "session-test-session", parent, parentRunId: parent.lifecycleRunId!, outerCtx: ctx,
+    })).toEqual({ running: 1, queued: 1 });
+    expect(harness.teamToolsRuntime.nestedChildSnapshot({
+      teamName: "session-test-session", parent, parentRunId: "old-run", outerCtx: ctx,
+    })).toEqual({ running: 0, queued: 0 });
   });
 
   it("releases a queued nested-name reservation when the item is dropped", async () => {

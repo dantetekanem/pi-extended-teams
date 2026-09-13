@@ -11,7 +11,8 @@ import * as claims from "../../src/utils/claims.js";
 import type { Member, TeamConfig } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 import { enqueueReadAgentMessageDelivery, NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "../agents/read-agent-session-lifecycle.js";
-import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
+import { readLifecycleTombstone, withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone.js";
+import { createAgentStatusTool } from "../tools/agent-status-tool.js";
 import { registerTaskRuntimeTools } from "../tools/task-runtime-tools.js";
 import { createPendingChildController } from "../runtime/pending-child-controller.js";
 
@@ -850,8 +851,8 @@ describe("team lifecycle performance", () => {
     expect(runningReadAgents.get(`${teamName}:${reader.name}`)).toBe(state);
   });
 
-  it("preserves proven member removal when a later queue drain fails", async () => {
-    const writer = member("drain-failure");
+  it("keeps a post-removal queue-drain failure discoverable until matching fence release", async () => {
+    const writer = member("drain-failure", { lifecycleRunId: "drain-failure-run" });
     writeConfig({
       name: "drain-failure-team",
       description: "",
@@ -883,6 +884,23 @@ describe("team lifecycle performance", () => {
     });
     expect(drainWriteQueue).toHaveBeenCalledOnce();
     expect((await teams.readConfig("drain-failure-team")).members.map(item => item.name)).toEqual(["team-lead"]);
+    const statusTool = createAgentStatusTool({
+      getTeamName: () => "drain-failure-team", runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, terminal: null, listQueuedAgents: () => [],
+    });
+    const snapshot = await statusTool.execute("status", { agent_name: writer.name });
+    expect(snapshot.details.statuses).toEqual([expect.objectContaining({
+      name: writer.name, runId: writer.lifecycleRunId, role: "write", phase: "quarantined", error: "queue unavailable",
+    })]);
+    expect(snapshot.content[0].text).toContain("queue unavailable");
+    await withLifecycleTombstoneLock("drain-failure-team", writer.name, async lock => {
+      expect(lock.clearMatching("different-run")).toBe(false);
+    });
+    expect((await statusTool.execute("status", {})).details.statuses).toEqual(snapshot.details.statuses);
+    await withLifecycleTombstoneLock("drain-failure-team", writer.name, async lock => {
+      expect(lock.clearMatching(writer.lifecycleRunId!)).toBe(true);
+    });
+    expect((await statusTool.execute("status", {})).details.statuses).toEqual([]);
   });
 
   it("does not reap a watchdog-stale member while its in-process state is still live", async () => {

@@ -114,7 +114,8 @@ function registerTools() {
       });
     });
   });
-  const adoptTeamAsLead = vi.fn();
+  let adoptedTeam: string | undefined;
+  const adoptTeamAsLead = vi.fn((teamName: string) => { adoptedTeam = teamName; });
   const piEventEmit = vi.fn();
   const shutdownTeammate = vi.fn(async (teamName: string, member: Member) => {
     runningReadAgents.delete(readAgentKey(teamName, member.name));
@@ -166,7 +167,7 @@ function registerTools() {
     buildRoster: vi.fn(async () => ({})),
     isTeammate: false,
     agentName: "team-lead",
-    getTeamName: () => "session-test-session",
+    getTeamName: () => adoptedTeam ?? (teams.teamExists("session-test-session") ? "session-test-session" : undefined),
     getSessionCtx: () => sessionCtx,
     pendingChildController,
   });
@@ -910,7 +911,7 @@ describe("public agent spawn tools", () => {
     await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
     expect(harness.runReadAgentInProcess.mock.calls[1][1].name).toBe("eligible");
     const status = await harness.tools.get("get_agent_status")!.execute("status", { agent_name: "fenced" }, new AbortController().signal, undefined, makeCtx());
-    expect(status.details.statuses[0]).toMatchObject({ name: "fenced", phase: "queued" });
+    expect(status.details.statuses[0]).toMatchObject({ name: "fenced", phase: "quarantined", queuePosition: 1, error: expect.stringContaining("tombstone could not be read") });
     expect(fs.readFileSync(fencePath, "utf8")).toBe("{corrupt");
     await harness.shutdown();
   });
@@ -1259,6 +1260,7 @@ describe("public agent spawn tools", () => {
   });
 
   it("unsubscribes the lifecycle probe listener idempotently during reload shutdown", async () => {
+    teams.createTeam("session-test-session", "test-session", "lead-agent", "", "provider/model");
     const { emit, shutdown, eventUnsubscribes } = registerTools();
     const respond = vi.fn();
     const payload = { sessionId: "test-session", respond };

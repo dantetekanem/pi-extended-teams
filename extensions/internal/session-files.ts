@@ -31,18 +31,22 @@ export function findLeadTeamForSession(sessionId?: string): string | null {
     const teamsDir = path.dirname(paths.teamDir("__probe__"));
     if (!fs.existsSync(teamsDir)) return null;
 
+    let latest: { name: string; selectedAt: number } | undefined;
     for (const teamDir of fs.readdirSync(teamsDir)) {
+      if (teamDir.startsWith("prompt-build-")) continue;
       try {
         const sessionFile = paths.leadSessionPath(teamDir);
         if (!fs.existsSync(sessionFile)) continue;
         const session = JSON.parse(fs.readFileSync(sessionFile, "utf-8"));
         if (session.sessionId === sessionId && session.pid === process.pid) {
-          return teamDir;
+          const selectedAt = typeof session.startedAt === "number" && Number.isFinite(session.startedAt) ? session.startedAt : 0;
+          if (!latest || selectedAt > latest.selectedAt) latest = { name: teamDir, selectedAt };
         }
       } catch {
         // ignore entries that are not valid team names, and invalid session files
       }
     }
+    return latest?.name ?? null;
   } catch {
     // ignore errors
   }
@@ -50,13 +54,17 @@ export function findLeadTeamForSession(sessionId?: string): string | null {
 }
 
 export function registerLeadSession(teamName: string, sessionId?: string) {
+  const previousTeam = findLeadTeamForSession(sessionId);
+  const previous = previousTeam ? readJsonFile(paths.leadSessionPath(previousTeam)) : null;
+  // Ownership selections stay ordered even when two adoptions share a clock tick.
+  const selectedAt = Math.max(Date.now(), typeof previous?.startedAt === "number" && Number.isFinite(previous.startedAt) ? previous.startedAt + 1 : 0);
   const sessionFile = paths.leadSessionPath(teamName);
   const dir = path.dirname(sessionFile);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(sessionFile, JSON.stringify({
     pid: process.pid,
     sessionId,
-    startedAt: Date.now(),
+    startedAt: selectedAt,
   }));
 }
 

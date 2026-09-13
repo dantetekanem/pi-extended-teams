@@ -110,6 +110,15 @@ describe("session file cleanup", () => {
     expect(findLeadTeamForSession("missing-session-id")).toBeNull();
   });
 
+  it("restores the public team instead of a private prompt-build lead record", () => {
+    const binding = { leadPid: process.pid, sessionId: "current-session-id" };
+    writeTeam("prompt-build-pi-retitle-current-session-id", binding);
+    expect(findLeadTeamForSession("current-session-id")).toBeNull();
+
+    writeTeam("session-current-session-id", binding);
+    expect(findLeadTeamForSession("current-session-id")).toBe("session-current-session-id");
+  });
+
   it("findLeadTeamForSession ignores stray entries that are not valid team names", () => {
     writeTeam("current-session", { leadPid: process.pid, sessionId: "current-session-id" });
     fs.writeFileSync(path.join(teamsRoot, ".DS_Store"), "stray");
@@ -121,6 +130,17 @@ describe("session file cleanup", () => {
     writeTeam("same-session-other-pid", { leadPid: 99999999, sessionId: "current-session-id" });
 
     expect(findLeadTeamForSession("current-session-id")).toBeNull();
+  });
+
+  it("restores the latest public ownership selection even within one clock tick", () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_000);
+    for (const name of ["a-first", "z-second", "prompt-build-private"]) {
+      writeTeam(name);
+      registerLeadSession(name, "same-session");
+    }
+    expect(findLeadTeamForSession("same-session")).toBe("z-second");
+    registerLeadSession("a-first", "same-session");
+    expect(findLeadTeamForSession("same-session")).toBe("a-first");
   });
 
   it("registerLeadSession records the Pi session id used for future adoption", () => {

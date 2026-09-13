@@ -77,6 +77,7 @@ function makeTool(
 describe("get_agent_status", () => {
   beforeEach(() => {
     vi.spyOn(lifecycleTombstones, "readLifecycleTombstone").mockResolvedValue({ status: "absent" });
+    vi.spyOn(lifecycleTombstones, "listLifecycleTombstones").mockResolvedValue([]);
   });
 
   afterEach(() => vi.restoreAllMocks());
@@ -159,6 +160,33 @@ describe("get_agent_status", () => {
       }),
     ]);
   });
+
+  it.each(["persistence_closed", "cleanup_failed", "corrupt"] as const)(
+    "projects an orphan %s fence ahead of queue/report history only for the lead", async phase => {
+      mockRoster(member("active"));
+      vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue(null);
+      vi.spyOn(reportEvents, "listTeamReportEvents").mockResolvedValue([report("orphan")]);
+      vi.mocked(lifecycleTombstones.listLifecycleTombstones).mockResolvedValue([
+        { agentName: "active", result: { status: "corrupt", error: "roster already represents this name" } },
+        { agentName: "orphan", result: phase === "corrupt" ? { status: "corrupt", error: "invalid fence" } : {
+          status: "occupied", tombstone: {
+            version: 1, team: "team", agent: "orphan", runId: "orphan-run", role: "read", reason: "quit", phase,
+            ownerPid: 123, extensionInstanceId: "test", timestamps: { createdAt: 1_000, updatedAt: 2_000 },
+            error: phase === "cleanup_failed" ? "queue unavailable" : undefined,
+          },
+        } },
+      ]);
+      const queued: QueuedAgentStatus[] = [{ name: "orphan", role: "read", queuedAt: 1_000, queuePosition: 1 }];
+      const snapshot = await makeTool(new Map(), queued).execute("status", {});
+      expect(snapshot.details.statuses).toHaveLength(2);
+      expect(snapshot.details.statuses[1]).toMatchObject({
+        name: "orphan", runId: phase === "corrupt" ? undefined : "orphan-run", queuePosition: 1,
+        phase: phase === "persistence_closed" ? "stopping" : "quarantined",
+        error: phase === "corrupt" ? "invalid fence" : phase === "cleanup_failed" ? "queue unavailable" : undefined,
+      });
+      const nested = makeTool(new Map(), queued, { parentName: "writer", parentRunId: "writer-run", parentStartedAt: 500 });
+      expect((await nested.execute("status", {})).details.statuses).toEqual([]);
+    });
 
   it("does not return the same agent as both active and queued during admission", async () => {
     const active = member("reader");

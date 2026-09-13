@@ -10,6 +10,13 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.12] - 2026-09-12
+
+### Fixed
+- Keep unfinished agents visible when runtime telemetry is missing or stale, including cleanup failures after roster removal.
+- Prevent private jobs and public team switches from hiding active agents, and restore the selected public team consistently.
+- Show normal cleanup as stopping while preserving error details for blocked cleanup.
+
 ## [2.2.11] - 2026-09-12
 
 ### Fixed

@@ -799,6 +799,144 @@ describe("extension integration", () => {
     }
   });
 
+  it.each(["create", "reuse", "spawn"].flatMap(operation => [true, false].map(privateJob => ({ operation, privateJob }))))(
+    "preserves public agent status and footer during team $operation (private: $privateJob)", async ({ operation, privateJob }) => {
+    const setup = await setupExtension();
+    try {
+      let completePrivateJob: (() => Promise<unknown>) | undefined;
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), {
+          runId: member.lifecycleRunId, name: member.name, teamName, role: member.role,
+          startedAt: Date.now(), lastActivityAt: Date.now(), status: "working",
+          tokensUsed: 0, recentEvents: [], latestProgress: "Reviewing the package",
+          session: { dispose: vi.fn(), getSessionStats: () => ({ tokens: { total: 0 } }) },
+        });
+        if (teamName.startsWith("prompt-build-")) {
+          completePrivateJob = () => options.shutdownTeammate(teamName, member);
+        }
+      });
+      const ctx = makeCtx(setup.root, "private-team-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      const signal = new AbortController().signal;
+      await setup.tools.get("spawn_agent")!.execute("public", {
+        name: "coordinator", prompt: "Review the package", model_slot: "write-critical",
+      }, signal, undefined, ctx);
+      await vi.advanceTimersByTimeAsync(100);
+      const widgetCall = ctx.ui.setWidget.mock.calls.find((call: any[]) =>
+        call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      const widget = widgetCall![1]({ requestRender: vi.fn() });
+      expect(widget.render(160).join("\n")).toContain("(coordinator)");
+
+      const otherTeam = privateJob ? "prompt-build-pi-retitle-private-team-session" : "other-public-team";
+      if (operation !== "create") {
+        setup.teams.createTeam(otherTeam, "local-session", "lead-agent", "Background job", "provider/model");
+      }
+      const handler = setup.extensionEventHandlers.get("pi-extended-teams:orchestration-request")![0];
+      await handler({
+        requestId: "title-request", ctx,
+        type: operation === "spawn" ? "spawn_teammate_once" : "ensure_team",
+        params: {
+          team_name: otherTeam, default_model_slot: "read-review",
+          name: "title-agent", prompt: "Generate a title", model_slot: "read-review",
+        },
+      });
+      expect(setup.pi.events.emit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response",
+        expect.objectContaining({ requestId: "title-request", ok: privateJob }));
+      if (!privateJob) {
+        expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledOnce();
+        expect(setup.teams.teamExists(otherTeam)).toBe(operation !== "create");
+      }
+      await vi.advanceTimersByTimeAsync(1_100);
+
+      expect.soft(widget.render(160).join("\n")).toContain("(coordinator)");
+      const status = setup.tools.get("get_agent_status")!;
+      const snapshot = await status.execute("all", {}, signal, undefined, ctx);
+      expect.soft(snapshot.details).toMatchObject({
+        teamName: "session-private-team-session",
+        statuses: [{ name: "coordinator", phase: "working", role: "write" }],
+      });
+      await expect(status.execute("named", { agent_name: "coordinator" }, signal, undefined, ctx))
+        .resolves.toMatchObject({ details: { statuses: [{ name: "coordinator", phase: "working" }] } });
+      const sessionFiles = await import("./internal/session-files.js");
+      expect(sessionFiles.findLeadTeamForSession("private-team-session")).toBe("session-private-team-session");
+      const paths = await import("../src/utils/paths.js");
+      if (privateJob) expect(JSON.parse(fs.readFileSync(paths.leadSessionPath(otherTeam), "utf8")))
+        .toMatchObject({ pid: process.pid, sessionId: "private-team-session" });
+      if (completePrivateJob) {
+        await expect(completePrivateJob()).resolves.toMatchObject({ finalized: true, removedMember: true });
+        await vi.advanceTimersByTimeAsync(1_100);
+        expect(widget.render(160).join("\n")).toContain("(coordinator)");
+        await expect(status.execute("after-title", {}, signal, undefined, ctx)).resolves.toMatchObject({
+          details: { teamName: "session-private-team-session", statuses: [{ name: "coordinator", phase: "working" }] },
+        });
+      }
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("rejects public spawn re-entry until an adopted team's roster has settled", async () => {
+    const setup = await setupExtension();
+    try {
+      const ctx = makeCtx(setup.root, "reentry-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      const handler = setup.extensionEventHandlers.get("pi-extended-teams:orchestration-request")![0];
+      await handler({ requestId: "ensure", type: "ensure_team", ctx,
+        params: { team_name: "adopted-team", default_model_slot: "read-review" } });
+      await handler({ requestId: "spawn", type: "spawn_teammate_once", ctx,
+        params: { team_name: "adopted-team", name: "coordinator", prompt: "Work", model_slot: "read-review" } });
+      const spawn = () => setup.tools.get("spawn_agent")!.execute("public", {
+        name: "new-reader", prompt: "New work", model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      await expect(spawn()).rejects.toThrow("unfinished agents");
+      expect(setup.teams.teamExists("session-reentry-session")).toBe(false);
+      expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledOnce();
+      const snapshot = await setup.tools.get("get_agent_status")!.execute("status", { agent_name: "coordinator" }, new AbortController().signal, undefined, ctx);
+      expect(snapshot.details.teamName).toBe("adopted-team");
+
+      const member = (await setup.teams.readConfig("adopted-team")).members.find((entry: any) => entry.name === "coordinator")!;
+      await setup.teams.removeMemberMatchingRun("adopted-team", member.name, member.lifecycleRunId!);
+      await expect(spawn()).resolves.toMatchObject({ details: { session: "session-reentry-session" } });
+      const sessionFiles = await import("./internal/session-files.js");
+      expect(sessionFiles.findLeadTeamForSession("reentry-session")).toBe("session-reentry-session");
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it("rejects a competing team during an in-flight public admission", async () => {
+    const setup = await setupExtension();
+    try {
+      const ctx = makeCtx(setup.root, "concurrent-scope-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      setup.teams.createTeam("other-team", "local-session", "lead", "", "provider/model");
+      let release!: () => void;
+      let entered!: () => void;
+      const preflightEntered = new Promise<void>(resolve => { entered = resolve; });
+      ctx.modelRegistry.getAvailable.mockImplementationOnce(() => new Promise(resolve => {
+        release = () => resolve([{ provider: "provider", id: "model" }]);
+        entered();
+      }));
+      const first = setup.tools.get("spawn_agent")!.execute("first", {
+        name: "coordinator", prompt: "Work", model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      await preflightEntered;
+      const handler = setup.extensionEventHandlers.get("pi-extended-teams:orchestration-request")![0];
+      const second = handler({ requestId: "second", type: "spawn_teammate_once", ctx,
+        params: { team_name: "other-team", name: "hidden-worker", prompt: "Work", model_slot: "read-review" } });
+      release();
+      await Promise.all([first, second]);
+      expect(setup.pi.events.emit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response",
+        expect.objectContaining({ requestId: "second", ok: false }));
+      expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledOnce();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("renders zero before provider context usage and updates without remounting", async () => {
     const setup = await setupExtension();
     try {
@@ -1024,12 +1162,11 @@ describe("extension integration", () => {
       writerState.latestProgress = undefined;
       await vi.advanceTimersByTimeAsync(1_200);
 
-      const finishedRendered = widget.render(180).join("\n");
-      expect(finishedRendered).toContain("1 active · 1 write");
-      expect(finishedRendered).not.toContain(" read");
-      expect(finishedRendered).not.toContain("(writer) +");
-      expect(finishedRendered).not.toContain("active-helper");
-      expect(finishedRendered).not.toContain("runtime-helper");
+      const unsettledRendered = widget.render(180).join("\n");
+      expect(unsettledRendered).toContain("2 active · 1 read · 1 write");
+      expect(unsettledRendered).toContain("(runtime-helper) stalled · heartbeat stale");
+      expect(unsettledRendered).not.toContain("(writer) +");
+      expect(unsettledRendered).not.toContain("active-helper");
     } finally {
       setup.restoreEnv();
     }
@@ -1492,9 +1629,9 @@ describe("extension integration", () => {
         .reverse()
         .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
       const card = widgetCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
-      expect(card).toContain(replaced ? "1 active · 1 read" : "2 active · 2 read");
-      if (replaced) expect(card).not.toContain("runtime-reader");
-      else expect(card).toContain("runtime-reader");
+      expect(card).toContain("2 active · 2 read");
+      expect(card).toContain("runtime-reader");
+      if (replaced) expect(card).toContain("telemetry unavailable");
 
       const editorFactory = ctx.ui.setEditorComponent.mock.calls.at(-1)?.[0];
       const editor = editorFactory({}, {}, {});
@@ -1515,7 +1652,7 @@ describe("extension integration", () => {
     }
   });
 
-  it("clears the activity card instead of showing stale ready runtime JSON", async () => {
+  it.each(["stale", "missing"])("keeps a started reader visible with %s runtime telemetry", async (telemetry) => {
     const setup = await setupExtension();
     try {
       const runtime = await import("../src/utils/runtime.js");
@@ -1533,9 +1670,11 @@ describe("extension integration", () => {
       }, abort, undefined, ctx);
 
       const now = Date.now();
-      const readerRunId = (await setup.teams.readConfig("session-runtime-only-status-session")).members
+      const teamName = "session-runtime-only-status-session";
+      await setup.teams.updateMember(teamName, "reader", { joinedAt: now - 120_000 });
+      const readerRunId = (await setup.teams.readConfig(teamName)).members
         .find((member: any) => member.name === "reader")!.lifecycleRunId!;
-      await runtime.writeRuntimeStatus("session-runtime-only-status-session", "reader", readerRunId, {
+      if (telemetry === "stale") await runtime.writeRuntimeStatus(teamName, "reader", readerRunId, {
         pid: process.pid,
         startedAt: now - 120_000,
         lastHeartbeatAt: now - runtime.HEARTBEAT_STALE_MS - 1_000,
@@ -1550,14 +1689,20 @@ describe("extension integration", () => {
       const latestActivityCall = [...ctx.ui.setWidget.mock.calls]
         .reverse()
         .find((call: any[]) => call[0] === "01-pi-extended-teams-readers");
-      expect(latestActivityCall?.[1]).toBeUndefined();
-      expect(ctx.ui.setWidget.mock.calls.some((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function")).toBe(false);
+      expect(latestActivityCall?.[1]).toBeTypeOf("function");
+      const card = latestActivityCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
+      expect(card).toContain("reader");
+      expect(card).toContain("stalled");
+      expect(card).toContain(telemetry === "stale" ? "heartbeat stale" : "telemetry unavailable");
+      const snapshot = await setup.tools.get("get_agent_status")!.execute("status", { agent_name: "reader" }, abort, undefined, ctx);
+      expect(snapshot.details.statuses).toMatchObject([{ name: "reader", phase: "stalled" }]);
     } finally {
       setup.restoreEnv();
     }
   });
 
-  it("renders an orphaned occupied tombstone as inactive quarantine, then clears the latest activity widget after matching release", async () => {
+  it.each(["closing", "persistence_closed", "finalizing", "timed_out", "cleanup_failed"] as const)(
+    "renders %s cleanup honestly and clears the widget after matching release", async (phase) => {
     const setup = await setupExtension();
     try {
       const lifecycle = await import("../src/utils/lifecycle-tombstone.js");
@@ -1578,6 +1723,7 @@ describe("extension integration", () => {
           reason: "quit",
           extensionInstanceId: "index-production-test",
         });
+        lock.updateMatching("orphan-run", { phase });
       });
       const ctx = makeCtx(setup.root, "tombstone-activity-session");
       for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
@@ -1589,9 +1735,10 @@ describe("extension integration", () => {
       const widget = mountedActivityCall![1]({ requestRender: vi.fn() });
       const rendered = widget.render(160).join("\n");
       expect(rendered).toContain("orphan-writer");
-      expect(rendered).toContain("inactive");
-      expect(rendered).toContain("quarantined");
-      expect(rendered).toContain("run orphan-run");
+      const blocked = phase === "timed_out" || phase === "cleanup_failed";
+      expect(rendered).toContain(blocked ? "quarantined" : "stopping");
+      expect(rendered).toContain(blocked ? "Cleanup blocked" : "Finishing cleanup");
+      if (blocked) expect(rendered).toContain("check_teammate");
 
       await lifecycle.withLifecycleTombstoneLock(teamName, "orphan-writer", async lock => {
         expect(lock.clearMatching("orphan-run")).toBe(true);
@@ -1607,7 +1754,7 @@ describe("extension integration", () => {
   });
 
   it.each(["stopping", "quarantined", "persistence_failed", "finalized"] as const)(
-    "excludes %s read teardown state from the active card and clears it",
+    "keeps %s teardown visible until finalization even without a persisted fence",
     async (teardownState) => {
       const setup = await setupExtension();
       try {
@@ -1636,8 +1783,16 @@ describe("extension integration", () => {
         }, new AbortController().signal, undefined, ctx);
         await vi.advanceTimersByTimeAsync(100);
 
-        expect(ctx.ui.setWidget).toHaveBeenCalledWith("01-pi-extended-teams-readers", undefined);
-        expect(ctx.ui.setWidget.mock.calls.some((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function")).toBe(false);
+        const activityCall = ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === "01-pi-extended-teams-readers").at(-1);
+        if (teardownState === "finalized") {
+          expect(activityCall?.[1]).toBeUndefined();
+        } else {
+          expect(activityCall?.[1]).toBeTypeOf("function");
+          const card = activityCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
+          expect(card).toContain("reader");
+          expect(card).toContain(teardownState.replace("_", "-"));
+          expect(card).toContain(teardownState === "stopping" ? "Finishing cleanup" : "Cleanup blocked");
+        }
       } finally {
         setup.restoreEnv();
       }

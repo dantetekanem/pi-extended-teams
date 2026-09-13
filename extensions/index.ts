@@ -31,6 +31,7 @@ import * as runtime from "../src/utils/runtime";
 import * as teamPaths from "../src/utils/paths";
 import { listReadHelperQueue, removeQueuedReadHelperRequest } from "../src/utils/read-helper-queue";
 import type { Member } from "../src/utils/models";
+import { projectAgentStatus, projectLifecycleFence } from "../src/orchestration/status-projection";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { createSpawnResourcePlan, parentProjectTrustForSpawn } from "./resources/spawn-resource-plan.js";
 import { generateExtensionInstanceId, listLifecycleTombstones, onLifecycleTombstoneCleared, readLifecycleTombstone } from "../src/utils/lifecycle-tombstone";
@@ -567,11 +568,12 @@ export default function (pi: ExtensionAPI) {
 
     const now = Date.now();
     const activityTeamName = teamName || null;
-    const runningAgents = activityTeamName
+    const sessionAgents = activityTeamName
       ? Array.from(runningReadAgents.values())
-        .filter(agent => agent.teamName === activityTeamName && hasActiveReadAgentLifecycle(agent))
+        .filter(agent => agent.teamName === activityTeamName)
         .sort((a, b) => a.name.localeCompare(b.name))
       : [];
+    const runningAgents = sessionAgents.filter(hasActiveReadAgentLifecycle);
     const readAgents = runningAgents.filter(agent => (agent.role || "read") === "read");
     const writeAgents = runningAgents.filter(agent => (agent.role || "read") === "write");
     const activityConfig = activityTeamName ? await teams.readConfig(activityTeamName).catch(() => null) : null;
@@ -579,17 +581,21 @@ export default function (pi: ExtensionAPI) {
     const activityTombstones = activityTeamName
       ? await listLifecycleTombstones(activityTeamName).catch(() => [])
       : [];
-    const runtimeOnlyMembers = activityTeamName
-      ? (await Promise.all(activityMembers
+    const unsettledAgents = sessionAgents.filter(agent => !hasActiveReadAgentLifecycle(agent)
+      && agent.teardownState !== "finalized"
+      && !activityTombstones.some(fence => fence.agentName === agent.name));
+    const runtimeOnlyCandidates = activityTeamName
+      ? await Promise.all(activityMembers
         .filter(member => member.name !== "team-lead")
         .filter(member => !runningReadAgents.has(readAgentKey(activityTeamName, member.name)))
         .map(async (member) => ({
           member,
           runtimeStatus: await runtime.readRuntimeStatus(activityTeamName, member.name).catch(() => null),
-        }))))
-        .filter((entry): entry is { member: Member; runtimeStatus: runtime.AgentRuntimeStatus } => isVisibleRuntimeOnlyMember(entry.member, entry.runtimeStatus, now))
-        .filter(({ member, runtimeStatus }) => member.lifecycleRunId === runtimeStatus.lifecycleRunId)
+        })))
       : [];
+    const runtimeOnlyMembers = runtimeOnlyCandidates
+      .filter((entry): entry is { member: Member; runtimeStatus: runtime.AgentRuntimeStatus } => isVisibleRuntimeOnlyMember(entry.member, entry.runtimeStatus, now))
+      .filter(({ member, runtimeStatus }) => member.lifecycleRunId === runtimeStatus.lifecycleRunId);
     const runtimeOnlyMemberNames = new Set(runtimeOnlyMembers.map(({ member }) => member.name));
     const runtimeOnlyReadMembers = runtimeOnlyMembers.filter(({ member }) => memberActivityRole(member) === "read");
     const runtimeOnlyWriteMembers = runtimeOnlyMembers.filter(({ member }) => memberActivityRole(member) === "write");
@@ -618,6 +624,11 @@ export default function (pi: ExtensionAPI) {
         .filter(member => member.name !== "team-lead" && member.isActive !== false && memberActivityRole(member) === "write")
         .filter(member => !!(member.tmuxPaneId && terminal?.isAlive?.(member.tmuxPaneId)) && !runningReadAgents.has(readAgentKey(activityTeamName, member.name)) && !runtimeOnlyMemberNames.has(member.name)) ?? []
       : [];
+    const unobservedMembers = runtimeOnlyCandidates.filter(({ member }) => member.isActive !== false
+      && !runtimeOnlyMemberNames.has(member.name)
+      && !activeWriteMembers.some(writer => writer.name === member.name)
+      && !activityTombstones.some(fence => fence.agentName === member.name));
+    const activeCount = runningAgents.length + runtimeOnlyMembers.length + activeWriteMembers.length + unobservedMembers.length;
     navigationRuntimeAgents.clear();
     for (const { member, runtimeStatus } of runtimeOnlyReadMembers) {
       if (member.lifecycleRunId === runtimeStatus.lifecycleRunId) {
@@ -633,11 +644,12 @@ export default function (pi: ExtensionAPI) {
     leadInboxUnreadCount = unreadLeadMessages.length;
     clearLeadInboxWidgetOnce();
 
-    if ((readAgents.length > 0 || writeAgents.length > 0 || runtimeOnlyReadMembers.length > 0 || runtimeOnlyWriteMembers.length > 0 || activeWriteMembers.length > 0 || activityTombstones.length > 0) && !readAgentStatusTimer) {
+    const hasVisibleAgents = activeCount > 0 || unsettledAgents.length > 0 || activityTombstones.length > 0;
+    if (hasVisibleAgents && !readAgentStatusTimer) {
       readAgentStatusTimer = setInterval(renderReadAgentStatus, 1000);
     }
 
-    if (readAgents.length === 0 && writeAgents.length === 0 && runtimeOnlyReadMembers.length === 0 && runtimeOnlyWriteMembers.length === 0 && activeWriteMembers.length === 0 && activityTombstones.length === 0) {
+    if (!hasVisibleAgents) {
       sessionCtx.ui.setStatus?.("01-pi-extended-teams-read", undefined);
       clearTeamActivityWidget();
       sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
@@ -648,7 +660,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const activeCount = readAgents.length + writeAgents.length + runtimeOnlyReadMembers.length + runtimeOnlyWriteMembers.length + activeWriteMembers.length;
     const entries: TeamActivityStatusEntry[] = [];
     const footerStatuses: string[] = [];
     const statusCounts: Record<string, number> = {};
@@ -742,16 +753,37 @@ export default function (pi: ExtensionAPI) {
       footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now));
     }
 
+    for (const { member, runtimeStatus } of unobservedMembers) {
+      const projected = projectAgentStatus({ member, runtime: runtimeStatus, fence: { status: "absent" }, terminalAlive: null, now });
+      const telemetry = !projected.runtime ? "runtime telemetry unavailable"
+        : runtimeHeartbeatIsRecent(projected.runtime, now) ? "awaiting runtime readiness" : "heartbeat stale";
+      countStatus(projected.phase);
+      entries.push({ name: member.name, role: memberActivityRole(member), status: projected.phase, detail: telemetry });
+      footerStatuses.push(`(${member.name}) ${projected.phase} · ${telemetry}`);
+    }
+
+    for (const agent of unsettledAgents) {
+      const status = agent.teardownState === "persistence_failed" ? "persistence-failed"
+        : agent.teardownState === "quarantined" ? "quarantined" : "stopping";
+      const reason = agent.teardownError instanceof Error ? agent.teardownError.message
+        : agent.teardownResult?.error || "cleanup has not settled";
+      const detail = status === "stopping" ? "Finishing cleanup" : `Cleanup blocked: ${reason} · use check_teammate`;
+      countStatus(status);
+      entries.push({ name: agent.name, role: agent.role === "write" ? "write" : "read", status, detail });
+    }
+
     for (const { agentName: quarantinedName, result } of activityTombstones) {
       const persistedMember = activityMembers.find(member => member.name === quarantinedName);
       const role = result.status === "occupied"
         ? result.tombstone.role
         : persistedMember ? memberActivityRole(persistedMember) : "read";
-      const detail = result.status === "occupied"
-        ? `inactive · run ${result.tombstone.runId} · ${result.tombstone.phase}`
-        : `inactive · corrupt lifecycle tombstone · ${result.error}`;
-      countStatus("quarantined");
-      entries.push({ name: quarantinedName, role, status: "quarantined", detail });
+      const projected = projectLifecycleFence(persistedMember ?? {}, result);
+      const reason = projected.error || (result.status === "occupied" && result.tombstone.phase === "timed_out" ? "cleanup timed out" : "cleanup failed");
+      const detail = projected.phase === "stopping"
+        ? "Finishing cleanup"
+        : `Cleanup blocked: ${reason} · use check_teammate`;
+      countStatus(projected.phase);
+      entries.push({ name: quarantinedName, role, status: projected.phase, detail });
     }
 
     wakeLeadForIdleReadAgents(idleNudgeMessages);
@@ -762,8 +794,8 @@ export default function (pi: ExtensionAPI) {
     sessionCtx.ui.setWidget?.("01-pi-extended-teams-status", undefined);
     updateTeamActivityWidget({
       activeCount,
-      readCount: readAgents.length + runtimeOnlyReadMembers.length,
-      writeCount: writeAgents.length + runtimeOnlyWriteMembers.length + activeWriteMembers.length,
+      readCount: readAgents.length + runtimeOnlyReadMembers.length + unobservedMembers.filter(({ member }) => memberActivityRole(member) === "read").length,
+      writeCount: writeAgents.length + runtimeOnlyWriteMembers.length + activeWriteMembers.length + unobservedMembers.filter(({ member }) => memberActivityRole(member) === "write").length,
       unreadCount: leadInboxUnreadCount,
       entries,
       statusCounts,
@@ -965,10 +997,12 @@ export default function (pi: ExtensionAPI) {
   function adoptTeamAsLead(name: string, ctx?: any): void {
     if (isTeammate || !name) return;
     const sessionId = getPiSessionId(ctx ?? sessionCtx);
+    registerLeadSession(name, sessionId);
+    // Private jobs retain cleanup ownership, not the public roster/inbox/UI scope.
+    if (name.startsWith("prompt-build-")) return;
     if (teamName !== name) {
       teamName = name;
     }
-    registerLeadSession(name, sessionId);
     ensureReadAgentStatusTicker();
     startLeadInboxPolling();
     startReadHelperQueueDraining();

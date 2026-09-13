@@ -2,8 +2,8 @@ import { Type } from "@sinclair/typebox";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as reportEvents from "../../src/utils/report-events";
-import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
-import { projectAgentStatus, type ActiveAgentPhase } from "../../src/orchestration/status-projection";
+import { listLifecycleTombstones, readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
+import { projectAgentStatus, projectLifecycleFence, type ActiveAgentPhase } from "../../src/orchestration/status-projection";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
 import type { RunningReadAgent } from "../runtime/types";
 import { isWriteMemberAlive } from "../team/roster";
@@ -30,6 +30,7 @@ export interface AgentStatusScope {
 
 export interface AgentStatusSnapshot {
   name: string;
+  runId?: string;
   role: string;
   phase: AgentStatusPhase;
   progress?: string;
@@ -145,6 +146,7 @@ export function formatAgentStatusesForModel(statuses: AgentStatusSnapshot[]): st
 
   const blocks = statuses.map(status => {
     const lines = [`${status.name}: ${status.phase} (${status.role})`];
+    if (status.runId) lines.push(`  run: ${status.runId}`);
     if (status.progress) lines.push(`  progress: ${status.progress}${status.progressAgeMs === undefined ? "" : ` (${formatElapsed(status.progressAgeMs)} ago)`}`);
     if (status.activeTool) lines.push(`  tool: ${status.activeTool}`);
     const activity = formatAge("activity", status.activityAgeMs)
@@ -189,8 +191,22 @@ export function createAgentStatusTool(options: AgentStatusToolOptions): any {
         .filter(report => ownsReport(report, options.scope));
 
       const activeStatuses = await Promise.all(activeMembers.map(member => activeStatus(teamName, member, options, now)));
-      const queuedStatuses = queued.map(item => queuedStatus(item, now));
-      const currentNames = new Set([...activeStatuses, ...queuedStatuses].map(status => status.name));
+      // Orphan fences lack parent metadata; only the lead can inspect them.
+      const fencedStatuses: AgentStatusSnapshot[] = options.scope ? [] : (await listLifecycleTombstones(teamName))
+        .filter(({ agentName }) => !rosterNames.has(agentName))
+        .map(({ agentName, result }) => {
+          const pending = queued.find(item => item.name === agentName);
+          return {
+            ...(pending ? queuedStatus(pending, now) : {}),
+            name: agentName,
+            runId: result.status === "occupied" ? result.tombstone.runId : undefined,
+            role: result.status === "occupied" ? result.tombstone.role : pending?.role || "unknown",
+            ...projectLifecycleFence({}, result),
+          };
+        });
+      const fencedNames = new Set(fencedStatuses.map(status => status.name));
+      const queuedStatuses = queued.filter(item => !fencedNames.has(item.name)).map(item => queuedStatus(item, now));
+      const currentNames = new Set([...activeStatuses, ...fencedStatuses, ...queuedStatuses].map(status => status.name));
       const completedByName = new Map<string, TeamReportEvent>();
       for (const report of reports) {
         if (currentNames.has(report.agentName)) continue;
@@ -198,7 +214,7 @@ export function createAgentStatusTool(options: AgentStatusToolOptions): any {
         completedByName.set(report.agentName, report);
       }
       const completedStatuses = Array.from(completedByName.values()).slice(-20).map(report => completedStatus(report, now));
-      const statuses = [...activeStatuses, ...queuedStatuses, ...completedStatuses];
+      const statuses = [...activeStatuses, ...fencedStatuses, ...queuedStatuses, ...completedStatuses];
       const selected = params.agent_name
         ? statuses.filter(status => status.name === params.agent_name)
         : statuses;

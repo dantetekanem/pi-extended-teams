@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { findPackageJSON } from "node:module";
+import { pathToFileURL } from "node:url";
 import { execFileSync, spawnSync } from "node:child_process";
 import { CheckJournal } from "../../src/results/check-journal";
 import { createReportResult, effectiveTaskOutcome, type ReportResult } from "../../src/results/report-result";
@@ -102,6 +104,30 @@ import { createTeammateInterrupter } from "../runtime/teammate-interrupt.js";
 import { createCombinedSessionCost } from "../team/session-cost.js";
 
 let root: string;
+
+type PiFixturePackageManifest = {
+  main?: string;
+  exports?: string | null | { ".": string | { import?: string; default?: string } };
+};
+
+function resolvePiFixturePackageJson(packageName: string, parent: string): string {
+  const packageJsonPath = findPackageJSON(packageName, parent);
+  if (!packageJsonPath) throw new Error(`Package not found: ${packageName}`);
+  return fs.realpathSync(packageJsonPath);
+}
+function resolvePiFixtureEntry(packageJsonPath: string): string {
+  const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as PiFixturePackageManifest;
+  const rootExport = manifest.exports && typeof manifest.exports === "object"
+    ? manifest.exports["."]
+    : manifest.exports;
+  const entrypoint = typeof rootExport === "string"
+    ? rootExport
+    : rootExport?.import ?? rootExport?.default ?? manifest.main;
+  if (typeof entrypoint !== "string") {
+    throw new Error(`No public entrypoint in ${packageJsonPath}`);
+  }
+  return pathToFileURL(path.resolve(path.dirname(packageJsonPath), entrypoint)).href;
+}
 
 function installPathSpies() {
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName))));
@@ -4086,10 +4112,18 @@ describe("in-process read agent tool wiring", () => {
   });
 
   it.each([false, true])("uses the installed Agent loop to stop an accepted report (idle continuation: %s)", async (idle) => {
-    // Override with a public current-host module URL; the default peer proves legacy compatibility only.
-    const coreModule = process.env.PI_AGENT_CORE_CONTRACT_MODULE ?? "@mariozechner/pi-agent-core";
+    const packageResolutionBase = pathToFileURL(path.join(process.cwd(), "package.json")).href;
+    const codingAgentPackageJson = resolvePiFixturePackageJson("@mariozechner/pi-coding-agent", packageResolutionBase);
+    const codingAgentModule = resolvePiFixtureEntry(codingAgentPackageJson);
+    // Override with a public current-host module URL; the default peer resolves from the coding-agent context.
+    const coreModule = process.env.PI_AGENT_CORE_CONTRACT_MODULE ?? resolvePiFixtureEntry(
+      resolvePiFixturePackageJson("@mariozechner/pi-agent-core", codingAgentModule),
+    );
+    const aiModule = resolvePiFixtureEntry(
+      resolvePiFixturePackageJson("@mariozechner/pi-ai", codingAgentModule),
+    );
     const { Agent } = await import(coreModule);
-    const { createAssistantMessageEventStream } = await import("@mariozechner/pi-ai");
+    const { createAssistantMessageEventStream } = await import(aiModule);
     const session = makeSession();
     const model = { provider: "provider", id: "model", api: "openai-completions" };
     let responses = 0;

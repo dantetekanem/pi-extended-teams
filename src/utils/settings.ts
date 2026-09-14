@@ -116,7 +116,23 @@ export interface AgentSessionsConfig {
   showInResume: boolean;
 }
 
+export const DEFAULT_ACTIVITY_COLORS = {
+  name: "#50FA7B",
+  model: "#FFD700",
+  thinking: "#FFF2A8",
+  tier: "#FF92C8",
+  tierCollect: "#FFD6EB",
+  tierReview: "#FFBDDE",
+  tierAnalyze: "#FFA7D3",
+  text: "#F8F8F2",
+  message: "#969CAB",
+  warning: "#FFD700",
+  error: "#FF5555",
+};
+export type ActivityColors = typeof DEFAULT_ACTIVITY_COLORS;
+
 export interface PiExtendedTeamsSettings {
+  activityColors: ActivityColors;
   watchdog: WatchdogConfig;
   writeAgents: WriteAgentsConfig;
   readAgents: ReadAgentsConfig;
@@ -134,6 +150,7 @@ export const DEFAULT_READ_AGENT_MAX_CONCURRENT = 25;
 export const DEFAULT_READ_HELPER_MAX_CONCURRENT = 10;
 
 export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
+  activityColors: DEFAULT_ACTIVITY_COLORS,
   watchdog: { bufferSeconds: 30 },
   writeAgents: { maxConcurrent: DEFAULT_WRITE_AGENT_MAX_CONCURRENT, queueOverflow: true },
   readAgents: { maxConcurrent: DEFAULT_READ_AGENT_MAX_CONCURRENT, queueOverflow: true },
@@ -268,6 +285,13 @@ function favoriteModelConfigFromRaw(
 function applyLayer(acc: PiExtendedTeamsSettings, raw: any, options: { favoriteModels?: boolean } = {}): void {
   if (!raw || typeof raw !== "object") return;
   const includeFavoriteModels = options.favoriteModels !== false;
+
+  if (raw.activityColors && typeof raw.activityColors === "object" && !Array.isArray(raw.activityColors)) {
+    for (const key of Object.keys(DEFAULT_ACTIVITY_COLORS) as Array<keyof ActivityColors>) {
+      const value = raw.activityColors[key];
+      if (typeof value === "string" && /^#[\da-f]{6}$/i.test(value)) acc.activityColors[key] = value;
+    }
+  }
 
   if (raw.watchdog && typeof raw.watchdog === "object") {
     const b = Number(raw.watchdog.bufferSeconds);

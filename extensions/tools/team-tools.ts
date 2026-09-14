@@ -10,15 +10,14 @@ import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
 import * as writeQueue from "../../src/utils/write-queue";
-import { ACCEPTED_FAVORITE_MODEL_SLOTS, FAVORITE_MODEL_SLOTS, canonicalPersistedModelSlot, isFavoriteModelSlot, loadSettings, normalizeFavoriteModelSlot, requireFavoriteModelLevel, resolveModel, roleForFavoriteModelSlot, type AgentRole, type CanonicalFavoriteModelSlot } from "../../src/utils/settings";
+import { FAVORITE_MODEL_SLOTS, canonicalPersistedModelSlot, isFavoriteModelSlot, loadSettings, normalizeFavoriteModelSlot, requireFavoriteModelLevel, resolveModel, roleForFavoriteModelSlot, type AgentRole, type CanonicalFavoriteModelSlot } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
-import { CheckPolicySchema, normalizeCheckPolicy } from "../../src/results/check-policy";
-import { RepairPolicySchema, normalizeRepairPolicy } from "../../src/results/repair-policy";
-import { CheckpointPolicySchema } from "../../src/results/checkpoint-policy";
+import { normalizeCheckPolicy } from "../../src/results/check-policy";
+import { normalizeRepairPolicy } from "../../src/results/repair-policy";
 import { createCheckpointAssignment, captureCheckpointAssignment, continuationPrompt } from "../../src/results/checkpoint-assignment";
 import { assertUnusedContinuationRecipient, freshContinuationName } from "../../src/results/continuation-recipient";
 import { readCheckpoint } from "../../src/results/specialist-checkpoint";
-import { CompletionGroup, CompletionGroupPolicySchema, completionGroupIdentity, normalizeCompletionGroupPolicy, type CompletionGroupBinding } from "../../src/results/completion-group";
+import { CompletionGroup, completionGroupIdentity, normalizeCompletionGroupPolicy, type CompletionGroupBinding } from "../../src/results/completion-group";
 import { listStoredTeamReportEvents } from "../../src/utils/report-events";
 import { enqueueCompletionGroupDeliveries } from "../../src/results/completion-group-delivery";
 import { shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
@@ -48,6 +47,8 @@ import {
   type QueuedAgentStatus,
 } from "./agent-status-tool";
 
+import { publicTeamToolMetadata } from "./public-team-tools";
+
 export const CHILD_AGENT_LIFECYCLE_PROBE = "pi-extended-teams:child-agent-lifecycle-probe";
 
 interface ChildAgentLifecycleProbe {
@@ -74,6 +75,8 @@ export interface TeamToolsOptions {
   getSessionCtx?(): any;
   setSessionCtx?(ctx: any): void;
   pendingChildController?: PendingChildController;
+  isHostAttached?(): boolean;
+  waitForHost?(): Promise<void>;
 }
 
 export interface NestedReadAgentToolBinding {
@@ -92,6 +95,8 @@ export interface TeamToolsRuntime {
   createNestedReadAgentTools(binding: NestedReadAgentToolBinding): any[];
   nestedChildSnapshot(binding: NestedReadAgentToolBinding): NestedChildSnapshot;
   cancelQueuedAgent(teamName: string, agentName: string): boolean | Promise<boolean>;
+  hasPendingWork(): boolean;
+  resumeQueues(): void;
 }
 
 interface SpawnTeammateOptions {
@@ -131,6 +136,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       createNestedReadAgentTools: () => [],
       nestedChildSnapshot: () => ({ running: 0, queued: 0 }),
       cancelQueuedAgent: () => false,
+      hasPendingWork: () => false,
+      resumeQueues: () => {},
     };
   }
 
@@ -864,7 +871,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   async function drainQueuedReadSpawns(teamName: string): Promise<void> {
-    if (lifecycleProbeCleanedUp) return;
+    if (lifecycleProbeCleanedUp || options.isHostAttached?.() === false) return;
     if (readQueueDrainingTeams.has(teamName)) {
       pendingQueueDrains.add(teamName);
       return;
@@ -872,7 +879,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     readQueueDrainingTeams.add(teamName);
     try {
       let progressed = true;
-      while (progressed && !lifecycleProbeCleanedUp) {
+      while (progressed && !lifecycleProbeCleanedUp && options.isHostAttached?.() !== false) {
         progressed = false;
         for (const queued of readQueue(teamName)) {
           if (queued.admissionError) continue;
@@ -1278,28 +1285,6 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       .catch(error => emitOrchestrationResponse(payload?.requestId, payload?.type, { ok: false, error: error instanceof Error ? error.message : String(error) }));
   });
 
-  const levelDescription = "Required intent tier. Configured favorites take priority; an unconfigured tier inherits the current lead model and thinking. Read tiers: read-collect gathers bounded facts without owning the conclusion; read-review is the normal default for focused review, verification, and bounded synthesis; read-analyze explains behavior or root cause across connected evidence; read-critical is only for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning. Write tiers: write-patch makes a narrow localized change; write-feature implements a bounded feature with a known design; write-system owns a cross-cutting integration or refactor within explicitly claimed files; write-critical is only for high-risk security, concurrency, recovery, migration, or data-integrity changes. Prefer canonical tiers; legacy reading-*/writing-* aliases remain accepted for this minor release. Do not pass role, model, or thinking directly; see README.md.";
-  const publicAgentBaseParams = {
-    name: Type.Optional(Type.String({ description: "Stable display name. Defaults to a generated agent name." })),
-    prompt: Type.String({ description: "The agent's assignment, relevant prior context, evidence already gathered, constraints, and report shape." }),
-    cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the lead session cwd." })),
-    checks: Type.Optional(CheckPolicySchema),
-    repair: Type.Optional(RepairPolicySchema),
-    checkpoint: Type.Optional(CheckpointPolicySchema),
-    continue_from: Type.Optional(Type.String({ description: "Continue this checkpoint as a fresh recipient/run with the current assignment and tier. name is a prefix, not a recipient to reuse." })),
-    session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Optional filtered snapshot of the lead's active session branch. Use lazy only when omitted session history may materially affect the lane; the child reads it on demand rather than receiving transcript content in its prompt.", default: "none" })),
-    metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
-    allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Opt in eligible depth-0 write-feature/write-critical agents to restricted read-only child spawning.", default: false })),
-  };
-  const publicAgentParams = {
-    ...publicAgentBaseParams,
-    model_slot: StringEnum(ACCEPTED_FAVORITE_MODEL_SLOTS, { description: levelDescription, default: "read-review" }),
-  };
-  const publicSwarmAgentParams = {
-    ...publicAgentBaseParams,
-    model_slot: Type.Optional(StringEnum(ACCEPTED_FAVORITE_MODEL_SLOTS, { description: levelDescription })),
-  };
-
   function generatedAgentName(index?: number): string {
     const position = index === undefined ? "" : `-${index + 1}`;
     return `agent-${Date.now().toString(36)}${position}-${crypto.randomUUID().slice(0, 8)}`;
@@ -1350,6 +1335,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   ): Promise<{ content: any[]; details: any }> {
     rejectUnexpectedNestedParams(params, ["name", "prompt", "model_slot"], context);
     requireNestedReadSpawnLevel(params, context);
+    if (options.isHostAttached?.() === false) await options.waitForHost?.();
     await assertNestedParentAuthorized(binding.teamName, binding.parent.name, binding.parentRunId, binding.parent.cwd);
     const name = params.name || generatedAgentName();
     const result = await spawnTeammate({
@@ -1358,7 +1344,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       model_slot: params.model_slot,
       team_name: binding.teamName,
       cwd: binding.parent.cwd,
-    }, binding.outerCtx, {
+    }, options.isHostAttached ? options.getSessionCtx?.() ?? binding.outerCtx : binding.outerCtx, {
       nestedParent: {
         teamName: binding.teamName,
         name: binding.parent.name,
@@ -1446,33 +1432,14 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   pi.registerTool(statusTool());
 
   pi.registerTool({
-    name: "spawn_agent",
-    label: "Spawn Agent",
-    description: "Spawn one agent by intent tier only. Configured favorites take priority; an unconfigured tier inherits the current lead model and thinking. Give it the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta rather than a context-free task. Use session_context=lazy only as an on-demand fallback when omitted session history may materially matter; it never replaces a good mission prompt. read-review is the normal read default; use read-collect for bounded fact gathering, read-analyze for connected explanation/root cause, and read-critical only for irreducible high-stakes reasoning. For edits, choose write-patch, write-feature, write-system, or the rare high-risk write-critical by scope and risk. After spawning, do not duplicate or take over its lane; work only on unrelated work, then end the turn so the automatic report can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or treat healthy silence as failure. Wait for the actual report before synthesizing; intervene only on a reported blocker/error, actual health failure, or explicit user cancellation. model_slot selects behavior, model, and thinking; do not pass role, model, or thinking directly.",
-    parameters: Type.Object(publicAgentParams),
+    ...publicTeamToolMetadata.spawn_agent,
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       return spawnPublicAgent(params, ctx, _signal);
     },
   });
 
   pi.registerTool({
-    name: "spawn_swarm_agents",
-    label: "Spawn Swarm Agents",
-    description: "Spawn a batch by intent tier only. Configured favorites take priority; unconfigured tiers inherit the current lead model and thinking. Give each lane the relevant goal, decisions, prior attempts, inspected evidence, constraints, and expected delta. Use session_context=lazy selectively as an on-demand fallback, never instead of a good mission prompt. Use read-review as the normal default, read-collect for bounded collection lanes, read-analyze for connected explanation, and read-critical only for irreducible high-stakes reasoning; choose write-patch/feature/system/critical by edit scope and risk. Each spawned lane is delegation-locked: do not duplicate or take it over. After unrelated work is done, end the turn so automatic reports can resume you. One get_agent_status snapshot is allowed when current status is needed; never sleep, busy-wait, repeatedly read inbox/status, or intervene early. Synthesize only after actual reports; intervene only on blocker/error, actual failure, or explicit cancellation. Each agent gets model_slot directly or from defaults; do not pass role, model, or thinking directly.",
-    parameters: Type.Object({
-      defaults: Type.Optional(Type.Object({
-        cwd: Type.Optional(Type.String()),
-        checks: Type.Optional(CheckPolicySchema),
-        repair: Type.Optional(RepairPolicySchema),
-        checkpoint: Type.Optional(CheckpointPolicySchema),
-        model_slot: Type.Optional(StringEnum(ACCEPTED_FAVORITE_MODEL_SLOTS, { description: levelDescription })),
-        metadata: Type.Optional(Type.Record(Type.String(), Type.Any())),
-        session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Shared lazy session-reference policy.", default: "none" })),
-        allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Shared opt-in for eligible depth-0 write-feature/write-critical agents.", default: false })),
-      })),
-      completion_group: Type.Optional(CompletionGroupPolicySchema),
-      agents: Type.Array(Type.Object(publicSwarmAgentParams), { description: "Agents to spawn as one batch. Each one must have model_slot directly or inherit it from defaults." }),
-    }),
+    ...publicTeamToolMetadata.spawn_swarm_agents,
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
       if (!ctx) throw new Error("No active Pi session context is available for spawn_swarm_agents.");
@@ -1553,6 +1520,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   return {
     createNestedReadAgentTools,
     nestedChildSnapshot,
+    hasPendingWork: () => queuedReadSpawnsByTeam.size > 0 || checkpointAdmissions.size > 0 || readQueueDrainingTeams.size > 0,
+    resumeQueues: () => { for (const teamName of queuedReadSpawnsByTeam.keys()) void drainQueuedReadSpawns(teamName); },
     cancelQueuedAgent: (teamName, agentName) => {
       // Retain the entry for admission bookkeeping, but let active teardown own cancellation after launch commits.
       if (readQueue(teamName).some(queued => queued.member.name === agentName && queued.launchCommitted)) return false;

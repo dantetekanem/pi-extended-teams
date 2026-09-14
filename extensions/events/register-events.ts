@@ -51,6 +51,20 @@ function hasPersistedTeamSettings(ctx: any): boolean {
     && fs.existsSync(projectSettingsPath(ctx.cwd));
 }
 
+export function registerAgentReportRenderer(pi: any): void {
+  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, _renderOptions: any, theme: any) => {
+    const d = message.details || {};
+    const meta = [
+      d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
+      typeof d.tokens === "number" ? `${formatTokenCount(d.tokens)} tok` : "",
+    ].filter(Boolean).join(" · ");
+    const mark = d.ok === false ? theme.fg("warning", "✗") : theme.fg("success", "✓");
+    const headline = `${mark} ${d.name || "agent"} reported${meta ? ` · ${meta}` : ""}`;
+    const body = typeof message.content === "string" ? message.content : "";
+    return new Text(`${theme.bold(headline)}\n\n${body}`, 0, 0);
+  });
+}
+
 export function registerExtensionEvents(pi: any, options: RegisterEventsOptions): void {
   let teammateWakeIfUnread: (() => Promise<void>) | null = null;
   let teammatePendingInboxWake = false;
@@ -131,17 +145,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     }
   };
 
-  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, _renderOptions: any, theme: any) => {
-    const d = message.details || {};
-    const meta = [
-      d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
-      typeof d.tokens === "number" ? `${formatTokenCount(d.tokens)} tok` : "",
-    ].filter(Boolean).join(" · ");
-    const mark = d.ok === false ? theme.fg("warning", "✗") : theme.fg("success", "✓");
-    const headline = `${mark} ${d.name || "agent"} reported${meta ? ` · ${meta}` : ""}`;
-    const body = typeof message.content === "string" ? message.content : "";
-    return new Text(`${theme.bold(headline)}\n\n${body}`, 0, 0);
-  });
+  registerAgentReportRenderer(pi);
 
   pi.on("session_start", async (_event: any, ctx: any) => {
     paths.ensureDirs();

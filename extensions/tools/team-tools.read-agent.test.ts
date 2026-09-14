@@ -125,7 +125,7 @@ function makeRunningAgent(teamName: string, member: Member): RunningReadAgent {
   };
 }
 
-function registerTools() {
+function registerTools(host: { isHostAttached?(): boolean; waitForHost?(): Promise<void>; getSessionCtx?(): any } = {}) {
   const tools = new Map<string, RegisteredTool>();
   const eventHandlers = new Map<string, Array<(payload: any) => void>>();
   const sessionHandlers = new Map<string, Array<(event: any) => void | Promise<void>>>();
@@ -201,6 +201,7 @@ function registerTools() {
     getTeamName: () => adoptedTeam ?? (teams.teamExists("session-test-session") ? "session-test-session" : undefined),
     getSessionCtx: () => sessionCtx,
     pendingChildController,
+    ...host,
   });
 
   const emit = (name: string, payload: any) => {
@@ -2203,6 +2204,32 @@ describe("public agent spawn tools", () => {
       prompt: "do not admit",
       model_slot: "read-collect",
     })).rejects.toThrow("bound parent lifecycle is not active");
+  });
+
+  it("defers nested spawning across reload and uses the reattached root instead of the old context", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 8, queueOverflow: true } });
+    let attached = false;
+    let reconnect!: () => void;
+    const ready = new Promise<void>(resolve => { reconnect = resolve; });
+    const currentContext = makeCtx();
+    const harness = registerTools({ isHostAttached: () => attached, waitForHost: () => ready,
+      getSessionCtx: () => attached ? currentContext : undefined });
+    const parent = await admitNestedReadParent(harness);
+    const tools = harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session", parent, parentRunId: parent.lifecycleRunId!,
+      outerCtx: new Proxy({}, { get() { throw new Error("Stale host context"); } }),
+    });
+    const spawn = tools.find(tool => tool.name === "spawn_agent")!;
+    const pending = spawn.execute("nested", { name: "after-reload", prompt: "Continue investigating", model_slot: "read-review" });
+    await Promise.resolve();
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+    expect(harness.runningReadAgents.get("session-test-session:writer")?.runId).toBe(parent.lifecycleRunId);
+    attached = true;
+    reconnect();
+    expect((await pending).details).toMatchObject({ name: "after-reload", queued: false });
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledExactlyOnceWith("session-test-session",
+      expect.objectContaining({ parentLifecycleRunId: parent.lifecycleRunId }), "Continue investigating", currentContext, expect.any(Object));
   });
 
   it("admits single and swarm children with forced parent provenance and never replaces a duplicate", async () => {

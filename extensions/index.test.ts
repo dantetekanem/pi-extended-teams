@@ -136,7 +136,10 @@ async function setupExtension(
   const commands = new Map<string, any>();
   const eventHandlers = new Map<string, Function[]>();
   const extensionEventHandlers = new Map<string, Function[]>();
-  const pi: any = {
+  const costEntries: any[] = [];
+  function createApi() {
+    const api: any = {
+    appendEntry: vi.fn((customType, data) => costEntries.push({ type: "custom", customType, data })),
     registerTool: vi.fn((tool: RegisteredTool) => tools.set(tool.name, tool)),
     registerCommand: vi.fn((name: string, command: any) => commands.set(name, command)),
     registerShortcut: vi.fn(),
@@ -172,8 +175,10 @@ async function setupExtension(
     },
     sendUserMessage: vi.fn(),
   };
-  if (options.withSendMessage) pi.sendMessage = vi.fn();
-
+    if (options.withSendMessage) api.sendMessage = vi.fn();
+    return api;
+  }
+  let pi = createApi();
   extension(pi as any);
 
   return {
@@ -182,7 +187,8 @@ async function setupExtension(
     commands,
     eventHandlers,
     extensionEventHandlers,
-    pi,
+    get pi() { return pi; },
+    costEntries,
     terminal,
     readAgentMock,
     sleepController,
@@ -194,6 +200,25 @@ async function setupExtension(
       extension(pi);
       for (const handler of eventHandlers.get("session_start") ?? []) await handler({ reason: "reload" }, ctx);
     },
+    async reloadFresh(ctx: any, invalidateContext: () => void, gap: () => Promise<void>) {
+      const manager = ctx.sessionManager;
+      const thinkingLevel = ctx.thinkingLevel;
+      for (const handler of eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "reload" }, ctx);
+      const staleAccesses: string[] = [];
+      for (const [name, fn] of [...Object.entries(pi), ...Object.entries(pi.events)]) {
+        if (typeof fn === "function" && "mockImplementation" in fn) (fn as any).mockImplementation(() => {
+          staleAccesses.push(name); throw new Error(`Stale host API: ${name}`);
+        });
+      }
+      invalidateContext();
+      tools.clear(); commands.clear(); eventHandlers.clear(); extensionEventHandlers.clear();
+      await gap();
+      pi = createApi();
+      const nextContext = { ...makeCtx(root, manager.getSessionId()), sessionManager: manager, thinkingLevel };
+      extension(pi);
+      for (const handler of eventHandlers.get("session_start") ?? []) await handler({ reason: "reload" }, nextContext);
+      return { ctx: nextContext, staleAccesses };
+    },
     restoreEnv() {
       process.env = originalEnv;
       vi.restoreAllMocks();
@@ -202,10 +227,11 @@ async function setupExtension(
   };
 }
 
-function writeFavoriteLevels(root: string) {
+function writeFavoriteLevels(root: string, settings: Record<string, unknown> = {}) {
   const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify({
+    ...settings,
     favoriteModels: {
       "read-collect": { model: "provider/model", thinking: "low" },
       "read-review": { model: "provider/model", thinking: "high" },
@@ -404,7 +430,7 @@ describe("extension integration", () => {
         "session-edit-session",
         expect.objectContaining({ name: "editor", role: "write", model: "provider/model", thinking: "xhigh", modelSlot: "write-critical" }),
         "Edit the file",
-        ctx,
+        expect.objectContaining({ cwd: ctx.cwd, model: ctx.model, modelRegistry: ctx.modelRegistry, sessionManager: ctx.sessionManager }),
         expect.any(Object),
       );
 
@@ -512,6 +538,7 @@ describe("extension integration", () => {
     const setup = await setupExtension();
     try {
       const ctx = makeCtx(setup.root, "sleep-assertion-shutdown-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
 
       for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) {
         await handler({ reason: "quit" }, ctx);
@@ -587,7 +614,7 @@ describe("extension integration", () => {
       }, new AbortController().signal, undefined, ctx);
 
       const spawnOptions = setup.readAgentMock.runReadAgentInProcess.mock.calls[0]![4];
-      const plan = spawnOptions.createResourcePlan({ cwd: setup.root, projectTrusted: true });
+      const plan = await spawnOptions.createResourcePlan({ cwd: setup.root, projectTrusted: true });
       expect(plan.selfExtensionPath).toBe(selfPath);
       expect(plan.extensionPaths).toEqual([externalPath]);
       expect(plan.extensions).toEqual(expect.arrayContaining([
@@ -665,7 +692,9 @@ describe("extension integration", () => {
         await entered;
         await setup.reload(ctx);
         release(); await polling;
-        expect(setup.pi.sendMessage).not.toHaveBeenCalled();
+        expect(setup.pi.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+          customType: "pi-extended-teams-wake", content: expect.stringContaining("1 new agent message is ready"),
+        }), { triggerTurn: true, deliverAs: "followUp" });
         expect(group.read().deliveries[0].wake?.state).toBe("pending");
         return;
       }
@@ -1169,7 +1198,7 @@ describe("extension integration", () => {
       expect(ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function")).toHaveLength(1);
       expect(ctx.ui.setWidget.mock.calls.slice(firstWidgetCallIndex + 1).some((call: any[]) => call[0] === "01-pi-extended-teams-readers" && call[1] === undefined)).toBe(false);
 
-      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "reload" }, ctx);
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, ctx);
       expect(ctx.ui.setWidget).toHaveBeenCalledWith("01-pi-extended-teams-readers", undefined);
       expect(abortAgent).toHaveBeenCalledOnce();
       expect(disposeAgent).toHaveBeenCalledOnce();
@@ -1475,6 +1504,101 @@ describe("extension integration", () => {
     }
   });
 
+  it("inherits lead thinking through fresh spawn adapters before and after reload", async () => {
+    const setup = await setupExtension();
+    try {
+      const ctx = { ...makeCtx(setup.root, "thinking-reload"), thinkingLevel: "high" };
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      const spawn = (name: string, context: any) => setup.tools.get("spawn_agent")!.execute(name, {
+        name, prompt: "Investigate", cwd: setup.root, model_slot: "read-review",
+      }, new AbortController().signal, undefined, context);
+      await spawn("before", ctx);
+      expect(setup.readAgentMock.runReadAgentInProcess.mock.calls.at(-1)?.[1].thinking).toBe("high");
+      const reloaded = await setup.reloadFresh(ctx, () => {}, async () => {});
+      await spawn("after", reloaded.ctx);
+      expect(setup.readAgentMock.runReadAgentInProcess.mock.calls.at(-1)?.[1].thinking).toBe("high");
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, reloaded.ctx);
+    } finally { setup.restoreEnv(); }
+  });
+
+  it("retains the same running agent across reload and cleans it up on quit", async () => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    try {
+      const abort = vi.fn(async () => {});
+      const dispose = vi.fn();
+      let state: any;
+      let launchContext: any;
+      let callbacks: any;
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        launchContext = _ctx;
+        callbacks = options;
+        state = {
+          runId: member.lifecycleRunId, name: member.name, teamName,
+          startedAt: Date.now(), tokensUsed: 0, status: "working", recentEvents: [],
+          lastActivityAt: Date.now(), role: member.role, model: member.model,
+          thinking: member.thinking, modelSlot: member.modelSlot,
+          acceptingMessages: true, messageDeliveryClosed: false,
+          session: { abort, dispose, clearQueue: () => ({ steering: [], followUp: [] }),
+            getSessionStats: () => ({ tokens: { total: 0 } }) },
+        };
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), state);
+      });
+      let valid = true;
+      const staleContexts: string[] = [];
+      const baseContext = makeCtx(setup.root, "reload-survival-session");
+      Object.assign(baseContext.sessionManager, { getEntries: () => setup.costEntries });
+      const ctx = new Proxy(baseContext, { get(target, key, receiver) {
+        if (!valid) { staleContexts.push(String(key)); throw new Error("Stale root context"); }
+        return Reflect.get(target, key, receiver);
+      } });
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root, { readAgents: { maxConcurrent: 1, queueOverflow: true } });
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader", prompt: "Keep investigating", cwd: setup.root, model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+
+      const queued = await setup.tools.get("spawn_agent")!.execute("queue", {
+        name: "waiting-reader", prompt: "Investigate next", cwd: setup.root, model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      expect(queued.details.queued).toBe(true);
+      let resourcePlan: Promise<any> | undefined;
+      let gapCostRun: any;
+      let planned = false;
+      const reloaded = await setup.reloadFresh(ctx, () => { valid = false; }, async () => {
+        gapCostRun = callbacks.beginCostRun("reload-survival-session", state.teamName, "admitted-during-reload");
+        resourcePlan = callbacks.createResourcePlan({ cwd: setup.root, projectTrusted: true }).then((plan: any) => { planned = true; return plan; });
+        expect(launchContext.cwd).toBe(setup.root);
+        launchContext.ui.notify("Old presentation work");
+        callbacks.emitAgentReport(state.teamName, "finished-sibling", Date.now(), 10, "Full report during reload", true);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(planned).toBe(false);
+      });
+      expect(await resourcePlan).toMatchObject({ skills: "all" });
+      gapCostRun.settle({ childSessionId: "gap-child", costUsd: 2 }, "completed");
+      expect(setup.pi.appendEntry).toHaveBeenCalledWith("pi-extended-teams-cost-v1", expect.objectContaining({
+        lifecycleRunId: "admitted-during-reload", phase: "final", costUsd: 2,
+      }));
+      expect(reloaded.staleAccesses).toEqual([]);
+      expect(staleContexts).toEqual([]);
+      expect(setup.pi.sendMessage).toHaveBeenCalledOnce();
+      expect(setup.pi.sendMessage.mock.calls[0][0]).toMatchObject({ content: "Full report during reload" });
+      expect(abort).not.toHaveBeenCalled();
+      expect(dispose).not.toHaveBeenCalled();
+      expect(state.acceptingMessages).toBe(true);
+      expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledOnce();
+      const status = await setup.tools.get("get_agent_status")!.execute("status", {}, new AbortController().signal, undefined, reloaded.ctx);
+      expect(status.details.statuses).toEqual(expect.arrayContaining([expect.objectContaining({ name: "waiting-reader", phase: "queued" })]));
+      setup.readAgentMock.sendMessageToRunningReadAgent.mockResolvedValue(true);
+      await setup.tools.get("send_message")!.execute("message", { recipient: "reader", content: "Continue" },
+        new AbortController().signal, undefined, reloaded.ctx);
+      expect(setup.readAgentMock.sendMessageToRunningReadAgent).toHaveBeenCalledWith(state, "Continue", false);
+
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, reloaded.ctx);
+      expect(abort).toHaveBeenCalledOnce();
+      expect(dispose).toHaveBeenCalledOnce();
+    } finally { setup.restoreEnv(); }
+  });
+
   it("quarantines a parent-shutdown delivery timeout and defers child cleanup", async () => {
     const setup = await setupExtension();
     try {
@@ -1522,8 +1646,9 @@ describe("extension integration", () => {
       }, new AbortController().signal, undefined, ctx);
 
       const shutdown = Promise.all(
-        (setup.eventHandlers.get("session_shutdown") ?? []).map(handler => handler({ reason: "reload" }, ctx))
+        (setup.eventHandlers.get("session_shutdown") ?? []).map(handler => handler({ reason: "quit" }, ctx))
       );
+      const shutdownCheck = expect(shutdown).rejects.toThrow("Team cleanup is still fenced");
       await vi.advanceTimersByTimeAsync(0);
 
       const teamName = "session-shutdown-timeout-session";
@@ -1535,11 +1660,11 @@ describe("extension integration", () => {
       ).rejects.toThrow("lifecycle-quarantined");
 
       await vi.advanceTimersByTimeAsync(2_500);
-      await shutdown;
+      await shutdownCheck;
       expect(runningState.teardownState).toBe("quarantined");
       expect((await setup.teams.readConfig(teamName)).members.map((item: any) => item.name)).toEqual(["team-lead", "reader"]);
       expect(emitShutdown).toHaveBeenCalledOnce();
-      expect(emitShutdown).toHaveBeenCalledWith({ type: "session_shutdown", reason: "reload" });
+      expect(emitShutdown).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
       expect(disposeAgent).not.toHaveBeenCalled();
 
       // A repeated parent shutdown consumes the cached bounded proof and does
@@ -1603,7 +1728,7 @@ describe("extension integration", () => {
       const configPath = paths.configPath("session-shutdown-close-failure-session");
       fs.writeFileSync(configPath, "{ malformed config");
       const shutdown = Promise.all(
-        (setup.eventHandlers.get("session_shutdown") ?? []).map(handler => handler({ reason: "reload" }, ctx))
+        (setup.eventHandlers.get("session_shutdown") ?? []).map(handler => handler({ reason: "quit" }, ctx))
       );
       await expect(shutdown).rejects.toThrow(
         "Could not close 1 agent recipient(s) during extension shutdown"

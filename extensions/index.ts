@@ -25,6 +25,8 @@ import { parseQualifiedModel } from "../src/utils/model-resolution";
 import { formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 import { createPendingChildController } from "./runtime/pending-child-controller.js";
+import { createTeamHost } from "./runtime/team-host";
+import { registerLeadAttachment, type TeamExecutionOwner } from "./runtime/lead-attachment";
 import { createActiveAgentSleepController, runWithActiveAgentSleepAssertion } from "./runtime/active-agent-sleep.js";
 import { createTeammateInterrupter } from "./runtime/teammate-interrupt.js";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
@@ -39,9 +41,17 @@ import type { Member } from "../src/utils/models";
 import { projectAgentStatus, projectLifecycleFence } from "../src/orchestration/status-projection";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { createSpawnResourcePlan, parentProjectTrustForSpawn } from "./resources/spawn-resource-plan.js";
-import { generateExtensionInstanceId, listLifecycleTombstones, onLifecycleTombstoneCleared, readLifecycleTombstone } from "../src/utils/lifecycle-tombstone";
+import { generateExtensionInstanceId, generateLifecycleRunId, listLifecycleTombstones, onLifecycleTombstoneCleared, readLifecycleTombstone } from "../src/utils/lifecycle-tombstone";
 
-export default function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI): void {
+  if (process.env.PI_AGENT_NAME) { createExecutionRuntime(pi); return; }
+  registerLeadAttachment(pi, () => {
+    const host = createTeamHost();
+    return createExecutionRuntime(host.api as unknown as ExtensionAPI, host);
+  });
+}
+
+function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof createTeamHost>): TeamExecutionOwner {
   const isTeammate = !!process.env.PI_AGENT_NAME;
   const agentName = process.env.PI_AGENT_NAME || "team-lead";
   const extensionInstanceId = generateExtensionInstanceId();
@@ -67,6 +77,14 @@ export default function (pi: ExtensionAPI) {
   let readHelperQueueDrainPending = false;
   let sessionCtx: any = null;
   let extensionShuttingDown = false;
+  let executionClosing = false;
+  const pendingRootAdmissions = new Set<Promise<void>>();
+  function trackRootAdmission(): () => void {
+    let settle!: () => void;
+    const pending = new Promise<void>(resolve => { settle = resolve; });
+    pendingRootAdmissions.add(pending);
+    return () => { pendingRootAdmissions.delete(pending); settle(); };
+  }
   const lifecycleFenceClearUnsubscribe = onLifecycleTombstoneCleared((clearedTeamName) => {
     if (clearedTeamName === teamName) void drainReadHelperQueueOnce();
   });
@@ -82,6 +100,7 @@ export default function (pi: ExtensionAPI) {
   let teamActivityStatusSnapshotSignature: string | null = null;
   let teamActivityWidgetMounted = false;
   let teamActivityWidgetTui: { requestRender?: () => void } | null = null;
+  let presentationGeneration = 0;
   let teamActivityRenderInFlight = false;
   let teamActivityRenderDirty = false;
   let teamActivityRenderTimer: NodeJS.Timeout | null = null;
@@ -93,8 +112,10 @@ export default function (pi: ExtensionAPI) {
   // instead of unread count prevents a read message being replaced by a new one
   // at the same count from silently suppressing the new wake.
   const leadWakeNotifiedMessageKeys = new Set<string>();
-  const createCurrentSpawnResourcePlan = (input: { cwd: string; projectTrusted: boolean }) => {
-    return createSpawnResourcePlan({ ...input, pi });
+  const createCurrentSpawnResourcePlan = async (input: { cwd: string; projectTrusted: boolean }) => {
+    while (host && !host.ready) await host.whenAttached();
+    const projectTrusted = host ? parentProjectTrustForSpawn(sessionCtx, input.cwd) : input.projectTrusted;
+    return createSpawnResourcePlan({ ...input, projectTrusted, pi });
   };
   let teamToolsRuntime: TeamToolsRuntime | undefined;
   const pendingChildController = createPendingChildController();
@@ -447,9 +468,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function notifyLeadOfInboxReports(targetTeamName: string): Promise<void> {
-    if (isTeammate) return;
+    if (isTeammate || extensionShuttingDown) return;
+    const generation = presentationGeneration;
     const unread = await messaging.peekInbox(targetTeamName, agentName, true);
+    if (generation !== presentationGeneration) return;
     await renderLeadInboxStatus();
+    if (generation !== presentationGeneration) return;
     await wakeLeadForInboxReports(unread);
   }
 
@@ -530,6 +554,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const generation = presentationGeneration;
     teamActivityRenderInFlight = true;
     let renderError: unknown;
     try {
@@ -538,6 +563,7 @@ export default function (pi: ExtensionAPI) {
     } catch (error) {
       renderError = error;
     } finally {
+      if (generation !== presentationGeneration) return;
       teamActivityRenderInFlight = false;
       if (renderError) {
         teamActivityRenderDirty = false;
@@ -602,6 +628,8 @@ export default function (pi: ExtensionAPI) {
 
   async function renderTeamActivityStatusNow() {
     if (!sessionCtx?.ui) return;
+    const generation = presentationGeneration;
+    const isCurrent = () => generation === presentationGeneration && !extensionShuttingDown;
 
     const now = Date.now();
     const activityTeamName = teamName || null;
@@ -630,6 +658,7 @@ export default function (pi: ExtensionAPI) {
           runtimeStatus: await runtime.readRuntimeStatus(activityTeamName, member.name).catch(() => null),
         })))
       : [];
+    if (!isCurrent()) return;
     const runtimeOnlyMembers = runtimeOnlyCandidates
       .filter((entry): entry is { member: Member; runtimeStatus: runtime.AgentRuntimeStatus } => isVisibleRuntimeOnlyMember(entry.member, entry.runtimeStatus, now))
       .filter(({ member, runtimeStatus }) => member.lifecycleRunId === runtimeStatus.lifecycleRunId);
@@ -678,6 +707,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
     const unreadLeadMessages = activityTeamName ? await messaging.readInbox(activityTeamName, agentName, true, false).catch(() => []) : [];
+    if (!isCurrent()) return;
     leadInboxUnreadCount = unreadLeadMessages.length;
     clearLeadInboxWidgetOnce();
 
@@ -746,6 +776,7 @@ export default function (pi: ExtensionAPI) {
         joinedAt: member.joinedAt,
       });
       const runtimeStatus = await runtime.readRuntimeStatus(activityTeamName!, member.name).catch(() => null);
+      if (!isCurrent()) return;
       const elapsed = formatElapsed(now - (runtimeStatus?.startedAt || member.joinedAt));
       const modelLabel = formatModelLabel(member.model, member.thinking);
       const contextUsage = formatRunningContextUsage(runtimeStatus?.contextUsage);
@@ -870,12 +901,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function drainReadHelperQueueOnce() {
-    if (isTeammate || !sessionCtx || !teamName) return;
+    if (isTeammate || !sessionCtx || !teamName || (host && !host.ready)) return;
     if (readHelperQueueDraining) {
       readHelperQueueDrainPending = true;
       return;
     }
     readHelperQueueDraining = true;
+    const settled = trackRootAdmission();
     try {
       for (let drained = 0; drained < 10 && teamName; drained++) {
         const [nextQueued] = await listReadHelperQueue(teamName);
@@ -886,6 +918,8 @@ export default function (pi: ExtensionAPI) {
 
         try {
           const config = await teams.readConfig(queued.teamName);
+          const launchContext = sessionCtx;
+          if (!launchContext || (host && !host.ready)) return;
           if (config.members.some(member => member.name === queued.name)) {
             throw new Error(`Teammate ${queued.name} already exists in team ${queued.teamName}.`);
           }
@@ -894,7 +928,7 @@ export default function (pi: ExtensionAPI) {
           const parsedModel = parseQualifiedModel(level.model);
           const provider = parsedModel?.provider;
           const modelId = parsedModel?.model;
-          const model = provider && modelId ? sessionCtx.modelRegistry?.find?.(provider, modelId) : undefined;
+          const model = provider && modelId ? launchContext.modelRegistry?.find?.(provider, modelId) : undefined;
           if (!model) throw new Error(`Read helper model \"${level.model}\" from intent tier ${level.slot} is not available in the lead session.`);
 
           const helperPrompt = buildReadHelperPrompt(queued.teamName, queued.requester, queued.prompt);
@@ -916,9 +950,15 @@ export default function (pi: ExtensionAPI) {
             helperKind: "read_helper",
           };
 
+          member.lifecycleRunId = generateLifecycleRunId();
           await teams.addMember(queued.teamName, member);
+          if (executionClosing) {
+            await shutdownTeammate(queued.teamName, member);
+            await removeQueuedReadHelperRequest(queued.teamName, queued.id);
+            break;
+          }
           observeReadAgentLaunch(
-            runInProcessAgentWithSleepAssertion(queued.teamName, member, helperPrompt, sessionCtx, readAgentOptions())
+            runInProcessAgentWithSleepAssertion(queued.teamName, member, helperPrompt, launchContext, readAgentOptions())
           );
           await removeQueuedReadHelperRequest(teamName, queued.id);
         } catch (e) {
@@ -971,6 +1011,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
     } finally {
+      settled();
       readHelperQueueDraining = false;
       if (readHelperQueueDrainPending) {
         readHelperQueueDrainPending = false;
@@ -1023,9 +1064,12 @@ export default function (pi: ExtensionAPI) {
 
     leadInboxPollTimer = setInterval(async () => {
       if (!teamName) return;
+      const generation = presentationGeneration;
       try {
         const unread = await messaging.readInbox(teamName, agentName, true, false);
+        if (generation !== presentationGeneration) return;
         await renderLeadInboxStatus();
+        if (generation !== presentationGeneration) return;
         await wakeLeadForInboxReports(unread);
       } catch {
         // Ignore errors for lead polling
@@ -1055,11 +1099,12 @@ export default function (pi: ExtensionAPI) {
   pi.events?.on?.("pi-prompt:prompt-build:start", async (payload: any) => {
     if (isTeammate || !sessionCtx) return;
     const requestedTeamName = teamPaths.sanitizeName(payload?.teamName || `prompt-build-${Date.now()}`);
-
+    const launchContext = sessionCtx;
+    const settled = trackRootAdmission();
     try {
       const prompts = Array.isArray(payload?.prompts) ? payload.prompts : [];
       activePromptBuildTeamName = requestedTeamName;
-      const cwd = payload?.cwd || sessionCtx.cwd;
+      const cwd = payload?.cwd || launchContext.cwd;
       const agentNamePrefix = teamPaths.sanitizeName(payload?.agentNamePrefix || "prompt-branch");
       if (payload?.model || payload?.thinking || payload?.role) {
         throw new Error("Prompt-build agents must use model_slot only; direct model, thinking, or role is not allowed.");
@@ -1069,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
       if (level.role !== "read") throw new Error(`Prompt-build requires a read-* intent tier configured via /agents-favorite-models, got ${level.slot}.`);
 
       if (!teams.teamExists(requestedTeamName)) {
-        teams.createTeam(requestedTeamName, getPiSessionId(sessionCtx) || "local-session", "lead-agent", payload?.description || "pi-prompt prompt-build", level.model);
+        teams.createTeam(requestedTeamName, getPiSessionId(launchContext) || "local-session", "lead-agent", payload?.description || "pi-prompt prompt-build", level.model);
       }
       // Prompt-build teams are private fanout jobs owned by pi-prompt. Do not
       // adopt them as the lead's current team, or normal session context and
@@ -1094,21 +1139,25 @@ export default function (pi: ExtensionAPI) {
           thinking: level.thinking,
           modelSlot: level.slot,
         };
+        if (executionClosing) break;
+        member.lifecycleRunId = generateLifecycleRunId();
         await teams.addMember(requestedTeamName, member);
+        if (executionClosing) { await shutdownTeammate(requestedTeamName, member); break; }
         observeReadAgentLaunch(
-          runInProcessAgentWithSleepAssertion(requestedTeamName, member, prompt, sessionCtx, readAgentOptions())
+          runInProcessAgentWithSleepAssertion(requestedTeamName, member, prompt, launchContext, readAgentOptions())
         );
         pi.events?.emit?.("pi-prompt:prompt-build:progress", { teamName: requestedTeamName, status: "spawned", started: i + 1, total: prompts.length, text: `building prompt — ${i + 1}/${prompts.length} branches started` });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       pi.events?.emit?.("pi-prompt:prompt-build:error", { teamName: requestedTeamName, error: message });
-    }
+    } finally { settled(); }
   });
 
   function setSessionCtx(ctx: any): void {
+    if (host && !host.attached) return;
     extensionShuttingDown = false;
-    sessionCtx = ctx;
+    sessionCtx = host?.context ?? ctx;
     if (!isTeammate && !teamName) {
       const foundTeam = findLeadTeamForSession(getPiSessionId(ctx));
       if (foundTeam) adoptTeamAsLead(foundTeam, ctx);
@@ -1142,7 +1191,10 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function cleanupExtensionRuntime(ctx: any, reason: unknown): Promise<void> {
+  function detachPresentation(): void {
+    presentationGeneration++;
+    teamActivityRenderInFlight = false;
+    navigationRuntimeAgents.clear();
     extensionShuttingDown = true;
     sessionCtx = null;
     stopLeadWatchdog();
@@ -1158,13 +1210,20 @@ export default function (pi: ExtensionAPI) {
     readHelperQueueFallbackTimer = null;
     readHelperQueueWatcher = null;
     leadPollingStarted = false;
-    leadWakeNotifiedMessageKeys.clear();
     readHelperQueueFallbackStarted = false;
     readHelperQueueWatchedTeam = null;
-    lifecycleFenceClearUnsubscribe();
     teamActivityRenderDirty = false;
     settleTeamActivityRenderWaiters();
+    teamActivityStatusSnapshot = null;
+    teamActivityStatusSnapshotSignature = null;
+    teamActivityWidgetMounted = false;
+    teamActivityWidgetTui = null;
+  }
 
+  async function cleanupExtensionRuntime(ctx: any, reason: unknown): Promise<void> {
+    detachPresentation();
+    leadWakeNotifiedMessageKeys.clear();
+    lifecycleFenceClearUnsubscribe();
     try {
       await stopRunningAgentsForShutdown(reason);
     } finally {
@@ -1334,6 +1393,8 @@ export default function (pi: ExtensionAPI) {
     getSessionCtx: () => sessionCtx,
     setSessionCtx,
     pendingChildController,
+    isHostAttached: () => !host || host.ready,
+    waitForHost: () => host?.whenAttached() ?? Promise.resolve(),
   });
 
   if (isTeammate) {
@@ -1345,7 +1406,7 @@ export default function (pi: ExtensionAPI) {
     }));
   }
 
-  registerCoordinationTools(pi, {
+  const coordination: Parameters<typeof registerCoordinationTools>[1] = {
     agentName,
     isTeammate,
     terminal,
@@ -1360,9 +1421,10 @@ export default function (pi: ExtensionAPI) {
     resetLeadWakeNotifiedCount: () => { leadWakeNotifiedMessageKeys.clear(); },
     deliverMessageToActiveAgent,
     extensionInstanceId,
-  });
+  };
+  if (isTeammate) registerCoordinationTools(pi, coordination);
 
-  registerTaskRuntimeTools(pi, {
+  const taskTools: Parameters<typeof registerTaskRuntimeTools>[1] = {
     isTeammate,
     terminal,
     runningReadAgents,
@@ -1371,6 +1433,46 @@ export default function (pi: ExtensionAPI) {
     cancelQueuedAgent: (targetTeamName, targetAgentName) => teamToolsRuntime?.cancelQueuedAgent(targetTeamName, targetAgentName) ?? false,
     shutdownTeammate,
     getTeamName: () => teamName,
-  });
+  };
+  if (isTeammate) registerTaskRuntimeTools(pi, taskTools);
 
+  return {
+    host: host!, coordination, taskTools,
+    hasWork: () => runningReadAgents.size > 0 || activeWritersTabs.length > 0 || pendingRootAdmissions.size > 0 || teamToolsRuntime?.hasPendingWork() === true,
+    async attach(binding) {
+      host!.attach(binding);
+      const ctx = host!.snapshot(binding.ctx);
+      const costAttached = combinedSessionCost?.attach(binding.pi, ctx);
+      await host!.emit("session_start", binding.event, ctx);
+      if (!host!.attached) return;
+      if (!costAttached) combinedSessionCost?.attach(binding.pi, ctx);
+    },
+    activate() {
+      host!.flush();
+      teamToolsRuntime?.resumeQueues();
+      void drainReadHelperQueueOnce();
+      if (teamName) void notifyLeadOfInboxReports(teamName).catch(warnGroup);
+    },
+    detach() {
+      sessionCtx?.ui?.setWidget?.("01-pi-extended-teams-readers", undefined);
+      sessionCtx?.ui?.setWidget?.("01-pi-extended-teams-status", undefined);
+      detachPresentation();
+      combinedSessionCost?.detach();
+      host?.detach();
+    },
+    async close(reason) {
+      executionClosing = true;
+      sessionCtx?.ui?.setWidget?.("01-pi-extended-teams-readers", undefined);
+      sessionCtx?.ui?.setWidget?.("01-pi-extended-teams-status", undefined);
+      detachPresentation();
+      host?.close();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const admissions = Promise.race([
+        Promise.all([...pendingRootAdmissions]),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Team admission cleanup is still pending.")), 2_500); }),
+      ]).finally(() => clearTimeout(timer));
+      await Promise.all([host!.emit("session_shutdown", { reason }, undefined), admissions]);
+      if (runningReadAgents.size) throw new Error("Team cleanup is still fenced by unsettled agents.");
+    },
+  };
 }

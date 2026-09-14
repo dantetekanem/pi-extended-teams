@@ -146,6 +146,18 @@ describe("legacy tmux writer resource plan", () => {
     };
   });
 
+  it.each(["checkpoint", "checkpointAssignment", "continueFrom", "continue_from"])("rejects legacy %s startup before preparing or admitting a process", async field => {
+    const terminal = { spawn: vi.fn() };
+    const createResourcePlan = vi.fn();
+    const runtime = createWriteAgentRuntime({ terminal, createResourcePlan });
+    const member = writer();
+    Object.assign(member, { [field]: { originalPrompt: "Review", policy: { inputs: ["src"], retentionDays: 30, decisions: [] } } });
+    await expect(runtime.startWriteAgent("team", member, "Review")).rejects.toThrow(/checkpoint.*in-process/i);
+    expect(createResourcePlan).not.toHaveBeenCalled();
+    expect(mocks.addMember).not.toHaveBeenCalled();
+    expect(terminal.spawn).not.toHaveBeenCalled();
+  });
+
   it("starts an unconfigured write tier using the already-resolved current lead model and thinking", async () => {
     mocks.configuredFavorite = null as any;
     const terminal = { spawn: vi.fn(() => "%writer") };

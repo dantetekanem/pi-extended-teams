@@ -6,9 +6,11 @@ import * as runtime from "../utils/runtime";
 import * as writeQueue from "../utils/write-queue";
 import * as reports from "../utils/report-events";
 import type { Member } from "../utils/models";
+import { createCheckpointAssignment } from "../results/checkpoint-assignment";
+import { assertUnusedContinuationRecipient, freshContinuationName } from "../results/continuation-recipient";
 import { readLifecycleTombstone } from "../utils/lifecycle-tombstone";
 import { isAgentActivity, projectAgentStatus } from "./status-projection";
-import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel, roleForFavoriteModelSlot } from "../utils/settings";
+import { canonicalPersistedModelSlot, loadSettings, normalizeFavoriteModelSlot, requireFavoriteModelLevel, roleForFavoriteModelSlot } from "../utils/settings";
 import type {
   BroadcastMessageOnceRequest,
   EnsureTeamRequest,
@@ -355,6 +357,17 @@ export async function spawnTeammatesOnce(
   options: SpawnTeammateOnceOptions = {}
 ): Promise<SpawnTeammatesOnceResponse> {
   if (requests.length === 0) return [];
+  requests = requests.map(request => {
+    const assignment = createCheckpointAssignment(request.checkpoint, request.prompt, request.continueFrom);
+    if (!assignment) return request;
+    if (!assignment.parent) return { ...request, checkpoint: assignment.policy };
+    const modelSlot = normalizeFavoriteModelSlot(request.modelSlot);
+    if (!modelSlot) throw new Error("Continuation requires an explicit current model tier.");
+    const name = freshContinuationName(request.name);
+    if (name.toLowerCase() === assignment.parent.author.agentName.toLowerCase()) throw new Error("Continuation requires an unused recipient name.");
+    assertUnusedContinuationRecipient(request.teamName, name);
+    return { ...request, name, modelSlot, checkpoint: assignment.policy };
+  });
 
   const stateByTeam = new Map<string, SpawnOnceTeamState>();
   const uniqueTeamNames = [...new Set(requests.map((request) => request.teamName))];
@@ -366,6 +379,11 @@ export async function spawnTeammatesOnce(
   for (const request of requests) {
     const state = stateByTeam.get(request.teamName);
     if (!state) throw new Error(`Team ${request.teamName} not found`);
+    if (request.continueFrom !== undefined) {
+      if (state.membersByName.has(request.name) || state.queuedByName.has(request.name)) throw new Error("Continuation requires an unused recipient name.");
+      results.push(await startSpawnTeammateOnce(state, request, options));
+      continue;
+    }
 
     const existing = findExistingMemberCandidate(state, request)?.item;
     if (existing) {

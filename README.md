@@ -175,6 +175,56 @@ One September 8, 2026 comparison used Pi 0.85.1 and configured `read-review` mod
 
 Both syntheses preserved all ten required finding/control pairs, pending acceptance and the exact detail retrieved from full report F9. Each session emitted one `agent_settled` event; wake requests are not equivalent to completed agent runs. These are actual provider usage figures from one controlled replay, not estimates, randomized statistics, new specialist investigations or a general review-speed guarantee. The [measurement record](docs/grouped-report-measurement.json) retains the assignment, complete corpus, tested source identity, method and observations without session histories or credentials.
 
+## Optional specialist continuation
+
+Save a specialist's findings when you expect a later follow-up:
+
+```text
+spawn_agent({
+  name: "auth-review",
+  model_slot: "read-review",
+  prompt: "Review auth and config. Report stable finding IDs, evidence and inspected source references.",
+  checkpoint: { inputs: ["auth", "config"], retentionDays: 30 }
+})
+```
+
+The checkpoint preserves the original assignment, scoped source observations, author/run/tier, findings, questions, reported `inspectedEvidence`, lead-supplied `decisions`, and independent report references. It keeps the original report plus bounded recent history. Records are limited to 64 KiB and live in `~/.pi/agent/checkpoints/`, outside private transcripts and Pi's resume picker. Omit both `checkpoint` and `continue_from` to keep ordinary spawning unchanged; metadata and nested helpers cannot enable them. Swarm defaults and individual agents also accept `checkpoint`; put `continue_from` on each selected agent.
+
+Copy the exact checkpoint ID from the saved report into a new assignment:
+
+```text
+spawn_agent({
+  name: "auth-followup",
+  model_slot: "read-review",
+  continue_from: "checkpoint:<saved hash>",
+  prompt: "Recheck F1 and F2 after the tenant fix. Revalidate token-policy dependencies, including unchanged callers."
+})
+```
+
+`name` becomes a prefix for a fresh recipient. Continuation creates a new run and SDK session; it does not reopen the old mailbox or transcript, resume a process, transfer claims, or inherit execution permissions or repair budgets. The current prompt, cwd, tier, instructions, checks and repair policy govern. Old findings, verification and acceptance remain historical claims. Edit agents must acquire their own claims normally.
+
+Continuation inherits the checkpoint's input scope and retention unless you supply a current `checkpoint` override; old lead decisions are not reauthorized. Scope entries are literal paths relative to the current cwd, contained within its repository. At actual launch, including after queue delays, the harness reloads the checkpoint and compares each retained report's dependency scope. Changed, uncertain or changed-during-investigation evidence requires revalidation beyond the diff. An unchanged fingerprint is not proof that a finding still holds, a dependency graph or a snapshot; ignored/external inputs and restored edits remain outside its evidence.
+
+Full reports are synchronized independently before checkpoint publication and cleanup. Missing known report provenance or uncertain publication prevents destructive cleanup. In-process read and edit admission supports checkpoints; legacy terminal startup/queue requests reject checkpoint and continuation options. Existing legacy report producers can preserve checkpoint-bound reports. Trusted orchestration requests use `continueFrom`; a custom start callback still owns actual admission and execution.
+
+Retention defaults to 30 days, with an integer range of 1 to 365. Use the lead-only `/agents-checkpoints list` and `/agents-checkpoints delete <checkpoint ID>` commands. Expired records cannot be loaded; one lead startup sweep retires due records and reports corrupt entries without discarding healthy siblings. Missing, incompatible, corrupt, deleted or expired selections fail with an actionable error. Deletion retires that exact root record permanently, preventing future continuation and replay. It does not erase independent report history or context already delivered to a successor.
+
+### Measured follow-up
+
+One September 8, 2026 pair used Pi 0.85.1 and `openai-codex/gpt-5.6-terra`, high thinking, with identical current source, task and tools. A scripted original investigation saved F1/F2/F3, then its real SDK session was disposed and its private transcript removed before either fresh follow-up session. The fixture fixed tenant isolation, left expiration broken and reopened unsigned-token acceptance through a changed configuration dependency. Both follow-ups correctly classified all three controls.
+
+| Observation | Fresh | Checkpoint |
+| --- | ---: | ---: |
+| Model / HTTP requests | 3 / 3 | 3 / 3 |
+| Provider input tokens, excluding cache | 1,841 | 3,789 |
+| Cache-read / cache-write tokens | 0 / 0 | 1,536 / 0 |
+| Output tokens | 267 | 233 |
+| File reads / unchanged-file rereads | 3 / 1 | 3 / 1 |
+| First useful persisted result | 8.682s | 8.344s |
+| Elapsed through final response | 10.296s | 10.156s |
+
+This fixture showed no read or input-token savings: input including cache was 1,841 versus 5,325 tokens. One fixed fresh-then-checkpoint pair cannot establish a speed improvement. Each session emitted one `agent_settled`; lead acceptance stayed pending. The controlled starter/report submission exercised real SDK and checkpoint APIs, not full production admission-to-teardown or an OS-process restart. The pair predates the replay, missing-report cleanup and native cancellation repairs, so it does not measure those fixes. The [public record](docs/continuation-measurement.json) preserves the fixed corpus, assignments, method, historical source observation, aggregate results and limits; scripted usage remains null.
+
 ## Intent tiers
 
 Every spawn names a `model_slot`. Configured favorites take priority; otherwise the tier uses the current lead-session model and thinking level:

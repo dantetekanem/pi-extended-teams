@@ -13,6 +13,7 @@ import { createWriterScreenState, registerWriterScreenShortcut, removeWriterScre
 import { registerFavoriteModelsCommand } from "./ui/favorite-models-command.js";
 import { registerExtensionsCommand } from "./ui/extensions-command.js";
 import { registerOnboardingCommand } from "./ui/onboarding-command.js";
+import { registerCheckpointsCommand } from "./ui/checkpoints-command.js";
 import { installAgentNavigation } from "./ui/agent-navigation.js";
 import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordination-tools.js";
 import { createReportProgressTool } from "./tools/agent-communication-tools.js";
@@ -1272,6 +1273,7 @@ export default function (pi: ExtensionAPI) {
   registerFavoriteModelsCommand(pi);
   registerExtensionsCommand(pi);
   if (!isTeammate) registerOnboardingCommand(pi);
+  if (!isTeammate) registerCheckpointsCommand(pi);
 
   registerWriterScreenShortcut(pi, {
     getTeamName: () => teamName,

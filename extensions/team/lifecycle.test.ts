@@ -6,6 +6,8 @@ import { execFileSync } from "node:child_process";
 import { VerificationController } from "../../src/results/verification-controller";
 import { CompletionGroup } from "../../src/results/completion-group";
 import { createReportResult } from "../../src/results/report-result";
+import { checkpointReference, saveReportCheckpoint } from "../../src/results/checkpoint-report";
+import { checkpointPath, readCheckpoint, retireCheckpoint } from "../../src/results/specialist-checkpoint";
 import * as sourceIdentity from "../../src/results/source-identity";
 import { createLifecycleRuntime } from "./lifecycle.js";
 import * as paths from "../../src/utils/paths.js";
@@ -32,6 +34,7 @@ function installPathSpies() {
   vi.spyOn(paths, "inboxPath").mockImplementation((team, name) => path.join(teamsRoot, paths.sanitizeName(team), "inboxes", `${paths.sanitizeName(name)}.json`));
   vi.spyOn(paths, "reportEventsPath").mockImplementation(teamName => path.join(teamsRoot, paths.sanitizeName(teamName), "reports.json"));
   vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "reports"));
+  vi.spyOn(paths, "checkpointFilesDir").mockReturnValue(path.join(fs.realpathSync(root), "checkpoints"));
   vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName: unknown, agentName: unknown) => {
     return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "runtime", `${paths.sanitizeName(String(agentName))}.json`);
   });
@@ -70,6 +73,54 @@ describe("team lifecycle performance", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["prepared", "deleted", "missing-draft", "missing-report", "missing-event", "missing-event-and-report", "removed-binding", "old-run"])("uses source-free checkpoint receipts during finalization: %s", async mode => {
+    const observed: sourceIdentity.SourceIdentity = { version: 1, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fingerprint: "a".repeat(64), fileCount: 1 };
+    const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(observed);
+    const writer = member("writer", { lifecycleRunId: "checkpoint-run", modelSlot: "write-feature", prompt: "Review",
+      checkpointAssignment: { originalPrompt: "Review", policy: { inputs: ["src"], retentionDays: 30, decisions: [] }, sourceBefore: observed } });
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [writer] });
+    const report = await reportEvents.appendTeamReportEvent("team", { agentName: writer.name, status: "completed", source: "write-agent", report: "Saved findings",
+      checkpoint: checkpointReference("team", writer), result: createReportResult("team", writer.name, writer.lifecycleRunId!, {}) });
+    if (mode !== "missing-draft") await saveReportCheckpoint("team", writer, report);
+    if (mode === "prepared" || mode === "removed-binding") fs.unlinkSync(checkpointPath(report.checkpoint!.id));
+    if (mode === "deleted") await retireCheckpoint(report.checkpoint!.id, "deleted");
+    if (mode === "missing-report") fs.unlinkSync(report.reportPath!);
+    if (mode === "removed-binding") { delete writer.checkpointAssignment; await teams.updateMember("team", writer.name, { checkpointAssignment: undefined }); }
+    if (mode === "old-run") await teams.updateMember("team", writer.name, { lifecycleRunId: "replacement-run" });
+    capture.mockReset().mockRejectedValue(new Error("Source must not execute during cleanup"));
+    const release = vi.fn(async () => []);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const missingEvent = mode.startsWith("missing-event");
+    const transcript = path.join(paths.teamDir("team"), "agent-sessions", writer.name, writer.lifecycleRunId!, "session.jsonl");
+    if (missingEvent) {
+      fs.unlinkSync(paths.reportEventsPath("team"));
+      if (mode === "missing-event-and-report") fs.unlinkSync(report.reportPath!);
+      fs.mkdirSync(path.dirname(transcript), { recursive: true }); fs.writeFileSync(transcript, "Private recovery evidence");
+      await runtime.writeRuntimeStatus("team", writer.name, writer.lifecycleRunId!, { ready: true });
+      await claims.claimFiles("team", writer.name, ["src/recovery.ts"], 1);
+      runningReadAgents.set("team:writer", { name: writer.name, teamName: "team", runId: writer.lifecycleRunId!, startedAt: Date.now(), tokensUsed: 0,
+        status: "finishing", recentEvents: [], lastActivityAt: Date.now(), cleanupPrivateSessionOnFinalize: true });
+    }
+    const lifecycle = createLifecycleRuntime({ isTeammate: false, terminal: null, runningReadAgents,
+      readAgentKey: (team, name) => `${team}:${name}`, isCurrentReadAgentRun: () => true, renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, getSessionCwd: () => root, getTeamName: () => "team" });
+    const blocked = mode.startsWith("missing") || mode === "old-run";
+    const result = await lifecycle.shutdownTeammate("team", writer, { reason: "reload" });
+    expect(result.finalized).toBe(!blocked);
+    expect(release).toHaveBeenCalledTimes(blocked ? 0 : 1);
+    expect(capture).not.toHaveBeenCalled();
+    if (missingEvent) {
+      expect(result).toMatchObject({ status: "cleanup_failed", finalized: false, removedMember: false, releasedClaims: [] });
+      expect(fs.readFileSync(transcript, "utf8")).toBe("Private recovery evidence");
+      expect(fs.existsSync(paths.runtimeStatusPath("team", writer.name))).toBe(true);
+      expect(await claims.listClaims("team")).toEqual([{ agent: writer.name, path: "src/recovery.ts", since: 1 }]);
+      expect((await teams.readConfig("team")).members).toContainEqual(expect.objectContaining({ name: writer.name, lifecycleRunId: writer.lifecycleRunId }));
+      expect(await readLifecycleTombstone("team", writer.name)).toMatchObject({ status: "occupied", tombstone: { phase: "cleanup_failed" } });
+    }
+    if (mode === "prepared" || mode === "removed-binding") expect(readCheckpoint(report.checkpoint!.id).reportId).toBe(report.id);
+    if (mode === "deleted") expect(JSON.parse(fs.readFileSync(checkpointPath(report.checkpoint!.id), "utf8")).state).toBe("deleted");
   });
 
   it.each(["quit", "reload", "reported", "missing", "removed-binding"])("settles grouped ownership through the existing finalizer: %s", async condition => {

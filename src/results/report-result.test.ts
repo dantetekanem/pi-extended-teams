@@ -70,6 +70,20 @@ describe("structured task results", () => {
     expect(() => normalizeReportedTaskDetails(details)).toThrow(/report|finding/i);
   });
 
+  it("retains inspected references as isolated reported evidence, not observed verification", () => {
+    const inspectedEvidence = ["src/auth.ts:4", "https://example.test/auth-contract"];
+    const details = normalizeReportedTaskDetails({ inspectedEvidence });
+    inspectedEvidence.push("injected");
+    const result = createReportResult("team", "reader", "run", details);
+    expect(result.inspectedEvidence).toEqual(["src/auth.ts:4", "https://example.test/auth-contract"]);
+    expect(result.verification.state).toBe("not-requested");
+    expect(result.acceptance.state).toBe("pending");
+  });
+
+  it.each([[42], [" "], ["x".repeat(2049)], Array(129).fill("src/auth.ts")].map(inspectedEvidence => ({ inspectedEvidence })))("rejects malformed or oversized inspected references (case %#)", ({ inspectedEvidence }) => {
+    expect(() => normalizeReportedTaskDetails({ inspectedEvidence })).toThrow(/reported task details/i);
+  });
+
   it("isolates accepted evidence from later caller mutation", () => {
     const input = { findings: [{ id: "F1", text: "Original", evidence: ["file.ts:1"] }] };
     const details = normalizeReportedTaskDetails(input);

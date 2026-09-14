@@ -3,6 +3,7 @@ import path from "node:path";
 import { TeamConfig, Member } from "./models";
 import { configPath, teamDir, taskDir } from "./paths";
 import { withLock } from "./lock";
+import { assertUnusedContinuationRecipient } from "../results/continuation-recipient";
 import {
   assertLifecycleTombstoneAbsent,
   generateLifecycleRunId,
@@ -157,9 +158,10 @@ export async function addMember(teamName: string, member: Member) {
   member.lifecycleRunId = generateLifecycleRunId();
   await withLifecycleTombstoneLock(teamName, member.name, async lifecycleLock => {
     assertLifecycleTombstoneAbsent(teamName, member.name, lifecycleLock.read());
+    if (member.checkpointAssignment?.parent) assertUnusedContinuationRecipient(teamName, member.name);
     await withLock(p, async () => {
       const config = readConfigRaw(p);
-      if (config.members.some(existing => existing.name === member.name)) {
+      if (config.members.some(existing => existing.name === member.name || (member.checkpointAssignment?.parent && existing.name.toLowerCase() === member.name.toLowerCase()))) {
         throw new Error(`Teammate ${member.name} already exists in team ${teamName}.`);
       }
       config.members.push(member);

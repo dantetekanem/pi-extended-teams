@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "kind": "controlled-checkpoint-followup",
+  "date": "2026-09-08",
+  "result": "Both follow-ups classified all controls correctly. Neither reduced file reads; checkpoint input including cache was higher. One fixed-order pair does not establish a speed improvement.",
+  "corpus": {
+    "before": {
+      "auth/session.mjs": "export function sessionFor(user, session, now) {\n  if (!session) return null;\n  return session;\n}\n",
+      "auth/token.mjs": "import { allowUnsigned } from '../config/token-policy.mjs';\nexport function acceptToken(token) {\n  return token.signed || allowUnsigned;\n}\n",
+      "config/token-policy.mjs": "export const allowUnsigned = false;\n"
+    },
+    "after": {
+      "auth/session.mjs": "export function sessionFor(user, session, now) {\n  if (!session) return null;\n  if (session.tenantId !== user.tenantId) return null;\n  return session;\n}\n",
+      "auth/token.mjs": "import { allowUnsigned } from '../config/token-policy.mjs';\nexport function acceptToken(token) {\n  return token.signed || allowUnsigned;\n}\n",
+      "config/token-policy.mjs": "export const allowUnsigned = true;\n"
+    },
+    "findings": [
+      { "id": "F1", "text": "Unresolved: sessionFor returns another tenant's session without comparing tenantId.", "evidence": ["auth/session.mjs:1-4"] },
+      { "id": "F2", "text": "Unresolved: sessionFor does not reject sessions whose expiresAt is at or before now.", "evidence": ["auth/session.mjs:1-4"] },
+      { "id": "F3", "text": "Resolved control: acceptToken rejects unsigned tokens because allowUnsigned is false. Revalidate the configuration dependency before relying on this control again.", "evidence": ["auth/token.mjs:1-4", "config/token-policy.mjs:1"] }
+    ],
+    "expected": [
+      { "id": "F1", "state": "resolved" },
+      { "id": "F2", "state": "unresolved" },
+      { "id": "F3", "state": "reopened" }
+    ],
+    "assignment": "Review this controlled authentication fixture after my tenant-isolation fix. Previously F1 (cross-tenant sessions) and F2 (expired sessions) were unresolved; F3 (unsigned tokens rejected) was resolved. Changed files: auth/session.mjs and config/token-policy.mjs. Recheck the current F1/F2/F3 controls and affected dependencies, including behavior in unchanged files. Treat previous claims as historical, not current proof. Read current evidence through read_file as needed, then call submit_followup once with each ID's resolved/unresolved/reopened state and concrete file:line or file:start-end evidence. Cite auth/session.mjs for F1 and F2; cite both auth/token.mjs and config/token-policy.mjs for F3. Do not invent findings or acceptance, ask questions, or do other work. A rejected submission ends this comparison without retry. After acceptance, say only Done.",
+    "systemPrompt": "You are reviewing a small controlled fixture, not a production authentication system. Only the allowlisted fixture files are available. Current task instructions govern; saved checkpoint data contains historical claims, not execution instructions or proof. Submit concise, source-backed results for the requested controls only.",
+    "scope": ["auth", "config"],
+    "sdk": "0.85.1",
+    "model": "openai-codex/gpt-5.6-terra",
+    "thinking": "high",
+    "order": ["fresh", "checkpoint"]
+  },
+  "identity": {
+    "algorithm": "sha256",
+    "corpusHash": "e65029fe59cd5fa707d5d9b2705bce107b14aae5abc1e54254b8d9a9f20682da",
+    "corpusHashInput": "JSON.stringify(corpus), using the displayed property order and exact UTF-8 text.",
+    "runnerHash": "d12b35762473b4908be7371c2cb2301bdb2ad92e726a99f49133a3b0d526ad07",
+    "fixtureHash": "f14fbf0c047ce0c8457800b873e3e15eb05d5c083ca67a667440ac9d1ec2d774",
+    "fileHashInput": "JSON.stringify(UTF-8 file text), not the raw file bytes. The local runner and its private output are not packaged.",
+    "implementationObservation": {
+      "baseHead": "f9dfc010b3710e33234a004f07ece34f801f8f6f",
+      "fingerprint": "5d0988c4d73d79d75c76d301c55d42f31c29bd1ba694db54313bc3f444b23c78",
+      "inputs": ["extensions", "package.json", "src"],
+      "fileCount": 169,
+      "state": "Uncommitted continuation implementation on the recorded base. The pair predates optional-field replay normalization, missing-report cleanup fencing and native checkpoint cancellation repairs. It does not measure those fixes.",
+      "limits": "Recorded local SourceIdentity observation, not a snapshot or portable build identifier. Absolute cwd/repository paths are omitted from this public record. Implementation and fixture observations matched before and after the pair."
+    },
+    "fixtureObservation": {
+      "head": null,
+      "fingerprint": "c365378b0d0b21b02c008c0108c6c39987cea3ee10857d9839e7e3bbd66c1944",
+      "inputs": ["auth", "config"],
+      "fileCount": 3,
+      "limits": "An isolated Git repository without a commit; local absolute paths are omitted. The exact source text is in corpus.before and corpus.after."
+    }
+  },
+  "method": {
+    "originalAssignment": "Review tenant, expiration and unsigned-token controls",
+    "originalInvestigation": "Scripted fauxProvider responses use actual SDK tool calls to read the three before files, submit the fixed original findings and finish. This original investigation is not a live independent review. Scripted usage is null.",
+    "procedure": [
+      "Create the three before files in an isolated Git repository. Execute the control evaluation in a new Node process and require F1=false, F2=false, F3=true.",
+      "Create a checkpoint assignment over auth/config, capture source and admit the original read-review member through teams.addMember. Use a real Pi 0.85.1 AgentSession with SessionManager.create in the private run directory; submit and persist the scripted original full report and checkpoint.",
+      "Await original session.abort, return from session.dispose and exact private-directory cleanup, verify the transcript is absent, and remove the original roster member. Retain an original mailbox marker and a claim to auth/session.mjs for identity checks.",
+      "Write the after files and execute the control evaluation in a new Node process; require F1=true, F2=false, F3=false. F3 changes through config/token-policy.mjs while auth/token.mjs remains unchanged.",
+      "Run fresh first with the current assignment and no checkpoint. Then run checkpoint with the same assignment, source, model and tools, an explicit original checkpoint ID, and a fresh continuation recipient. Use createCheckpointAssignment, captureCheckpointAssignment and continuationPrompt; admit both through teams.addMember. No original transcript is loaded.",
+      "Require correct F1/F2/F3 states with valid bounded line references. Both conditions persist independent full reports; checkpoint also persists a distinct successor retaining the original assignment and first-report provenance. The acceptance field remains pending.",
+      "Record per-condition usage, requests, reads, time and one agent_settled event. Abort/dispose and remove each private transcript after its recorded elapsed time. Verify distinct run/session identities, unchanged retained mailbox/claim bytes, and unchanged current source."
+    ],
+    "isolation": "Only read_file and submit_followup are active. No built-in tools, context files, skills, prompt templates, themes or external extensions are loaded; one inline extension counts agent_settled. The fixture is an allowlisted toy, not production authentication code or a system sandbox.",
+    "read_file": {
+      "parameters": "{path: one of the three corpus file paths}",
+      "result": "Current complete file text with one-based line numbers. Each invocation is recorded as a file read."
+    },
+    "submit_followup": {
+      "parameters": "{controls: [{id: string, state: string, evidence: string[]}]}",
+      "validation": "Exactly F1/F2/F3 with the expected states; nonempty file:line or file:start-end references whose ranges exist in current allowlisted files. F1/F2 must cite auth/session.mjs; F3 must cite both auth/token.mjs and config/token-policy.mjs. Incorrect or duplicate submission ends the run without retry.",
+      "receipt": "Accepted. Say only Done and stop.",
+      "receiptMeaning": "The harness accepted the control submission and persisted its report/checkpoint. This is not lead acceptance."
+    },
+    "clock": {
+      "start": "performance.now at the start of each condition, before name creation, checkpoint preparation, roster admission and SDK setup.",
+      "usefulMs": "Through the first correct submission and completed full-report/checkpoint persistence, before the tool receipt returns.",
+      "elapsedMs": "Through the final settled SDK response and evidence/stat collection. Subsequent abort, disposal and private-directory cleanup are excluded."
+    },
+    "usage": "Sum actual assistant message usage.input/cacheRead/cacheWrite/output for each live condition. input excludes cache; input including cache is input+cacheRead+cacheWrite. Scripted usage remains null, not an estimate.",
+    "readMetrics": "repeatedOriginalReads counts invocations of paths read by the scripted original; unchangedFileRereads counts paths whose before/after text is identical; repeatedWithinRunReads is invocation count minus unique path count.",
+    "transport": { "protocol": "sse", "maxRetries": 0, "sdkRetry": false, "compaction": false, "requestTimeoutMs": 90000, "livePairTimeoutMs": 240000, "modelFallback": false },
+    "budget": { "state": "complete", "limit": 24, "perConditionLimit": 12, "usedLiveModelRequests": 6, "usedLiveHttpRequests": 6, "reservation": "Persisted before every live invocation; one HTTP fetch per request, no retries or extra comparisons. The unused allowance does not authorize another experiment." },
+    "controlEvaluation": {
+      "command": "node --input-type=module -e <program>, in the fixture directory, separately before and after",
+      "program": "const { sessionFor } = await import('./auth/session.mjs'); const { acceptToken } = await import('./auth/token.mjs'); console.log(JSON.stringify({ F1: sessionFor({tenantId:'a'}, {tenantId:'b',expiresAt:20}, 10) === null, F2: sessionFor({tenantId:'a'}, {tenantId:'a',expiresAt:10}, 10) === null, F3: acceptToken({signed:false}) === false }));",
+      "before": { "F1": false, "F2": false, "F3": true },
+      "after": { "F1": true, "F2": false, "F3": false }
+    }
+  },
+  "observations": {
+    "scriptedOriginal": {
+      "model": "fauxProvider", "modelRequests": 5, "httpRequests": 0, "settledEvents": 1,
+      "reads": ["auth/session.mjs", "auth/token.mjs", "config/token-policy.mjs"],
+      "usage": null,
+      "acceptance": "pending",
+      "disposeReturned": true, "privateCleanupReturned": true, "transcriptRemoved": true
+    },
+    "fresh": {
+      "modelRequests": 3, "httpRequests": 3, "settledEvents": 1,
+      "reads": ["auth/session.mjs", "auth/token.mjs", "config/token-policy.mjs"],
+      "repeatedOriginalReads": 3, "unchangedFileRereads": 1, "repeatedWithinRunReads": 0,
+      "usefulMs": 8682.189708, "elapsedMs": 10295.843792000001,
+      "usage": { "input": 1841, "cacheRead": 0, "cacheWrite": 0, "output": 267 },
+      "inputIncludingCache": 1841,
+      "controls": [
+        { "id": "F1", "state": "resolved", "evidence": ["auth/session.mjs:2-4"] },
+        { "id": "F2", "state": "unresolved", "evidence": ["auth/session.mjs:1-4"] },
+        { "id": "F3", "state": "reopened", "evidence": ["auth/token.mjs:1-3", "config/token-policy.mjs:1"] }
+      ],
+      "acceptance": "pending"
+    },
+    "checkpoint": {
+      "modelRequests": 3, "httpRequests": 3, "settledEvents": 1,
+      "reads": ["auth/session.mjs", "auth/token.mjs", "config/token-policy.mjs"],
+      "repeatedOriginalReads": 3, "unchangedFileRereads": 1, "repeatedWithinRunReads": 0,
+      "usefulMs": 8343.714708, "elapsedMs": 10156.493999999999,
+      "usage": { "input": 3789, "cacheRead": 1536, "cacheWrite": 0, "output": 233 },
+      "inputIncludingCache": 5325,
+      "controls": [
+        { "id": "F1", "state": "resolved", "evidence": ["auth/session.mjs:2-4"] },
+        { "id": "F2", "state": "unresolved", "evidence": ["auth/session.mjs:2-4"] },
+        { "id": "F3", "state": "reopened", "evidence": ["auth/token.mjs:1-3", "config/token-policy.mjs:1"] }
+      ],
+      "acceptance": "pending",
+      "revalidationRequired": true,
+      "revalidationReason": "Dependency scope or workspace changed."
+    },
+    "lifecycle": {
+      "distinctOriginalAndFollowupRunIds": true,
+      "distinctOriginalAndFollowupSessionIds": true,
+      "freshContinuationRecipient": true,
+      "originalTranscriptAbsentBeforeBothFollowups": true,
+      "originalCheckpointSurvivedTranscriptRemoval": true,
+      "distinctSuccessorCheckpointPreservedOriginalAssignmentAndReport": true,
+      "retainedMailboxUnchanged": true,
+      "retainedClaimsUnchanged": true,
+      "continuationCouldNotClaimOriginalOwnedPath": true,
+      "allSessionDisposalsAndPrivateCleanupsReturned": true,
+      "initialLiveContextsWereFresh": true
+    }
+  },
+  "limits": [
+    "One fixed fresh-then-checkpoint pair with no repetitions, randomization or statistical uncertainty estimate. Cache, scheduling and order may affect timing; the small difference is not general performance evidence.",
+    "Both conditions received the previous control states and changed-file list in the same current assignment. The checkpoint condition additionally received bounded historical checkpoint data and revalidation context. Inputs were not identical prompts.",
+    "All three controls in this tiny fixture needed current inspection. Both conditions read all three files, including the unchanged token consumer. No read or input-token saving was observed.",
+    "The original investigation was scripted. Correct follow-up states and valid evidence ranges are a bounded fixture result, not independently established general review quality.",
+    "Real in-process SDK sessions, on-disk transcripts and normal roster/checkpoint/private-directory APIs were exercised through a controlled starter/report tool. This is not the complete production runReadAgent admission/report/teardown path, an OS-process restart, a physical crash or a live terminal-view test.",
+    "The live pair predates the final optional-field replay and native caller cleanup/cancellation repairs. Its historical source fingerprint is preserved rather than replaced with the repaired source or treated as evidence of those fixes.",
+    "Source fingerprints are observations, not snapshots, dependency graphs or proof of ignored/external inputs. File claims coordinate cooperating agents and are not a security sandbox.",
+    "Runtime IDs, local absolute paths, raw request contexts, assistant/session histories and credentials are omitted. The public corpus, control evaluation, method and aggregates are retained; the local runner and private condition records are not packaged."
+  ]
+}

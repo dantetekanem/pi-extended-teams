@@ -118,6 +118,7 @@ async function setupExtension(
   vi.spyOn(os, "homedir").mockReturnValue(root);
   vi.spyOn(paths, "ensureDirs").mockImplementation(() => {});
   vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "reports"));
+  vi.spyOn(paths, "checkpointFilesDir").mockReturnValue(path.join(fs.realpathSync(root), "checkpoints"));
   vi.spyOn(paths, "reportEventsPath").mockImplementation(team => path.join(teamsRoot, paths.sanitizeName(team), "reports.json"));
 
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName))));
@@ -221,6 +222,12 @@ describe("extension integration", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it.each([false, true])("registers checkpoint controls only for the lead (teammate=%s)", async isTeammate => {
+    const setup = await setupExtension(isTeammate ? { PI_AGENT_NAME: "reader", PI_TEAM_NAME: "team" } : {});
+    try { expect(setup.commands.has("agents-checkpoints")).toBe(!isTeammate); }
+    finally { setup.restoreEnv(); }
   });
 
   it("registers the small public tool surface without legacy management commands", async () => {

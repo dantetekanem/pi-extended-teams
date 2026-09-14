@@ -7,6 +7,9 @@ import { CheckJournal } from "../../src/results/check-journal";
 import { createReportResult, effectiveTaskOutcome, type ReportResult } from "../../src/results/report-result";
 import { VerificationController } from "../../src/results/verification-controller";
 import { CompletionGroup } from "../../src/results/completion-group";
+import * as checkpointStore from "../../src/results/specialist-checkpoint";
+import * as checkpointSource from "../../src/results/source-identity";
+import * as checkpointDurability from "../../src/results/durable-json";
 import * as messaging from "../../src/utils/messaging";
 vi.mock("node:child_process", async (original) => ({
   ...await original<typeof import("node:child_process")>(), spawnSync: vi.fn(),
@@ -115,6 +118,7 @@ function installPathSpies() {
     return path.join(root, "teams", paths.sanitizeName(String(teamName)), "reports.json");
   });
   vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
+  vi.spyOn(paths, "checkpointFilesDir").mockReturnValue(path.join(fs.realpathSync(root), "checkpoints"));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => {
     return path.join(root, "teams", paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`);
   });
@@ -258,6 +262,169 @@ describe("in-process read agent tool wiring", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["completed-source", "completed-save", "failed-source", "stale-source"])("settles owned checkpoint publication without late delivery: %s", async mode => {
+    const observed: checkpointSource.SourceIdentity = { version: 1, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fileCount: 1, fingerprint: "a".repeat(64) };
+    const member: Member = { ...fixtureMember("reviewer"), lifecycleRunId: "checkpoint-run", prompt: "Review",
+      checkpointAssignment: { originalPrompt: "Review", policy: { inputs: ["src"], retentionDays: 30, decisions: [] }, sourceBefore: observed } };
+    writeTeamConfig("team", member); await claims.claimFiles("team", member.name, ["src/auth.ts"], 1);
+    let begin!: () => void; let resume!: () => void; let aborted!: () => void; let sourceSignal!: AbortSignal;
+    const began = new Promise<void>(resolve => { begin = resolve; }); const held = new Promise<void>(resolve => { resume = resolve; });
+    const abortCalled = new Promise<void>(resolve => { aborted = resolve; });
+    vi.spyOn(checkpointSource, "captureSourceIdentity").mockImplementation(async (_cwd, _inputs, signal) => {
+      sourceSignal = signal!; if (mode !== "completed-save") { begin(); await held; } return observed;
+    });
+    if (mode === "completed-save") {
+      const save = checkpointStore.saveCheckpoint;
+      vi.spyOn(checkpointStore, "saveCheckpoint").mockImplementationOnce(async value => { begin(); await held; return save(value); });
+    }
+    const session = makeSession(); let transcript = "";
+    session.abort.mockImplementation(async () => { aborted(); });
+    session.prompt.mockImplementation(async () => {
+      const created = piMocks.createAgentSession.mock.calls.at(-1)![0];
+      transcript = created.sessionManager.getSessionFile(); fs.writeFileSync(transcript, "Private recovery transcript");
+      if (mode === "failed-source") throw new Error("model failed");
+      await created.customTools.find((tool: any) => tool.name === "report_and_exit").execute("report", { content: "Complete report" });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session }); const options = makeRunOptions();
+    const lifecycle = createLifecycleRuntime({ ...options, terminal: null, drainWriteQueue: async () => {}, getSessionCwd: () => root });
+    const run = runReadAgentInProcess("team", member, "Review", { modelRegistry: { find: () => ({ provider: "provider", id: "model" }) } }, { ...options, shutdownTeammate: lifecycle.shutdownTeammate });
+    let stopping: ReturnType<typeof lifecycle.shutdownTeammate> | undefined;
+    try {
+      await began;
+      if (mode === "stale-source") {
+        await teams.updateMember("team", member.name, { lifecycleRunId: "replacement-run" });
+        const state = options.runningReadAgents.get("team:reviewer")!;
+        options.runningReadAgents.set("team:reviewer", { ...state, runId: "replacement-run" });
+      } else {
+        stopping = lifecycle.shutdownTeammate("team", member, { reason: "reload" }); await abortCalled;
+        expect(sourceSignal.aborted).toBe(true); expect(session.dispose).not.toHaveBeenCalled();
+        expect(options.releaseAllClaimsForAgent).not.toHaveBeenCalled();
+      }
+    } finally { resume(); await run; await stopping; }
+    expect(options.emitAgentReport).not.toHaveBeenCalled(); expect(options.releaseAllClaimsForAgent).not.toHaveBeenCalled();
+    expect(fs.readFileSync(transcript, "utf8")).toBe("Private recovery transcript");
+    expect(await claims.listClaims("team")).toEqual([{ agent: member.name, path: "src/auth.ts", since: 1 }]);
+    const [event] = await listTeamReportEvents("team"); expect(fs.existsSync(event.reportPath!)).toBe(true);
+    expect(fs.existsSync(paths.runtimeStatusPath("team", member.name))).toBe(true);
+    if (mode !== "stale-source") {
+      expect(await stopping).toMatchObject({ status: "cleanup_failed", finalized: false });
+      expect(await readLifecycleTombstone("team", member.name)).toMatchObject({ status: "occupied", tombstone: { phase: "cleanup_failed" } });
+    }
+    expect((await teams.readConfig("team")).members).toContainEqual(expect.objectContaining({ name: member.name, lifecycleRunId: mode === "stale-source" ? "replacement-run" : member.lifecycleRunId }));
+  });
+
+  it.each([
+    { label: "4097-character finding", invalid: { findings: [{ id: "F1", text: "x".repeat(4097), evidence: ["src/auth.ts:4"] }] },
+      corrected: { findings: [{ id: "F1", text: "x".repeat(4096), evidence: ["src/auth.ts:4"] }] }, error: /findings\/0\/text.*4096/ },
+    { label: "33 distinct questions", invalid: { questions: Array.from({ length: 33 }, (_, index) => `Question ${index}?`) },
+      corrected: { questions: Array.from({ length: 32 }, (_, index) => `Question ${index}?`) }, error: /questions.*32/ },
+    { label: "aggregate findings overflow", invalid: { findings: Array.from({ length: 16 }, (_, index) => ({ id: `F${index}`, text: "x".repeat(4096), evidence: [] })) },
+      corrected: { findings: [{ id: "F0", text: "Bounded finding", evidence: [] }] }, error: /65536.*bytes/i },
+    { label: "UTF-8 aggregate overflow", invalid: { findings: Array.from({ length: 6 }, (_, index) => ({ id: `F${index}`, text: "界".repeat(4096), evidence: [] })) },
+      corrected: { findings: [{ id: "F0", text: "Bounded finding", evidence: [] }] }, error: /65536.*bytes/i },
+    { label: "assignment plus findings overflow", prompt: "p".repeat(4096),
+      invalid: { findings: Array.from({ length: 15 }, (_, index) => ({ id: `F${index}`, text: "x".repeat(4096), evidence: [] })) },
+      corrected: { findings: [{ id: "F0", text: "Bounded finding", evidence: [] }] }, error: /65536.*bytes/i },
+  ])("rejects checkpoint $label before closure and accepts correction", async ({ invalid, corrected, error, prompt = "Review" }) => {
+    const observed: checkpointSource.SourceIdentity = { version: 1, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fileCount: 1, fingerprint: "a".repeat(64) };
+    vi.spyOn(checkpointSource, "captureSourceIdentity").mockResolvedValue(observed);
+    const member: Member = { ...fixtureMember("reviewer"), lifecycleRunId: "checkpoint-run", prompt,
+      checkpointAssignment: { originalPrompt: prompt, policy: { inputs: ["src"], retentionDays: 30, decisions: [] }, sourceBefore: observed } };
+    writeTeamConfig("team", member);
+    const options = makeRunOptions();
+    const session = makeSession();
+    let transcript = "";
+    let rejection: unknown;
+    let invalidReceipt: unknown;
+    let correctedReceipt: any;
+    let recipientOpen = false;
+    let acceptingMessages = false;
+    session.prompt.mockImplementation(async () => {
+      const created = piMocks.createAgentSession.mock.calls.at(-1)![0];
+      transcript = created.sessionManager.getSessionFile(); fs.writeFileSync(transcript, "private fixture transcript");
+      const tool = created.customTools.find((item: any) => item.name === "report_and_exit");
+      try { invalidReceipt = await tool.execute("invalid", { content: "Uncorrected report", ...invalid }); }
+      catch (error) { rejection = error; }
+      acceptingMessages = options.runningReadAgents.get("team:reviewer")!.acceptingMessages === true;
+      recipientOpen = await requireRunningMessageRecipient("team", member.name).then(() => true, () => false);
+      correctedReceipt = await tool.execute("corrected", { content: "Corrected complete report", ...corrected });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    await runReadAgentInProcess("team", member, "Review", { modelRegistry: { find: () => ({ provider: "provider", id: "model" }) } }, options);
+    expect(rejection).toBeInstanceOf(Error);
+    expect(String(rejection)).toMatch(/checkpoint.*correct.*resubmit/i);
+    expect(String(rejection)).toMatch(error);
+    expect(invalidReceipt).toBeUndefined();
+    expect(recipientOpen).toBe(true);
+    expect(acceptingMessages).toBe(true);
+    expect(correctedReceipt.details.accepted).toBe(true);
+    const events = await listTeamReportEvents("team");
+    expect(events).toHaveLength(1);
+    const [event] = events;
+    const checkpoint = checkpointStore.readCheckpoint(event.checkpoint!.id);
+    expect(checkpointStore.isSpecialistCheckpoint(checkpoint)).toBe(true);
+    expect(checkpoint.findings).toEqual((corrected.findings ?? []).map(finding => ({ ...finding, reportId: event.id })));
+    expect(checkpoint.questions).toEqual(corrected.questions ?? []);
+    expect(fs.readFileSync(event.reportPath!, "utf8")).toBe("Corrected complete report");
+    expect(options.releaseAllClaimsForAgent).toHaveBeenCalledWith("team", member.name);
+    expect(options.runningReadAgents.size).toBe(0);
+    expect(fs.existsSync(transcript)).toBe(false);
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect((await teams.readConfig("team")).members.some(item => item.name === member.name)).toBe(false);
+  });
+
+  it("preserves broader findings and questions for ordinary reports", async () => {
+    const member = { ...fixtureMember("reviewer"), lifecycleRunId: "ordinary-run" };
+    writeTeamConfig("team", member);
+    const details = { findings: [{ id: "F1", text: "x".repeat(4097), evidence: [] }], questions: Array.from({ length: 33 }, (_, index) => `Question ${index}?`) };
+    const session = makeSession();
+    let receipt: any;
+    session.prompt.mockImplementation(async () => {
+      const tool = piMocks.createAgentSession.mock.calls.at(-1)![0].customTools.find((item: any) => item.name === "report_and_exit");
+      receipt = await tool.execute("ordinary", { content: "Complete ordinary report", ...details });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    await runReadAgentInProcess("team", member, "Review", { modelRegistry: { find: () => ({ provider: "provider", id: "model" }) } }, options);
+    expect(receipt.details.accepted).toBe(true);
+    const [event] = await listTeamReportEvents("team");
+    expect(event.result).toMatchObject(details);
+    expect(options.runningReadAgents.size).toBe(0);
+    expect(session.dispose).toHaveBeenCalledOnce();
+  });
+
+  it.each(["read", "write", "storage-failure"])("publishes checkpoint evidence before %s cleanup", async mode => {
+    const observed: checkpointSource.SourceIdentity = { version: 1, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fileCount: 1, fingerprint: "a".repeat(64) };
+    vi.spyOn(checkpointSource, "captureSourceIdentity").mockResolvedValue(observed);
+    const member: Member = { ...fixtureMember("reviewer", mode === "write" ? "write" : "read"), lifecycleRunId: "checkpoint-run", prompt: "Review",
+      checkpointAssignment: { originalPrompt: "Review", policy: { inputs: ["src"], retentionDays: 30, decisions: [] }, sourceBefore: observed } };
+    writeTeamConfig("team", member);
+    const write = checkpointDurability.writeJsonDurably;
+    if (mode === "storage-failure") vi.spyOn(checkpointDurability, "writeJsonDurably").mockImplementation((file, value) => {
+      if (file.startsWith(paths.checkpointFilesDir())) throw new Error("checkpoint unavailable"); write(file, value);
+    });
+    const session = makeSession();
+    let transcript = "";
+    session.prompt.mockImplementation(async () => {
+      const created = piMocks.createAgentSession.mock.calls.at(-1)![0];
+      transcript = created.sessionManager.getSessionFile(); fs.writeFileSync(transcript, "private fixture transcript");
+      await created.customTools.find((tool: any) => tool.name === "report_and_exit").execute("report", { content: "Complete report", inspectedEvidence: ["src/auth.ts:4"] });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    await runReadAgentInProcess("team", member, "Review", { modelRegistry: { find: () => ({ provider: "provider", id: "model" }) } }, options);
+    const [event] = await listTeamReportEvents("team");
+    expect(event.checkpoint?.draft).toBeDefined();
+    expect(fs.readFileSync(event.reportPath!, "utf8")).toBe("Complete report");
+    expect(fs.existsSync(transcript)).toBe(mode === "storage-failure");
+    if (mode === "storage-failure") expect(options.releaseAllClaimsForAgent).not.toHaveBeenCalled();
+    else {
+      expect(checkpointStore.readCheckpoint(event.checkpoint!.id).inspectedEvidence).toEqual([{ reference: "src/auth.ts:4", reportId: event.id }]);
+      expect(options.emitAgentReport.mock.calls[0][4]).toContain(event.checkpoint!.id);
+      expect(options.runningReadAgents.size).toBe(0);
+    }
   });
 
   it.each(["complete", "suppressed", "runtime-failure", "delivery-failure"])("preserves native events and independent grouped reports: %s", async mode => {

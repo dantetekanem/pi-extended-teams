@@ -26,6 +26,7 @@ export interface ReadAgentDeliveryState {
 export interface ManagedReadAgentLifecycleState extends ReadAgentDeliveryState {
   session?: AgentSession;
   checkOperation?: { controller: AbortController; settled: Promise<void> };
+  checkpointOperation?: { controller: AbortController; settled: Promise<void> };
   activeOperationSettlementPromise?: Promise<void>;
   startupState?: ReadAgentStartupState;
   sessionCreation?: Promise<AgentSession | undefined>;
@@ -362,9 +363,11 @@ export function requestReadAgentTeardown(
 ): Promise<ReadAgentTeardownResult> {
   state.stopRequested = true;
   const checkOperation = state.checkOperation;
+  const checkpointOperation = state.checkpointOperation;
   checkOperation?.controller.abort();
+  checkpointOperation?.controller.abort();
   const operationSettlement = Promise.all([
-    checkOperation?.settled.catch(() => {}), state.activeOperationSettlementPromise?.catch(() => {}),
+    checkOperation?.settled.catch(() => {}), checkpointOperation?.settled.catch(() => {}), state.activeOperationSettlementPromise?.catch(() => {}),
   ]).then(() => {});
   if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
   state.heartbeatTimer = undefined;

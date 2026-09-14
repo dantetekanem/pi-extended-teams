@@ -87,6 +87,9 @@ export async function enqueueWriteSpawn(
   teamName: string,
   request: Omit<QueuedWriteSpawn, "id" | "requestedAt"> & Partial<Pick<QueuedWriteSpawn, "id" | "requestedAt">>
 ): Promise<QueuedWriteSpawn> {
+  if (["checkpoint", "checkpointAssignment", "continueFrom", "continue_from"].some(field => Reflect.get(request, field) !== undefined)) {
+    throw new Error("Checkpoint-enabled agents require in-process lead admission; the legacy terminal queue is unsupported.");
+  }
   const queuePath = ensureQueueDir(teamName);
   return await withLock(queuePath, async () => {
     const queue = readQueueRaw(queuePath);

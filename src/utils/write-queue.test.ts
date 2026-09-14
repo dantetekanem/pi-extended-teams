@@ -70,6 +70,12 @@ describe("write queue utilities", () => {
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
   });
 
+  it.each(["checkpoint", "checkpointAssignment", "continueFrom", "continue_from"])("rejects %s rather than silently dropping it from the legacy queue", async field => {
+    await expect(enqueueWriteSpawn("team", { ...highVolumeWriteSpawn(0), [field]: { inputs: ["src"] } }))
+      .rejects.toThrow(/checkpoint.*in-process/i);
+    expect(fs.existsSync(queuePath)).toBe(false);
+  });
+
   it("queues and dequeues write spawns in FIFO order", async () => {
     const first = await enqueueWriteSpawn("team", {
       id: "first",

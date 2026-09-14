@@ -5,6 +5,7 @@ import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
 import * as teams from "../../src/utils/teams";
 import { readStoredTeamReportEvent } from "../../src/utils/report-events";
+import { resyncReportCheckpoint } from "../../src/results/checkpoint-report";
 import { createReportResult } from "../../src/results/report-result";
 import { VerificationController } from "../../src/results/verification-controller";
 import { CompletionGroup } from "../../src/results/completion-group";
@@ -273,6 +274,8 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
           if (candidate.repairPolicy || result.repair || fs.existsSync(controller.journalPath)) {
             await controller.cancelAndRequireSettled();
           }
+          if ((candidate.checkpointAssignment || member.checkpointAssignment) && !report?.checkpoint) throw new Error("Checkpoint report provenance is unavailable.");
+          if (report?.checkpoint) await resyncReportCheckpoint(report);
           const groupBinding = candidate.completionGroup ?? member.completionGroup ?? report?.completionGroup;
           if (groupBinding) {
             const group = new CompletionGroup(teamName, groupBinding.groupId);

@@ -7,6 +7,7 @@ import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import * as reportEvents from "../../src/utils/report-events";
+import { checkpointReference, saveReportCheckpoint, resyncReportCheckpoint } from "../../src/results/checkpoint-report";
 import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails, ReportedTaskDetailsSchema, type ReportResult } from "../../src/results/report-result";
 import { canonicalPersistedModelSlot } from "../../src/utils/settings";
 import { normalizeCheckPolicy } from "../../src/results/check-policy";
@@ -61,7 +62,7 @@ function requireCurrentSession(options: CoordinationToolsOptions): string {
 
 export function registerCoordinationTools(pi: any, options: CoordinationToolsOptions): void {
   const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
-  const pendingWriterFinalization = new Map<string, { teamName: string; agentName: string; runId: string }>();
+  const pendingWriterFinalization = new Map<string, { teamName: string; agentName: string; runId: string; checkpointId?: string }>();
   const verifyingReports = new Set<string>();
   const blockedReports = new Set<string>();
   const pendingRepairs = new Map<string, { controller: VerificationController; result: ReportResult }>();
@@ -102,6 +103,11 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
             throw new Error(`Refusing to remove replacement runtime run ${currentRuntime.lifecycleRunId || "unknown"} of ${item.agentName}.`);
           }
 
+          if (item.checkpointId) {
+            const report = await reportEvents.readStoredTeamReportEvent(item.teamName, createReportResult(item.teamName, item.agentName, item.runId, {}).reportId);
+            if (report?.checkpoint?.id !== item.checkpointId) throw new Error("Checkpoint report provenance is unavailable.");
+            await resyncReportCheckpoint(report);
+          }
           const pidFile = path.join(paths.teamDir(item.teamName), `${item.agentName}.pid`);
           const pidFileExisted = fs.existsSync(pidFile);
           const pidFileUnlinked = unlinkPidFile(pidFile);
@@ -227,11 +233,6 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         reason: "quit",
         extensionInstanceId,
       });
-      pendingWriterFinalization.set(`${targetTeamName}:${options.agentName}`, {
-        teamName: targetTeamName,
-        agentName: options.agentName,
-        runId,
-      });
       const sessionUsage = summarizeSessionUsage(ctx);
       const tokensUsed = typeof sessionUsage.tokensUsed === "number" ? sessionUsage.tokensUsed : runtimeStatus?.tokensUsed;
       const costUsd = sessionUsage.costUsd;
@@ -254,6 +255,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       try {
         const persistedReport = await reportEvents.appendTeamReportEvent(targetTeamName, {
           agentName: options.agentName,
+          checkpoint: checkpointReference(targetTeamName, member),
           completionGroup: member.completionGroup,
           role: member?.role || "write",
           status: "completed",
@@ -273,15 +275,18 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         });
         reportPath = persistedReport.reportPath || "";
         if (!reportPath) throw new Error("The persisted report did not provide its standalone file path.");
-        const leadReport = checks?.length
+        await saveReportCheckpoint(targetTeamName, member, persistedReport, _signal);
+        if (persistedReport.checkpoint) result.checkpointId = persistedReport.checkpoint.id;
+        const leadReport = (checks?.length
           ? `${params.content}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}${result.repair ? `; repair: ${result.repair.state}; effective task: ${effectiveTaskOutcome(result) ?? "unspecified"}` : ""}. Evidence: ${result.reportId}.`
-          : params.content;
+          : params.content) + (result.checkpointId ? `\n\nCheckpoint reference: ${result.checkpointId}.` : "");
         const grouped = await deliverCompletionGroupReport(persistedReport);
         if (member.completionGroup && !grouped) throw new Error("Grouped report provenance is unavailable.");
         if (!grouped) {
           await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", leadReport, params.summary || "Final report", undefined, { metadata: reportMetadata });
         }
         releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);
+        pendingWriterFinalization.set(`${targetTeamName}:${options.agentName}`, { teamName: targetTeamName, agentName: options.agentName, runId, checkpointId: result.checkpointId });
       } catch (error) {
         pendingWriterFinalization.delete(`${targetTeamName}:${options.agentName}`);
         await withLifecycleTombstoneLock(targetTeamName, options.agentName, async lifecycleLock => {

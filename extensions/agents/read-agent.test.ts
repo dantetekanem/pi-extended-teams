@@ -758,6 +758,82 @@ describe("in-process read agent tool wiring", () => {
     }
   });
 
+  it("rejects Herdr transfer while an assigned fallback check is active", async () => {
+    vi.stubEnv("HERDR_ENV", "1");
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "input");
+    const member = { ...fixtureMember("checked"), cwd, lifecycleRunId: "run",
+      assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }] };
+    writeTeamConfig("team", member);
+    const session = Object.assign(makeSession(), {
+      model: { provider: "host", id: "current/model" }, thinkingLevel: "high",
+      agent: { state: { systemPrompt: "scoped read authority", tools: ["read", "read_inbox"].map(name => ({ name })) } },
+    });
+    session.prompt.mockImplementation(async () => { session.isStreaming = false; });
+    let sessionFile = "";
+    piMocks.createAgentSession.mockImplementation(async (options) => {
+      sessionFile = options.sessionManager.getSessionFile();
+      fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+      fs.writeFileSync(sessionFile, "existing conversation");
+      return { session };
+    });
+    let releaseCheck!: () => void;
+    const checkFinished = new Promise<void>(resolve => { releaseCheck = resolve; });
+    let checkStarted!: () => void;
+    const checkStartedPromise = new Promise<void>(resolve => { checkStarted = resolve; });
+    const exec = vi.fn(async (_command: string, _commandCwd: string, execution: { signal?: AbortSignal }) => {
+      checkStarted();
+      await checkFinished;
+      return { exitCode: 0 };
+    });
+    // Keep cleanup bounded if the regression is present: let the buggy transfer finish after release.
+    vi.mocked(spawnSync).mockImplementation((_command, argv) => {
+      const args = argv as string[];
+      if (args[1] === "split") return { pid: 0, output: [], signal: null, status: 0, stderr: "", stdout: JSON.stringify({ result: { pane: { pane_id: "active-check-pane" } } }) };
+      return { pid: 0, output: [], signal: null, status: 0, stderr: "", stdout: "" };
+    });
+    vi.spyOn(runtime, "readRuntimeStatus")
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({ lifecycleRunId: "run", pid: process.pid + 1 } as any);
+    const options = makeRunOptions();
+    const running = runReadAgentInProcess("team", member, "finish the assigned work", {
+      modelRegistry: { find: () => ({ id: "model" }) },
+    }, { ...options, loadCheckOperations: async () => ({ exec }) });
+    let moving: Promise<void> | undefined;
+    let retry: Promise<void> | undefined;
+    try {
+      await checkStartedPromise;
+      const state = options.runningReadAgents.get("team:checked")!;
+      expect(state.checkOperation).toBeDefined();
+      moving = state.moveToHerdr!();
+      await Promise.resolve();
+      expect(spawnSync).not.toHaveBeenCalled();
+      await expect(moving).rejects.toThrow(/assigned check is active/);
+      retry = state.moveToHerdr!();
+      expect(retry).not.toBe(moving);
+      await expect(retry).rejects.toThrow(/assigned check is active/);
+      expect(spawnSync).not.toHaveBeenCalled();
+      expect(session.dispose).not.toHaveBeenCalled();
+      expect(state.stopRequested).not.toBe(true);
+      expect(state.messageDeliveryClosed).not.toBe(true);
+      expect(options.runningReadAgents.has("team:checked")).toBe(true);
+    } finally {
+      releaseCheck();
+      await Promise.allSettled([running, moving, retry].filter((operation): operation is Promise<void> => Boolean(operation)));
+      vi.mocked(spawnSync).mockReset();
+    }
+    expect(sessionFile).not.toBe("");
+    expect(exec).toHaveBeenCalledOnce();
+    expect((await listTeamReportEvents("team"))[0]).toMatchObject({
+      status: "completed", report: "final report", result: { verification: { state: "passed" } },
+    });
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(options.releaseAllClaimsForAgent).toHaveBeenCalledOnce();
+    expect(options.runningReadAgents.size).toBe(0);
+  });
+
   it.each([{ delegationDepth: 1 }, { allowNestedReadAgents: true }])("keeps unsupported Herdr runs in-process: %j", async (scope) => {
     vi.stubEnv("HERDR_ENV", "1");
     const session = makeSession();

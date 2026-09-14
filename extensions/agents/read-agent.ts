@@ -1088,12 +1088,23 @@ export async function runReadAgentInProcess(
         }
         await teams.updateMember(readTeamName, member.name, { herdrPaneId: id, tmuxPaneId: "" });
       });
+      const rejectActiveCheck = (): void => {
+        if (state.checkOperation) {
+          throw new Error("Cannot move agent to Herdr while an assigned check is active. Try again after it settles.");
+        }
+      };
       state.moveToHerdr = () => moving ??= (async () => {
         if (!options.isCurrentReadAgentRun(key, state) || (!handoffRequested && !state.acceptingMessages)) {
           throw new Error("The agent is already finishing.");
         }
         if (handoffRequested && !released) throw new Error("The current operation is still stopping. Try h after it settles.");
-        if (paneId) { herdrCommand("pane", "close", paneId); await recordPane(undefined); paneId = undefined; }
+        if (paneId) {
+          rejectActiveCheck();
+          herdrCommand("pane", "close", paneId);
+          await recordPane(undefined);
+          paneId = undefined;
+        }
+        rejectActiveCheck();
         const sessionFile = childSessionManager.getSessionFile();
         if (!sessionFile || !fs.existsSync(sessionFile)) throw new Error("The agent has no saved session yet.");
         if (!handoffRequested) {

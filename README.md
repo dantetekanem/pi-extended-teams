@@ -135,6 +135,46 @@ Repair history lives under `~/.pi/teams/<team>/repairs/`. The report's `repair` 
 
 Exhausted, declined, cancelled, or otherwise blocked repair produces an effective blocker while preserving the agent's reported `outcome`. `effectiveTaskOutcome(result)` exposes that distinction to trusted consumers. Passing checks never invent a success claim or grant lead acceptance. Existing reports and spawns without a repair policy retain their behavior.
 
+## Optional grouped reports
+
+The lead can request compact reports for a batch:
+
+```text
+spawn_swarm_agents({
+  completion_group: { delivery: "all-settled" },
+  defaults: { model_slot: "read-review" },
+  agents: [
+    { name: "correctness", prompt: "Review correctness without editing." },
+    { name: "tests", prompt: "Review test coverage without editing." }
+  ]
+})
+```
+
+Omitting `completion_group` keeps immediate full-report delivery. `delivery: "immediate"` sends compact member indexes; `"all-settled"` waits for the batch, including queued members. Rejected admissions, cancellations and interruptions have explicit states. Blockers, runtime failures and failed/stale verification can request an early wake. An urgent last result does not require a redundant final wake.
+
+Reported members' indexes include task/run/slot identity, reported and effective outcomes, verification, acceptance, findings/questions, and a full-report ID/path. Unadmitted assignments retain their slot/state/reason without invented run IDs or results. Read the referenced Markdown when more evidence is needed; it survives private transcript deletion. Index verification is a stored snapshot, so recheck current source-bound evidence before accepting work. Group settlement never grants task success or lead acceptance. Nested reports still target their exact parent, and workflow/pi-prompt suppression excludes lead-facing evidence and wakes.
+
+Journals live under `~/.pi/teams/<team>/completion-groups/`. A sibling `<inbox>.json.durable` marker keeps an opted-in inbox's later writes synchronized even after its last grouped index is removed; never-grouped inboxes retain ordinary atomic writes. The harness binds membership before admission and actual run IDs before launch; agent metadata cannot authorize grouping. Reload preserves explicit terminal states, records lost unadmitted work as interrupted, and leaves uncertain running ownership unresolved. It does not restart work, revive recipients or release claims.
+
+A durable inbox index and a wake request have separate receipts. Pi's custom-message call does not return an admission acknowledgment. A reserved request remains `pending` until exact session history is `observed`; that observation is not provider success or a power-loss guarantee. Ambiguous requests are not automatically repeated after errors or reload. Use `read_inbox` for a saved index when a warning reports an unconfirmed wake. Grouped correlation requires Pi's custom-message/history APIs; ordinary delivery keeps its existing fallback.
+
+### Measured delivery replay
+
+One September 8, 2026 comparison used Pi 0.85.1 and configured `read-review` model `openai-codex/gpt-5.6-terra`, high thinking. Two fresh SDK sessions synthesized the same ten supplied source-backed reports, first immediate/full, then all-settled/compact. SSE transport, retries and compaction settings were identical; retries and compaction were disabled.
+
+| Observation | Immediate/full | All-settled/compact |
+| --- | ---: | ---: |
+| Wake requests | 10 | 1 |
+| Model requests / assistant responses | 11 | 3 |
+| Provider input tokens, excluding cache | 17,796 | 5,149 |
+| Cache-read tokens | 17,408 | 5,120 |
+| Cache-write tokens | 0 | 0 |
+| Output tokens | 293 | 237 |
+| Full-report retrievals | 0 | 1 |
+| Elapsed time | 26.239s | 10.748s |
+
+Both syntheses preserved all ten required finding/control pairs, pending acceptance and the exact detail retrieved from full report F9. Each session emitted one `agent_settled` event; wake requests are not equivalent to completed agent runs. These are actual provider usage figures from one controlled replay, not estimates, randomized statistics, new specialist investigations or a general review-speed guarantee. The [measurement record](docs/grouped-report-measurement.json) retains the assignment, complete corpus, tested source identity, method and observations without session histories or credentials.
+
 ## Intent tiers
 
 Every spawn names a `model_slot`. Configured favorites take priority; otherwise the tier uses the current lead-session model and thinking level:

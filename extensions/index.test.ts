@@ -63,6 +63,12 @@ async function setupExtension(
   };
 
   vi.doMock("../src/adapters/terminal-registry", () => ({ getTerminalAdapter: () => terminal }));
+  vi.doMock("./internal/session-files.js", async original => ({ ...await original<any>(),
+    cleanupOrphanedTeams: vi.fn(), cleanupAgentSessionFolders: vi.fn() }));
+  vi.doMock("./internal/session-context-reference.js", async original => ({ ...await original<any>(),
+    cleanupStaleSessionContextReferences: vi.fn(() => 0) }));
+  vi.doMock("./internal/agent-session-files.js", async original => ({ ...await original<any>(),
+    cleanupStalePrivateAgentSessions: vi.fn(() => 0) }));
 
   const readAgentMock = {
     runReadAgentInProcess: vi.fn(),
@@ -110,6 +116,9 @@ async function setupExtension(
   fs.mkdirSync(teamsRoot, { recursive: true });
   fs.mkdirSync(tasksRoot, { recursive: true });
   vi.spyOn(os, "homedir").mockReturnValue(root);
+  vi.spyOn(paths, "ensureDirs").mockImplementation(() => {});
+  vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "reports"));
+  vi.spyOn(paths, "reportEventsPath").mockImplementation(team => path.join(teamsRoot, paths.sanitizeName(team), "reports.json"));
 
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName))));
   vi.spyOn(paths, "taskDir").mockImplementation((teamName: unknown) => path.join(tasksRoot, paths.sanitizeName(String(teamName))));
@@ -177,6 +186,12 @@ async function setupExtension(
     sleepController,
     sleepAssertionReleases,
     teams,
+    async reload(ctx: any) {
+      for (const handler of eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "reload" }, ctx);
+      tools.clear(); commands.clear(); eventHandlers.clear(); extensionEventHandlers.clear();
+      extension(pi);
+      for (const handler of eventHandlers.get("session_start") ?? []) await handler({ reason: "reload" }, ctx);
+    },
     restoreEnv() {
       process.env = originalEnv;
       vi.restoreAllMocks();
@@ -602,6 +617,71 @@ describe("extension integration", () => {
         expect(Object.keys(payload as object).join(" ").toLowerCase()).not.toContain(denied);
       }
     } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it.each(["pending", "observed", "unrequested", "closing"])("recovers group wake history across extension reload: %s", async mode => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    const ctx = { ...makeCtx(setup.root), sessionManager: { getSessionId: () => "test-session", getEntries: () => entries } };
+    const entries: any[] = [];
+    try {
+      writeFavoriteLevels(setup.root);
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      await setup.tools.get("spawn_agent")!.execute("bootstrap", { name: "bootstrap", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, ctx);
+      const { CompletionGroup } = await import("../src/results/completion-group.js");
+      const { appendTeamReportEvent } = await import("../src/utils/report-events.js");
+      const { createReportResult } = await import("../src/results/report-result.js");
+      const { deliverCompletionGroupReport } = await import("../src/results/completion-group-delivery.js");
+      const messaging = await import("../src/utils/messaging.js");
+      const team = "session-test-session";
+      const group = await CompletionGroup.create({ teamName: team, sessionId: "test-session", submissionId: "group",
+        policy: { delivery: "all-settled" }, members: [{ name: "reader" }] });
+      if (!group) throw new Error("Expected group");
+      await group.seal();
+      await group.apply({ type: "running", ...group.binding(0), runId: "group-run" });
+      await deliverCompletionGroupReport(await appendTeamReportEvent(team, { agentName: "reader", status: "completed", source: "read-agent",
+        completionGroup: group.binding(0), report: "Independent report", result: createReportResult(team, "reader", "group-run", { outcome: "succeeded" }) }));
+      if (mode === "closing") {
+        await messaging.sendPlainMessage(team, "writer", "team-lead", "Ordinary message", "Ordinary");
+        let release!: () => void;
+        let arrived!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        const entered = new Promise<void>(resolve => { arrived = resolve; });
+        const reserve = CompletionGroup.prototype.reserveWake;
+        vi.spyOn(CompletionGroup.prototype, "reserveWake").mockImplementationOnce(async function(this: InstanceType<typeof CompletionGroup>, id) {
+          const result = await reserve.call(this, id);
+          arrived(); await held; return result;
+        });
+        const polling = vi.advanceTimersByTimeAsync(30_000);
+        await entered;
+        await setup.reload(ctx);
+        release(); await polling;
+        expect(setup.pi.sendMessage).not.toHaveBeenCalled();
+        expect(group.read().deliveries[0].wake?.state).toBe("pending");
+        return;
+      }
+      const observe = async () => {
+        entries.push({ type: "custom_message", id: "wake-entry", ...setup.pi.sendMessage.mock.calls[0][0] });
+        for (const handler of setup.eventHandlers.get("context") ?? []) await handler({ messages: [] }, ctx);
+      };
+      if (mode !== "unrequested") {
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(setup.pi.sendMessage).toHaveBeenCalledOnce();
+        expect(group.read().deliveries[0].wake?.state).toBe("pending");
+        if (mode === "observed") await observe();
+      }
+      await setup.reload(ctx);
+      expect(setup.pi.sendMessage).toHaveBeenCalledOnce();
+      expect(setup.pi.sendMessage.mock.calls[0][0].details.completionGroup.groupId).toBe(group.groupId);
+      if (mode === "pending") expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("unconfirmed"), "warning");
+      if (mode !== "observed") await observe();
+      expect(group.read().deliveries[0].wake).toMatchObject({ state: "observed", entryId: "wake-entry" });
+      expect(await messaging.peekInbox(team, "team-lead", true)).toEqual([]);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(setup.pi.sendMessage).toHaveBeenCalledOnce();
+    } finally {
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "reload" }, ctx);
       setup.restoreEnv();
     }
   });

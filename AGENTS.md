@@ -61,6 +61,8 @@ Edit agents claim paths before changes and release their own claims when finishe
 
 Only the lead or a trusted integration can assign `checks` and an optional `repair: { maxAttempts: 1 }` policy. Repair allows at most five additional attempts and is disabled by default. If `report_and_exit` returns an unaccepted `repairRequest`, remain active and resubmit after addressing the observed failure within the same scope and permissions. Keep or reacquire claims before repair edits; report blocked or failed when repair is unsafe. Verification, effective repair blockers, reported outcomes, and lead acceptance remain separate. Unresolved execution or persistence keeps cleanup fenced.
 
+Lead batches may opt into `completion_group: { delivery: "all-settled" }` to receive compact indexes after settlement, or `"immediate"` for compact member delivery. Omission keeps immediate full reports. Blockers/failures may wake early; nested-parent routing and suppression still apply. Read referenced full reports as needed, and keep stored verification, reported outcomes and lead acceptance separate. An unconfirmed wake is not automatically retried across reload; use the saved inbox index instead of polling or respawning work. Recovery does not revive recipients, release claims or invent successful outcomes.
+
 ## Status, queues, and recovery
 
 `get_agent_status` is read-only. It distinguishes current-run activity from lifecycle health and retains persisted quarantine even when the process is gone. Old-run heartbeats do not establish replacement-run health. Observation does not clean up agents.

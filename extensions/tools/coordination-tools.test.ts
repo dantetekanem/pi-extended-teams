@@ -14,6 +14,8 @@ import * as reportEvents from "../../src/utils/report-events.js";
 import type { Member, TeamConfig } from "../../src/utils/models.js";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 import { VerificationController } from "../../src/results/verification-controller.js";
+import { CompletionGroup } from "../../src/results/completion-group.js";
+import { createReportResult } from "../../src/results/report-result.js";
 
 let root: string;
 let teamsRoot: string;
@@ -75,6 +77,41 @@ describe("coordination tools", () => {
     vi.restoreAllMocks();
     syncBuiltinESMExports();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["pending", "blocked", "suppressed", "delivery-failure", "missing-provenance"])("persists legacy group reports before compact delivery: %s", async mode => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", "group-run");
+    const group = await CompletionGroup.create({ teamName: "team", sessionId: "session", submissionId: mode,
+      policy: { delivery: "all-settled" }, members: [{ name: "writer", suppressed: mode === "suppressed" }, { name: "peer" }] });
+    if (!group) throw new Error("Expected a group");
+    await group.seal();
+    await group.apply({ type: "running", ...group.binding(0), runId: "group-run" });
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [
+      member("team-lead"), member("writer", { lifecycleRunId: "group-run", completionGroup: group.binding(0) }),
+    ] });
+    const tools = new Map<string, any>();
+    const release = vi.fn(async () => [] as string[]);
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      agentName: "writer", isTeammate: true, terminal: null, getTeamName: () => "team", requireWriteAgentTeam: async () => "team",
+      requireTeamContext: () => "team", releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+    });
+    if (mode === "delivery-failure") vi.spyOn(messaging, "sendPlainMessageOnce").mockRejectedValue(new Error("index unavailable"));
+    const ctx = { cwd: root, shutdown: vi.fn(), sessionManager: { getBranch: () => [] } };
+    if (mode === "missing-provenance") await reportEvents.appendTeamReportEvent("team", { agentName: "writer", source: "write-agent",
+      status: "completed", report: "Full legacy report", result: createReportResult("team", "writer", "group-run", { outcome: "blocked" }) });
+    const execution = tools.get("report_and_exit").execute("report", { content: "Full legacy report", outcome: mode === "pending" ? "succeeded" : "blocked" }, new AbortController().signal, undefined, ctx);
+    if (mode === "delivery-failure" || mode === "missing-provenance") await expect(execution).rejects.toThrow(mode === "delivery-failure" ? "index unavailable" : "provenance");
+    else expect((await execution).details.accepted).toBe(true);
+    const [stored] = await reportEvents.listTeamReportEvents("team");
+    expect(stored.completionGroup).toEqual(mode === "missing-provenance" ? undefined : group.binding(0));
+    expect(fs.readFileSync(stored.reportPath!, "utf8")).toBe("Full legacy report");
+    const inbox = await messaging.readInbox("team", "team-lead", false, false);
+    expect(inbox).toHaveLength(mode === "blocked" ? 1 : 0);
+    if (inbox.length) expect(JSON.parse(inbox[0].text).members[0].report.id).toBe(stored.id);
+    expect(release).toHaveBeenCalledTimes(mode === "delivery-failure" || mode === "missing-provenance" ? 0 : 1);
+    await vi.advanceTimersByTimeAsync(250);
   });
 
   it.each([0, 1])("observes assigned legacy-writer checks before closure (exit=%s)", async exitCode => {

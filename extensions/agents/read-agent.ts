@@ -8,7 +8,8 @@ import * as runtime from "../../src/utils/runtime";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
-import type { Member } from "../../src/utils/models";
+import type { Member, TeamReportEvent } from "../../src/utils/models";
+import { deliverCompletionGroupReport } from "../../src/results/completion-group-delivery";
 import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails, type ReportResult, type ReportedTaskDetails } from "../../src/results/report-result";
 import { assignedCheckIds, normalizeCheckPolicy, type CheckDefinition } from "../../src/results/check-policy";
 import { normalizeRepairPolicy, type RepairPolicy } from "../../src/results/repair-policy";
@@ -439,12 +440,13 @@ async function recordReadAgentReportEvent(
   costUsd?: number,
   color?: string,
   reportMetadata: Record<string, any> = {}
-): Promise<{ persisted: true } | { persisted: false; error: unknown }> {
+): Promise<{ persisted: true; event: TeamReportEvent } | { persisted: false; error: unknown }> {
   const operation = operationMetadataFromMember(member);
   const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
   try {
-    await reportEvents.appendTeamReportEvent(teamName, {
+    const event = await reportEvents.appendTeamReportEvent(teamName, {
       agentName: member.name,
+      completionGroup: member.completionGroup,
       role: member.role || "read",
       status,
       result,
@@ -469,7 +471,7 @@ async function recordReadAgentReportEvent(
         ...reportMetadata,
       },
     });
-    return { persisted: true };
+    return { persisted: true, event };
   } catch (error) {
     return { persisted: false, error };
   }
@@ -776,6 +778,22 @@ export async function runReadAgentInProcess(
     }
   };
 
+  const deliverGroupedReport = async (event: TeamReportEvent, leadReport: string): Promise<void> => {
+    const planning = isPiPromptPlanningMember(member);
+    const suppressed = shouldSuppressLeadReportInjection(member);
+    const emitsEvent = planning || (!suppressed && !options.isTeammate
+      && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-")));
+    const grouped = await deliverCompletionGroupReport(event, () => {
+      if (emitsEvent) options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed,
+        planning ? event.report : leadReport, event.status === "completed", true);
+    });
+    if (!grouped) throw new Error("Grouped report provenance is unavailable.");
+    if (!suppressed && !readTeamName.startsWith("prompt-build-")) {
+      await options.renderLeadInboxStatus?.().catch(() => {});
+      await options.notifyLeadOfInboxReports?.(readTeamName).catch(() => {});
+    }
+  };
+
   const deliverCompletion = async (
     resolution: ResolvedReadAgentReport,
     completionSummary: string,
@@ -866,7 +884,9 @@ export async function runReadAgentInProcess(
       state.cleanupPrivateSessionOnFinalize = true;
     }
     const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
-    if (member.requestedBy) {
+    if (member.completionGroup && !member.requestedBy) {
+      await deliverGroupedReport(reportEventPersistence.event, leadReport);
+    } else if (member.requestedBy) {
       await ensureReadHelperCompletionMessages(
         readTeamName,
         member,
@@ -1528,7 +1548,9 @@ export async function runReadAgentInProcess(
         ...failureReportMetadata,
       };
       const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
-      if (member.requestedBy) {
+      if (member.completionGroup && !member.requestedBy && failureEventPersistence.persisted) {
+        await deliverGroupedReport(failureEventPersistence.event, failureReport);
+      } else if (member.requestedBy) {
         await ensureReadHelperCompletionMessages(
           readTeamName,
           member,

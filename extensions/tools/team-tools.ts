@@ -14,6 +14,10 @@ import { ACCEPTED_FAVORITE_MODEL_SLOTS, FAVORITE_MODEL_SLOTS, canonicalPersisted
 import type { Member } from "../../src/utils/models";
 import { CheckPolicySchema, normalizeCheckPolicy } from "../../src/results/check-policy";
 import { RepairPolicySchema, normalizeRepairPolicy } from "../../src/results/repair-policy";
+import { CompletionGroup, CompletionGroupPolicySchema, completionGroupIdentity, normalizeCompletionGroupPolicy, type CompletionGroupBinding } from "../../src/results/completion-group";
+import { listStoredTeamReportEvents } from "../../src/utils/report-events";
+import { enqueueCompletionGroupDeliveries } from "../../src/results/completion-group-delivery";
+import { shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 
 import type { RunningReadAgent } from "../runtime/types";
 import type { ReadAgentTeardownResult } from "../agents/read-agent-session-lifecycle";
@@ -58,6 +62,7 @@ export interface TeamToolsOptions {
   startWriteAgent(teamName: string, member: Member, prompt: string): Promise<string>;
   shutdownTeammate(teamName: string, member: Member, options?: ShutdownTeammateOptions): Promise<ReadAgentTeardownResult>;
   adoptTeamAsLead(teamName: string, ctx?: any): void;
+  onCompletionGroupUse?(groupId: string): void;
   buildRoster(teamName: string): Promise<any>;
   isTeammate: boolean;
   agentName: string;
@@ -82,11 +87,12 @@ export interface NestedChildSnapshot {
 export interface TeamToolsRuntime {
   createNestedReadAgentTools(binding: NestedReadAgentToolBinding): any[];
   nestedChildSnapshot(binding: NestedReadAgentToolBinding): NestedChildSnapshot;
-  cancelQueuedAgent(teamName: string, agentName: string): boolean;
+  cancelQueuedAgent(teamName: string, agentName: string): boolean | Promise<boolean>;
 }
 
 interface SpawnTeammateOptions {
   once?: boolean;
+  completionGroup?: CompletionGroupBinding;
   nestedParent?: {
     teamName: string;
     name: string;
@@ -110,6 +116,7 @@ interface QueuedReadSpawn {
   admissionError?: string;
   quarantineError?: string;
   launchCommitted?: boolean;
+  groupSettlement?: Promise<void>;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamToolsRuntime {
@@ -371,15 +378,22 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   });
   let lifecycleProbeCleanedUp = false;
   let pendingChildCancelUnsubscribe = (): void => {};
-  pi.on?.("session_shutdown", () => {
+  pi.on?.("session_shutdown", async () => {
     if (lifecycleProbeCleanedUp) return;
     lifecycleProbeCleanedUp = true;
+    const settlements: Promise<void>[] = [];
     for (const [teamName, queue] of queuedReadSpawnsByTeam) {
-      for (const queued of queue) removeQueuedReadSpawnById(teamName, queued.id);
+      for (const queued of queue) {
+        const removed = removeQueuedReadSpawnById(teamName, queued.id);
+        if (removed?.groupSettlement) settlements.push(removed.groupSettlement);
+      }
     }
-    if (typeof lifecycleProbeUnsubscribe === "function") lifecycleProbeUnsubscribe();
-    pendingChildCancelUnsubscribe();
-    lifecycleFenceUnsubscribe();
+    try { await Promise.all(settlements); }
+    finally {
+      if (typeof lifecycleProbeUnsubscribe === "function") lifecycleProbeUnsubscribe();
+      pendingChildCancelUnsubscribe();
+      lifecycleFenceUnsubscribe();
+    }
   });
 
   function setReadQueue(teamName: string, queue: QueuedReadSpawn[]): void {
@@ -400,6 +414,17 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     };
   }
 
+  function settleQueuedGroup(queued: QueuedReadSpawn): Promise<void> | undefined {
+    const binding = queued.member.completionGroup;
+    if (!binding) return;
+    return Promise.resolve().then(async () => {
+      const group = new CompletionGroup(queued.teamName, binding.groupId);
+      await group.apply({ type: queued.admissionError ? "rejected" : "cancelled", ...binding,
+        queueId: queued.id, reason: queued.admissionError || "Queued assignment cancelled." });
+      await enqueueCompletionGroupDeliveries(group);
+    });
+  }
+
   function removeQueuedReadSpawnById(
     teamName: string,
     id: string,
@@ -413,6 +438,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     if (settlePendingAcceptance && removed.pendingChildAcceptance) {
       pendingChildController.settleAcceptance(removed.pendingChildAcceptance);
     }
+    if (settlePendingAcceptance) removed.groupSettlement = settleQueuedGroup(removed);
     return removed;
   }
 
@@ -424,6 +450,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     for (const queued of removed) {
       releaseNestedReadName(teamName, queued.member.name, queued.nameReservationId);
       if (queued.pendingChildAcceptance) pendingChildController.settleAcceptance(queued.pendingChildAcceptance);
+      queued.groupSettlement = settleQueuedGroup(queued);
     }
     return removed;
   }
@@ -588,6 +615,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       }
 
       try {
+        if (member.completionGroup) {
+          if (!member.lifecycleRunId) throw new Error("Grouped admission requires an actual lifecycle run.");
+          await new CompletionGroup(teamName, member.completionGroup.groupId).apply({
+            type: "running", ...member.completionGroup, runId: member.lifecycleRunId,
+          });
+        }
         if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
         assertPending?.();
       } catch (error) {
@@ -738,11 +771,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     ctx: any,
     nameReservationId?: string
   ): Promise<QueuedReadSpawn> {
-    const append = (pendingChildAcceptance?: PendingChildAcceptance): QueuedReadSpawn => {
-      const queue = readQueue(teamName);
-      if (queue.some((queued) => queued.member.name === member.name)) {
-        throw new Error(`Nested read agent ${member.name} is already active or queued; nested delegation cannot replace an existing run.`);
-      }
+    const append = async (pendingChildAcceptance?: PendingChildAcceptance): Promise<QueuedReadSpawn> => {
       const queued: QueuedReadSpawn = {
         id: crypto.randomUUID(),
         teamName,
@@ -755,7 +784,18 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         nameReservationId,
         pendingChildAcceptance,
       };
-      setReadQueue(teamName, [...queue, queued]);
+      if (member.completionGroup) {
+        const group = new CompletionGroup(teamName, member.completionGroup.groupId);
+        await group.apply({ type: "queued", ...member.completionGroup, queueId: queued.id });
+        if (lifecycleProbeCleanedUp) {
+          await group.apply({ type: "cancelled", ...member.completionGroup, reason: "Agent session is closing." });
+          throw new Error("Agent session is closing; admission cancelled.");
+        }
+      }
+      if (readQueue(teamName).some(item => item.member.name === member.name)) {
+        throw new Error(`Nested read agent ${member.name} is already active or queued; nested delegation cannot replace an existing run.`);
+      }
+      setReadQueue(teamName, [...readQueue(teamName), queued]);
       void drainQueuedReadSpawns(teamName);
       return queued;
     };
@@ -771,7 +811,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       if (!parent) throw new Error(`Nested read agent ${member.name} is missing exact parent identity.`);
       const pendingChildAcceptance = pendingChildController.acceptChild(parent, member.name);
       try {
-        return append(pendingChildAcceptance);
+        return await append(pendingChildAcceptance);
       } catch (error) {
         pendingChildController.settleAcceptance(pendingChildAcceptance);
         throw error;
@@ -826,10 +866,17 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
             }
             queued.admissionError = error instanceof Error ? error.message : String(error);
             failedAdmissionsByTeam.set(teamName, [...(failedAdmissionsByTeam.get(teamName) ?? []), queued].slice(-20));
-            removeQueuedReadSpawnById(teamName, queued.id);
-            await messaging.sendPlainMessage(teamName, "system", queued.member.parentAgentName || "team-lead",
-              `Queued agent ${queued.member.name} failed admission: ${queued.admissionError}`,
-              `Queued agent ${queued.member.name} failed`, "red").catch(() => {});
+            const removed = removeQueuedReadSpawnById(teamName, queued.id);
+            let groupSettlementFailed = false;
+            await removed?.groupSettlement?.catch(error => {
+              groupSettlementFailed = true;
+              queued.admissionError += ` Group settlement failed: ${error instanceof Error ? error.message : String(error)}`;
+            });
+            if (!queued.member.completionGroup || groupSettlementFailed) {
+              await messaging.sendPlainMessage(teamName, "system", queued.member.parentAgentName || "team-lead",
+                `Queued agent ${queued.member.name} failed admission: ${queued.admissionError}`,
+                `Queued agent ${queued.member.name} failed`, "red").catch(() => {});
+            }
           }
         }
       }
@@ -1042,6 +1089,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       planModeRequired: params.plan_mode_required,
       assignedChecks,
       repairPolicy,
+      completionGroup: spawnOptions.completionGroup,
       metadata: operationMetadataFromParams(params),
       delegationDepth: spawnOptions.nestedParent ? 1 : 0,
       allowNestedReadAgents: !spawnOptions.nestedParent && spawnOptions.allowNestedReadAgents === true,
@@ -1053,7 +1101,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     };
 
     if (role === "write") await writeQueue.removeQueuedWriteSpawnsByName(safeTeamName, safeName);
-    if (!spawnOptions.nestedParent) removeQueuedReadSpawnsByName(safeTeamName, safeName);
+    if (!spawnOptions.nestedParent) {
+      const removed = removeQueuedReadSpawnsByName(safeTeamName, safeName);
+      if (removed.some(item => item.groupSettlement)) await Promise.all(removed.map(item => item.groupSettlement));
+    }
     if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
     const capacity = role === "write" ? settings.writeAgents : settings.readAgents;
     const activeCount = activeAgentCount(safeTeamName, role, true);
@@ -1356,6 +1407,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         session_context: Type.Optional(StringEnum(["none", "lazy"] as const, { description: "Shared lazy session-reference policy.", default: "none" })),
         allow_nested_read_agents: Type.Optional(Type.Boolean({ description: "Shared opt-in for eligible depth-0 write-feature/write-critical agents.", default: false })),
       })),
+      completion_group: Type.Optional(CompletionGroupPolicySchema),
       agents: Type.Array(Type.Object(publicSwarmAgentParams), { description: "Agents to spawn as one batch. Each one must have model_slot directly or inherit it from defaults." }),
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
@@ -1363,35 +1415,70 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       if (!ctx) throw new Error("No active Pi session context is available for spawn_swarm_agents.");
       if (!Array.isArray(params.agents) || params.agents.length === 0) throw new Error("spawn_swarm_agents requires at least one agent.");
 
+      const groupPolicy = normalizeCompletionGroupPolicy(params.completion_group);
+      const sessionId = getPiSessionId(ctx);
+      if (groupPolicy && (!sessionId || !_toolCallId?.trim())) throw new Error("Completion groups require a bound session and runtime submission identity.");
       const mergedAgents = params.agents.map((agent: any) => mergeSwarmAgentParams(params.defaults || {}, agent));
       const defaultModel = configuredFavoriteModelForSpawn(mergedAgents[0], ctx, "spawn_swarm_agents");
       for (let index = 0; index < mergedAgents.length; index += 1) {
         configuredFavoriteModelForSpawn(mergedAgents[index], ctx, `spawn_swarm_agents agent ${mergedAgents[index].name || index + 1}`);
       }
       const sessionName = await ensureCurrentSessionAgentGroup(ctx, defaultModel);
+      let group: CompletionGroup | undefined;
+      if (groupPolicy && sessionId) {
+        const identity = { teamName: sessionName, sessionId, submissionId: `tool:${_toolCallId}` };
+        const groupId = completionGroupIdentity(identity);
+        options.onCompletionGroupUse?.(groupId);
+        const config = await teams.readConfig(sessionName);
+        const reports = await listStoredTeamReportEvents(sessionName);
+        const inbox = await messaging.readInbox(sessionName, "team-lead", false, false);
+        const entries = ctx.sessionManager?.getBranch?.() ?? [];
+        const references = [...config.members.map(member => member.completionGroup),
+          ...readQueue(sessionName).map(queued => queued.member.completionGroup),
+          ...reports.map(report => report.completionGroup), ...inbox.map(message => message.metadata?.completionGroup),
+          ...entries.map((entry: any) => entry.message?.details?.completionGroup)];
+        if (references.some(binding => binding?.groupId === groupId)) new CompletionGroup(sessionName, groupId).read();
+        group = await CompletionGroup.create({ ...identity, policy: groupPolicy, members: mergedAgents.map((agent: any, index: number) => ({
+          name: paths.sanitizeName(agent.name || `agent-${crypto.createHash("sha256").update(`${_toolCallId}:${index}`).digest("hex").slice(0, 12)}`),
+          assignmentKey: crypto.createHash("sha256").update(JSON.stringify([agent, ctx.cwd])).digest("hex"),
+          suppressed: sessionName.startsWith("prompt-build-") || shouldSuppressLeadReportInjection(agent),
+        })) });
+        if (group && !group.created) return {
+          content: [{ type: "text", text: `Completion group ${group.groupId} already exists; no assignments replayed. State: ${group.journalPath}\n${AGENT_WAIT_CONTRACT}` }],
+          details: { session: sessionName, completionGroup: { groupId: group.groupId, journalPath: group.journalPath },
+            idempotent: true, spawned: [], failed: [], members: group.read().members },
+        };
+      }
       const spawned: any[] = [];
       const failed: Array<{ name: string; error: string }> = [];
 
       for (let index = 0; index < mergedAgents.length; index += 1) {
         const merged = mergedAgents[index];
-        const name = merged.name || generatedAgentName(index);
+        const name = group?.read().members[index].name || merged.name || generatedAgentName(index);
         try {
           const result = await spawnTeammate({
             ...merged,
             name,
             team_name: sessionName,
-          }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true });
+          }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index) });
           spawned.push({ ...result.details, name });
         } catch (error) {
-          failed.push({ name, error: error instanceof Error ? error.message : String(error) });
+          const message = error instanceof Error ? error.message : String(error);
+          failed.push({ name, error: message });
+          if (group) await group.apply({ type: "rejected", ...group.binding(index), runId: group.read().members[index].runId, reason: message });
         }
+      }
+      if (group) {
+        await group.seal();
+        await enqueueCompletionGroupDeliveries(group);
       }
 
       const lines = [`Spawned ${spawned.length}/${params.agents.length} agents in the current Pi session.`];
       for (const item of spawned) lines.push(`- ${item.name}: ${item.queued ? `queued at position ${item.queuePosition}` : `${item.role}, ${item.mode || "in-process"}`}`);
       for (const item of failed) lines.push(`- ${item.name}: failed — ${item.error}`);
       lines.push(AGENT_WAIT_CONTRACT);
-      return { content: [{ type: "text", text: lines.join("\n") }], details: { session: sessionName, spawned, failed } };
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { session: sessionName, spawned, failed,
+        ...(group ? { completionGroup: { groupId: group.groupId, journalPath: group.journalPath } } : {}) } };
     },
   });
 
@@ -1401,7 +1488,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     cancelQueuedAgent: (teamName, agentName) => {
       // Retain the entry for admission bookkeeping, but let active teardown own cancellation after launch commits.
       if (readQueue(teamName).some(queued => queued.member.name === agentName && queued.launchCommitted)) return false;
-      return removeQueuedReadSpawnsByName(teamName, agentName).length > 0;
+      const removed = removeQueuedReadSpawnsByName(teamName, agentName);
+      return removed.some(item => item.groupSettlement)
+        ? Promise.all(removed.map(item => item.groupSettlement)).then(() => removed.length > 0)
+        : removed.length > 0;
     },
   };
 }

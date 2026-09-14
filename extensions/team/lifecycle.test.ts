@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { VerificationController } from "../../src/results/verification-controller";
+import { CompletionGroup } from "../../src/results/completion-group";
 import { createReportResult } from "../../src/results/report-result";
 import * as sourceIdentity from "../../src/results/source-identity";
 import { createLifecycleRuntime } from "./lifecycle.js";
@@ -28,6 +29,7 @@ function installPathSpies() {
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName))));
   vi.spyOn(paths, "configPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "config.json"));
   vi.spyOn(paths, "claimsPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "claims.json"));
+  vi.spyOn(paths, "inboxPath").mockImplementation((team, name) => path.join(teamsRoot, paths.sanitizeName(team), "inboxes", `${paths.sanitizeName(name)}.json`));
   vi.spyOn(paths, "reportEventsPath").mockImplementation(teamName => path.join(teamsRoot, paths.sanitizeName(teamName), "reports.json"));
   vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "reports"));
   vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName: unknown, agentName: unknown) => {
@@ -68,6 +70,43 @@ describe("team lifecycle performance", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each(["quit", "reload", "reported", "missing", "removed-binding"])("settles grouped ownership through the existing finalizer: %s", async condition => {
+    const group = await CompletionGroup.create({ teamName: "group-team", sessionId: "session", submissionId: "batch",
+      policy: { delivery: "all-settled" }, members: [{ name: "writer" }] });
+    if (!group) throw new Error("Expected an enabled group");
+    const writer = member("writer", { lifecycleRunId: "group-run", completionGroup: group.binding(0) });
+    writeConfig({ name: "group-team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [writer] });
+    await group.apply({ type: "running", ...group.binding(0), runId: "group-run" });
+    await group.seal();
+    if (condition === "reported" || condition === "removed-binding") await reportEvents.appendTeamReportEvent("group-team", {
+      agentName: "writer", status: "completed", source: "write-agent", report: "A real blocker", completionGroup: writer.completionGroup,
+      result: createReportResult("group-team", "writer", "group-run", { outcome: "blocked" }),
+    });
+    if (condition === "removed-binding") {
+      delete writer.completionGroup;
+      await teams.updateMember("group-team", "writer", { completionGroup: undefined });
+    }
+    const missing = condition === "missing" || condition === "removed-binding";
+    if (missing) fs.unlinkSync(group.journalPath);
+    const release = vi.fn(async () => []);
+    const lifecycle = createLifecycleRuntime({ isTeammate: false, terminal: null, runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, isCurrentReadAgentRun: () => true, renderReadAgentStatus: vi.fn(),
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, getSessionCwd: () => root, getTeamName: () => "group-team" });
+    const capture = vi.spyOn(sourceIdentity, "captureSourceIdentity");
+    const stopped = await lifecycle.shutdownTeammate("group-team", writer, { reason: condition === "reload" ? "reload" : "quit" });
+    if (missing) {
+      expect(stopped).toMatchObject({ status: "cleanup_failed", finalized: false, removedMember: false });
+      expect(release).not.toHaveBeenCalled();
+      expect(fs.existsSync(group.journalPath)).toBe(false);
+    } else {
+      expect(stopped).toMatchObject({ status: "settled", finalized: true });
+      expect(group.read().members[0]).toMatchObject({ status: condition === "reported" ? "reported" : condition === "reload" ? "interrupted" : "cancelled" });
+      if (condition === "reported") expect(group.read().members[0].report?.outcome).toBe("blocked");
+      expect(release).toHaveBeenCalledOnce();
+    }
+    expect(capture).not.toHaveBeenCalled();
   });
 
   it.each(["running", "requested", "corrupt"])("preserves repair ownership through direct shared shutdown: %s", async state => {

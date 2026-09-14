@@ -17,6 +17,10 @@ import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
 import { NESTED_READ_MODEL_SLOTS } from "../runtime/nested-read-agents.js";
 import { closePersistedRecipient } from "../team/recipient-closure.js";
 import { createPendingChildController } from "../runtime/pending-child-controller.js";
+import { CompletionGroup, type CompletionGroupState } from "../../src/results/completion-group.js";
+import { appendTeamReportEvent } from "../../src/utils/report-events.js";
+import * as locks from "../../src/utils/lock.js";
+import { createReportResult } from "../../src/results/report-result.js";
 
 type RegisteredTool = {
   name: string;
@@ -33,8 +37,13 @@ function installPathSpies() {
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName))));
   vi.spyOn(paths, "taskDir").mockImplementation((teamName: unknown) => path.join(tasksRoot, paths.sanitizeName(String(teamName))));
   vi.spyOn(paths, "configPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "config.json"));
+  vi.spyOn(paths, "inboxPath").mockImplementation((teamName, agentName) => path.join(teamsRoot, paths.sanitizeName(teamName), "inboxes", `${paths.sanitizeName(agentName)}.json`));
+  vi.spyOn(paths, "claimsPath").mockImplementation(teamName => path.join(teamsRoot, paths.sanitizeName(teamName), "claims.json"));
+  vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName, agentName) => path.join(teamsRoot, paths.sanitizeName(teamName), "runtime", `${paths.sanitizeName(agentName)}.json`));
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "write-queue.json"));
   vi.spyOn(paths, "leadSessionPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lead-session.json"));
+  vi.spyOn(paths, "reportEventsPath").mockImplementation((teamName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "reports.json"));
+  vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "reports"));
   vi.spyOn(paths, "sessionContextReferencePath").mockImplementation((teamName: unknown, agentName: unknown, lifecycleRunId: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "session-context", `${paths.sanitizeName(String(agentName))}--${paths.sanitizeName(String(lifecycleRunId))}.md`));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`));
 }
@@ -116,6 +125,7 @@ function registerTools() {
   });
   let adoptedTeam: string | undefined;
   const adoptTeamAsLead = vi.fn((teamName: string) => { adoptedTeam = teamName; });
+  const onCompletionGroupUse = vi.fn();
   const piEventEmit = vi.fn();
   const shutdownTeammate = vi.fn(async (teamName: string, member: Member) => {
     runningReadAgents.delete(readAgentKey(teamName, member.name));
@@ -164,6 +174,7 @@ function registerTools() {
     startWriteAgent: vi.fn(async () => "%1"),
     shutdownTeammate,
     adoptTeamAsLead,
+    onCompletionGroupUse,
     buildRoster: vi.fn(async () => ({})),
     isTeammate: false,
     agentName: "team-lead",
@@ -181,7 +192,7 @@ function registerTools() {
   const shutdown = async (reason = "reload") => {
     for (const handler of sessionHandlers.get("session_shutdown") ?? []) await handler({ reason });
   };
-  return { tools, teamToolsRuntime, pendingChildController, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes, sessionCtx };
+  return { tools, teamToolsRuntime, pendingChildController, runningReadAgents, completions, runReadAgentInProcess, adoptTeamAsLead, onCompletionGroupUse, shutdownTeammate, emit, emitAsync, piEventEmit, shutdown, eventUnsubscribes, sessionCtx };
 }
 
 async function admitNestedReadParent(
@@ -233,6 +244,292 @@ describe("public agent spawn tools", () => {
     const { tools } = registerTools();
 
     expect(Array.from(tools.keys()).sort()).toEqual(["get_agent_status", "spawn_agent", "spawn_swarm_agents"]);
+  });
+
+  it("persists fixed group slots and actual run identities before launching a batch", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 2, queueOverflow: true } });
+    const { tools, runReadAgentInProcess, onCompletionGroupUse } = registerTools();
+    const create = CompletionGroup.create;
+    vi.spyOn(CompletionGroup, "create").mockImplementation(async options => {
+      expect(onCompletionGroupUse).toHaveBeenCalledOnce();
+      return create(options);
+    });
+    const launch = runReadAgentInProcess.getMockImplementation();
+    if (!launch) throw new Error("Missing test launch boundary");
+    const snapshots: CompletionGroupState[] = [];
+    runReadAgentInProcess.mockImplementation((team, member, prompt, ctx, options) => {
+      if (member.completionGroup) snapshots.push(new CompletionGroup(team, member.completionGroup.groupId).read());
+      return launch(team, member, prompt, ctx, options);
+    });
+    const result = await tools.get("spawn_swarm_agents")!.execute("grouped", {
+      completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" },
+      agents: [{ name: "one", prompt: "First" }, { name: "two", prompt: "Second" }],
+    }, new AbortController().signal, undefined, makeCtx());
+    expect(snapshots).toHaveLength(2);
+    for (const [index, [, member]] of runReadAgentInProcess.mock.calls.entries()) {
+      expect(snapshots[index]).toMatchObject({ sealed: false });
+      expect(snapshots[index].members[index]).toMatchObject({ status: "running", runId: member.lifecycleRunId, slotId: member.completionGroup?.slotId });
+    }
+    const g = new CompletionGroup(result.details.session, result.details.completionGroup.groupId);
+    expect(g.read()).toMatchObject({ sealed: true, members: [{ status: "running" }, { status: "running" }] });
+  });
+
+  it("settles rejected and cancelled queued group slots without launching them", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const { tools, teamToolsRuntime, runReadAgentInProcess } = registerTools();
+    const result = await tools.get("spawn_swarm_agents")!.execute("mixed-group", {
+      completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" },
+      agents: [{ name: "one", prompt: "Work" }, { name: "queued", prompt: "Work" },
+        { name: "invalid", prompt: "Work", repair: { maxAttempts: 1 } }],
+    }, new AbortController().signal, undefined, makeCtx());
+    expect(result.details.completionGroup).toBeDefined();
+    const g = new CompletionGroup(result.details.session, result.details.completionGroup.groupId);
+    expect(g.read().members.map(m => m.status)).toEqual(["running", "queued", "rejected"]);
+    expect(await teamToolsRuntime.cancelQueuedAgent(result.details.session, "queued")).toBe(true);
+    expect(g.read().members.map(m => m.status)).toEqual(["running", "cancelled", "rejected"]);
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+  });
+
+  it("reserves a queued name once across concurrent grouped batches", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const { tools, shutdown } = registerTools();
+    await tools.get("spawn_agent")!.execute("busy", { name: "busy", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+    const apply = CompletionGroup.prototype.apply;
+    let arrivals = 0;
+    let release!: () => void;
+    const queuedTogether = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(CompletionGroup.prototype, "apply").mockImplementation(async function(this: CompletionGroup, event) {
+      await apply.call(this, event);
+      if (event.type === "queued") {
+        if (++arrivals === 2) release();
+        await queuedTogether;
+      }
+    });
+    const params = { completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" }, agents: [{ name: "same", prompt: "Work" }] };
+    const results = await Promise.all(["first", "second"].map(id => tools.get("spawn_swarm_agents")!.execute(id, params, new AbortController().signal, undefined, makeCtx())));
+    await shutdown();
+    expect(results.map(result => result.details.spawned.length).sort()).toEqual([0, 1]);
+    expect(results.flatMap(result => result.details.failed)).toHaveLength(1);
+  });
+
+  it("settles the exact queued admission when cancellation contends with its journal binding", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const params = {
+      completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" },
+      agents: [{ name: "busy", prompt: "Work" }, { name: "queued", prompt: "Work" }],
+    };
+    const swarm = harness.tools.get("spawn_swarm_agents")!;
+    const result = await swarm.execute("cancel-binding", params, new AbortController().signal, undefined, makeCtx());
+    const g = new CompletionGroup(result.details.session, result.details.completionGroup.groupId);
+    const queued = g.read().members[1];
+    const busyResult = createReportResult(g.teamName, "busy", g.read().members[0].runId!, { outcome: "succeeded" });
+    await appendTeamReportEvent(g.teamName, { agentName: "busy", status: "completed", source: "read-agent",
+      report: "Busy assignment completed", result: busyResult, completionGroup: g.binding(0) });
+    await g.recordReport(g.binding(0).slotId, busyResult, "completed");
+
+    const bindingStarted = Promise.withResolvers<void>();
+    const bindingGate = Promise.withResolvers<void>();
+    const cancellationContended = Promise.withResolvers<void>();
+    const rolledBack = Promise.withResolvers<string>();
+    const withLock = locks.withLock;
+    let heldAdmission = false;
+    vi.spyOn(locks, "withLock").mockImplementation((lockPath, change, retries) => {
+      if (lockPath !== g.journalPath || heldAdmission) return withLock(lockPath, change, retries);
+      heldAdmission = true;
+      return withLock(lockPath, async () => {
+        bindingStarted.resolve();
+        await bindingGate.promise;
+        return change();
+      }, retries);
+    });
+    const write = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+      try { return write(file, data, options); }
+      catch (error) {
+        if (file === `${g.journalPath}.lock` && (error as NodeJS.ErrnoException).code === "EEXIST") {
+          cancellationContended.resolve();
+        }
+        throw error;
+      }
+    });
+    const remove = teams.removeMemberMatchingRun;
+    vi.spyOn(teams, "removeMemberMatchingRun").mockImplementation(async (team, name, run) => {
+      const removed = await remove(team, name, run);
+      if (name === "queued") rolledBack.resolve(run);
+      return removed;
+    });
+
+    harness.completions.get("busy")!();
+    await bindingStarted.promise;
+    expect(g.read().members[1]).toEqual(queued);
+    const cancelling = Promise.resolve(harness.teamToolsRuntime.cancelQueuedAgent(g.teamName, "queued"))
+      .then(value => ({ value }), error => ({ error: String(error) }));
+    try {
+      // The real lock has rejected cancellation's exclusive create while admission
+      // still holds it, before publishing running. No await-order guess or sleep.
+      await cancellationContended.promise;
+      expect(g.read().members[1].runId).toBeUndefined();
+    } finally {
+      bindingGate.resolve();
+    }
+    const cancellation = await cancelling;
+    const runId = await rolledBack.promise;
+    expect.soft(cancellation).toEqual({ value: true });
+    const restored = new CompletionGroup(g.teamName, g.groupId).read();
+    expect.soft(restored.members[1]).toMatchObject({ status: "cancelled", slotId: queued.slotId, queueId: queued.queueId, runId });
+    expect.soft(restored.deliveries).toMatchObject([{ kind: "settled", status: "enqueued" }]);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect((await teams.readConfig(g.teamName)).members.some(member => member.name === "queued")).toBe(false);
+    const indexes = (await messaging.readInbox(g.teamName, "team-lead", false, false)).filter(message => message.metadata?.completionGroup);
+    expect.soft(indexes).toHaveLength(1);
+    if (indexes[0]) expect(JSON.parse(indexes[0].text).members[1]).toMatchObject({ status: "cancelled", runId });
+    const replay = await swarm.execute("cancel-binding", params, new AbortController().signal, undefined, makeCtx());
+    expect(replay.details.idempotent).toBe(true);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    await harness.shutdown();
+  });
+
+  it.each(["replacement", "late-failure"])("settles grouped queues after %s without losing the early failure decision", async condition => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const params = { completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" },
+      agents: [{ name: "busy", prompt: "Work" }, { name: "queued", prompt: "Work" }] };
+    const result = await harness.tools.get("spawn_swarm_agents")!.execute("late-queue", params, new AbortController().signal, undefined, makeCtx());
+    const g = new CompletionGroup(result.details.session, result.details.completionGroup.groupId);
+    if (condition === "replacement") {
+      await harness.tools.get("spawn_agent")!.execute("replace", { name: "queued", prompt: "Other work", model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+      expect(harness.teamToolsRuntime.cancelQueuedAgent(result.details.session, "queued")).toBe(true);
+    } else {
+      vi.spyOn(teams, "addMember").mockRejectedValueOnce(new Error("Late admission failure"));
+      const markEnqueued = CompletionGroup.prototype.markEnqueued;
+      const notified = new Promise<void>(resolve => {
+        vi.spyOn(CompletionGroup.prototype, "markEnqueued").mockImplementationOnce(async function(this: CompletionGroup, id) {
+          await markEnqueued.call(this, id);
+          resolve();
+        });
+      });
+      harness.completions.get("busy")!();
+      await notified;
+    }
+    await harness.shutdown();
+    expect(g.read().members[1].status).toBe(condition === "replacement" ? "cancelled" : "rejected");
+    expect(await g.prepareDeliveries()).toEqual([]);
+    const indexes = (await messaging.readInbox(result.details.session, "team-lead", false, false)).filter(message => message.metadata?.completionGroup);
+    expect(indexes).toHaveLength(condition === "replacement" ? 0 : 1);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not relaunch a replayed batch or accept a changed assignment", async () => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess, shutdownTeammate } = registerTools();
+    const swarm = tools.get("spawn_swarm_agents")!;
+    const params = { completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" }, agents: [{ prompt: "Original" }] };
+    const first = await swarm.execute("same-batch", params, new AbortController().signal, undefined, makeCtx());
+    const replay = await swarm.execute("same-batch", params, new AbortController().signal, undefined, makeCtx());
+    expect(first.details.completionGroup).toBeDefined();
+    expect(replay.details.completionGroup.groupId).toBe(first.details.completionGroup.groupId);
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect(shutdownTeammate).not.toHaveBeenCalled();
+    await expect(swarm.execute("same-batch", { ...params, agents: [{ prompt: "Different" }] },
+      new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/binding/i);
+  });
+
+  it("refuses missing group history still referenced by an admitted member", async () => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess } = registerTools();
+    const swarm = tools.get("spawn_swarm_agents")!;
+    const params = { completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" }, agents: [{ name: "one", prompt: "Work" }] };
+    const first = await swarm.execute("lost-group", params, new AbortController().signal, undefined, makeCtx());
+    expect(first.details.completionGroup).toBeDefined();
+    const g = new CompletionGroup(first.details.session, first.details.completionGroup.groupId);
+    fs.unlinkSync(g.journalPath);
+    await expect(swarm.execute("lost-group", params, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/unavailable/i);
+    expect(fs.existsSync(g.journalPath)).toBe(false);
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves a queued-only group when its journal is missing on replay", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    await harness.tools.get("spawn_agent")!.execute("busy", { name: "busy", prompt: "Work", model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+    const swarm = harness.tools.get("spawn_swarm_agents")!;
+    const params = { completion_group: { delivery: "all-settled" }, agents: [{ name: "queued", prompt: "Work", model_slot: "read-review" }] };
+    const first = await swarm.execute("queued-only", params, new AbortController().signal, undefined, makeCtx());
+    const group = new CompletionGroup(first.details.session, first.details.completionGroup.groupId);
+    const journal = fs.readFileSync(group.journalPath);
+    fs.unlinkSync(group.journalPath);
+    try {
+      await expect(swarm.execute("queued-only", params, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/unavailable/i);
+      expect(fs.existsSync(group.journalPath)).toBe(false);
+      expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    } finally {
+      fs.writeFileSync(group.journalPath, journal);
+      await harness.shutdown();
+    }
+  });
+
+  it.each(["report", "inbox", "session"])("refuses missing group history referenced only by archived %s ownership", async reference => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    let entries: unknown[] = [];
+    const ctx = { ...makeCtx(), sessionManager: { ...makeCtx().sessionManager, getBranch: () => entries } };
+    const swarm = harness.tools.get("spawn_swarm_agents")!;
+    const params = { completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" }, agents: [{ name: "one", prompt: "Work" }] };
+    const first = await swarm.execute("archived-group", params, new AbortController().signal, undefined, ctx);
+    const binding = first.details.completionGroup;
+    const g = new CompletionGroup(first.details.session, binding.groupId);
+    if (reference === "report") await appendTeamReportEvent(first.details.session, { agentName: "one", status: "completed",
+      source: "read-agent", report: "Full saved report", completionGroup: g.binding(0) });
+    else if (reference === "inbox") {
+      await messaging.sendPlainMessage(first.details.session, "system", "team-lead", "Saved index", "Saved index", undefined,
+        { metadata: { completionGroup: binding } });
+      const inbox = JSON.parse(fs.readFileSync(path.join(teamsRoot, first.details.session, "inboxes", "team-lead.json"), "utf8"));
+      expect(inbox[0].metadata.completionGroup.groupId).toBe(binding.groupId);
+    } else entries = [{ message: { details: { completionGroup: binding } } }];
+    await teams.removeMember(first.details.session, "one");
+    harness.runningReadAgents.clear();
+    fs.unlinkSync(g.journalPath);
+    await expect(swarm.execute("archived-group", params, new AbortController().signal, undefined, ctx)).rejects.toThrow(/unavailable/i);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(g.journalPath)).toBe(false);
+  });
+
+  it("records suppression separately and ignores agent metadata claiming group authority", async () => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess } = registerTools();
+    const result = await tools.get("spawn_swarm_agents")!.execute("suppressed-group", {
+      completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" },
+      agents: [{ name: "one", prompt: "Work", metadata: { piPromptPlanning: { version: 1 } } }],
+    }, new AbortController().signal, undefined, makeCtx());
+    expect(result.details.completionGroup).toBeDefined();
+    const g = new CompletionGroup(result.details.session, result.details.completionGroup.groupId);
+    expect(g.read().members[0].suppressed).toBe(true);
+    await tools.get("spawn_agent")!.execute("ordinary", {
+      name: "ordinary", prompt: "Work", model_slot: "read-review", metadata: { completionGroup: g.binding(0) },
+    }, new AbortController().signal, undefined, makeCtx());
+    expect(runReadAgentInProcess.mock.calls[1][1].completionGroup).toBeUndefined();
+  });
+
+  it("cancels outstanding grouped queue entries on session shutdown", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const { tools, shutdown, runReadAgentInProcess } = registerTools();
+    const result = await tools.get("spawn_swarm_agents")!.execute("shutdown-group", {
+      completion_group: { delivery: "all-settled" }, defaults: { model_slot: "read-review" },
+      agents: [{ name: "one", prompt: "Work" }, { name: "queued", prompt: "Work" }],
+    }, new AbortController().signal, undefined, makeCtx());
+    expect(result.details.completionGroup).toBeDefined();
+    await shutdown();
+    const g = new CompletionGroup(result.details.session, result.details.completionGroup.groupId);
+    expect(g.read().members[1]).toMatchObject({ status: "cancelled" });
+    expect(runReadAgentInProcess).toHaveBeenCalledTimes(1);
   });
 
   it("binds only explicit lead check and repair policies to the admitted run", async () => {

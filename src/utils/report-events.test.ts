@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { VerificationController } from "../results/verification-controller";
-import { appendTeamReportEvent, listTeamReportEvents, readStoredTeamReportEvent, recordReportAcceptance } from "./report-events";
+import { appendTeamReportEvent, listTeamReportEvents, listStoredTeamReportEvents, readStoredTeamReportEvent, recordReportAcceptance } from "./report-events";
 import { createReportResult } from "../results/report-result";
 import * as paths from "./paths";
 import type { TeamReportEvent } from "./models";
@@ -90,6 +90,38 @@ describe("report events", () => {
     stored!.result!.verification.error = "Caller mutation";
     expect((await readStoredTeamReportEvent("team", result.reportId))?.result).toEqual(result);
     expect(await readStoredTeamReportEvent("team", "another-report")).toBeUndefined();
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it("withholds grouped report acknowledgment when full report synchronization fails", async () => {
+    const result = createReportResult("team", "grouped", "run", {});
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("report sync failed"); });
+    await expect(appendTeamReportEvent("team", { agentName: "grouped", source: "read-agent", status: "completed", result,
+      report: "Retained full report", completionGroup: { groupId: "group-id", slotId: "slot" } })).rejects.toThrow("report sync failed");
+    sync.mockRestore();
+    expect(await readStoredTeamReportEvent("team", result.reportId)).toBeUndefined();
+  });
+
+  it("preserves grouped durability on later ordinary appends and duplicate receipts", async () => {
+    const result = createReportResult("team", "grouped", "run", {});
+    const first = await appendTeamReportEvent("team", { agentName: "grouped", source: "read-agent", status: "completed", result,
+      report: "Full grouped report", completionGroup: { groupId: "group-id", slotId: "slot" } });
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("store sync failed"); });
+    await expect(appendTeamReportEvent("team", first)).rejects.toThrow("store sync failed");
+    await expect(appendTeamReportEvent("team", { agentName: "ordinary", source: "read-agent", status: "completed", report: "Other report" })).rejects.toThrow("store sync failed");
+    sync.mockRestore();
+    expect((await readStoredTeamReportEvent("team", first.id))?.report).toBe(first.report);
+  });
+
+  it("lists stored group ownership without source observation or mutable cached aliases", async () => {
+    const result = createReportResult("team", "reader", "run", {});
+    await appendTeamReportEvent("team", { agentName: "reader", status: "completed", report: "Full report", source: "read-agent",
+      result, metadata: { completionGroup: { groupId: "bound-group", slotId: "slot" } } });
+    const observe = vi.spyOn(VerificationController, "observe");
+    const [stored] = await listStoredTeamReportEvents("team");
+    expect(stored.metadata?.completionGroup.groupId).toBe("bound-group");
+    stored.metadata!.completionGroup.groupId = "caller mutation";
+    expect((await listStoredTeamReportEvents("team"))[0].metadata?.completionGroup.groupId).toBe("bound-group");
     expect(observe).not.toHaveBeenCalled();
   });
 

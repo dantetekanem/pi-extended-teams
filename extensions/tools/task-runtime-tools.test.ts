@@ -20,7 +20,7 @@ import type { RunningReadAgent } from "../runtime/types.js";
 
 let root = "";
 
-function registerTools(isTeammate: boolean, shutdownTeammate?: TaskRuntimeToolsOptions["shutdownTeammate"]) {
+function registerTools(isTeammate: boolean, shutdownTeammate?: TaskRuntimeToolsOptions["shutdownTeammate"], cancelQueuedAgent?: TaskRuntimeToolsOptions["cancelQueuedAgent"]) {
   const tools = new Map<string, any>();
   registerTaskRuntimeTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
     isTeammate,
@@ -46,6 +46,7 @@ function registerTools(isTeammate: boolean, shutdownTeammate?: TaskRuntimeToolsO
       releasedClaims: [],
     })),
     getTeamName: () => "team",
+    cancelQueuedAgent,
   });
   return tools;
 }
@@ -82,6 +83,20 @@ describe("task runtime tools", () => {
     expect(teammateTools.has("check_teammate")).toBe(true);
     expect(leadTools.get("check_teammate").description).toContain("get_agent_status");
     expect(leadTools.get("check_teammate").description).toContain("may clean up");
+  });
+
+  it("waits for durable grouped cancellation before acknowledging a queued stop", async () => {
+    let complete!: (value: boolean) => void;
+    const cancellation = new Promise<boolean>(resolve => { complete = resolve; });
+    const tool = registerTools(false, undefined, () => cancellation).get("stop_teammate");
+    let acknowledged = false;
+    const stopping = tool.execute("stop", { agent_name: "queued" }).then((result: any) => { acknowledged = true; return result; });
+    await Promise.resolve();
+    const acknowledgedEarly = acknowledged;
+    complete(true);
+    const result = await stopping;
+    expect(acknowledgedEarly).toBe(false);
+    expect(result.details).toMatchObject({ stopped: true, queued: true });
   });
 
   it("retrieves current-source verification and full check references without rewriting historical results", async () => {

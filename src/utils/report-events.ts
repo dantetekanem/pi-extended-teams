@@ -5,6 +5,7 @@ import { TeamReportEvent } from "./models";
 import * as paths from "./paths";
 import { withLock } from "./lock";
 import { writeJsonAtomic } from "./atomic-json";
+import { syncPathAndParents, writeJsonDurably } from "../results/durable-json";
 import { VerificationController } from "../results/verification-controller";
 import type { CheckRecord } from "../results/check-journal";
 
@@ -118,7 +119,8 @@ function readEventsCache(p: string): ReportEventsCache {
 }
 
 function writeEventsRaw(p: string, events: TeamReportEvent[], options: { sorted?: boolean } = {}): void {
-  writeJsonAtomic(p, events);
+  if (events.some(event => event.completionGroup)) writeJsonDurably(p, events);
+  else writeJsonAtomic(p, events);
   buildCache(p, events, reportEventsStatKey(p), options);
 }
 
@@ -208,12 +210,25 @@ export async function appendTeamReportEvent(teamName: string, event: NewTeamRepo
       throw new Error("Structured report identity does not match its event ID.");
     }
     const existing = cache.byId.get(normalized.id);
-    if (existing) return cloneTeamReportEvent(existing);
+    if (existing) return existing.completionGroup ? resyncEvent(p, existing) : cloneTeamReportEvent(existing);
 
     normalized.reportPath = writeStandaloneReport(teamName, normalized.agentName, normalized.report);
+    if (normalized.completionGroup) syncPathAndParents(normalized.reportPath);
     writeEventsRaw(p, insertEvent(cache.events, normalized), { sorted: true });
     return cloneTeamReportEvent(normalized);
   });
+}
+
+function resyncEvent(p: string, event: TeamReportEvent | undefined): TeamReportEvent {
+  if (!event?.reportPath) throw new Error(`Full report is unavailable in ${p}.`);
+  syncPathAndParents(event.reportPath);
+  syncPathAndParents(p);
+  return cloneTeamReportEvent(event);
+}
+
+export async function resyncStoredTeamReportEvent(teamName: string, reportId: string): Promise<TeamReportEvent> {
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => resyncEvent(p, readEventsCache(p).byId.get(reportId)));
 }
 
 export async function recordReportAcceptance(
@@ -245,12 +260,19 @@ export async function readStoredTeamReportEvent(teamName: string, reportId: stri
   });
 }
 
+export async function listStoredTeamReportEvents(
+  teamName: string,
+  options: ListTeamReportEventsOptions = {}
+): Promise<TeamReportEvent[]> {
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => selectEvents(readEventsCache(p), options));
+}
+
 export async function listTeamReportEvents(
   teamName: string,
   options: ListTeamReportEventsOptions = {}
 ): Promise<ObservedTeamReportEvent[]> {
-  const p = ensureReportEventsFile(teamName);
-  const events = await withLock(p, async () => selectEvents(readEventsCache(p), options));
+  const events = await listStoredTeamReportEvents(teamName, options);
   return Promise.all(events.map(async event => {
     if (!event.result) return event;
     try {

@@ -64,6 +64,29 @@ describe("nested read-agent delivery lifecycle", () => {
 });
 
 describe("nested selected-extension session shutdown", () => {
+  it.each([true, false])("keeps external checks quarantined until raw settlement (session=%s)", async hasSession => {
+    vi.useFakeTimers();
+    const { session } = makeSession();
+    const command = deferred();
+    const controller = new AbortController();
+    const finalize = vi.fn(async () => {});
+    const state: ManagedReadAgentLifecycleState = {
+      session: hasSession ? session : undefined,
+      checkOperation: { controller, settled: command.promise },
+    };
+    const shutdown = requestReadAgentTeardown(state, { closePersistence: async () => {}, finalize });
+    await vi.advanceTimersByTimeAsync(NESTED_SESSION_TEARDOWN_TIMEOUT_MS);
+    expect(controller.signal.aborted).toBe(true);
+    await expect(shutdown).resolves.toMatchObject({ status: "timed_out", finalized: false, dispose: "deferred" });
+    expect(finalize).not.toHaveBeenCalled();
+    expect(session.dispose).not.toHaveBeenCalled();
+    command.resolve();
+    await state.teardownFinalizationPromise;
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(state.teardownState).toBe("finalized");
+    expect(session.dispose).toHaveBeenCalledTimes(hasSession ? 1 : 0);
+  });
+
   it("invokes shutdown before clear/abort and uses the first concurrent reason exactly once", async () => {
     const { session, order } = makeSession();
     const handler = deferred();

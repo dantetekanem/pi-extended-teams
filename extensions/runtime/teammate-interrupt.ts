@@ -12,7 +12,7 @@ export interface TeammateInterruptResult {
   message: string;
   agentKind?: "read" | "write";
   lifecycleRunId?: string;
-  mechanism?: "agent-session-abort" | "tmux-escape";
+  mechanism?: "agent-session-abort" | "assigned-check-abort" | "tmux-escape";
   reason?: "no-active-session" | "session-not-created" | "lifecycle-closing"
     | "missing-pane" | "missing-runtime-proof" | "terminal-interrupt-unavailable";
   error?: string;
@@ -73,15 +73,18 @@ async function interruptReadAgent(
   }
 
   const generation = state.activeOperationGeneration;
+  const checkOperation = state.checkOperation;
   const toolName = state.activeToolName?.trim();
-  if (!generation || !toolName || state.status !== "working" || !state.session.isStreaming) {
+  if (!toolName || state.status !== "working" || (!checkOperation && (!generation || !state.session.isStreaming))) {
     return result("no_command", state.name, `Agent ${state.name} has no running tool command to interrupt.`, fields);
   }
   if (state.operationInterruptPromise) {
     return result("pending", state.name, `An interrupt is already pending for ${state.name}'s running ${toolName} command.`, fields);
   }
 
-  const operationSettlement = state.activeOperationSettlementPromise;
+  const operationSettlement = checkOperation
+    ? Promise.all([checkOperation.settled, state.activeOperationSettlementPromise]).then(() => {})
+    : state.activeOperationSettlementPromise;
   if (!operationSettlement) {
     return result("no_command", state.name, `Agent ${state.name} has no running tool command to interrupt.`, fields);
   }
@@ -89,7 +92,10 @@ async function interruptReadAgent(
   state.interruptRequestedGeneration = generation;
   let nativeAbort: Promise<void>;
   try {
-    nativeAbort = Promise.resolve(state.session.abort());
+    checkOperation?.controller.abort();
+    nativeAbort = checkOperation && !state.session.isStreaming
+      ? Promise.resolve()
+      : Promise.resolve(state.session.abort());
   } catch (error) {
     if (state.interruptRequestedGeneration === generation) state.interruptRequestedGeneration = undefined;
     const message = errorText(error);
@@ -130,7 +136,7 @@ async function interruptReadAgent(
     });
   }
   return result("interrupted", state.name, `Interrupted ${state.name}'s running ${toolName} command. The agent is still active and can receive a follow-up message.`, {
-    ...fields, mechanism: "agent-session-abort",
+    ...fields, mechanism: checkOperation ? "assigned-check-abort" : "agent-session-abort",
   });
 }
 

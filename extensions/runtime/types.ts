@@ -1,4 +1,5 @@
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { ReportResult } from "../../src/results/report-result";
 import type { ContextUsageSnapshot, RuntimeError } from "../../src/utils/runtime";
 import type { ManagedReadAgentLifecycleState } from "../agents/read-agent-session-lifecycle";
 
@@ -63,6 +64,7 @@ export interface CompletedAgentReport {
   name: string;
   role: string;
   status: "completed" | "failed";
+  result?: ReportResult;
   report: string;
   summary?: string;
   completedAt: number;

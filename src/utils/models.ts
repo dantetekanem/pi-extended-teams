@@ -1,4 +1,6 @@
 import { THINKING_LEVEL_NAMES, type ThinkingLevelName } from "./thinking-levels";
+import type { ReportResult } from "../results/report-result";
+import type { CheckDefinition } from "../results/check-policy";
 
 export const THINKING_LEVELS = THINKING_LEVEL_NAMES;
 export type ThinkingLevel = ThinkingLevelName;
@@ -18,6 +20,7 @@ export interface Member {
   color?: string;
   thinking?: ThinkingLevel;
   planModeRequired?: boolean;
+  assignedChecks?: CheckDefinition[];
   backendType?: string;
   isActive?: boolean;
   /** Optional programmatic orchestration/idempotency metadata. */
@@ -96,6 +99,7 @@ export interface TeamReportEvent {
   agentName: string;
   role?: string;
   status: "completed" | "failed";
+  result?: ReportResult;
   report: string;
   summary?: string;
   reportPath?: string;

@@ -25,6 +25,7 @@ export interface ReadAgentDeliveryState {
 
 export interface ManagedReadAgentLifecycleState extends ReadAgentDeliveryState {
   session?: AgentSession;
+  checkOperation?: { controller: AbortController; settled: Promise<void> };
   startupState?: ReadAgentStartupState;
   sessionCreation?: Promise<AgentSession | undefined>;
   stopRequested?: boolean;
@@ -77,7 +78,8 @@ interface NestedSessionLifecycle {
   requestShutdown(
     reason: unknown,
     rawDeliverySettlement: Promise<void>,
-    timeoutMs?: number
+    timeoutMs?: number,
+    checkSettlement?: Promise<void>
   ): Promise<NestedSessionTeardownResult>;
   finalized: Promise<void>;
 }
@@ -243,7 +245,7 @@ function installNestedSessionLifecycle(session: AgentSession): NestedSessionLife
 
   const lifecycle: NestedSessionLifecycle = {
     finalized: finalized.promise,
-    requestShutdown(reasonInput, rawDeliverySettlement, timeoutMs = NESTED_SESSION_TEARDOWN_TIMEOUT_MS) {
+    requestShutdown(reasonInput, rawDeliverySettlement, timeoutMs = NESTED_SESSION_TEARDOWN_TIMEOUT_MS, checkSettlement = Promise.resolve()) {
       if (shutdownPromise) return shutdownPromise;
       const reason = normalizeShutdownReason(reasonInput);
 
@@ -309,6 +311,7 @@ function installNestedSessionLifecycle(session: AgentSession): NestedSessionLife
           observedExtensionShutdown,
           observedDelivery,
           observedAbort,
+          checkSettlement.catch(() => {}),
         ]).then(() => {});
         void rawOperations.then(disposeOnce);
 
@@ -357,6 +360,9 @@ export function requestReadAgentTeardown(
   options: ReadAgentTeardownOptions
 ): Promise<ReadAgentTeardownResult> {
   state.stopRequested = true;
+  const checkOperation = state.checkOperation;
+  checkOperation?.controller.abort();
+  const checkSettlement = checkOperation?.settled.catch(() => {}) ?? Promise.resolve();
   if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
   state.heartbeatTimer = undefined;
   const deliveryClose = closeReadAgentMessageDelivery(state);
@@ -474,6 +480,7 @@ export function requestReadAgentTeardown(
       }
     );
 
+    const observedOperations = Promise.all([observedDelivery, checkSettlement]).then(() => {});
     let session = state.session;
     if (state.startupState === "pending" && state.sessionCreation) {
       let startupSettled = false;
@@ -497,10 +504,10 @@ export function requestReadAgentTeardown(
         const lateRawOperations = observedStartup.then(async () => {
           if (session) {
             const sessionLifecycle = installNestedSessionLifecycle(session);
-            await sessionLifecycle.requestShutdown(reason, deliveryClose.rawDeliverySettlement, 0);
+            await sessionLifecycle.requestShutdown(reason, deliveryClose.rawDeliverySettlement, 0, checkSettlement);
             await sessionLifecycle.finalized;
           } else {
-            await observedDelivery;
+            await observedOperations;
           }
         });
         if (!deliverySettled) deliveryOutcome = "timed_out";
@@ -518,7 +525,7 @@ export function requestReadAgentTeardown(
     session ??= state.session;
     if (!session) {
       const deliveryTimedOut = await operationTimedOut(
-        observedDelivery,
+        observedOperations,
         Math.max(0, deadline - Date.now())
       );
       if (deliveryTimedOut) {
@@ -529,7 +536,7 @@ export function requestReadAgentTeardown(
           delivery: deliveryOutcome,
           dispose: "deferred",
         });
-        deferFinalization(observedDelivery, timedOutResult);
+        deferFinalization(observedOperations, timedOutResult);
         return publishBoundedResult(timedOutResult);
       }
 
@@ -548,7 +555,8 @@ export function requestReadAgentTeardown(
     const sessionResult = await sessionLifecycle.requestShutdown(
       reason,
       deliveryClose.rawDeliverySettlement,
-      Math.max(0, deadline - Date.now())
+      Math.max(0, deadline - Date.now()),
+      checkSettlement
     );
     if (sessionResult.status === "timed_out") {
       const timedOutResult = unfinishedResult("timed_out", sessionResult.reason, {

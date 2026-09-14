@@ -2,12 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { verifyAssignedChecks } from "../../src/results/check-policy";
+import { createAgentStatusTool } from "./agent-status-tool";
 import * as paths from "../../src/utils/paths.js";
 import { registerTaskRuntimeTools } from "./task-runtime-tools.js";
 import * as teams from "../../src/utils/teams.js";
 import * as runtime from "../../src/utils/runtime.js";
 import * as messaging from "../../src/utils/messaging.js";
 import * as reportEvents from "../../src/utils/report-events.js";
+import { createReportResult } from "../../src/results/report-result";
 import type { Member } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 
@@ -46,6 +50,7 @@ function registerTools(isTeammate: boolean) {
 describe("task runtime tools", () => {
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "task-runtime-tools-"));
+    vi.spyOn(paths, "teamDir").mockImplementation(teamName => path.join(root, String(teamName)));
     vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName, agentName) => {
       return path.join(root, String(teamName), "lifecycle", "quarantine", `${String(agentName)}.json`);
     });
@@ -72,6 +77,35 @@ describe("task runtime tools", () => {
     expect(teammateTools.has("check_teammate")).toBe(true);
     expect(leadTools.get("check_teammate").description).toContain("get_agent_status");
     expect(leadTools.get("check_teammate").description).toContain("may clean up");
+  });
+
+  it("retrieves current-source verification and full check references without rewriting historical results", async () => {
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "tested");
+    vi.spyOn(teams, "readConfig").mockResolvedValue({
+      name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [],
+    });
+    const result = createReportResult("team", "reader", "run", { outcome: "succeeded" });
+    const exec = vi.fn(async (_command: string, _cwd: string, options: { onData(data: Buffer): void }) => {
+      options.onData(Buffer.from("full observed output")); return { exitCode: 0 };
+    });
+    result.verification = (await verifyAssignedChecks("team", result, cwd,
+      [{ name: "tests", command: "assigned", timeoutSeconds: 2 }], { loadOperations: async () => ({ exec }) })).verification;
+    await reportEvents.appendTeamReportEvent("team", { agentName: "reader", status: "completed", source: "read-agent", report: "Full report", result });
+    const status = createAgentStatusTool({ getTeamName: () => "team", runningReadAgents: new Map(),
+      readAgentKey: (team, name) => `${team}:${name}`, terminal: null, listQueuedAgents: () => [] });
+    expect((await status.execute("before", {})).details.statuses[0].verification).toBe("passed");
+    fs.writeFileSync(path.join(cwd, "input.ts"), "changed after verification");
+    expect((await status.execute("after", {})).details.statuses[0].verification).toBe("stale");
+    const recovered = await registerTools(false).get("check_teammate").execute("recover", { agent_name: "reader" });
+    expect(recovered.details.completedReport.result.verification.state).toBe("stale");
+    const check = recovered.details.completedReport.checks[0];
+    expect(recovered.content[0].text).toContain(check.logPath);
+    expect(fs.readFileSync(check.logPath, "utf8")).toBe("full observed output");
+    expect(JSON.parse(fs.readFileSync(paths.reportEventsPath("team"), "utf8"))[0].result.verification.state).toBe("passed");
+    expect(exec).toHaveBeenCalledOnce();
   });
 
   it("cancels accepted queued work before looking for an active process", async () => {
@@ -178,13 +212,15 @@ describe("task runtime tools", () => {
     }
   });
 
-  it("limits post-roster persisted report recovery to the lead", async () => {
+  it.each([undefined, "blocked"] as const)("limits post-roster report recovery to the lead with outcome %s", async outcome => {
     const leadTools = registerTools(false);
     const teammateTools = registerTools(true);
     vi.spyOn(teams, "readConfig").mockResolvedValue({
       name: "team", description: "", createdAt: Date.now(), leadAgentId: "lead", leadSessionId: "session", members: [],
     });
+    const structured = outcome ? createReportResult("team", "finished-reader", "run-1", { outcome }) : undefined;
     await reportEvents.appendTeamReportEvent("team", {
+      result: structured,
       agentName: "finished-reader",
       role: "read",
       status: "completed",
@@ -208,6 +244,7 @@ describe("task runtime tools", () => {
       completedReport: { agentName: "finished-reader", report: "Durable completed report" },
     });
 
+    expect(result.details.completedReport.result).toEqual(structured);
     const listReports = vi.spyOn(reportEvents, "listTeamReportEvents");
     await expect(teammateTools.get("check_teammate").execute("check", { agent_name: "finished-reader" }))
       .rejects.toThrow("Agent finished-reader not found");

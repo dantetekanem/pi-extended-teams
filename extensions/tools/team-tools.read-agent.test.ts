@@ -235,6 +235,46 @@ describe("public agent spawn tools", () => {
     expect(Array.from(tools.keys()).sort()).toEqual(["get_agent_status", "spawn_agent", "spawn_swarm_agents"]);
   });
 
+  it("binds only explicit lead check policy to the admitted run", async () => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess } = registerTools();
+    const checks = [{ name: "tests", command: "authorized command", timeoutSeconds: 2 }];
+    const spawn = tools.get("spawn_agent")!;
+    await spawn.execute("checked", { name: "checked", prompt: "Work", model_slot: "read-review", checks }, new AbortController().signal, undefined, makeCtx());
+    await spawn.execute("ordinary", { name: "ordinary", prompt: "Work", model_slot: "read-review", metadata: { assignedChecks: checks } }, new AbortController().signal, undefined, makeCtx());
+    checks[0].command = "changed after admission";
+    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({
+      assignedChecks: [{ name: "tests", command: "authorized command", timeoutSeconds: 2 }],
+    });
+    expect(runReadAgentInProcess.mock.calls[1][1].assignedChecks).toBeUndefined();
+  });
+
+  it("inherits swarm check policy while allowing an explicit empty override", async () => {
+    writeFavoriteLevels();
+    const { tools, runReadAgentInProcess } = registerTools();
+    const checks = [{ name: "tests", command: "authorized command", timeoutSeconds: 2 }];
+    await tools.get("spawn_swarm_agents")!.execute("swarm", {
+      defaults: { model_slot: "read-review", checks },
+      agents: [{ name: "checked", prompt: "Work" }, { name: "ordinary", prompt: "Work", checks: [] }],
+    }, new AbortController().signal, undefined, makeCtx());
+    expect(runReadAgentInProcess.mock.calls[0][1]).toMatchObject({ assignedChecks: checks });
+    expect(runReadAgentInProcess.mock.calls[1][1].assignedChecks).toBeUndefined();
+  });
+
+  it("refuses check assignment through a nested child's spawn tool", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const nested = harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session", parent, parentRunId: parent.lifecycleRunId!, outerCtx: makeCtx(),
+    }).find(tool => tool.name === "spawn_agent")!;
+    await expect(nested.execute("child", {
+      name: "child", prompt: "Inspect", model_slot: "read-review",
+      checks: [{ name: "tests", command: "unauthorized command", timeoutSeconds: 2 }],
+    })).rejects.toThrow(/checks/);
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+  });
+
   it("includes queued edit agents in one-shot status snapshots", async () => {
     const { tools } = registerTools();
     teams.createTeam("session-test-session", "test-session", "lead-agent", "Pi session agents", "provider/model");

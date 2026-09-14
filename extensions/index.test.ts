@@ -1504,6 +1504,91 @@ describe("extension integration", () => {
     }
   });
 
+  it("closes admission before awaiting an existing runner's shutdown", async () => {
+    const setup = await setupExtension();
+    let releaseAdmission!: () => void;
+    let releaseTeardown!: () => void;
+    const admissionGate = new Promise<void>(resolve => { releaseAdmission = resolve; });
+    const teardownGate = new Promise<void>(resolve => { releaseTeardown = resolve; });
+    const abort = vi.fn(() => teardownGate);
+    let closing: Promise<unknown> | undefined;
+    try {
+      const ctx = makeCtx(setup.root, "shutdown-admission-order");
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName, member, _prompt, _ctx, options) => {
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), {
+          name: member.name, teamName, runId: member.lifecycleRunId, role: member.role,
+          startedAt: Date.now(), lastActivityAt: Date.now(), status: "working", recentEvents: [], tokensUsed: 0,
+          acceptingMessages: true, messageDeliveryClosed: false,
+          session: { abort, dispose: vi.fn(), clearQueue: () => ({ steering: [], followUp: [] }),
+            getSessionStats: () => ({ tokens: { total: 0 } }) },
+        });
+      });
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      const spawn = (name: string) => setup.tools.get("spawn_agent")!.execute(name, {
+        name, prompt: "Investigate", cwd: setup.root, model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      await spawn("existing");
+      ctx.modelRegistry.getAvailable.mockClear().mockImplementation(async () => {
+        await admissionGate;
+        return [{ provider: "provider", id: "model" }];
+      });
+      const admission = spawn("starting");
+      const outcome = admission.then(() => "launched", error => String(error));
+      await vi.waitFor(() => expect(ctx.modelRegistry.getAvailable).toHaveBeenCalled());
+      closing = Promise.all((setup.eventHandlers.get("session_shutdown") ?? [])
+        .map(handler => handler({ reason: "quit" }, ctx)));
+      void closing.catch(() => {});
+      await vi.waitFor(() => expect(abort).toHaveBeenCalledOnce());
+      releaseAdmission();
+      expect(await outcome).toContain("admission cancelled");
+      expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledOnce();
+      releaseTeardown();
+      await closing;
+    } finally {
+      releaseAdmission();
+      releaseTeardown();
+      await closing?.catch(() => {});
+      setup.restoreEnv();
+    }
+  });
+
+  it.each(["reload", "quit"])("settles an ordinary admission correctly during %s before its runner exists", async reason => {
+    const setup = await setupExtension();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      const ctx = makeCtx(setup.root, "admission-reload");
+      ctx.modelRegistry.getAvailable.mockImplementation(async () => {
+        await gate;
+        return [{ provider: "provider", id: "model" }];
+      });
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      const admission = setup.tools.get("spawn_agent")!.execute("admit", {
+        name: "starting-reader", prompt: "Investigate", cwd: setup.root, model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      await vi.waitFor(() => expect(ctx.modelRegistry.getAvailable).toHaveBeenCalled());
+      expect(setup.readAgentMock.runReadAgentInProcess).not.toHaveBeenCalled();
+      if (reason === "quit") {
+        let closed = false;
+        const closing = Promise.all((setup.eventHandlers.get("session_shutdown") ?? [])
+          .map(handler => handler({ reason }, ctx))).then(() => { closed = true; });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(closed).toBe(false);
+        release();
+        await expect(admission).rejects.toThrow("admission cancelled");
+        await closing;
+        expect(setup.readAgentMock.runReadAgentInProcess).not.toHaveBeenCalled();
+        return;
+      }
+      const reloaded = await setup.reloadFresh(ctx, () => {}, async () => {});
+      release();
+      await expect(admission).resolves.toMatchObject({ details: { name: "starting-reader" } });
+      expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledOnce();
+      expect(reloaded.staleAccesses).toEqual([]);
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, reloaded.ctx);
+    } finally { release(); setup.restoreEnv(); }
+  });
+
   it("inherits lead thinking through fresh spawn adapters before and after reload", async () => {
     const setup = await setupExtension();
     try {

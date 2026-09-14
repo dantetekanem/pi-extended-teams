@@ -96,6 +96,7 @@ export interface TeamToolsRuntime {
   nestedChildSnapshot(binding: NestedReadAgentToolBinding): NestedChildSnapshot;
   cancelQueuedAgent(teamName: string, agentName: string): boolean | Promise<boolean>;
   hasPendingWork(): boolean;
+  closeAdmission(): void;
   resumeQueues(): void;
 }
 
@@ -137,6 +138,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       nestedChildSnapshot: () => ({ running: 0, queued: 0 }),
       cancelQueuedAgent: () => false,
       hasPendingWork: () => false,
+      closeAdmission: () => {},
       resumeQueues: () => {},
     };
   }
@@ -396,10 +398,29 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     return pending?.settled;
   }
   let lifecycleProbeCleanedUp = false;
+  let shutdownStarted = false;
+  const closeAdmission = () => { lifecycleProbeCleanedUp = true; };
+  const admissions = new Set<Promise<void>>();
+  async function trackAdmission<T>(action: () => Promise<T>): Promise<T> {
+    if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
+    let settle!: () => void;
+    const settled = new Promise<void>(resolve => {
+      settle = resolve;
+    });
+    admissions.add(settled);
+
+    try {
+      return await action();
+    } finally {
+      admissions.delete(settled);
+      settle();
+    }
+  }
   let pendingChildCancelUnsubscribe = (): void => {};
   pi.on?.("session_shutdown", async () => {
-    if (lifecycleProbeCleanedUp) return;
-    lifecycleProbeCleanedUp = true;
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    closeAdmission();
     const settlements: Promise<void>[] = [];
     for (const pending of checkpointAdmissions.values()) {
       pending.controller.abort(new Error("Checkpoint preparation cancelled: session is closing."));
@@ -411,8 +432,17 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         if (removed?.groupSettlement) settlements.push(removed.groupSettlement);
       }
     }
-    try { await Promise.all(settlements); }
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const admissionSettlement = Promise.race([
+      Promise.all([...admissions]),
+      new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error("Agent admissions are still settling during shutdown.")), 2_500);
+        deadline.unref?.();
+      }),
+    ]);
+    try { await Promise.all([...settlements, admissionSettlement]); }
     finally {
+      clearTimeout(deadline);
       if (typeof lifecycleProbeUnsubscribe === "function") lifecycleProbeUnsubscribe();
       pendingChildCancelUnsubscribe();
       lifecycleFenceUnsubscribe();
@@ -1281,7 +1311,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
   pi.events?.on?.("pi-extended-teams:orchestration-request", (payload: any) => {
     if (payload?.type !== "ensure_team" && payload?.type !== "spawn_teammate_once") return handleOrchestrationRequest(payload);
-    return withPublicScope(String(payload?.params?.team_name || ""), () => handleOrchestrationRequest(payload))
+    return trackAdmission(() => withPublicScope(String(payload?.params?.team_name || ""), () => handleOrchestrationRequest(payload)))
       .catch(error => emitOrchestrationResponse(payload?.requestId, payload?.type, { ok: false, error: error instanceof Error ? error.message : String(error) }));
   });
 
@@ -1291,7 +1321,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   function spawnPublicAgent(params: any, ctx: any, signal?: AbortSignal): Promise<{ content: any[]; details: any }> {
-    return withPublicScope(currentSessionAgentGroupName(ctx), () => spawnPublicAgentInScope(params, ctx, signal));
+    return trackAdmission(() => withPublicScope(currentSessionAgentGroupName(ctx), () => spawnPublicAgentInScope(params, ctx, signal)));
   }
 
   async function spawnPublicAgentInScope(params: any, ctx: any, signal?: AbortSignal): Promise<{ content: any[]; details: any }> {
@@ -1328,7 +1358,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     model_slot: Type.Optional(StringEnum(NESTED_READ_MODEL_SLOTS, { description: "Canonical read-* tier, or inherit defaults.model_slot." })),
   };
 
-  async function spawnNestedReadAgent(
+  function spawnNestedReadAgent(params: any, binding: NestedReadAgentToolBinding, context = "spawn_agent") {
+    return trackAdmission(() => spawnNestedReadAgentInScope(params, binding, context));
+  }
+
+  async function spawnNestedReadAgentInScope(
     params: any,
     binding: NestedReadAgentToolBinding,
     context = "spawn_agent"
@@ -1441,86 +1475,94 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   pi.registerTool({
     ...publicTeamToolMetadata.spawn_swarm_agents,
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
-      if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
-      if (!ctx) throw new Error("No active Pi session context is available for spawn_swarm_agents.");
-      if (!Array.isArray(params.agents) || params.agents.length === 0) throw new Error("spawn_swarm_agents requires at least one agent.");
+      return trackAdmission(async () => {
+        if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
+        if (!ctx) throw new Error("No active Pi session context is available for spawn_swarm_agents.");
+        if (!Array.isArray(params.agents) || params.agents.length === 0) throw new Error("spawn_swarm_agents requires at least one agent.");
 
-      const groupPolicy = normalizeCompletionGroupPolicy(params.completion_group);
-      const sessionId = getPiSessionId(ctx);
-      if (groupPolicy && (!sessionId || !_toolCallId?.trim())) throw new Error("Completion groups require a bound session and runtime submission identity.");
-      const mergedAgents = params.agents.map((agent: any, index: number) => {
-        const merged = mergeSwarmAgentParams(params.defaults || {}, agent);
-        merged.checkpoint = createCheckpointAssignment(merged.checkpoint, merged.prompt, merged.continue_from)?.policy;
-        if (merged.continue_from !== undefined) merged.name = freshContinuationName(merged.name || "agent", JSON.stringify([sessionId, _toolCallId, index, merged.continue_from]));
-        return merged;
-      });
-      const defaultModel = configuredFavoriteModelForSpawn(mergedAgents[0], ctx, "spawn_swarm_agents");
-      for (let index = 0; index < mergedAgents.length; index += 1) {
-        configuredFavoriteModelForSpawn(mergedAgents[index], ctx, `spawn_swarm_agents agent ${mergedAgents[index].name || index + 1}`);
-      }
-      const sessionName = await ensureCurrentSessionAgentGroup(ctx, defaultModel);
-      let group: CompletionGroup | undefined;
-      if (groupPolicy && sessionId) {
-        const identity = { teamName: sessionName, sessionId, submissionId: `tool:${_toolCallId}` };
-        const groupId = completionGroupIdentity(identity);
-        options.onCompletionGroupUse?.(groupId);
-        const config = await teams.readConfig(sessionName);
-        const reports = await listStoredTeamReportEvents(sessionName);
-        const inbox = await messaging.readInbox(sessionName, "team-lead", false, false);
-        const entries = ctx.sessionManager?.getBranch?.() ?? [];
-        const references = [...config.members.map(member => member.completionGroup),
-          ...readQueue(sessionName).map(queued => queued.member.completionGroup),
-          ...reports.map(report => report.completionGroup), ...inbox.map(message => message.metadata?.completionGroup),
-          ...entries.map((entry: any) => entry.message?.details?.completionGroup)];
-        if (references.some(binding => binding?.groupId === groupId)) new CompletionGroup(sessionName, groupId).read();
-        group = await CompletionGroup.create({ ...identity, policy: groupPolicy, members: mergedAgents.map((agent: any, index: number) => ({
-          name: paths.sanitizeName(agent.name || `agent-${crypto.createHash("sha256").update(`${_toolCallId}:${index}`).digest("hex").slice(0, 12)}`),
-          assignmentKey: crypto.createHash("sha256").update(JSON.stringify([agent, ctx.cwd])).digest("hex"),
-          suppressed: sessionName.startsWith("prompt-build-") || shouldSuppressLeadReportInjection(agent),
-        })) });
-        if (group && !group.created) return {
-          content: [{ type: "text", text: `Completion group ${group.groupId} already exists; no assignments replayed. State: ${group.journalPath}\n${AGENT_WAIT_CONTRACT}` }],
-          details: { session: sessionName, completionGroup: { groupId: group.groupId, journalPath: group.journalPath },
-            idempotent: true, spawned: [], failed: [], members: group.read().members },
-        };
-      }
-      const spawned: any[] = [];
-      const failed: Array<{ name: string; error: string }> = [];
-
-      for (let index = 0; index < mergedAgents.length; index += 1) {
-        const merged = mergedAgents[index];
-        const name = group?.read().members[index].name || merged.name || generatedAgentName(index);
-        try {
-          const result = await spawnTeammate({
-            ...merged,
-            name,
-            team_name: sessionName,
-          }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index), signal: _signal });
-          spawned.push({ ...result.details, name });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          failed.push({ name, error: message });
-          if (group) await group.apply({ type: "rejected", ...group.binding(index), runId: group.read().members[index].runId, reason: message });
+        const groupPolicy = normalizeCompletionGroupPolicy(params.completion_group);
+        const sessionId = getPiSessionId(ctx);
+        if (groupPolicy && (!sessionId || !_toolCallId?.trim())) throw new Error("Completion groups require a bound session and runtime submission identity.");
+        const mergedAgents = params.agents.map((agent: any, index: number) => {
+          const merged = mergeSwarmAgentParams(params.defaults || {}, agent);
+          merged.checkpoint = createCheckpointAssignment(merged.checkpoint, merged.prompt, merged.continue_from)?.policy;
+          if (merged.continue_from !== undefined) merged.name = freshContinuationName(merged.name || "agent", JSON.stringify([sessionId, _toolCallId, index, merged.continue_from]));
+          return merged;
+        });
+        const defaultModel = configuredFavoriteModelForSpawn(mergedAgents[0], ctx, "spawn_swarm_agents");
+        for (let index = 0; index < mergedAgents.length; index += 1) {
+          configuredFavoriteModelForSpawn(mergedAgents[index], ctx, `spawn_swarm_agents agent ${mergedAgents[index].name || index + 1}`);
         }
-      }
-      if (group) {
-        await group.seal();
-        await enqueueCompletionGroupDeliveries(group);
-      }
+        const sessionName = await ensureCurrentSessionAgentGroup(ctx, defaultModel);
+        let group: CompletionGroup | undefined;
+        if (groupPolicy && sessionId) {
+          const identity = { teamName: sessionName, sessionId, submissionId: `tool:${_toolCallId}` };
+          const groupId = completionGroupIdentity(identity);
+          options.onCompletionGroupUse?.(groupId);
+          const config = await teams.readConfig(sessionName);
+          const reports = await listStoredTeamReportEvents(sessionName);
+          const inbox = await messaging.readInbox(sessionName, "team-lead", false, false);
+          const entries = ctx.sessionManager?.getBranch?.() ?? [];
+          const references = [...config.members.map(member => member.completionGroup),
+            ...readQueue(sessionName).map(queued => queued.member.completionGroup),
+            ...reports.map(report => report.completionGroup), ...inbox.map(message => message.metadata?.completionGroup),
+            ...entries.map((entry: any) => entry.message?.details?.completionGroup)];
+          if (references.some(binding => binding?.groupId === groupId)) new CompletionGroup(sessionName, groupId).read();
+          group = await CompletionGroup.create({ ...identity, policy: groupPolicy, members: mergedAgents.map((agent: any, index: number) => ({
+            name: paths.sanitizeName(agent.name || `agent-${crypto.createHash("sha256").update(`${_toolCallId}:${index}`).digest("hex").slice(0, 12)}`),
+            assignmentKey: crypto.createHash("sha256").update(JSON.stringify([agent, ctx.cwd])).digest("hex"),
+            suppressed: sessionName.startsWith("prompt-build-") || shouldSuppressLeadReportInjection(agent),
+          })) });
+          if (group && !group.created) return {
+            content: [{ type: "text", text: `Completion group ${group.groupId} already exists; no assignments replayed. State: ${group.journalPath}\n${AGENT_WAIT_CONTRACT}` }],
+            details: { session: sessionName, completionGroup: { groupId: group.groupId, journalPath: group.journalPath },
+              idempotent: true, spawned: [], failed: [], members: group.read().members },
+          };
+        }
+        const spawned: any[] = [];
+        const failed: Array<{ name: string; error: string }> = [];
 
-      const lines = [`Spawned ${spawned.length}/${params.agents.length} agents in the current Pi session.`];
-      for (const item of spawned) lines.push(`- ${item.name}: ${item.queued ? `queued at position ${item.queuePosition}` : `${item.role}, ${item.mode || "in-process"}`}`);
-      for (const item of failed) lines.push(`- ${item.name}: failed — ${item.error}`);
-      lines.push(AGENT_WAIT_CONTRACT);
-      return { content: [{ type: "text", text: lines.join("\n") }], details: { session: sessionName, spawned, failed,
-        ...(group ? { completionGroup: { groupId: group.groupId, journalPath: group.journalPath } } : {}) } };
+        for (let index = 0; index < mergedAgents.length; index += 1) {
+          const merged = mergedAgents[index];
+          const name = group?.read().members[index].name || merged.name || generatedAgentName(index);
+          try {
+            const result = await spawnTeammate({
+              ...merged,
+              name,
+              team_name: sessionName,
+            }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index), signal: _signal });
+            spawned.push({ ...result.details, name });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            failed.push({ name, error: message });
+            if (group) await group.apply({ type: "rejected", ...group.binding(index), runId: group.read().members[index].runId, reason: message });
+          }
+        }
+        if (group) {
+          await group.seal();
+          await enqueueCompletionGroupDeliveries(group);
+        }
+
+        const lines = [`Spawned ${spawned.length}/${params.agents.length} agents in the current Pi session.`];
+        for (const item of spawned) lines.push(`- ${item.name}: ${item.queued ? `queued at position ${item.queuePosition}` : `${item.role}, ${item.mode || "in-process"}`}`);
+        for (const item of failed) lines.push(`- ${item.name}: failed — ${item.error}`);
+        lines.push(AGENT_WAIT_CONTRACT);
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { session: sessionName, spawned, failed,
+          ...(group ? { completionGroup: { groupId: group.groupId, journalPath: group.journalPath } } : {}) } };
+      });
     },
   });
 
   return {
     createNestedReadAgentTools,
     nestedChildSnapshot,
-    hasPendingWork: () => queuedReadSpawnsByTeam.size > 0 || checkpointAdmissions.size > 0 || readQueueDrainingTeams.size > 0,
+    closeAdmission,
+    hasPendingWork: () => (
+      admissions.size > 0
+      || queuedReadSpawnsByTeam.size > 0
+      || checkpointAdmissions.size > 0
+      || readQueueDrainingTeams.size > 0
+    ),
     resumeQueues: () => { for (const teamName of queuedReadSpawnsByTeam.keys()) void drainQueuedReadSpawns(teamName); },
     cancelQueuedAgent: (teamName, agentName) => {
       // Retain the entry for admission bookkeeping, but let active teardown own cancellation after launch commits.

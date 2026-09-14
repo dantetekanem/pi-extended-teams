@@ -1461,6 +1461,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       host?.detach();
     },
     async close(reason) {
+      teamToolsRuntime.closeAdmission();
       executionClosing = true;
       sessionCtx?.ui?.setWidget?.("01-pi-extended-teams-readers", undefined);
       sessionCtx?.ui?.setWidget?.("01-pi-extended-teams-status", undefined);

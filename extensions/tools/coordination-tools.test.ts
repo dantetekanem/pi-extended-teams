@@ -129,7 +129,13 @@ describe("coordination tools", () => {
     );
 
     expect(result.details.messages).toHaveLength(1);
-    expect(result.details.messages[0]).toMatchObject({ text: "New report", read: true });
+    expect(result.details.messages[0]).toMatchObject({ text: "New report", read: true, senderStatus: { status: "not_running", canMessage: false } });
+    expect(result.content[0].text).toContain("sender now: not_running; can message: no");
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    for (const expanded of [false, true]) {
+      const rendered = tools.get("read_inbox").renderResult(result, { expanded }, theme).render(120).join("\n");
+      expect(rendered).toContain("sender now: not_running; can message: no");
+    }
     expect(result.content[0].text).not.toContain("Already handled");
     expect(resetLeadWakeNotifiedCount).toHaveBeenCalledOnce();
     expect(renderLeadInboxStatus).toHaveBeenCalledOnce();

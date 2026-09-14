@@ -104,7 +104,11 @@ export function summarizeInboxMessage(message: any): string {
   const from = message?.from || "unknown";
   const summary = message?.summary || "message";
   const timestamp = message?.timestamp ? new Date(message.timestamp).toLocaleTimeString() : "";
-  return `${from}${timestamp ? ` ${timestamp}` : ""}: ${summary}`;
+  const sender = message?.senderStatus;
+  const availability = sender
+    ? ` [sender now: ${sender.status}; can message: ${sender.canMessage === null ? "unknown" : sender.canMessage ? "yes" : "no"}]`
+    : "";
+  return `${from}${availability}${timestamp ? ` ${timestamp}` : ""}: ${summary}`;
 }
 
 export function formatInboxMessagesForModel(messages: any[]): string {

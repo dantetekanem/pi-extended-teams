@@ -26,6 +26,20 @@ function harness() {
   return { cost, entries, pi, ctx, handlers, switchTo: (id: string) => { root = id; handlers.get("session_start")!({}, ctx); } };
 }
 
+function reloadedHost(entries: any[], root: string) {
+  const handlers = new Map<string, Function>();
+  const events = new EventEmitter();
+  const pi = {
+    events: { emit: vi.fn((name, data) => events.emit(name, data)), on: (name: string, handler: (...args: any[]) => void) => {
+      events.on(name, handler);
+      return () => events.off(name, handler);
+    } },
+    on: (event: string, handler: Function) => handlers.set(event, handler),
+    appendEntry: vi.fn((customType, data) => entries.push({ type: "custom", customType, data })),
+  };
+  return { pi, handlers, ctx: { sessionManager: { getEntries: () => entries, getSessionId: () => root } } };
+}
+
 describe("combined Pi-recorded session cost", () => {
   it("serves live totals only to the current session's display, including incomplete and replayed costs", () => {
     const h = harness();
@@ -97,6 +111,89 @@ describe("combined Pi-recorded session cost", () => {
     expect(h.cost.total().complete).toBe(false);
     unpersisted.settle({ childSessionId: "recovered", costUsd: 3 }, "completed");
     expect(h.cost.total()).toEqual({ usd: 3, complete: false });
+  });
+
+  it("retains detached admissions until matching attach and settlement", () => {
+    const h = harness();
+    h.cost.detach();
+    h.pi.appendEntry.mockImplementation(() => { throw new Error("old host used"); });
+    h.ctx.sessionManager.getEntries = () => { throw new Error("old context used"); };
+    h.ctx.sessionManager.getSessionId = () => { throw new Error("old context used"); };
+
+    const run = h.cost.begin("root-a", "team", "detached");
+    const fresh = reloadedHost(h.entries, "root-a");
+    h.cost.attach(fresh.pi as any, fresh.ctx as any);
+    expect(h.cost.total()).toEqual({ usd: 0, complete: false });
+    expect(fresh.pi.appendEntry).not.toHaveBeenCalled();
+
+    run.settle({ childSessionId: "child", costUsd: 2 }, "completed");
+    expect(h.cost.total()).toEqual({ usd: 2, complete: true });
+    expect(fresh.pi.appendEntry.mock.calls.filter(call => call[1].lifecycleRunId === "detached")).toHaveLength(1);
+    h.cost.detach();
+    h.cost.attach(fresh.pi as any, fresh.ctx as any);
+    expect(fresh.pi.appendEntry.mock.calls.filter(call => call[1].lifecycleRunId === "detached")).toHaveLength(1);
+  });
+
+  it("replays only the first detached terminal receipt on attach", () => {
+    const h = harness();
+    h.cost.detach();
+    h.pi.appendEntry.mockImplementation(() => { throw new Error("old host used"); });
+    h.ctx.sessionManager.getEntries = () => { throw new Error("old context used"); };
+    h.ctx.sessionManager.getSessionId = () => { throw new Error("old context used"); };
+
+    const run = h.cost.begin("root-a", "team", "detached-terminal");
+    run.settle({ childSessionId: "child", costUsd: 3 }, "completed");
+    run.settle({ childSessionId: "later", costUsd: 99 }, "failed");
+    const fresh = reloadedHost(h.entries, "root-a");
+    h.cost.attach(fresh.pi as any, fresh.ctx as any);
+    expect(h.cost.total()).toEqual({ usd: 3, complete: true });
+    expect(fresh.pi.appendEntry).toHaveBeenCalledExactlyOnceWith(COST_ENTRY_TYPE,
+      expect.objectContaining({ lifecycleRunId: "detached-terminal", phase: "final", outcome: "completed", costUsd: 3 }));
+    h.cost.detach();
+    h.cost.attach(fresh.pi as any, fresh.ctx as any);
+    expect(fresh.pi.appendEntry).toHaveBeenCalledOnce();
+  });
+
+  it("detaches from invalidated hosts, restores matching roots once, and deactivates finally", () => {
+    const h = harness();
+    const run = h.cost.begin("root-a", "team", "reload");
+    const retry = h.cost.begin("root-a", "team", "retry");
+    h.pi.appendEntry.mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    retry.settle({ childSessionId: "retry-child", costUsd: 3 }, "completed");
+    h.cost.detach();
+    h.pi.appendEntry.mockImplementation(() => { throw new Error("old host used"); });
+    h.ctx.sessionManager.getEntries = () => { throw new Error("old context used"); };
+    h.ctx.sessionManager.getSessionId = () => { throw new Error("old context used"); };
+    run.settle({ childSessionId: "child", costUsd: 2 }, "completed");
+    const fresh = reloadedHost(h.entries, "root-a");
+    h.cost.attach(fresh.pi as any, fresh.ctx as any);
+    expect(h.cost.total()).toEqual({ usd: 5, complete: true });
+    expect(fresh.pi.appendEntry.mock.calls.filter(call => call[1].lifecycleRunId === "reload")).toHaveLength(1);
+    expect(fresh.pi.appendEntry.mock.calls.find(call => call[1].lifecycleRunId === "retry")?.[1].phase).toBe("final");
+    h.cost.detach();
+    h.cost.attach(fresh.pi as any, fresh.ctx as any);
+    expect(fresh.pi.appendEntry.mock.calls.filter(call => call[1].lifecycleRunId === "reload")).toHaveLength(1);
+    h.cost.detach();
+    h.cost.attach(reloadedHost(h.entries, "other-root").pi as any, reloadedHost(h.entries, "other-root").ctx as any);
+    expect(h.cost.total()).toEqual({ usd: 0, complete: false });
+    h.cost.deactivate();
+    expect(h.cost.total()).toEqual({ usd: 0, complete: false });
+  });
+
+  it("persists detached terminal cost even when the initial receipt was never appended", () => {
+    const h = harness();
+    h.pi.appendEntry.mockImplementationOnce(() => { throw new Error("initial write failed"); });
+    const run = h.cost.begin("root-a", "team", "initially-unpersisted");
+    h.cost.detach();
+    run.settle({ childSessionId: "child", costUsd: 4 }, "completed");
+    const fresh = reloadedHost(h.entries, "root-a");
+    h.cost.attach(fresh.pi as any, fresh.ctx as any);
+    expect(h.cost.total()).toEqual({ usd: 4, complete: true });
+    expect(fresh.pi.appendEntry).toHaveBeenCalledExactlyOnceWith(COST_ENTRY_TYPE,
+      expect.objectContaining({ lifecycleRunId: "initially-unpersisted", phase: "final", costUsd: 4 }));
+    h.cost.detach();
+    h.cost.attach(fresh.pi as any, fresh.ctx as any);
+    expect(fresh.pi.appendEntry).toHaveBeenCalledOnce();
   });
 
   it("binds callbacks to their origin, excludes terminal handoffs, and refreshes only on post-persistence events", () => {

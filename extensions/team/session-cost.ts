@@ -7,6 +7,8 @@ export interface CostRun {
   settle(snapshot: AgentCostSnapshot | undefined, outcome: CostOutcome): void;
   exclude(): void;
 }
+export type SessionCostContext = Pick<ExtensionContext, "sessionManager">;
+type CostHost = Pick<ExtensionAPI, "on" | "appendEntry" | "events">;
 interface Receipt {
   rootSessionId: string;
   teamName: string;
@@ -15,6 +17,11 @@ interface Receipt {
   childSessionId?: string;
   costUsd?: number | null;
   outcome?: CostOutcome;
+}
+interface Scope {
+  root: string;
+  failed: Set<string>;
+  pending: Map<string, Receipt>;
 }
 const object = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -40,8 +47,13 @@ export function recordedSessionCost(entries: readonly unknown[]): { usd: number;
   return { usd, complete };
 }
 
-export function createCombinedSessionCost(pi: Pick<ExtensionAPI, "on" | "appendEntry" | "events">) {
-  let scope: { root: string; ctx: ExtensionContext; failed: Set<string>; pending: Map<string, Receipt> } | undefined;
+export function createCombinedSessionCost(initialHost: CostHost) {
+  let scope: Scope | undefined;
+  let host: CostHost | undefined;
+  let context: SessionCostContext | undefined;
+  let displayTotal: ReturnType<typeof recordedSessionCost> | undefined;
+  let unsubscribeDisplay: (() => void) | undefined;
+  let listenerGeneration = 0;
   const receipts = (entries: readonly unknown[]) => {
     const runs = new Map<string, Receipt>();
     let complete = true;
@@ -62,10 +74,11 @@ export function createCombinedSessionCost(pi: Pick<ExtensionAPI, "on" | "appendE
     }
     return { runs, complete };
   };
+  const active = () => !!scope && !!host && !!context && context.sessionManager.getSessionId() === scope.root;
   const total = () => {
     try {
-      if (!scope || scope.ctx.sessionManager.getSessionId() !== scope.root) return { usd: 0, complete: false };
-      const entries = scope.ctx.sessionManager.getEntries();
+      if (!active() || !scope || !context) return { usd: 0, complete: false };
+      const entries = context.sessionManager.getEntries();
       const own = recordedSessionCost(entries);
       const replay = receipts(entries);
       let complete = own.complete && replay.complete && scope.failed.size === 0;
@@ -85,65 +98,122 @@ export function createCombinedSessionCost(pi: Pick<ExtensionAPI, "on" | "appendE
       return { usd, complete };
     } catch { return { usd: 0, complete: false }; }
   };
-  let displayTotal: ReturnType<typeof recordedSessionCost> | undefined;
-  // Synchronous display-only query: native usage and durable receipts stay untouched.
-  const unsubscribe = pi.events.on("pi-extended-teams:cost-request", (value) => {
-    const request = object(value);
-    if (scope && request.sessionId === scope.root && scope.ctx.sessionManager.getSessionId() === scope.root) {
-      request.result = displayTotal;
-    }
-  });
   const refresh = () => {
-    displayTotal = scope ? total() : undefined;
-    try { pi.events.emit("pi-extended-teams:cost-changed", undefined); }
+    if (!host) {
+      displayTotal = undefined;
+      return;
+    }
+    displayTotal = total();
+    try { host.events.emit("pi-extended-teams:cost-changed", undefined); }
     catch { /* Display observers must not affect lifecycle cleanup. */ }
   };
-  pi.on("session_start", (_event, ctx) => {
-    scope = { root: ctx.sessionManager.getSessionId(), ctx, failed: new Set(), pending: new Map() };
-    refresh();
-  });
-  pi.on("turn_end", refresh);
-  pi.on("agent_end", refresh);
-  pi.on("session_compact", refresh);
-  pi.on("session_tree", refresh);
+  const append = (origin: Scope, key: string, receipt: Receipt) => {
+    if (!active() || scope !== origin || !host) return false;
+    try {
+      host.appendEntry(COST_ENTRY_TYPE, receipt);
+      origin.failed.delete(key);
+      origin.pending.delete(key);
+      refresh();
+      return true;
+    } catch {
+      // Keep the terminal receipt, not its pending predecessor, for reload retry.
+      origin.failed.add(key);
+      origin.pending.set(key, receipt);
+      refresh();
+      return false;
+    }
+  };
+  const listen = (nextHost: CostHost) => {
+    host = nextHost;
+    const generation = ++listenerGeneration;
+    unsubscribeDisplay = nextHost.events.on("pi-extended-teams:cost-request", (value) => {
+      const request = object(value);
+      if (generation === listenerGeneration && scope && context && request.sessionId === scope.root
+        && context.sessionManager.getSessionId() === scope.root) request.result = displayTotal;
+    });
+    nextHost.on("session_start", (_event, nextContext) => {
+      if (generation !== listenerGeneration) return;
+      const root = nextContext.sessionManager.getSessionId();
+      if (!scope || scope.root !== root) scope = { root, failed: new Set(), pending: new Map() };
+      context = nextContext;
+      refresh();
+    });
+    const refreshCurrent = () => { if (generation === listenerGeneration) refresh(); };
+    nextHost.on("turn_end", refreshCurrent);
+    nextHost.on("agent_end", refreshCurrent);
+    nextHost.on("session_compact", refreshCurrent);
+    nextHost.on("session_tree", refreshCurrent);
+  };
+  const flushFinalReceipts = () => {
+    if (!scope || !context) return;
+    const durable = receipts(context.sessionManager.getEntries()).runs;
+    for (const [key, receipt] of scope.pending) {
+      if (receipt.phase === "pending") continue;
+      const persisted = durable.get(key);
+      if (persisted && persisted.phase !== "pending") {
+        scope.pending.delete(key);
+        scope.failed.delete(key);
+      } else append(scope, key, receipt);
+    }
+  };
+  const detach = () => {
+    listenerGeneration++;
+    unsubscribeDisplay?.();
+    unsubscribeDisplay = undefined;
+    host = undefined;
+    context = undefined;
+    displayTotal = undefined;
+  };
+  listen(initialHost);
   return {
     total,
-    deactivate() {
-      scope = undefined;
-      unsubscribe();
+    // The reload owner must pass the newly supplied context for this saved root; other roots are never adopted.
+    attach(nextHost: CostHost, nextContext: SessionCostContext) {
+      try {
+        if (!scope || scope.root !== nextContext.sessionManager.getSessionId()) return false;
+      } catch { return false; }
+      detach();
+      context = nextContext;
+      listen(nextHost);
+      try { flushFinalReceipts(); }
+      catch { refresh(); }
       refresh();
+      return true;
+    },
+    detach,
+    deactivate() {
+      detach();
+      scope = undefined;
     },
     begin(rootSessionId: string, teamName: string, lifecycleRunId: string): CostRun {
       const origin = scope;
       if (!origin || origin.root !== rootSessionId) return { settle() {}, exclude() {} };
       const pending: Receipt = { rootSessionId, teamName, lifecycleRunId, phase: "pending" };
       const key = identity(pending);
-      const active = () => scope === origin && origin.ctx.sessionManager.getSessionId() === rootSessionId;
-      const append = (receipt: Receipt) => {
-        try {
-          if (!active()) return false;
-          pi.appendEntry(COST_ENTRY_TYPE, receipt);
-          origin.failed.delete(key);
-          origin.pending.delete(key);
-          refresh();
-          return true;
-        } catch {
-          origin.failed.add(key);
-          origin.pending.set(key, pending);
-          refresh();
-          return false;
+      if (!origin.pending.has(key)) {
+        if (!context) origin.pending.set(key, pending);
+        else {
+          try {
+            if (!receipts(context.sessionManager.getEntries()).runs.has(key)) append(origin, key, pending);
+          } catch { origin.failed.add(key); origin.pending.set(key, pending); refresh(); }
         }
-      };
-      try {
-        if (!receipts(origin.ctx.sessionManager.getEntries()).runs.has(key)) append(pending);
-      } catch { origin.failed.add(key); origin.pending.set(key, pending); refresh(); }
+      }
       const finish = (receipt: Receipt) => {
+        if (scope !== origin) return;
+        const previous = origin.pending.get(key);
+        if (!active() || !context) {
+          if (!previous || previous.phase === "pending") {
+            origin.failed.add(key);
+            origin.pending.set(key, receipt);
+          }
+          return;
+        }
         try {
-          if (!active()) return;
-          const previous = origin.pending.get(key) ?? receipts(origin.ctx.sessionManager.getEntries()).runs.get(key);
-          if (previous?.phase !== "pending") return;
-          append(receipt);
-        } catch { origin.failed.add(key); refresh(); }
+          const durable = receipts(context.sessionManager.getEntries()).runs.get(key);
+          const current = previous ?? durable;
+          if (current?.phase !== "pending") return;
+          append(origin, key, receipt);
+        } catch { origin.failed.add(key); origin.pending.set(key, receipt); refresh(); }
       };
       return {
         settle: (snapshot, outcome) => finish({ ...pending, phase: "final", outcome,

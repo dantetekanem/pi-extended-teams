@@ -1,35 +1,26 @@
-import { canonicalPersistedModelSlot } from "../../src/utils/settings";
+import { canonicalPersistedModelSlot, loadSettings, type ActivityColors } from "../../src/utils/settings";
 
 export const CONTEXT_USAGE_STATUS_SUFFIX = /^(?:\?|[\d.]+[kM]?) tok(?: \((?:\?|[\d.]+)%\))?$/;
 
-const ACTIVITY_COLORS = {
-  name: "51;153;255",
-  model: "255;215;0",
-  thinking: "255;242;168",
-  tier: "255;146;200",
-  text: "248;248;242",
-  message: "150;156;171",
-  warning: "255;215;0",
-  error: "255;85;85",
-} as const;
-
-const TIER_PINKS: Record<string, string> = {
-  "read-collect": "255;214;235",
-  "write-patch": "255;214;235",
-  "read-review": "255;189;222",
-  "write-feature": "255;189;222",
-  "read-analyze": "255;167;211",
-  "write-system": "255;167;211",
-  "read-critical": ACTIVITY_COLORS.tier,
-  "write-critical": ACTIVITY_COLORS.tier,
+const TIER_COLORS: Record<string, keyof ActivityColors> = {
+  "read-collect": "tierCollect",
+  "write-patch": "tierCollect",
+  "read-review": "tierReview",
+  "write-feature": "tierReview",
+  "read-analyze": "tierAnalyze",
+  "write-system": "tierAnalyze",
 };
 
-// The shared activity palette is fixed; each view's surrounding chrome stays theme-owned.
+// Views share settings; surrounding chrome remains theme-owned.
 export function createActivityColors(enabled: boolean) {
-  const foreground = (rgb: string, text: string): string =>
-    enabled ? `\x1b[38;2;${rgb}m${text}\x1b[39m` : text;
-  const color = (token: keyof typeof ACTIVITY_COLORS, text: string): string => foreground(ACTIVITY_COLORS[token], text);
-  const tier = (text: string): string => foreground(TIER_PINKS[canonicalPersistedModelSlot(text)] ?? ACTIVITY_COLORS.tier, text);
+  const palette = loadSettings({ projectDir: process.cwd() }).activityColors;
+  const color = (token: keyof ActivityColors, text: string): string => {
+    if (!enabled) return text;
+    const hex = palette[token];
+    const rgb = [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16)).join(";");
+    return `\x1b[38;2;${rgb}m${text}\x1b[39m`;
+  };
+  const tier = (text: string): string => color(TIER_COLORS[canonicalPersistedModelSlot(text)] ?? "tier", text);
   const metadata = (text: string, name: string): string => {
     const identity = `(${name})`;
     return text.split(" · ").map((part, index) => {

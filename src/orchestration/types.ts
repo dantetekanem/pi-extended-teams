@@ -5,6 +5,7 @@ import type { FileClaim } from "../utils/claims";
 import type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel } from "../utils/models";
 import type { FavoriteModelSlot } from "../utils/settings";
 import type { CheckDefinition } from "../results/check-policy";
+import type { RepairPolicy } from "../results/repair-policy";
 import type { ObservedTeamReportEvent } from "../utils/report-events";
 
 export type { InboxMessage, Member, TaskFile, TeamConfig, TeamReportEvent, ThinkingLevel, FavoriteModelSlot };
@@ -74,6 +75,7 @@ export interface SpawnTeammateOnceRequest extends OrchestrationOperationMetadata
   /** Required intent tier; selects read/write behavior, configured model, and thinking. */
   modelSlot: FavoriteModelSlot;
   checks?: CheckDefinition[];
+  repair?: RepairPolicy;
   planModeRequired?: boolean;
   color?: string;
 }

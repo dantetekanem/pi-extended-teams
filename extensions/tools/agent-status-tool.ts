@@ -5,7 +5,8 @@ import * as reportEvents from "../../src/utils/report-events";
 import { listLifecycleTombstones, readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
 import { projectAgentStatus, projectLifecycleFence, type ActiveAgentPhase } from "../../src/orchestration/status-projection";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
-import type { ReportResult } from "../../src/results/report-result";
+import { createReportResult, effectiveTaskOutcome, type ReportResult } from "../../src/results/report-result";
+import { VerificationController } from "../../src/results/verification-controller";
 import type { RunningReadAgent } from "../runtime/types";
 import { isWriteMemberAlive } from "../team/roster";
 import { formatElapsed } from "../ui/renderers";
@@ -45,6 +46,8 @@ export interface AgentStatusSnapshot {
   taskId?: string;
   reportId?: string;
   outcome?: ReportResult["outcome"];
+  effectiveOutcome?: ReportResult["outcome"];
+  repair?: ReportResult["repair"];
   verification?: ReportResult["verification"]["state"];
   acceptance?: ReportResult["acceptance"]["state"];
   summary?: string;
@@ -92,6 +95,7 @@ async function activeStatus(
   member: Member,
   options: AgentStatusToolOptions,
   now: number,
+  report?: TeamReportEvent,
 ): Promise<AgentStatusSnapshot> {
   const candidateState = options.runningReadAgents.get(options.readAgentKey(teamName, member.name));
   const [candidateRuntimeStatus, lifecycleResult] = await Promise.all([
@@ -109,6 +113,9 @@ async function activeStatus(
   const { state, runtime: runtimeStatus } = projected;
   const progress = state?.latestProgress || runtimeStatus?.latestProgress;
   const progressUpdatedAt = state?.progressUpdatedAt || runtimeStatus?.progressUpdatedAt;
+  const result = report?.result ?? (member.lifecycleRunId
+    ? (await VerificationController.observe(teamName, createReportResult(teamName, member.name, member.lifecycleRunId, {}))).result
+    : undefined);
   return {
     name: member.name,
     role: member.role || state?.role || "read",
@@ -118,7 +125,17 @@ async function activeStatus(
     activeTool: state?.activeToolName || runtimeStatus?.activeToolName,
     activityAgeMs: age(now, state?.lastActivityAt),
     heartbeatAgeMs: age(now, runtimeStatus?.lastHeartbeatAt),
-    error: projected.error,
+    ...(result?.repair ? resultStatus(result) : {}),
+    error: projected.error ?? result?.verification.error,
+  };
+}
+
+function resultStatus(result: ReportResult) {
+  return {
+    taskId: result.taskId, runId: result.runId, reportId: result.reportId,
+    outcome: result.outcome, verification: result.verification.state, acceptance: result.acceptance.state,
+    error: result.verification.error,
+    ...(result.repair ? { repair: result.repair, effectiveOutcome: effectiveTaskOutcome(result) } : {}),
   };
 }
 
@@ -138,11 +155,7 @@ function completedStatus(report: TeamReportEvent, now: number): AgentStatusSnaps
     name: report.agentName,
     role: report.role || "read",
     phase: report.status,
-    ...(report.result && {
-      taskId: report.result.taskId, runId: report.result.runId, reportId: report.result.reportId,
-      outcome: report.result.outcome, verification: report.result.verification.state, acceptance: report.result.acceptance.state,
-      error: report.result.verification.error,
-    }),
+    ...(report.result ? resultStatus(report.result) : {}),
     completedAgeMs: age(now, report.createdAt),
     summary: report.summary,
   };
@@ -169,6 +182,7 @@ export function formatAgentStatusesForModel(statuses: AgentStatusSnapshot[]): st
     const completed = formatAge(status.phase === "failed" ? "failed" : "completed", status.completedAgeMs);
     if (completed) lines.push(`  ${completed}`);
     if (status.reportId) lines.push(`  task: ${status.outcome ?? "unspecified"}; verification: ${status.verification}; acceptance: ${status.acceptance}`);
+    if (status.repair) lines.push(`  repair: ${status.repair.state}; effective task: ${status.effectiveOutcome ?? "unspecified"}; ledger: ${status.repair.journalPath}`);
     if (status.summary) lines.push(`  summary: ${status.summary}`);
     if (status.error) lines.push(`  error: ${status.error}`);
     return lines.join("\n");
@@ -202,7 +216,8 @@ export function createAgentStatusTool(options: AgentStatusToolOptions): any {
       }).catch(() => []))
         .filter(report => ownsReport(report, options.scope));
 
-      const activeStatuses = await Promise.all(activeMembers.map(member => activeStatus(teamName, member, options, now)));
+      const activeStatuses = await Promise.all(activeMembers.map(member => activeStatus(teamName, member, options, now,
+        reports.filter(report => report.agentName === member.name && report.result?.runId === member.lifecycleRunId).at(-1))));
       // Orphan fences lack parent metadata; only the lead can inspect them.
       const fencedStatuses: AgentStatusSnapshot[] = options.scope ? [] : (await listLifecycleTombstones(teamName))
         .filter(({ agentName }) => !rosterNames.has(agentName))

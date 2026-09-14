@@ -1,5 +1,6 @@
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
+import type { RepairResult } from "./repair-policy";
 
 const reference = Type.String({ minLength: 1 });
 
@@ -31,6 +32,11 @@ export interface ReportResult extends ReportedTaskDetails {
   reportId: string;
   verification: { state: VerificationState; checkIds?: string[]; error?: string };
   acceptance: { state: "pending" | "accepted" | "rejected"; decidedAt?: number; reason?: string };
+  repair?: RepairResult;
+}
+
+export function effectiveTaskOutcome(result: ReportResult): TaskOutcome | undefined {
+  return result.repair?.outcome ?? result.outcome;
 }
 
 export function normalizeReportedTaskDetails(value: unknown): ReportedTaskDetails {

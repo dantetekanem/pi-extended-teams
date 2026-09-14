@@ -119,9 +119,21 @@ Verification records the actual exit, full output, and source before and after e
 
 Check records and private full logs live under `~/.pi/teams/<team>/checks/`. Report IDs reference their check IDs. `listTeamReportEvents` and orchestration/status reads recheck current source and expose stale verification without rewriting historical evidence. After roster removal, `check_teammate` retrieves the report, observed check records, and full-log paths. Ordinary lead notifications include verification state, not full logs.
 
-Repeated reports do not rerun commands. An unresolved execution claim is not replayed and prevents clean finalization. In-process interruption and shutdown cancel assigned checks and wait for raw settlement; nonsettling operations remain quarantined without releasing claims. Failed checks do not imply a failed lifecycle, overwrite the reported task outcome, or grant lead acceptance. There is no automatic repair or retry in this feature.
+Duplicate submissions do not rerun commands. An unresolved execution claim is not replayed and prevents clean finalization. In-process interruption and shutdown cancel assigned checks and wait for raw settlement; nonsettling operations remain quarantined without releasing claims. Failed checks do not imply a failed lifecycle, overwrite the reported task outcome, or grant lead acceptance. Automatic repair is disabled unless explicitly authorized.
 
 These fingerprints are observations, not snapshots or workspace isolation. They do not capture ignored/external inputs, external services, or edits restored between observations. Checks and agents share the host's permissions; this is not a sandbox against other same-user processes.
+
+## Optional bounded repair
+
+Add `repair: { maxAttempts: 1 }` to a spawn with assigned `checks` to allow one additional repair attempt after initial verification. The limit is zero to five; zero disables repair. Swarm defaults are inherited, and an agent can override them with `{ maxAttempts: 0 }`. Only the lead or a trusted integration can authorize repair. Metadata, report parameters, and nested helpers cannot enable it. Trusted integrations bind the request's `repair` as the member's `repairPolicy`.
+
+A failed check returns its observed exit and full-log reference to the responsible agent. A `report_and_exit` repair receipt has `accepted: false` and a `repairRequest`; the agent remains active, repairs only its assigned scope, and resubmits. Repair does not grant edit permissions: read agents must report a blocker when edits are needed, and edit agents must keep or reacquire claims before changing files. Plaintext reporting uses a separate repair turn after current work settles. An accepted final-report receipt is still separate from lead acceptance.
+
+The harness reruns failed checks and checks whose scoped inputs changed. It reuses passed evidence only when the current scoped source matches. Runtime submission IDs prevent duplicate reports from consuming another attempt. Reservations and decisions are persisted before check execution or repair feedback; cancellation prevents further automatic attempts. A pending native claim or controller reservation keeps cleanup fenced even after in-process state is lost. A stop may therefore report blocked cleanup rather than claim the agent stopped.
+
+Repair history lives under `~/.pi/teams/<team>/repairs/`. The report's `repair` includes its controller ID, ledger path, state, and available attempt counts/request IDs. Missing or corrupt records remain pending with an error; unknown counts are omitted. `listTeamReportEvents`, status, and report recovery read authoritative repair/check evidence without rewriting history. `readStoredTeamReportEvent` retrieves an exact historical record without observing source.
+
+Exhausted, declined, cancelled, or otherwise blocked repair produces an effective blocker while preserving the agent's reported `outcome`. `effectiveTaskOutcome(result)` exposes that distinction to trusted consumers. Passing checks never invent a success claim or grant lead acceptance. Existing reports and spawns without a repair policy retain their behavior.
 
 ## Intent tiers
 

@@ -9,13 +9,15 @@ import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
 import type { Member } from "../../src/utils/models";
-import { createReportResult, normalizeReportedTaskDetails, type ReportResult, type ReportedTaskDetails } from "../../src/results/report-result";
-import { assignedCheckIds, normalizeCheckPolicy, verifyAssignedChecks, type CheckDefinition } from "../../src/results/check-policy";
+import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails, type ReportResult, type ReportedTaskDetails } from "../../src/results/report-result";
+import { assignedCheckIds, normalizeCheckPolicy, type CheckDefinition } from "../../src/results/check-policy";
+import { normalizeRepairPolicy, type RepairPolicy } from "../../src/results/repair-policy";
+import { VerificationController, type VerificationDecision } from "../../src/results/verification-controller";
 import type { CheckRunnerOptions } from "../../src/results/check-runner";
 import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
-import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
+import { createAgentCommunicationTools, formatRepairRequest, type SubmittedAgentReport } from "../tools/agent-communication-tools";
 import { requireWriteAgentTeam } from "../team/roster";
 import { isPiPromptPlanningMember, shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
@@ -55,6 +57,7 @@ import {
 export { closeReadAgentMessageDelivery } from "./read-agent-session-lifecycle";
 
 const pendingParentWakeSignals = new WeakMap<RunningReadAgent, () => void>();
+const repairCancellationHandlers = new WeakMap<RunningReadAgent, () => Promise<void>>();
 
 interface ReadAgentWakeState {
   generation: number;
@@ -172,8 +175,9 @@ async function runReadAgentSessionOperation(
       failure = error;
     }
 
-    if (state.activeOperationGeneration === generation) state.activeOperationGeneration = undefined;
     const interrupted = state.interruptRequestedGeneration === generation;
+    if (interrupted || failure || state.stopRequested) await repairCancellationHandlers.get(state)?.();
+    if (state.activeOperationGeneration === generation) state.activeOperationGeneration = undefined;
     if (interrupted) state.interruptRequestedGeneration = undefined;
     state.completedOperationGeneration = generation;
     state.completedOperationInterrupted = interrupted;
@@ -368,7 +372,7 @@ export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | un
     agent.name,
     async () => {
       const check = agent.checkOperation;
-      if (check) await (agent.activeOperationSettlementPromise ?? check.settled);
+      if (check || !session.isStreaming) await (agent.activeOperationSettlementPromise ?? check?.settled);
       const pendingInterrupt = agent.operationInterruptPromise;
       if (pendingInterrupt) await pendingInterrupt.catch(() => {});
       if (agent.messageDeliveryClosed || agent.stopRequested) throw new ReadAgentDeliveryCancelledError(agent.name);
@@ -662,6 +666,25 @@ export async function runReadAgentInProcess(
   let completedReportPersisted = false;
   let resolvedTaskResult: ReportResult | undefined;
   let assignedChecks: CheckDefinition[] | undefined;
+  let repairPolicy: RepairPolicy | undefined;
+  const deliveredRepairRequests = new Set<string>();
+  let repairCancellation: Promise<void> | undefined;
+  const cancelAutomaticRepair = async (): Promise<void> => {
+    const result = resolvedTaskResult;
+    if (!repairPolicy || result?.repair?.state !== "requested") return;
+    repairCancellation ??= (async () => {
+      try {
+        await new VerificationController({ teamName: readTeamName, result, cwd: member.cwd, checks: assignedChecks, repair: repairPolicy }).cancel();
+        result.repair = { ...result.repair!, state: "cancelled", outcome: "blocked" };
+      } catch (error) {
+        state.finalizationBlockedReason = `Repair cancellation could not be persisted: ${error instanceof Error ? error.message : String(error)}`;
+        result.verification.error = state.finalizationBlockedReason;
+        closeReadAgentMessageDelivery(state);
+        throw error;
+      }
+    })();
+    await repairCancellation;
+  };
   const pendingChildController = options.pendingChildController;
   const pendingChildParent: ParentRunIdentity | undefined = isEligibleNestedReadParent(member)
     ? {
@@ -696,14 +719,19 @@ export async function runReadAgentInProcess(
     return deliveryClose;
   };
 
-  const verifyTaskResult = async (reported: ReportedTaskDetails, signal?: AbortSignal): Promise<ReportResult> => {
+  const verifyTaskResult = async (reported: ReportedTaskDetails, signal?: AbortSignal, submissionId?: string): Promise<VerificationDecision> => {
     if (state.checkOperation) throw new Error("Check verification is already active for this run.");
-    if (assignedChecks?.length && (state.stopRequested || !options.isCurrentReadAgentRun(key, state))) {
+    if (assignedChecks?.length && (state.stopRequested || state.messageDeliveryClosed || state.finalizationBlockedReason || !options.isCurrentReadAgentRun(key, state))) {
       throw new Error("Check verification cancelled: agent run is closing.");
     }
     const result = createReportResult(readTeamName, member.name, state.runId, reported);
+    if (resolvedTaskResult?.repair) Object.assign(result, { verification: resolvedTaskResult.verification, repair: resolvedTaskResult.repair });
     resolvedTaskResult = result;
-    if (!assignedChecks?.length) return result;
+    if (!assignedChecks?.length) return { result, checks: [] };
+    let decision: VerificationDecision = { result, checks: [] };
+    const verificationController = new VerificationController({
+      teamName: readTeamName, result, cwd: member.cwd, checks: assignedChecks, repair: repairPolicy,
+    });
     result.verification = { state: "pending", checkIds: assignedCheckIds(result, assignedChecks) };
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -716,14 +744,17 @@ export async function runReadAgentInProcess(
     options.renderReadAgentStatus();
     try {
       try {
-        const evidence = await verifyAssignedChecks(readTeamName, result, member.cwd, assignedChecks, {
+        decision = await verificationController.verify(submissionId ?? "", {
           loadOperations: options.loadCheckOperations ?? loadNativeCheckOperations,
           signal: controller.signal,
         });
-        result.verification = evidence.verification;
+        Object.assign(result, decision.result);
+        decision.result = result;
       } catch (error) {
         state.finalizationBlockedReason = `Assigned check evidence could not be persisted: ${error instanceof Error ? error.message : String(error)}`;
         result.verification.error = state.finalizationBlockedReason;
+        const repair = verificationController.pendingRepair(error);
+        if (repair) result.repair = repair;
         throw error;
       }
       if (result.verification.state === "pending") {
@@ -731,9 +762,10 @@ export async function runReadAgentInProcess(
         throw new Error(state.finalizationBlockedReason);
       }
       if (controller.signal.aborted || state.stopRequested || !options.isCurrentReadAgentRun(key, state)) {
+        await cancelAutomaticRepair();
         throw new Error("Assigned check verification was cancelled.");
       }
-      return result;
+      return decision;
     } finally {
       signal?.removeEventListener("abort", abort);
       if (state.checkOperation === operation) state.checkOperation = undefined;
@@ -756,7 +788,7 @@ export async function runReadAgentInProcess(
     const result = resolvedTaskResult ?? createReportResult(readTeamName, member.name, state.runId, resolution);
     resolvedTaskResult = result;
     const leadReport = assignedChecks?.length
-      ? `${report}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}. Evidence: ${result.reportId}.`
+      ? `${report}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}${result.repair ? `; repair: ${result.repair.state}; effective task: ${effectiveTaskOutcome(result) ?? "unspecified"}` : ""}. Evidence: ${result.reportId}.`
       : report;
     const completionStats = session.getSessionStats();
     // Private child transcripts are deleted after teardown; never publish pointers
@@ -862,6 +894,9 @@ export async function runReadAgentInProcess(
 
   try {
     assignedChecks = normalizeCheckPolicy(member.assignedChecks);
+    repairPolicy = normalizeRepairPolicy(member.repairPolicy);
+    if (repairPolicy && !assignedChecks?.length) throw new Error("Repair policy requires explicitly assigned checks.");
+    if (repairPolicy) repairCancellationHandlers.set(state, cancelAutomaticRepair);
     if (pendingChildParent && !pendingChildController) {
       throw new Error(`Eligible nested read parent ${member.name} requires a pending child controller.`);
     }
@@ -957,7 +992,9 @@ export async function runReadAgentInProcess(
               ]
             : ["You cannot spawn or create other agents. If another agent is needed, use send_message to ask team-lead; only the lead decides and performs the spawn."]),
         "NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.",
-        "When finished, use report_and_exit with the complete required deliverable in content and only a short label in summary, then stop. Never replace required output with a summary. Do not wait for the lead to kill you — report and exit cleanly.",
+        repairPolicy
+          ? `Use report_and_exit with the complete deliverable in content. The lead authorized at most ${repairPolicy.maxAttempts} additional repair attempts for assigned checks. If the tool requests repair, stay active, inspect its observed evidence and repair only within your role and assigned scope. Report blocked or failed if you cannot continue safely. Stop only after the report is accepted; never replace the deliverable with a summary.`
+          : "When finished, use report_and_exit with the complete required deliverable in content and only a short label in summary, then stop. Never replace required output with a summary. Do not wait for the lead to kill you — report and exit cleanly.",
       ],
     });
     await loader.reload();
@@ -980,13 +1017,19 @@ export async function runReadAgentInProcess(
         pushReadAgentEvent(state, status);
         options.renderReadAgentStatus();
       },
-      onReportAndExit: async (report, signal) => {
+      repairEnabled: !!repairPolicy,
+      onReportAndExit: async (report, signal, submissionId) => {
         const content = nonEmptyReportText(report.content);
         if (!content) throw new Error("Final report content must not be empty.");
         if (submittedFinalReport || finalReportSubmissionInProgress) return { accepted: false };
         finalReportSubmissionInProgress = true;
         try {
-          const result = await verifyTaskResult(report, signal);
+          const decision = await verifyTaskResult(report, signal, submissionId ? `tool:${submissionId}` : undefined);
+          if (decision.request) {
+            deliveredRepairRequests.add(decision.request.id);
+            return { accepted: false, verification: decision.result.verification, repairRequest: decision.request };
+          }
+          const result = decision.result;
           const deliveryClose = await closeRecipient();
           submittedFinalReport = {
             ...normalizeReportedTaskDetails(report),
@@ -1333,8 +1376,10 @@ export async function runReadAgentInProcess(
         if (completionResolution.terminalFailure || !completionResolution.report) {
           throw unavailableReportError(completionResolution.terminalFailure ?? "No usable report is available for verification.");
         }
+        const submissionId = `fallback:${state.completedOperationGeneration ?? 0}`;
+        let decision: VerificationDecision | undefined;
         const verification = await runReadAgentSessionOperation(state, async () => {
-          await verifyTaskResult(completionResolution!);
+          decision = await verifyTaskResult(completionResolution!, undefined, submissionId);
         });
         if (verification.interrupted) {
           if (!await waitForPostInterruptOperation(verification.generation, wakeGeneration)) return;
@@ -1346,7 +1391,21 @@ export async function runReadAgentInProcess(
           } while (deliveryTail !== state.messageDeliveryTail);
           state.acceptingMessages = false;
           const latestGeneration = state.completedOperationGeneration ?? verification.generation;
-          if (latestGeneration === verification.generation) break;
+          if (latestGeneration === verification.generation) {
+            const request = decision?.request;
+            if (!request || deliveredRepairRequests.has(request.id)) break;
+            deliveredRepairRequests.add(request.id);
+            if (state.messageDeliveryClosed || state.stopRequested || !options.isCurrentReadAgentRun(key, state)) return;
+            state.acceptingMessages = true;
+            markReadAgentActivity(state, `repairing assigned checks (attempt ${request.attempt})`, "thinking");
+            options.renderReadAgentStatus();
+            const repairWake = readAgentWakeGeneration(state);
+            const repairOperation = await runReadAgentSessionOperation(state, () => session.prompt(formatRepairRequest(request), { source: "extension" as any }));
+            refreshReadAgentStats(state, session);
+            if (repairOperation.interrupted && !await waitForPostInterruptOperation(repairOperation.generation, repairWake)) return;
+            completionResolution = resolveCurrentReport();
+            continue;
+          }
           if (state.completedOperationError) throw state.completedOperationError;
           if (state.completedOperationInterrupted) {
             state.acceptingMessages = !state.messageDeliveryClosed && !state.stopRequested && options.isCurrentReadAgentRun(key, state);
@@ -1382,6 +1441,7 @@ export async function runReadAgentInProcess(
     const recoveryReference = readAgentRecoveryReference(readTeamName, member.name, state.runId, childSessionManager);
     await deliverCompletion(completionResolution, completionSummary, recoveryAttempted, recoveryReference);
   } catch (e) {
+    await cancelAutomaticRepair().catch(() => {});
     const lastError = runtime.createRuntimeError(e);
     state.lastError = lastError;
     options.renderReadAgentStatus();
@@ -1502,6 +1562,8 @@ export async function runReadAgentInProcess(
     }
   } finally {
     childLifecycleProbeUnsubscribe();
+    if (state.stopRequested) await cancelAutomaticRepair().catch(() => {});
+    repairCancellationHandlers.delete(state);
     pendingParentWakeSignals.delete(state);
     disposeReadAgentWake(state);
     settleSessionCreation(state.session);

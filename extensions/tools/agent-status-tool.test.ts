@@ -6,6 +6,7 @@ import * as lifecycleTombstones from "../../src/utils/lifecycle-tombstone.js";
 import type { Member, TeamReportEvent } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
 import { createReportResult } from "../../src/results/report-result";
+import { VerificationController } from "../../src/results/verification-controller";
 import { createAgentStatusTool, type QueuedAgentStatus } from "./agent-status-tool.js";
 
 function member(name: string, extras: Partial<Member> = {}): Member {
@@ -77,6 +78,7 @@ function makeTool(
 
 describe("get_agent_status", () => {
   beforeEach(() => {
+    vi.spyOn(VerificationController, "observe").mockImplementation(async (_team, result) => ({ result, checks: [] }));
     vi.spyOn(lifecycleTombstones, "readLifecycleTombstone").mockResolvedValue({ status: "absent" });
     vi.spyOn(lifecycleTombstones, "listLifecycleTombstones").mockResolvedValue([]);
   });

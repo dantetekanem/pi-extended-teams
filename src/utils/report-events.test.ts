@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { appendTeamReportEvent, listTeamReportEvents, recordReportAcceptance } from "./report-events";
+import { execFileSync } from "node:child_process";
+import { VerificationController } from "../results/verification-controller";
+import { appendTeamReportEvent, listTeamReportEvents, readStoredTeamReportEvent, recordReportAcceptance } from "./report-events";
 import { createReportResult } from "../results/report-result";
 import * as paths from "./paths";
 import type { TeamReportEvent } from "./models";
@@ -50,6 +52,45 @@ describe("report events", () => {
     expect(reports[0].result?.verification).toMatchObject({ state: "failed", error: expect.stringContaining("Invalid check identity") });
     expect(reports[1].result).toEqual(good);
     expect(fs.readFileSync(reportsPath(), "utf8")).toBe(before);
+  });
+
+  it.each(["running", "corrupt"])("observes %s repair ownership without rewriting reports or hiding unrelated results", async state => {
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "tested");
+    const result = createReportResult("team", "repairer", "run", { outcome: "succeeded" });
+    const controller = new VerificationController({ teamName: "team", result, cwd,
+      checks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }], repair: { maxAttempts: 1 } });
+    const exec = vi.fn(async () => ({ exitCode: 0 }));
+    const verified = await controller.verify("initial", { loadOperations: async () => ({ exec }) });
+    const ledger = JSON.parse(fs.readFileSync(controller.journalPath, "utf8"));
+    ledger.stages[0].state = "running";
+    fs.writeFileSync(controller.journalPath, state === "corrupt" ? "{" : JSON.stringify(ledger));
+    await appendTeamReportEvent("team", { agentName: "repairer", status: "failed", report: "Recovery report", source: "read-agent",
+      result: state === "running" ? result : verified.result });
+    const good = createReportResult("team", "other", "run", { outcome: "blocked" });
+    await appendTeamReportEvent("team", { agentName: "other", status: "completed", report: "Other report", source: "read-agent", result: good });
+    const before = fs.readFileSync(reportsPath(), "utf8");
+    const [observed, unrelated] = await listTeamReportEvents("team");
+    expect(observed).toMatchObject({ result: { outcome: "succeeded", verification: { state: "pending" },
+      repair: { state: "pending", outcome: "blocked" }, acceptance: { state: "pending" } }, checks: [{ state: "passed", exitCode: 0 }] });
+    expect(unrelated.result).toEqual(good);
+    expect(fs.readFileSync(reportsPath(), "utf8")).toBe(before);
+    expect(exec).toHaveBeenCalledOnce();
+  });
+
+  it("reads exact stored recovery metadata without source observation or shared mutable results", async () => {
+    const result = createReportResult("team", "reader", "run", { outcome: "succeeded" });
+    result.verification = { state: "pending", error: "Uncertain persistence" };
+    const event = await appendTeamReportEvent("team", { agentName: "reader", status: "failed", report: "Recovery", source: "read-agent", result });
+    const observe = vi.spyOn(VerificationController, "observe");
+    const stored = await readStoredTeamReportEvent("team", result.reportId);
+    expect(stored).toEqual(event);
+    stored!.result!.verification.error = "Caller mutation";
+    expect((await readStoredTeamReportEvent("team", result.reportId))?.result).toEqual(result);
+    expect(await readStoredTeamReportEvent("team", "another-report")).toBeUndefined();
+    expect(observe).not.toHaveBeenCalled();
   });
 
   it("filters before applying latest-limit pagination", async () => {

@@ -7,9 +7,11 @@ import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import * as reportEvents from "../../src/utils/report-events";
-import { createReportResult, normalizeReportedTaskDetails, ReportedTaskDetailsSchema } from "../../src/results/report-result";
+import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails, ReportedTaskDetailsSchema, type ReportResult } from "../../src/results/report-result";
 import { canonicalPersistedModelSlot } from "../../src/utils/settings";
-import { normalizeCheckPolicy, verifyAssignedChecks } from "../../src/results/check-policy";
+import { normalizeCheckPolicy } from "../../src/results/check-policy";
+import { VerificationController } from "../../src/results/verification-controller";
+import { formatRepairRequest } from "./agent-communication-tools";
 import type { CheckRunnerOptions } from "../../src/results/check-runner";
 import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import { createFileClaimTools } from "./file-claim-tools";
@@ -60,8 +62,24 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
   const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
   const pendingWriterFinalization = new Map<string, { teamName: string; agentName: string; runId: string }>();
   const verifyingReports = new Set<string>();
+  const blockedReports = new Set<string>();
+  const pendingRepairs = new Map<string, { controller: VerificationController; result: ReportResult }>();
+  let repairCancellation: Promise<void> | undefined;
+  const cancelPendingRepairs = () => repairCancellation ??= (async () => {
+    for (const [reportId, { controller }] of pendingRepairs) {
+      try {
+        await controller.cancel();
+        pendingRepairs.delete(reportId);
+      } catch (error) {
+        blockedReports.add(reportId);
+        throw error;
+      }
+    }
+  })().finally(() => { repairCancellation = undefined; });
 
+  pi.on?.("agent_settled", cancelPendingRepairs);
   pi.on?.("session_shutdown", async () => {
+    await cancelPendingRepairs();
     const pending = Array.from(pendingWriterFinalization.values());
     for (const item of pending) {
       let cleared = false;
@@ -175,18 +193,32 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         runtimeStatus = await runtime.writeRuntimeStatus(targetTeamName, options.agentName, runId, {});
       }
       const checks = normalizeCheckPolicy(member.assignedChecks);
-      if (checks?.length) {
-        if (verifyingReports.has(result.reportId)) throw new Error("Final report verification is already in progress for this run.");
-        verifyingReports.add(result.reportId);
-        try {
-          result.verification = (await verifyAssignedChecks(targetTeamName, result, member.cwd, checks, {
-            loadOperations: options.loadCheckOperations ?? loadNativeCheckOperations, signal: _signal,
-          })).verification;
-          if (_signal?.aborted) throw new Error("Assigned check verification was cancelled.");
-          if (result.verification.state === "pending") throw new Error("Assigned checks have an unresolved execution claim; inspect the durable journal before finalizing this run.");
-        } finally {
-          verifyingReports.delete(result.reportId);
+      if (repairCancellation) await repairCancellation;
+      if (blockedReports.has(result.reportId)) throw new Error("Final report verification is blocked by uncertain persistence for this run.");
+      if (verifyingReports.has(result.reportId)) throw new Error("Final report verification is already in progress for this run.");
+      const previous = pendingRepairs.get(result.reportId)?.result;
+      if (previous) Object.assign(result, { verification: previous.verification, repair: previous.repair });
+      const controller = new VerificationController({ teamName: targetTeamName, result, cwd: member.cwd, checks, repair: member.repairPolicy });
+      verifyingReports.add(result.reportId);
+      try {
+        const decision = await controller.verify(`tool:${_toolCallId}`, {
+          loadOperations: options.loadCheckOperations ?? loadNativeCheckOperations, signal: _signal,
+        }).catch(error => { blockedReports.add(result.reportId); throw error; });
+        Object.assign(result, decision.result);
+        if (decision.request) pendingRepairs.set(result.reportId, { controller, result: structuredClone(result) });
+        else pendingRepairs.delete(result.reportId);
+        if (checks?.length && _signal?.aborted) {
+          await controller.cancel().catch(error => { blockedReports.add(result.reportId); throw error; });
+          pendingRepairs.delete(result.reportId);
+          throw new Error("Assigned check verification was cancelled.");
         }
+        if (result.verification.state === "pending") throw new Error("Assigned checks have an unresolved execution claim; inspect the durable journal before finalizing this run.");
+        if (decision.request) return {
+          content: [{ type: "text", text: formatRepairRequest(decision.request) }],
+          details: { accepted: false, session: targetTeamName, repairRequest: decision.request, result },
+        };
+      } finally {
+        verifyingReports.delete(result.reportId);
       }
       await closePersistedRecipient(targetTeamName, options.agentName, runId, {
         removeOnFailure: true,
@@ -240,7 +272,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         reportPath = persistedReport.reportPath || "";
         if (!reportPath) throw new Error("The persisted report did not provide its standalone file path.");
         const leadReport = checks?.length
-          ? `${params.content}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}. Evidence: ${result.reportId}.`
+          ? `${params.content}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}${result.repair ? `; repair: ${result.repair.state}; effective task: ${effectiveTaskOutcome(result) ?? "unspecified"}` : ""}. Evidence: ${result.reportId}.`
           : params.content;
         await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", leadReport, params.summary || "Final report", undefined, { metadata: reportMetadata });
         releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);
@@ -259,7 +291,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         try { ctx.shutdown(); } catch { process.exit(0); }
       }, 250);
 
-      return { content: [{ type: "text", text: `Final report sent. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { session: targetTeamName, releasedClaims, reportPath, result } };
+      return { content: [{ type: "text", text: `Final report sent. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { accepted: true, session: targetTeamName, releasedClaims, reportPath, result } };
     },
   });
 

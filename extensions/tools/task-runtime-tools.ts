@@ -11,6 +11,7 @@ import type { ReadAgentTeardownResult } from "../agents/read-agent-session-lifec
 import type { ShutdownTeammateOptions } from "../team/lifecycle";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
 import type { TeammateInterruptResult } from "../runtime/teammate-interrupt";
+import { effectiveTaskOutcome } from "../../src/results/report-result";
 
 export interface TaskRuntimeToolsOptions {
   isTeammate: boolean;
@@ -147,6 +148,10 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
       if (!member) {
         const fence = await readLifecycleTombstone(teamName, params.agent_name);
         if (fence.status !== "absent") {
+          const completedReport = !options.isTeammate && fence.status === "occupied"
+            ? (await reportEvents.listTeamReportEvents(teamName, { agentName: params.agent_name }))
+              .filter(report => report.result?.runId === fence.tombstone.runId && report.result.repair).at(-1)
+            : undefined;
           const details = {
             agentName: params.agent_name,
             alive: false,
@@ -157,12 +162,17 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
             startupStalled: false,
             runtime: await runtime.readRuntimeStatus(teamName, params.agent_name).catch(() => null),
             teardownState: "quarantined",
+            ...(completedReport ? { completedReport } : {}),
             removedMember: false,
             releasedClaims: [],
             tombstone: fence.status === "occupied" ? fence.tombstone : undefined,
             error: fence.status === "corrupt" ? fence.error : undefined,
           };
-          return { content: [{ type: "text", text: formatTeammateStatusForModel(params.agent_name, details) }], details };
+          const text = [formatTeammateStatusForModel(params.agent_name, details),
+            completedReport ? `Full report: ${completedReport.reportPath}; repair ledger: ${completedReport.result!.repair!.journalPath}` : undefined,
+            ...(completedReport?.checks?.map(check => `Check ${check.checkId}: ${check.state}; full log: ${check.logPath}`) ?? []),
+          ].filter(Boolean).join("\n\n");
+          return { content: [{ type: "text", text }], details };
         }
         if (options.isTeammate) throw new Error(`Agent ${params.agent_name} not found`);
         const latestReport = (await reportEvents.listTeamReportEvents(teamName, {
@@ -179,6 +189,9 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
             `Agent ${params.agent_name} is no longer active. Recovered its latest persisted ${latestReport.status} report from ${reportPath}.`,
             latestReport.result
               ? `Task: ${latestReport.result.outcome ?? "unspecified"}; verification: ${latestReport.result.verification.state}; acceptance: ${latestReport.result.acceptance.state}. Report ID: ${latestReport.result.reportId}.`
+              : undefined,
+            latestReport.result?.repair
+              ? `Repair: ${latestReport.result.repair.state}; effective task: ${effectiveTaskOutcome(latestReport.result) ?? "unspecified"}; ledger: ${latestReport.result.repair.journalPath}.`
               : undefined,
             latestReport.checks?.map(check => `Check ${check.checkId}: ${check.state}; exit ${check.exitCode ?? "unknown"}; full log: ${check.logPath}`).join("\n"),
             latestReport.result?.verification.error,
@@ -251,7 +264,8 @@ export function registerTaskRuntimeTools(pi: any, options: TaskRuntimeToolsOptio
         removedMember: teardown?.removedMember ?? false,
         error: teardown?.error ?? lifecycleError,
       };
-      return { content: [{ type: "text", text: formatTeammateStatusForModel(params.agent_name, details) }], details };
+      const text = [formatTeammateStatusForModel(params.agent_name, details), details.error].filter(Boolean).join("\n\n");
+      return { content: [{ type: "text", text }], details };
     },
     renderResult(result: any, { expanded }: any, theme: any) {
       return renderTeammateStatus(result, expanded, theme);

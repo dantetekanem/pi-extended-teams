@@ -9,7 +9,7 @@ import { cleanupAgentSessionFolders, cleanupOrphanedTeams } from "../internal/se
 import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
 import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
-import { FAVORITE_MODEL_SLOTS, loadSettings } from "../../src/utils/settings";
+import { globalSettingsPath, projectSettingsPath } from "../../src/utils/settings";
 import { generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
 import { cleanupStaleSessionContextReferences } from "../internal/session-context-reference";
 import { cleanupStalePrivateAgentSessions } from "../internal/agent-session-files";
@@ -40,6 +40,13 @@ export function isInboxFileWatchEvent(inboxFile: string, filename: string | Buff
   const inboxBase = path.basename(inboxFile);
   const changedName = filename?.toString();
   return !changedName || changedName === inboxBase || changedName === `${inboxBase}.lock`;
+}
+
+function hasPersistedTeamSettings(ctx: any): boolean {
+  if (fs.existsSync(globalSettingsPath())) return true;
+  return typeof ctx.cwd === "string"
+    && ctx.isProjectTrusted?.() === true
+    && fs.existsSync(projectSettingsPath(ctx.cwd));
 }
 
 export function registerExtensionEvents(pi: any, options: RegisterEventsOptions): void {
@@ -163,14 +170,9 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       } catch {
         // Session-start janitors are best-effort and must not block initialization.
       }
-      const settings = loadSettings({ projectDir: ctx.cwd });
-      const configuredTiers = FAVORITE_MODEL_SLOTS.filter((slot) => {
-        const config = settings.favoriteModels[slot];
-        return !!config?.model && !!config.thinking;
-      });
-      if (configuredTiers.length === 0) {
+      if (!hasPersistedTeamSettings(ctx)) {
         ctx.ui?.notify?.(
-          "No agent intent tiers are configured. Define them with /agents-favorite-models before spawning agents. See README.md for intent-tier examples.",
+          "pi-extended-teams is not configured yet. Run /pi-extended-teams-onboard for agent-led model and shared-extension setup.",
           "warning"
         );
       }
@@ -220,10 +222,14 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       }
 
       scheduleTeammateOneShot(() => {
-        options.quietTrigger("read_inbox to get your instructions, then begin your work.");
+        options.quietTrigger(process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1"
+          ? "Continue your existing assignment. Read any new inbox messages, then finish and report_and_exit from this pane."
+          : "read_inbox to get your instructions, then begin your work.");
       }, 1000);
 
       if (teamName) {
+        const herdrResume = process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1";
+        let notifiedInbox: string | undefined;
         let wakeInFlight = false;
         const wakeIfUnread = async () => {
           if (teammateInboxDisposed) return;
@@ -232,7 +238,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             scheduleTeammateInboxWake(250);
             return;
           }
-          if (!ctx.isIdle()) {
+          if (!ctx.isIdle() && !herdrResume) {
             teammatePendingInboxWake = true;
             scheduleTeammateInboxWake(250);
             return;
@@ -246,7 +252,15 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
               lastHeartbeatAt: Date.now(),
             });
             if (unread.length > 0) {
-              options.quietTrigger(`You have ${unread.length} new inbox message(s). Read them with read_inbox and act.`);
+              const content = `You have ${unread.length} new inbox message(s). Read them with read_inbox and act.`;
+              if (herdrResume) {
+                const inboxVersion = JSON.stringify(unread);
+                if (inboxVersion !== notifiedInbox) {
+                  pi.sendMessage({ customType: "pi-extended-teams-wake", content, display: false },
+                    { triggerTurn: true, deliverAs: "steer" });
+                  notifiedInbox = inboxVersion;
+                }
+              } else options.quietTrigger(content);
             }
           } catch (e) {
             if (!teammateInboxDisposed) {

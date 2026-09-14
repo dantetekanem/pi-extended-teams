@@ -29,8 +29,7 @@ export function isAgentActivity(value: unknown): value is AgentActivity {
     && ["starting", "thinking", "working", "finishing"].includes(value.status);
 }
 
-function lifecyclePhase(member: Member, fence: LifecycleTombstoneReadResult): { phase: ActiveAgentPhase; error?: string } | undefined {
-  if (fence.status === "absent") return;
+export function projectLifecycleFence(member: Pick<Member, "lifecycleRunId">, fence: Exclude<LifecycleTombstoneReadResult, { status: "absent" }>): { phase: ActiveAgentPhase; error?: string } {
   if (fence.status === "corrupt") return { phase: "quarantined", error: fence.error };
   const { tombstone } = fence;
   const mismatch = member.lifecycleRunId && tombstone.runId !== member.lifecycleRunId
@@ -54,7 +53,7 @@ export function projectAgentStatus(input: {
   const { member, now } = input;
   const state = input.activity?.runId === member.lifecycleRunId ? input.activity : undefined;
   const runtime = input.runtime?.lifecycleRunId === member.lifecycleRunId ? input.runtime : null;
-  const persisted = lifecyclePhase(member, input.fence);
+  const persisted = input.fence.status === "absent" ? undefined : projectLifecycleFence(member, input.fence);
   const hasRecentHeartbeat = isHeartbeatFresh(runtime, now);
   const inProcess = !!state && state.teardownState !== "finalized" && !state.handoffDetached;
   const externalAlive = member.isActive !== false && (hasRecentHeartbeat || input.terminalAlive === true);

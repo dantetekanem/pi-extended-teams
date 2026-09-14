@@ -446,6 +446,7 @@ export function createAgentFollowComponent(
 
     const recipient = agent.name;
     sendingMessage = true;
+    messageInput.setValue("");
     messageStatus = `Sending to ${recipient}…`;
     tui.requestRender();
     void Promise.resolve()
@@ -455,6 +456,7 @@ export function createAgentFollowComponent(
         stopComposingMessage();
       })
       .catch((error: unknown) => {
+        if (composingMessage) messageInput.setValue(value);
         messageStatus = error instanceof Error ? error.message : `Could not message ${recipient}.`;
         tui.requestRender();
       })
@@ -465,6 +467,13 @@ export function createAgentFollowComponent(
   };
 
   const sortedAgents = () => options.getAgents().slice().sort((a, b) => a.name.localeCompare(b.name));
+
+  const scrollTranscript = (delta: number) => {
+    if (!Number.isFinite(delta)) return;
+    const maxOffset = Math.max(0, lastTranscriptRows - lastBodyHeight);
+    offsetFromBottom = Math.max(0, Math.min(maxOffset, offsetFromBottom - Math.trunc(delta)));
+    tui.requestRender();
+  };
 
   const selectRelative = (delta: number) => {
     const agents = sortedAgents();
@@ -598,11 +607,12 @@ export function createAgentFollowComponent(
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";
       const messageAction = options.sendMessage ? " · m message" : "";
       const interruptAction = options.interruptAgent ? " · i interrupt" : "";
-      const help = composingMessage
+      const herdrAction = process.env.HERDR_ENV === "1" && agent.moveToHerdr ? " · h Herdr" : "";
+      const help = messageStatus && !options.sendMessage ? messageStatus : composingMessage
         ? `message ${agent.name} · enter send · esc cancel`
         : agents.length > 1
-          ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction}${interruptAction} · x stop · pgup/pgdn scroll · esc main`
-          : `↑/esc main · ${logAction}${messageAction}${interruptAction} · x stop · pgup/pgdn scroll · end follow`;
+          ? `↑ previous/main · ↓ next agent · ←/→ agent · ${logAction}${messageAction}${interruptAction}${herdrAction} · x stop · pgup/pgdn scroll · esc main`
+          : `↑/esc main · ${logAction}${messageAction}${interruptAction}${herdrAction} · x stop · pgup/pgdn scroll · end follow`;
 
       const currentTranscriptWidth = Math.max(20, innerWidth);
       if (transcriptAgent !== agent
@@ -713,10 +723,29 @@ export function createAgentFollowComponent(
       clearInterval(refreshTimer);
       if (forwardHerdrPageKeys) tui.terminal.write("\x1b[?1000l");
     },
+    handleMouse(event: { type: string; wheelDelta?: number }) {
+      if (event.type !== "wheel") return;
+      scrollTranscript(event.wheelDelta ?? 0);
+      return { handled: true };
+    },
     handleInput(data: string) {
+      const sgrMouse = /^\x1b\[<(\d+);\d+;\d+([Mm])$/.exec(data);
+      const mouseButton = sgrMouse ? Number(sgrMouse[1])
+        : data.length === 6 && data.startsWith("\x1b[M") ? data.charCodeAt(3) - 32 : undefined;
+      if (mouseButton !== undefined) {
+        if (sgrMouse?.[2] !== "m" && mouseButton >= 64 && mouseButton <= 93) {
+          const wheelButton = mouseButton & ~28;
+          if (wheelButton === 64 || wheelButton === 65) scrollTranscript(wheelButton === 64 ? -3 : 3);
+        }
+        return;
+      }
       if (composingMessage) {
         if (matchesKey(data, Key.ctrl("c"))) {
           done();
+          return;
+        }
+        if (sendingMessage) {
+          if (matchesKey(data, Key.escape)) stopComposingMessage();
           return;
         }
         messageInput.handleInput(data);
@@ -737,11 +766,19 @@ export function createAgentFollowComponent(
         tui.requestRender();
         return;
       }
-      if (data.toLowerCase() === "m" && options.sendMessage) {
+      if (data.toLowerCase() === "m" && options.sendMessage && !sendingMessage) {
         composingMessage = true;
         messageStatus = "";
         syncInputFocus();
         tui.requestRender();
+        return;
+      }
+      if (data.toLowerCase() === "h" && process.env.HERDR_ENV === "1") {
+        const agent = currentAgent(sortedAgents(), selectedName);
+        if (agent?.moveToHerdr) void agent.moveToHerdr().then(done).catch(error => {
+          messageStatus = sanitizePlainTuiLine(error instanceof Error ? error.message : String(error));
+          tui.requestRender();
+        });
         return;
       }
       if (data.toLowerCase() === "i" && options.interruptAgent) {

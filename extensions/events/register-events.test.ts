@@ -5,8 +5,7 @@ import path from "node:path";
 import { isInboxFileWatchEvent, registerExtensionEvents } from "./register-events.js";
 import * as paths from "../../src/utils/paths.js";
 import * as runtime from "../../src/utils/runtime.js";
-import * as settings from "../../src/utils/settings.js";
-import { sendPlainMessage } from "../../src/utils/messaging.js";
+import { readInbox, sendPlainMessage } from "../../src/utils/messaging.js";
 
 let root: string;
 let teamsRoot: string;
@@ -32,8 +31,10 @@ function setupEvents(
   if (!fs.existsSync(paths.configPath("team"))) writeTeamConfig();
   const handlers = new Map<string, Function[]>();
   const quietTrigger = vi.fn();
+  const sendMessage = vi.fn();
   const terminal = { setTitle: vi.fn() };
   registerExtensionEvents({
+    sendMessage,
     registerMessageRenderer: vi.fn(),
     on: vi.fn((eventName: string, handler: Function) => {
       handlers.set(eventName, [...(handlers.get(eventName) || []), handler]);
@@ -55,7 +56,7 @@ function setupEvents(
     ui: { notify: vi.fn(), setTitle: vi.fn() },
     isIdle,
   };
-  return { handlers, quietTrigger, terminal, ctx };
+  return { handlers, quietTrigger, sendMessage, terminal, ctx };
 }
 
 function writeTeamConfig(role: "read" | "write" = "write", metadata: Record<string, any> = {}) {
@@ -153,6 +154,10 @@ describe("extension teammate inbox wake", () => {
     for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
 
     expect(cleanupStalePrivateAgentSessions).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+      expect.stringContaining("/pi-extended-teams-onboard"),
+      expect.anything(),
+    );
   });
 
   it("continues lead session_start initialization when the private-session janitor fails", async () => {
@@ -163,7 +168,6 @@ describe("extension teammate inbox wake", () => {
       throw new Error("simulated janitor failure");
     });
     const cleanupStaleSessionContextReferences = vi.fn(() => 0);
-    const loadSettings = vi.spyOn(settings, "loadSettings").mockReturnValue({ favoriteModels: {} } as any);
     const { handlers, ctx } = setupEvents(() => true, {
       isTeammate: false,
       agentName: "team-lead",
@@ -178,7 +182,6 @@ describe("extension teammate inbox wake", () => {
     await expect(Promise.all((handlers.get("session_start") || []).map(handler => handler({}, ctx)))).resolves.toBeDefined();
 
     expect(setSessionCtx).toHaveBeenCalledWith(ctx);
-    expect(loadSettings).toHaveBeenCalledWith({ projectDir: root });
     expect(cleanupStaleSessionContextReferences).toHaveBeenCalledOnce();
     expect(startLeadInboxPolling).toHaveBeenCalledOnce();
     expect(startLeadWatchdog).toHaveBeenCalledOnce();
@@ -285,6 +288,37 @@ describe("extension teammate inbox wake", () => {
     await vi.advanceTimersByTimeAsync(250);
 
     expect(quietTrigger).toHaveBeenCalledWith("You have 1 new inbox message(s). Read them with read_inbox and act.");
+  });
+
+  it("steers a busy Herdr-resumed agent once per unread inbox change", async () => {
+    vi.stubEnv("PI_EXTENDED_TEAMS_HERDR_RESUME", "1");
+    let watchCallback!: (event: string, filename: string) => void;
+    const { handlers, sendMessage, ctx } = setupEvents(() => false, {
+      watchInboxDirectory: (_directory, callback) => {
+        watchCallback = callback;
+        return { close: vi.fn() } as unknown as fs.FSWatcher;
+      },
+    });
+    for (const handler of handlers.get("session_start") || []) await handler({}, ctx);
+    await vi.advanceTimersByTimeAsync(1000);
+    await sendPlainMessage("team", "team-lead", "writer", "post-h token", "Continue");
+    watchCallback("change", "writer.json");
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+    expect(sendMessage).toHaveBeenLastCalledWith({
+      customType: "pi-extended-teams-wake",
+      content: "You have 1 new inbox message(s). Read them with read_inbox and act.",
+      display: false,
+    }, { triggerTurn: true, deliverAs: "steer" });
+    expect((await readInbox("team", "writer", true, false)).map(message => message.text)).toEqual(["post-h token"]);
+
+    watchCallback("change", "writer.json.lock");
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    await readInbox("team", "writer", true);
+    await sendPlainMessage("team", "team-lead", "writer", "next token", "Continue");
+    watchCallback("change", "writer.json");
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+    for (const handler of handlers.get("session_shutdown") || []) await handler({}, ctx);
   });
 
   it("does not reject the inbox wake when runtime status writes keep failing", async () => {

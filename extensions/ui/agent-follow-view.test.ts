@@ -395,6 +395,61 @@ describe("agent follow component", () => {
     expect(terminal.write).toHaveBeenLastCalledWith("\x1b[?1000l");
   });
 
+  it.each([
+    ["legacy", "\x1b[M`!!", "\x1b[Ma!!"],
+    ["SGR", "\x1b[<64;1;1M", "\x1b[<65;1;1M"],
+    ["modified SGR", "\x1b[<68;1;1M", "\x1b[<69;1;1M"],
+  ])("scrolls %s wheel input within the transcript and returns to following", (_protocol, up, down) => {
+    vi.stubEnv("HERDR_ENV", "1");
+    const tui = { mode: "regular", terminal: { rows: 18, write: vi.fn() }, requestRender: vi.fn() };
+    const messages = Array.from({ length: 20 }, (_, index) => ({ role: "assistant", content: [{ type: "text", text: `entry-${index + 1}-text` }] }));
+    const agent = makeAgent({ session: { messages } as any });
+    const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [agent] });
+    const render = () => stripAnsi(component.render(80).join("\n"));
+    expect(render()).toContain("entry-20-text");
+    component.handleInput(up);
+    expect(render()).not.toContain("entry-20-text");
+    for (let i = 0; i < 30; i++) component.handleInput(up);
+    expect(render()).toContain("entry-1-text");
+    for (let i = 0; i < 30; i++) component.handleInput(down);
+    expect(render()).toContain("entry-20-text");
+    messages.push({ role: "assistant", content: [{ type: "text", text: "entry-21-text" }] });
+    expect(render()).toContain("entry-21-text");
+    component.dispose();
+  });
+
+  it("handles normalized fullscreen wheels without taking over terminal mouse mode", () => {
+    vi.stubEnv("HERDR_ENV", "1");
+    const tui = { mode: "fullscreen", terminal: { rows: 18, write: vi.fn() }, requestRender: vi.fn() };
+    const messages = Array.from({ length: 20 }, (_, index) => ({ role: "assistant", content: [{ type: "text", text: `entry-${index + 1}-text` }] }));
+    const component = createAgentFollowComponent(tui, vi.fn(), { getAgents: () => [makeAgent({ session: { messages } as any })] });
+    component.render(80);
+    expect(component.handleMouse({ type: "wheel", wheelDelta: -3 })).toEqual({ handled: true });
+    expect(stripAnsi(component.render(80).join("\n"))).not.toContain("entry-20-text");
+    expect(component.handleMouse({ type: "wheel", wheelDelta: 3 })).toEqual({ handled: true });
+    expect(stripAnsi(component.render(80).join("\n"))).toContain("entry-20-text");
+    component.dispose();
+    expect(tui.terminal.write).not.toHaveBeenCalled();
+  });
+
+  it("does not insert mouse sequences into a message or change agent selection", async () => {
+    const sendMessage = vi.fn();
+    const agents = [makeAgent({ name: "a" }), makeAgent({ name: "b" })];
+    const component = createAgentFollowComponent({ terminal: { rows: 24 }, requestRender: vi.fn() }, vi.fn(), {
+      getAgents: () => agents, sendMessage,
+    });
+    component.render(80);
+    component.handleInput("m");
+    component.handleInput("hello");
+    component.handleInput("\x1b[<64;1;1M");
+    component.handleInput("\x1b[<0;1;1M");
+    component.handleInput("\x1b[<64;1;1m");
+    component.handleInput("\r");
+    await Promise.resolve();
+    expect(sendMessage).toHaveBeenCalledWith("a", "hello");
+    component.dispose();
+  });
+
   it("starts at zero instead of showing the pre-response message estimate", () => {
     const tui = { terminal: { rows: 24 }, requestRender: vi.fn() };
     const agent = makeAgent({
@@ -567,6 +622,26 @@ describe("agent follow component", () => {
     component.dispose();
   });
 
+  it.each(["1", undefined])("moves only the selected agent with h inside Herdr (%s)", async (herdr) => {
+    vi.stubEnv("HERDR_ENV", herdr);
+    const done = vi.fn();
+    const alpha = Object.assign(makeAgent({ name: "alpha" }), { moveToHerdr: vi.fn() });
+    const beta = Object.assign(makeAgent({ name: "beta" }), { moveToHerdr: vi.fn(async () => {}) });
+    const component = createAgentFollowComponent({ terminal: { rows: 24, write: vi.fn() }, requestRender: vi.fn() }, done, {
+      getAgents: () => [alpha, beta], initialAgentName: "beta",
+    });
+    try {
+      component.handleInput("h");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(beta.moveToHerdr).toHaveBeenCalledTimes(herdr ? 1 : 0);
+      expect(alpha.moveToHerdr).not.toHaveBeenCalled();
+      expect(done).toHaveBeenCalledTimes(herdr ? 1 : 0);
+    } finally {
+      component.dispose();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("shows a direct-message input and sends to the selected agent", async () => {
     const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
     const sendMessage = vi.fn(async () => {});
@@ -591,6 +666,42 @@ describe("agent follow component", () => {
     component.dispose();
   });
 
+  it.each([true, false])("clears a pending send and restores the draft only on failure (%s)", async (succeeds) => {
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const sendMessage = vi.fn(() => new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
+    const component = createAgentFollowComponent({ terminal: { rows: 30 }, requestRender: vi.fn() }, vi.fn(), {
+      getAgents: () => [makeAgent()], sendMessage,
+    });
+    try {
+      component.handleInput("m");
+      component.handleInput("Please inspect the test");
+      component.handleInput("\r");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sendMessage).toHaveBeenCalledWith("reader", "Please inspect the test");
+      expect(component.render(120).join("\n")).not.toContain("Please inspect the test");
+      component.handleInput("extra text");
+      component.handleInput("\r");
+      expect(sendMessage).toHaveBeenCalledOnce();
+      if (succeeds) resolve();
+      else reject(new Error("Delivery failed"));
+      await vi.advanceTimersByTimeAsync(0);
+      if (succeeds) {
+        component.handleInput("m");
+        component.handleInput("Next message");
+        component.handleInput("\r");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(sendMessage).toHaveBeenLastCalledWith("reader", "Next message");
+        resolve();
+        await vi.advanceTimersByTimeAsync(0);
+      } else {
+        expect(stripAnsi(component.render(120).join("\n"))).toContain("Please inspect the test");
+      }
+    } finally {
+      component.dispose();
+    }
+  });
+
   it("keeps the message draft open when delivery fails", async () => {
     const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
     const component = createAgentFollowComponent(tui, vi.fn(), {
@@ -605,7 +716,7 @@ describe("agent follow component", () => {
 
     const rendered = component.render(120).join("\n");
     expect(rendered).toContain("Cannot send message to reader: agent is not running.");
-    expect(rendered).toContain("Are you still there?");
+    expect(stripAnsi(rendered)).toContain("Are you still there?");
     component.dispose();
   });
 

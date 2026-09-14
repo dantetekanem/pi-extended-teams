@@ -30,13 +30,21 @@ Or install directly from GitHub:
 pi install git:github.com/dantetekanem/pi-extended-teams
 ```
 
+For the first run, start with:
+
+```text
+/pi-extended-teams-onboard
+```
+
+On a new installation with no pi-extended-teams settings, a startup notice points to this command. It gives the current agent a read-only snapshot of the models, favorite tiers, shared extensions, and package source available in that Pi session. The agent recommends a setup, shows the exact changes it wants to make, and explains how to update the installed package. Nothing changes until you approve it. Run the command again whenever your models or extensions change.
+
 Then ask for help naturally:
 
 ```text
 Review the current changes with separate agents for correctness, test gaps, and security. Give me the evidence so I can make the final call.
 ```
 
-The current Pi session becomes the agent group automatically. There is no separate setup step. Until you configure a tier, it uses the current lead-session model and thinking level. Run `/agents-favorite-models` when you want particular tiers to use different models.
+The current Pi session becomes the agent group automatically. Setup remains optional: an unset tier inherits the current lead-session model and thinking level. Use `/agents-favorite-models` to configure tiers directly and `/agents-extensions` to choose which observable loaded extensions spawned agents receive.
 
 ## How it works
 
@@ -54,6 +62,10 @@ This works well for multi-angle code review, root-cause investigation, parallel 
 ## Live control
 
 With the editor empty, press Down to open agent navigation. Use Down/Up to move, `l` to expand large tool logs, `m` to message an agent, `i` to interrupt its currently running tool command, `x` to stop the whole agent, and Escape to return.
+
+Inside Herdr, press `h` in an ordinary direct agent's preview to move it into a focused sibling Pi pane in the same workspace. Its conversation and team communication continue there. Nested helpers and delegation-enabled or workflow agents are excluded.
+
+Scroll the transcript with Page Up/Page Down or the mouse wheel, including under Herdr. Press End or scroll back to the bottom to follow new output.
 
 The lead can invoke the same command-only behavior with `interrupt_teammate({ agent_name: "agent" })`. It keeps the agent's session, task context, and file claims intact so you can send follow-up work. In-process cancellation is cooperative and may report that it is still pending; for tmux-backed agents, success means Pi's Escape key was delivered, not that command settlement was independently confirmed.
 
@@ -144,9 +156,31 @@ spawn_swarm_agents({
 
 For an edit, choose a write tier and name the files it may claim. Never run overlapping writers against the same paths.
 
+### Programmatic event launch
+
+Another loaded extension can ask the lead session to launch one public agent through the orchestration event. Register the response listener and correlate it by `requestId` before emitting the request:
+
+```ts
+pi.events.emit("pi-extended-teams:orchestration-request", {
+  requestId,
+  type: "spawn_agent",
+  ctx, // pass the current Pi command context when needed
+  params: {
+    name: "implementation",
+    prompt: "Implement the claimed change and report the evidence.",
+    cwd,
+    model_slot: "write-critical",
+    allow_nested_read_agents: true,
+    metadata: { operationId },
+  },
+});
+```
+
+The correlated response is `{ requestId, type, ok: true, details, content }` on success or `{ requestId, type, ok: false, error }` on failure. `prompt` is always a direct string; it may tell the child where a packaged prompt file lives, but there is no `prompt_file` API. The configured extension allowlist still determines which tools are available inside the child session. Teammate sessions cannot satisfy these requests.
+
 ## Configuration
 
-Global settings live at `~/.pi/agent/pi-extended-teams/settings.json`. Project overrides live at `.pi/pi-extended-teams.json`. Favorite intent tiers are global so `/agents-favorite-models` and spawning use the same choices. Configuring favorites is optional; an unset tier falls back to the current lead-session model and thinking level.
+Global settings live at `~/.pi/agent/pi-extended-teams/settings.json`. Project overrides live at `.pi/pi-extended-teams.json`. Favorite intent tiers are global so `/agents-favorite-models` and spawning use the same choices. Configuring favorites is optional; an unset tier falls back to the current lead-session model and thinking level. `/pi-extended-teams-onboard` inspects both settings layers, recommends a complete model and extension policy, and gives source-specific package update instructions without changing either file on its first pass.
 
 Public read and edit spawns respect their role's concurrency limit and overflow setting. Enabled overflow queues accepted work; disabled overflow returns a capacity error. Quarantined requests stay fenced without blocking unrelated eligible work. `stop_teammate` can cancel a queued request before launch. Failed admissions trigger an attempted recipient notification and remain visible in status (up to 20 recent failures). The public queue and recent failure index are session-local, not restart-durable.
 

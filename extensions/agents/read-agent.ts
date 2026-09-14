@@ -1,4 +1,9 @@
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { buildPiCommand, getPiLaunchCommand, shellQuote } from "../internal/pi-command";
+import { herdrCommand } from "../runtime/herdr";
 import * as runtime from "../../src/utils/runtime";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
@@ -14,8 +19,9 @@ import { createAgentCommunicationTools, type SubmittedAgentReport } from "../too
 import { requireWriteAgentTeam } from "../team/roster";
 import { isPiPromptPlanningMember, shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
+import { parseQualifiedModel } from "../../src/utils/model-resolution";
 import { closePersistedRecipient } from "../team/recipient-closure";
-import { generateExtensionInstanceId, generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
+import { generateExtensionInstanceId, generateLifecycleRunId, withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
 import { createLifecycleRuntime, type ShutdownTeammateOptions } from "../team/lifecycle";
 import {
   createSpawnResourcePlan,
@@ -25,7 +31,7 @@ import {
 import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
 import { preparePrivateAgentSessionDirectory } from "../internal/agent-session-files";
 import { isEligibleNestedReadParent, NESTED_DELEGATION_TOOL_NAMES } from "../runtime/nested-read-agents";
-import type { NestedReadAgentToolBinding } from "../tools/team-tools";
+import { CHILD_AGENT_LIFECYCLE_PROBE, type NestedReadAgentToolBinding } from "../tools/team-tools";
 import type { ParentRunIdentity, PendingChildController } from "../runtime/pending-child-controller";
 import {
   closeReadAgentMessageDelivery,
@@ -118,6 +124,7 @@ export interface RunReadAgentOptions {
   createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
   extensionInstanceId?: string;
   createNestedReadAgentTools?(binding: NestedReadAgentToolBinding): any[];
+  nestedChildSnapshot?(binding: NestedReadAgentToolBinding): { running: number; queued: number };
   pendingChildController?: PendingChildController;
   loadCheckOperations?: CheckRunnerOptions["loadOperations"];
 }
@@ -595,7 +602,9 @@ export async function runReadAgentInProcess(
     resolveSessionCreation = resolve;
   });
   let lifecycleRunId = member.lifecycleRunId ?? generateLifecycleRunId();
-  if (teams.teamExists(readTeamName)) {
+  // Admitted runs can publish startup ownership without awaiting the compatibility lookup.
+  // writeRuntimeStatus validates their identity under lifecycle/config locks before work starts.
+  if (!member.lifecycleRunId && teams.teamExists(readTeamName)) {
     lifecycleRunId = await teams.ensureMemberLifecycleRunId(readTeamName, member.name, lifecycleRunId);
   }
   member.lifecycleRunId = lifecycleRunId;
@@ -644,9 +653,11 @@ export async function runReadAgentInProcess(
     getTeamName: () => readTeamName,
   }).shutdownTeammate;
 
+  let handoffRequested = false;
   let submittedFinalReport: SubmittedAgentReport | undefined;
   let finalReportSubmissionInProgress = false;
   let childSessionManager: any;
+  let childLifecycleProbeUnsubscribe = (): void => {};
   let privateSessionDirectory: string | undefined;
   let completedReportPersisted = false;
   let resolvedTaskResult: ReportResult | undefined;
@@ -672,6 +683,7 @@ export async function runReadAgentInProcess(
   const closeRecipient = async (): Promise<ReadAgentDeliveryCloseResult> => {
     if (pendingChildParent) pendingChildController?.cancelParent(pendingChildParent);
     const deliveryClose = closeReadAgentMessageDelivery(state);
+    if (handoffRequested) return deliveryClose;
     if (!state.recipientClosurePromise) {
       state.recipientClosurePromise = closePersistedRecipient(
         readTeamName,
@@ -853,7 +865,9 @@ export async function runReadAgentInProcess(
     if (pendingChildParent && !pendingChildController) {
       throw new Error(`Eligible nested read parent ${member.name} requires a pending child controller.`);
     }
-    const [provider, modelId] = (member.model || "").split("/", 2);
+    const parsedModel = parseQualifiedModel(member.model || "");
+    const provider = parsedModel?.provider;
+    const modelId = parsedModel?.model;
     const model = provider && modelId ? ctx.modelRegistry.find(provider, modelId) : undefined;
     if (!model) {
       throw new Error(`Read agent model "${member.model}" is not available.`);
@@ -881,6 +895,7 @@ export async function runReadAgentInProcess(
 
     const {
       createAgentSession,
+      createEventBus,
       DefaultResourceLoader,
       getAgentDir,
       SessionManager,
@@ -900,16 +915,21 @@ export async function runReadAgentInProcess(
     const childSettingsManager = createSettingsManager(member.cwd, agentDir, {
       projectTrusted: resourcePlan.trust.projectTrusted,
     });
-    const nestedReadAgentTools = isEligibleNestedReadParent(member)
-      ? options.createNestedReadAgentTools?.({
+    const nestedReadBinding = isEligibleNestedReadParent(member)
+      ? {
           teamName: readTeamName,
           parent: member,
           parentRunId: state.runId,
           outerCtx: ctx,
-        }) ?? []
+        }
+      : undefined;
+    const nestedReadAgentTools = nestedReadBinding
+      ? options.createNestedReadAgentTools?.(nestedReadBinding) ?? []
       : [];
     const nestedReadDelegationEnabled = nestedReadAgentTools.length > 0;
+    const childEventBus = createEventBus();
     const loader = new DefaultResourceLoader({
+      eventBus: childEventBus,
       cwd: member.cwd,
       agentDir,
       settingsManager: childSettingsManager,
@@ -1011,6 +1031,13 @@ export async function runReadAgentInProcess(
     childSessionManager = privateSessionDirectory
       ? SessionManager.create(member.cwd, privateSessionDirectory)
       : SessionManager.create(member.cwd);
+    if (nestedReadBinding && options.nestedChildSnapshot) {
+      const childSessionId = childSessionManager.getSessionId();
+      childLifecycleProbeUnsubscribe = childEventBus.on(CHILD_AGENT_LIFECYCLE_PROBE, (payload: any) => {
+        if (payload?.sessionId !== childSessionId || typeof payload.respond !== "function") return;
+        payload.respond({ sessionId: childSessionId, ...options.nestedChildSnapshot!(nestedReadBinding) });
+      });
+    }
     const parentModelRuntime: unknown = Reflect.get(ctx.modelRegistry, "runtime");
     const { session } = await createAgentSession({
       cwd: member.cwd,
@@ -1028,7 +1055,7 @@ export async function runReadAgentInProcess(
     } as Parameters<typeof createAgentSession>[0] & { modelRuntime?: unknown });
 
     state.session = session;
-    installReadAgentSessionLifecycle(session);
+    const sessionLifecycle = installReadAgentSessionLifecycle(session);
     try {
       if (typeof session.bindExtensions === "function") {
         await (session.bindExtensions as (bindings: { mode: "print" }) => Promise<void>)({ mode: "print" });
@@ -1041,6 +1068,96 @@ export async function runReadAgentInProcess(
     if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) {
       if (state.teardownState !== "persistence_failed") await state.teardownPromise;
       return;
+    }
+    if (process.env.HERDR_ENV === "1" && (member.delegationDepth ?? 0) === 0
+      && !member.requestedBy && !member.parentAgentName && !member.allowNestedReadAgents
+      && !shouldSuppressLeadReportInjection(member)) {
+      let moving: Promise<void> | undefined;
+      let paneId: string | undefined;
+      let command = "";
+      let queued: string[] = [];
+      let released = false;
+      const release = Promise.all([finished, sessionLifecycle.finalized]).then(() => {
+        if (handoffRequested) { state.session = undefined; released = true; }
+      });
+      void release.catch(() => {});
+      const recordPane = (id: string | undefined) => withLifecycleTombstoneLock(readTeamName, member.name, async lock => {
+        const current = (await teams.readConfig(readTeamName)).members.find(item => item.name === member.name);
+        if (!current || current.lifecycleRunId !== state.runId || current.isActive === false || lock.read().status !== "absent") {
+          throw new Error("The agent is no longer available to move.");
+        }
+        await teams.updateMember(readTeamName, member.name, { herdrPaneId: id, tmuxPaneId: "" });
+      });
+      state.moveToHerdr = () => moving ??= (async () => {
+        if (!options.isCurrentReadAgentRun(key, state) || (!handoffRequested && !state.acceptingMessages)) {
+          throw new Error("The agent is already finishing.");
+        }
+        if (handoffRequested && !released) throw new Error("The current operation is still stopping. Try h after it settles.");
+        if (paneId) { herdrCommand("pane", "close", paneId); await recordPane(undefined); paneId = undefined; }
+        const sessionFile = childSessionManager.getSessionFile();
+        if (!sessionFile || !fs.existsSync(sessionFile)) throw new Error("The agent has no saved session yet.");
+        if (!handoffRequested) {
+          const promptDir = privateSessionDirectory ?? preparePrivateAgentSessionDirectory(readTeamName, member.name, state.runId);
+          const promptFile = path.join(promptDir, "herdr-system-prompt.txt");
+          fs.writeFileSync(promptFile, session.agent.state.systemPrompt.replace("running in-process so the lead can follow and control you from Pi", "running in a Herdr pane"), { mode: 0o600 });
+          const tools = session.agent.state.tools.map(tool => tool.name).join(",");
+          const identity = {
+            HOME: os.homedir(), PI_CODING_AGENT_DIR: agentDir,
+            PI_AGENT_NAME: member.name, PI_TEAM_NAME: readTeamName, PI_LIFECYCLE_RUN_ID: state.runId,
+            PI_EXTENDED_TEAMS_HERDR_RESUME: "1",
+          };
+          const currentModel = session.model ?? model;
+          const launch = buildPiCommand(getPiLaunchCommand(), `${currentModel.provider}/${currentModel.id}`,
+            session.thinkingLevel ?? member.thinking, resourcePlan.extensionPaths,
+            resourcePlan.trust.projectTrusted, resourcePlan.selfExtensionPath);
+          command = [
+            "env", ...Object.entries(identity).map(([name, value]) => `${name}=${shellQuote(value)}`), launch,
+            "--session", shellQuote(sessionFile), "--tools", shellQuote(tools), "--system-prompt", shellQuote(promptFile),
+          ].join(" ");
+          // Keep fresh-shell input below the PTY line limit without shortening the launch arguments.
+          const launchFile = path.join(promptDir, "herdr-launch.sh");
+          fs.writeFileSync(launchFile, `exec ${command}\n`, { mode: 0o600 });
+          command = `/bin/sh ${shellQuote(launchFile)}`;
+        }
+        paneId = JSON.parse(herdrCommand("pane", "split", "--current", "--direction", "right", "--cwd", member.cwd, "--focus")).result?.pane?.pane_id;
+        if (typeof paneId !== "string" || !paneId) throw new Error("Herdr did not return a pane ID.");
+        try {
+          if (!handoffRequested) {
+            handoffRequested = true;
+            state.stopRequested = true;
+            const delivery = closeReadAgentMessageDelivery(state);
+            const pending = session.clearQueue();
+            queued = [...pending.steering, ...pending.followUp];
+            signalReadAgentWake(state);
+            const shutdown = await sessionLifecycle.requestShutdown("resume", delivery.rawDeliverySettlement);
+            if (shutdown.status !== "settled" || shutdown.abort !== "settled" || shutdown.dispose !== "settled") {
+              throw new Error("The current operation has not stopped. Try h after it settles.");
+            }
+            await release;
+          }
+          if (queued.length) {
+            SessionManager.open(sessionFile).appendMessage({ role: "user", content: queued.join("\n\n"), timestamp: Date.now() });
+            queued = [];
+          }
+          const previousPid = (await runtime.readRuntimeStatus(readTeamName, member.name))?.pid;
+          await recordPane(paneId);
+          herdrCommand("pane", "run", paneId, command);
+          const deadline = Date.now() + 10000;
+          for (;;) {
+            const status = await runtime.readRuntimeStatus(readTeamName, member.name);
+            if (status?.lifecycleRunId === state.runId && status.pid && status.pid !== previousPid && status.pid !== process.pid) break;
+            if (Date.now() >= deadline) throw new Error("Pi did not resume. The saved session is retained; h can retry.");
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          if (options.isCurrentReadAgentRun(key, state)) options.runningReadAgents.delete(key);
+          options.renderReadAgentStatus();
+        } catch (error) {
+          herdrCommand("pane", "close", paneId);
+          await recordPane(undefined);
+          paneId = undefined;
+          throw error;
+        }
+      })().catch(error => { moving = undefined; throw error; });
     }
     markReadAgentActivity(state, "started", "thinking");
     options.renderReadAgentStatus();
@@ -1373,6 +1490,7 @@ export async function runReadAgentInProcess(
       }
     }
   } finally {
+    childLifecycleProbeUnsubscribe();
     pendingParentWakeSignals.delete(state);
     disposeReadAgentWake(state);
     settleSessionCreation(state.session);
@@ -1380,6 +1498,7 @@ export async function runReadAgentInProcess(
     if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
     state.heartbeatTimer = undefined;
     closeReadAgentMessageDelivery(state);
+    if (handoffRequested) { state.resolveFinished?.(); return; }
     const teardown = await shutdownTeammate(readTeamName, member, { reason: "quit" });
     if (pendingChildController && pendingChildParent) {
       pendingChildController.forgetParent(pendingChildParent);

@@ -10,6 +10,61 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
 
+## [2.2.12] - 2026-09-12
+
+### Fixed
+- Keep unfinished agents visible when runtime telemetry is missing or stale, including cleanup failures after roster removal.
+- Prevent private jobs and public team switches from hiding active agents, and restore the selected public team consistently.
+- Show normal cleanup as stopping while preserving error details for blocked cleanup.
+
+## [2.2.11] - 2026-09-12
+
+### Fixed
+- Let orchestration requests spawn current-session agents and preserve nested-read opt-in for named-team one-shot spawns.
+- Expose parent-scoped running and queued helper counts to lifecycle probes on each child session's private event bus.
+
+## [2.2.10] - 2026-09-12
+
+### Fixed
+- Clear the agent-view message input while sending and restore the draft on failure if the composer remains open ([#37](https://github.com/dantetekanem/pi-extended-teams/pull/37)).
+- Show package directory names instead of generic `src` or `extensions` entrypoint labels.
+
+## [2.2.9] - 2026-09-12
+
+### Fixed
+- Let typed text filter full provider/model names from any favorite-picker column; reserve navigation for arrow keys.
+- Save favorite model, thinking and clear changes immediately, with retryable error feedback.
+- Fill the favorite picker background across the pane while keeping its controls centered.
+
+## [2.2.8] - 2026-09-12
+
+### Fixed
+- Use current-run state for in-process agent status ([#26](https://github.com/dantetekanem/pi-extended-teams/pull/26)).
+- Reserve reader and writer capacity during admission so concurrent spawns queue correctly.
+- Cancel agents during queue handoff and startup without falsely reporting that they stopped.
+
+## [2.2.7] - 2026-09-11
+
+### Fixed
+- Keep long Herdr handoff commands intact by launching them from a private script.
+- Focus the new pane without waiting for Herdr to detect the resumed Pi agent.
+- Deliver inbox notices while a Herdr-resumed agent is working, without repeating notices for an unchanged inbox.
+
+## [2.2.6] - 2026-09-10
+
+### Fixed
+- Show runtime-only read agents in Down-key live navigation whenever the activity card counts them as active, excluding status from replaced lifecycles ([#35](https://github.com/dantetekanem/pi-extended-teams/pull/35)).
+
+## [2.2.5] - 2026-09-10
+
+### Fixed
+- Fix mouse-wheel scrolling in the live agent view, including under Herdr ([#25](https://github.com/dantetekanem/pi-extended-teams/pull/25)).
+
+## [2.2.4] - 2026-09-09
+
+### Fixed
+- Preserve slashes in model IDs when starting read agents and queued read helpers, fixing failed lookups for models such as Fireworks router IDs. Thanks to @luisrudge ([#33](https://github.com/dantetekanem/pi-extended-teams/pull/33)).
+
 ## [2.2.1] - 2026-09-01
 
 ### Changed

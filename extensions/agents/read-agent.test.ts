@@ -2,14 +2,18 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { CheckJournal } from "../../src/results/check-journal";
 import { createReportResult } from "../../src/results/report-result";
+vi.mock("node:child_process", async (original) => ({
+  ...await original<typeof import("node:child_process")>(), spawnSync: vi.fn(),
+}));
 import * as paths from "../../src/utils/paths.js";
 import * as claims from "../../src/utils/claims.js";
 import * as teams from "../../src/utils/teams.js";
 import * as runtime from "../../src/utils/runtime.js";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
+import * as lifecycleTombstones from "../../src/utils/lifecycle-tombstone.js";
 import { readInbox, requireRunningMessageRecipient, sendPlainMessage, sendPlainMessageIfRunning } from "../../src/utils/messaging.js";
 import { listTeamReportEvents } from "../../src/utils/report-events.js";
 import * as reportEvents from "../../src/utils/report-events.js";
@@ -24,6 +28,7 @@ const piMocks = vi.hoisted(() => ({
   sessionManagerOpen: vi.fn(),
   persistedSessionEntries: new Map<string, any[]>(),
   sessionManagerCounter: 0,
+  eventBuses: [] as Array<{ on(name: string, handler: (payload: any) => void): () => void; emit(name: string, payload: any): void }>,
 }));
 
 function mockedPiRuntimeApi() {
@@ -58,6 +63,20 @@ function mockedPiRuntimeApi() {
     create: piMocks.sessionManagerCreate,
     open: piMocks.sessionManagerOpen,
   },
+  createEventBus: () => {
+    const handlers = new Map<string, Array<(payload: any) => void>>();
+    const eventBus = {
+      on(name: string, handler: (payload: any) => void) {
+        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+        return () => handlers.set(name, (handlers.get(name) ?? []).filter(candidate => candidate !== handler));
+      },
+      emit(name: string, payload: any) {
+        for (const handler of handlers.get(name) ?? []) handler(payload);
+      },
+    };
+    piMocks.eventBuses.push(eventBus);
+    return eventBus;
+  },
   };
 }
 
@@ -68,6 +87,7 @@ vi.mock("../internal/pi-runtime-api", () => ({
 
 import { closeReadAgentMessageDelivery, handleReadAgentSessionEvent, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./read-agent.js";
 import { createLifecycleRuntime } from "../team/lifecycle.js";
+import { registerTaskRuntimeTools } from "../tools/task-runtime-tools.js";
 import { sanitizeTuiLine } from "../ui/renderers.js";
 import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "./read-agent-session-lifecycle.js";
 import type { RunningReadAgent } from "../runtime/types.js";
@@ -174,7 +194,7 @@ function makeSession() {
     isStreaming: true,
     hasExtensionHandlers: vi.fn(() => false),
     extensionRunner: { emit: vi.fn(async () => {}) },
-    clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
+    clearQueue: vi.fn((): { steering: string[]; followUp: string[] } => ({ steering: [], followUp: [] })),
     abort: vi.fn(async () => {}),
     dispose: vi.fn(),
   };
@@ -206,6 +226,7 @@ describe("in-process read agent tool wiring", () => {
     piMocks.sessionManagerOpen.mockReset();
     piMocks.persistedSessionEntries.clear();
     piMocks.sessionManagerCounter = 0;
+    piMocks.eventBuses.length = 0;
     piMocks.sessionManagerCreate.mockImplementation((cwd: string, sessionDir?: string) => {
       const id = `child-session-${++piMocks.sessionManagerCounter}`;
       const sessionFile = path.join(sessionDir ?? path.join(root, "child-sessions"), `${id}.jsonl`);
@@ -632,6 +653,166 @@ describe("in-process read agent tool wiring", () => {
     expect(reports[0]).toMatchObject({ status: "failed", result: { verification: { state: "pending", checkIds: [record.checkId] } } });
   });
 
+  it.each(["read", "write"] as const)("moves a direct %s agent to Herdr without finalizing its session or mailbox", async (role) => {
+    vi.stubEnv("HERDR_ENV", "1");
+    const member = fixtureMember(role === "read" ? "reader" : "writer", role);
+    const session = Object.assign(makeSession(), {
+      model: { provider: "host", id: "current/model" }, thinkingLevel: "high",
+      agent: { state: { systemPrompt: `scoped ${role} authority`, tools: ["read", "read_inbox",
+        ...Array.from({ length: 20 }, (_, i) => `allowed_extension_tool_${i}`)].map(name => ({ name })) } },
+    });
+    let finish!: () => void;
+    let releaseAbort!: () => void;
+    const abortGate = new Promise<void>(resolve => { releaseAbort = resolve; });
+    let sessionFile = "";
+    session.prompt.mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+    session.abort.mockImplementation(async () => { await abortGate; finish(); });
+    session.clearQueue.mockReturnValueOnce({ steering: ["queued guidance"], followUp: [] });
+    const append = vi.fn(message => fs.appendFileSync(sessionFile, `\n${JSON.stringify(message)}`));
+    piMocks.sessionManagerOpen.mockImplementation(() => ({ appendMessage: append, getEntries: () => [] }));
+    piMocks.createAgentSession.mockImplementation(async (options) => {
+      sessionFile = options.sessionManager.getSessionFile();
+      fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+      fs.writeFileSync(sessionFile, "existing conversation");
+      return { session };
+    });
+    const options = makeRunOptions();
+    const run = runReadAgentInProcess("team", member, "finish the assigned work", { modelRegistry: { find: () => ({ id: "model" }) } }, options);
+    try {
+      await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledOnce());
+      const state = options.runningReadAgents.get(`team:${member.name}`)!;
+      let launches = 0;
+      let refuseClose = role === "write";
+      let paneGone = false;
+      vi.mocked(spawnSync).mockImplementation((_command, argv) => {
+        const args = argv as string[];
+        // Pi can resume before Herdr's agent detection catches up.
+        if (args[0] === "agent" && args[1] === "focus") return { pid: 0, output: [], signal: null, status: 1,
+          stdout: "", stderr: "agent_not_found" };
+        if (args[1] === "close" && refuseClose) return { pid: 0, output: [], signal: null, status: 1, stderr: "closure unconfirmed", stdout: "" };
+        if (args[1] === "close" && paneGone) return { pid: 0, output: [], signal: null, status: 1, stdout: "",
+          stderr: JSON.stringify({ error: { code: "pane_not_found" } }) };
+        if (args[1] === "run") {
+          expect(session.dispose).toHaveBeenCalledOnce();
+          // A fresh macOS PTY can truncate a long line before the shell is ready.
+          expect(Buffer.byteLength(args[3])).toBeLessThan(1024);
+          const launchFile = path.join(path.dirname(sessionFile), "herdr-launch.sh");
+          expect(args[3]).toBe(`/bin/sh '${launchFile}'`);
+          const launch = fs.readFileSync(launchFile, "utf8");
+          expect(fs.statSync(launchFile).mode & 0o777).toBe(0o600);
+          expect(launch.startsWith("exec env ")).toBe(true);
+          expect(launch).toContain(sessionFile);
+          expect(launch).toContain(state.runId);
+          expect(launch).toContain(`--tools '${session.agent.state.tools.map(tool => tool.name).join(",")}'`);
+          expect(launch).toContain("--model 'host/current/model:high'");
+          expect(launch).toContain(`HOME='${root}'`);
+          if (++launches > 1) void runtime.writeRuntimeStatus("team", member.name, state.runId, { pid: process.pid + 1 });
+        }
+        return { pid: 0, output: [], signal: null, status: args[1] === "run" && launches === 1 ? 1 : 0,
+          stderr: "launch refused", stdout: JSON.stringify({ result: { pane: { pane_id: "owned-pane" } } }) };
+      });
+      expect(state.moveToHerdr).toBeTypeOf("function");
+      const moving = state.moveToHerdr!();
+      expect(state.moveToHerdr!()).toBe(moving);
+      await vi.waitFor(() => expect(session.abort).toHaveBeenCalledOnce());
+      expect(launches).toBe(0);
+      releaseAbort();
+      await expect(moving).rejects.toThrow(/launch refused|closure unconfirmed/);
+      if (refuseClose) {
+        await expect(state.moveToHerdr!()).rejects.toThrow("closure unconfirmed");
+        expect(launches).toBe(1);
+        refuseClose = false;
+      }
+      expect(fs.readFileSync(sessionFile, "utf8")).toContain("existing conversation");
+      expect(fs.readFileSync(path.join(path.dirname(sessionFile), "herdr-system-prompt.txt"), "utf8")).toBe(`scoped ${role} authority`);
+      await sendPlainMessageIfRunning("team", "team-lead", member.name, "follow-up", "follow-up");
+      await state.moveToHerdr!();
+      expect(spawnSync).toHaveBeenCalledWith("herdr",
+        ["pane", "split", "--current", "--direction", "right", "--cwd", member.cwd, "--focus"], expect.any(Object));
+      expect(options.runningReadAgents.has(`team:${member.name}`)).toBe(false);
+      expect(append).toHaveBeenCalledExactlyOnceWith({ role: "user", content: "queued guidance", timestamp: expect.any(Number) });
+      expect(fs.readFileSync(sessionFile, "utf8")).toContain("queued guidance");
+      expect((await teams.readConfig("team")).members.find(item => item.name === member.name)).toMatchObject({
+        lifecycleRunId: state.runId, herdrPaneId: "owned-pane",
+      });
+      expect((await readInbox("team", member.name, true, false)).map(message => message.text)).toContain("follow-up");
+      expect(options.emitAgentReport).not.toHaveBeenCalled();
+      expect(options.releaseAllClaimsForAgent).not.toHaveBeenCalled();
+      expect(await readLifecycleTombstone("team", member.name)).toEqual({ status: "absent" });
+      const pidFile = path.join(paths.teamDir("team"), `${member.name}.pid`);
+      fs.writeFileSync(pidFile, "424242");
+      paneGone = true;
+      const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+      await createLifecycleRuntime({ ...options, terminal: null, getSessionCwd: () => root, drainWriteQueue: async () => {} })
+        .killTeammate("team", (await teams.readConfig("team")).members.find(item => item.name === member.name)!);
+      expect(kill).not.toHaveBeenCalledWith(424242, "SIGKILL");
+      const closedPanes = vi.mocked(spawnSync).mock.calls.map(([, args]) => args as string[]).filter(args => args[1] === "close");
+      expect(closedPanes.map(args => args[2])).toEqual(Array(role === "write" ? 4 : 2).fill("owned-pane"));
+      expect(fs.existsSync(pidFile)).toBe(false);
+    } finally {
+      releaseAbort();
+      finish?.();
+      await run;
+      vi.mocked(spawnSync).mockReset();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([{ delegationDepth: 1 }, { allowNestedReadAgents: true }])("keeps unsupported Herdr runs in-process: %j", async (scope) => {
+    vi.stubEnv("HERDR_ENV", "1");
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    const registration = vi.spyOn(options.runningReadAgents, "set");
+    try {
+      await runReadAgentInProcess("team", { ...fixtureMember("reader"), ...scope }, "inspect", { modelRegistry: { find: () => ({ id: "model" }) } }, options);
+      expect(session.prompt).toHaveBeenCalledOnce();
+      expect(registration.mock.calls[0][1].moveToHerdr).toBeUndefined();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("answers the child task probe on its private event bus and removes it during teardown", async () => {
+    const member = eligibleNestedParent("writer");
+    writeTeamConfig("team", member);
+    const session = makeSession();
+    const nestedChildSnapshot = vi.fn(() => ({ running: 1, queued: 2 }));
+    const response = vi.fn();
+    let childSessionId = "";
+    session.bindExtensions.mockImplementation(async () => {
+      const childSessionManager = piMocks.sessionManagerCreate.mock.results.at(-1)?.value;
+      if (!childSessionManager) throw new Error("child session manager was not created");
+      childSessionId = childSessionManager.getSessionId();
+      piMocks.loaderOptions.at(-1)?.eventBus?.emit("pi-extended-teams:child-agent-lifecycle-probe", {
+        sessionId: childSessionId, respond: response,
+      });
+    });
+    session.prompt.mockImplementation(async () => {
+      const reportTool = piMocks.createAgentSession.mock.calls[0][0].customTools
+        .find((tool: any) => tool.name === "report_and_exit");
+      await reportTool.execute("report", { content: "Finished", summary: "Done" });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = {
+      ...makeRunOptions(),
+      nestedChildSnapshot,
+      pendingChildController: createPendingChildController(),
+    };
+
+    await runReadAgentInProcess("team", member, "finish", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+
+    expect(nestedChildSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+      teamName: "team", parent: member, parentRunId: expect.any(String),
+    }));
+    expect(response).toHaveBeenCalledWith({ sessionId: childSessionId, running: 1, queued: 2 });
+    const responseAfterTeardown = vi.fn();
+    piMocks.loaderOptions.at(-1).eventBus.emit("pi-extended-teams:child-agent-lifecycle-probe", {
+      sessionId: childSessionId, respond: responseAfterTeardown,
+    });
+    expect(responseAfterTeardown).not.toHaveBeenCalled();
+  });
+
   it("isolates completed report persistence in the test temp directory", () => {
     expect(paths.reportFilesDir()).toBe(path.join(root, "agent", "reports"));
   });
@@ -764,6 +945,40 @@ describe("in-process read agent tool wiring", () => {
     await run;
     await rejectedRecipient;
     expect(runningReadAgents.size).toBe(0);
+  });
+
+  it("resolves models whose qualified key contains slashes in the model id", async () => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const slashModelKey = "fireworks/fireworks:accounts/fireworks/routers/glm-5p3-fast";
+    const settingsPath = path.join(root, ".pi", "agent", "pi-extended-teams", "settings.json");
+    fs.writeFileSync(settingsPath, JSON.stringify({
+      favoriteModels: {
+        "reading-default": { model: slashModelKey, thinking: "high" },
+        "writing-basic": { model: "provider/model", thinking: "high" },
+        "writing-hard": { model: "provider/model", thinking: "xhigh" },
+        "write-feature": { model: "provider/model", thinking: "medium" },
+        "write-critical": { model: "provider/model", thinking: "xhigh" },
+      },
+    }));
+    const member = { ...fixtureMember("reader"), model: slashModelKey, prompt: "investigate" };
+    writeTeamConfig("team", member);
+    const find = vi.fn((provider: string, modelId: string) =>
+      provider === "fireworks" && modelId === "fireworks:accounts/fireworks/routers/glm-5p3-fast"
+        ? { provider: "fireworks", id: "fireworks:accounts/fireworks/routers/glm-5p3-fast" }
+        : undefined);
+    const releaseAllClaimsForAgent = vi.fn(async () => [] as string[]);
+
+    const run = runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find },
+    }, {
+      ...makeRunOptions(),
+      releaseAllClaimsForAgent,
+    });
+
+    await vi.waitFor(() => expect(releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader"));
+    expect(find).toHaveBeenCalledWith("fireworks", "fireworks:accounts/fireworks/routers/glm-5p3-fast");
+    await run;
   });
 
   it("stops heartbeating when lifecycle teardown is refused by an unreadable fence", async () => {
@@ -2349,6 +2564,77 @@ describe("in-process read agent tool wiring", () => {
     expect(JSON.stringify({ state: options.rememberCompletedAgentReport.mock.calls, leadInbox, reports })).not.toContain("writing-hard");
   });
 
+  it.each(["read", "write"] as const)("runs an admitted %s after validating its identity", async (role) => {
+    const member = { ...fixtureMember("starting", role), lifecycleRunId: "starting-run" };
+    writeTeamConfig("team", member);
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    await runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, options);
+    expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
+    expect(options.runningReadAgents.size).toBe(0);
+  });
+
+  it("rejects a changed admitted identity before creating a session or touching the replacement", async () => {
+    const member = { ...fixtureMember("starting"), lifecycleRunId: "starting-run" };
+    const replacement = { ...member, lifecycleRunId: "replacement-run" };
+    writeTeamConfig("team", replacement);
+    piMocks.createAgentSession.mockResolvedValue({ session: makeSession() });
+    await expect(runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, makeRunOptions())).rejects.toThrow("expected run starting-run, found replacement-run");
+    expect(piMocks.createAgentSession).not.toHaveBeenCalled();
+    expect((await teams.readConfig("team")).members.find(item => item.name === member.name)).toEqual(replacement);
+  });
+
+  it.each([
+    ["read", false], ["write", false], ["read", true], ["write", true],
+  ] as const)("stops an admitted %s during startup persistence (failure: %s)", async (role, failPersistence) => {
+    const member = { ...fixtureMember("starting", role), lifecycleRunId: "starting-run" };
+    writeTeamConfig("team", member);
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions();
+    const lifecycle = createLifecycleRuntime({
+      ...options, terminal: null, drainWriteQueue: vi.fn(async () => {}), getSessionCwd: () => root,
+    });
+    const tools = new Map<string, any>();
+    registerTaskRuntimeTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      ...options, terminal: null, shutdownTeammate: lifecycle.shutdownTeammate,
+    });
+    let releasePersistence!: () => void;
+    const persistenceGate = new Promise<void>(resolve => { releasePersistence = resolve; });
+    let persistenceStarted!: () => void;
+    const started = new Promise<void>(resolve => { persistenceStarted = resolve; });
+    const withLifecycleLock = lifecycleTombstones.withLifecycleTombstoneLock;
+    vi.spyOn(lifecycleTombstones, "withLifecycleTombstoneLock").mockImplementationOnce(async (team, name, operation) => {
+      persistenceStarted();
+      await persistenceGate;
+      if (failPersistence) throw new Error("startup persistence failed");
+      return withLifecycleLock(team, name, operation);
+    });
+    const run = runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, { ...options, shutdownTeammate: lifecycle.shutdownTeammate });
+    await started;
+    const stopping = tools.get("stop_teammate").execute("stop", { agent_name: member.name });
+    try {
+      await vi.waitFor(() => expect(options.runningReadAgents.get("team:starting")?.stopRequested).toBe(true));
+      releasePersistence();
+      expect((await stopping).details.stopped).toBe(true);
+      await run;
+      expect(options.runningReadAgents.size).toBe(0);
+      expect((await teams.readConfig("team")).members.map(item => item.name)).toEqual(["team-lead"]);
+      expect(options.releaseAllClaimsForAgent).toHaveBeenCalledOnce();
+      expect(piMocks.createAgentSession).not.toHaveBeenCalled();
+    } finally {
+      releasePersistence();
+      await Promise.allSettled([run, stopping]);
+    }
+  });
+
   it("keeps stop-before-create quarantined until the late started session finishes shutdown", async () => {
     vi.useFakeTimers();
     try {
@@ -3396,11 +3682,12 @@ describe("in-process read agent tool wiring", () => {
     expect(firstRunId).toEqual(expect.any(String));
     await readInbox("team", "team-lead", true, true);
 
-    await teams.addMember("team", { ...helper, joinedAt: Date.now(), isActive: true });
+    const secondHelper = { ...helper, joinedAt: Date.now(), isActive: true };
+    await teams.addMember("team", secondHelper);
     const secondSession = makeSession();
     secondSession.prompt.mockRejectedValue(new Error("second run failed"));
     piMocks.createAgentSession.mockResolvedValueOnce({ session: secondSession });
-    await runReadAgentInProcess("team", { ...helper, joinedAt: Date.now(), isActive: true }, "investigate", {
+    await runReadAgentInProcess("team", secondHelper, "investigate", {
       modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
     }, options);
 

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CHILD_AGENT_LIFECYCLE_PROBE, registerTeamTools } from "./team-tools.js";
+import { registerTaskRuntimeTools } from "./task-runtime-tools.js";
 import { createLifecycleRuntime } from "../team/lifecycle.js";
 import { NESTED_SESSION_TEARDOWN_TIMEOUT_MS } from "../agents/read-agent-session-lifecycle.js";
 import * as paths from "../../src/utils/paths.js";
@@ -113,7 +114,8 @@ function registerTools() {
       });
     });
   });
-  const adoptTeamAsLead = vi.fn();
+  let adoptedTeam: string | undefined;
+  const adoptTeamAsLead = vi.fn((teamName: string) => { adoptedTeam = teamName; });
   const piEventEmit = vi.fn();
   const shutdownTeammate = vi.fn(async (teamName: string, member: Member) => {
     runningReadAgents.delete(readAgentKey(teamName, member.name));
@@ -165,7 +167,7 @@ function registerTools() {
     buildRoster: vi.fn(async () => ({})),
     isTeammate: false,
     agentName: "team-lead",
-    getTeamName: () => "session-test-session",
+    getTeamName: () => adoptedTeam ?? (teams.teamExists("session-test-session") ? "session-test-session" : undefined),
     getSessionCtx: () => sessionCtx,
     pendingChildController,
   });
@@ -504,6 +506,86 @@ describe("public agent spawn tools", () => {
       details: { sessionContextAvailable: true },
     });
     await vi.waitFor(() => expect(fs.existsSync(asynchronousPath)).toBe(false));
+  });
+
+  it("launches current-session spawn_agent requests with fallback model and nested-read opt-in", async () => {
+    const harness = registerTools();
+    const ctx = makeCtx();
+
+    await harness.emitAsync("pi-extended-teams:orchestration-request", {
+      requestId: "current-session-writer",
+      type: "spawn_agent",
+      params: {
+        name: "current-session-writer",
+        prompt: "Implement the claimed change.",
+        cwd: root,
+        model_slot: "write-critical",
+        allow_nested_read_agents: true,
+      },
+      ctx,
+    });
+
+    expect(harness.piEventEmit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response", expect.objectContaining({
+      requestId: "current-session-writer",
+      type: "spawn_agent",
+      ok: true,
+      details: expect.objectContaining({
+        name: "current-session-writer",
+        role: "write",
+        model: "provider/model",
+        modelSource: "current",
+        session: "session-test-session",
+      }),
+      content: expect.any(Array),
+    }));
+    const member = harness.runReadAgentInProcess.mock.calls[0]![1];
+    expect(member).toMatchObject({
+      name: "current-session-writer",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+      modelSlot: "write-critical",
+    });
+    expect(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent: member,
+      parentRunId: member.lifecycleRunId!,
+      outerCtx: ctx,
+    })).not.toEqual([]);
+  });
+
+  it("forwards nested-read opt-in through named-team spawn_teammate_once requests", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    const ctx = makeCtx();
+    teams.createTeam("named-team", "test-session", "lead-agent", "Named team", "provider/model");
+
+    await harness.emitAsync("pi-extended-teams:orchestration-request", {
+      requestId: "named-team-writer",
+      type: "spawn_teammate_once",
+      params: {
+        team_name: "named-team",
+        name: "named-team-writer",
+        prompt: "Implement the claimed change.",
+        cwd: root,
+        model_slot: "write-critical",
+        allow_nested_read_agents: true,
+      },
+      ctx,
+    });
+
+    expect(harness.piEventEmit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response", expect.objectContaining({
+      requestId: "named-team-writer",
+      type: "spawn_teammate_once",
+      ok: true,
+      details: expect.objectContaining({ agentId: "named-team-writer@named-team", role: "write" }),
+      content: expect.any(Array),
+    }));
+    expect(harness.runReadAgentInProcess.mock.calls[0]![1]).toMatchObject({
+      name: "named-team-writer",
+      delegationDepth: 0,
+      allowNestedReadAgents: true,
+      modelSlot: "write-critical",
+    });
   });
 
   it("canonicalizes persisted legacy model slots when reusing an existing member", async () => {
@@ -869,7 +951,7 @@ describe("public agent spawn tools", () => {
     await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
     expect(harness.runReadAgentInProcess.mock.calls[1][1].name).toBe("eligible");
     const status = await harness.tools.get("get_agent_status")!.execute("status", { agent_name: "fenced" }, new AbortController().signal, undefined, makeCtx());
-    expect(status.details.statuses[0]).toMatchObject({ name: "fenced", phase: "queued" });
+    expect(status.details.statuses[0]).toMatchObject({ name: "fenced", phase: "quarantined", queuePosition: 1, error: expect.stringContaining("tombstone could not be read") });
     expect(fs.readFileSync(fencePath, "utf8")).toBe("{corrupt");
     await harness.shutdown();
   });
@@ -897,6 +979,46 @@ describe("public agent spawn tools", () => {
     await vi.waitFor(async () => expect((await teams.readConfig("session-test-session")).members.some(member => member.name === "queued")).toBe(false));
     expect(harness.runReadAgentInProcess).toHaveBeenCalledOnce();
     await harness.shutdown();
+  });
+
+  it.each(["read-review", "write-feature"])("stops %s through active teardown during the queued launch handoff", async (model_slot) => {
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true }, writeAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const teamName = "session-test-session";
+    const ctx = makeCtx();
+    const signal = new AbortController().signal;
+    registerTaskRuntimeTools({ registerTool: (tool: RegisteredTool) => harness.tools.set(tool.name, tool) }, {
+      isTeammate: false, terminal: null, runningReadAgents: harness.runningReadAgents,
+      readAgentKey: (team, name) => `${team}:${name}`, getTeamName: () => teamName,
+      cancelQueuedAgent: harness.teamToolsRuntime.cancelQueuedAgent,
+      shutdownTeammate: harness.shutdownTeammate,
+    });
+    let stopAfterLaunch!: () => void;
+    const stopped = new Promise<any>((resolve, reject) => {
+      stopAfterLaunch = () => queueMicrotask(() => {
+        void harness.tools.get("stop_teammate")!.execute("stop", { agent_name: "queued" }, signal, undefined, ctx).then(resolve, reject);
+      });
+    });
+    const run = harness.runReadAgentInProcess.getMockImplementation()!;
+    harness.runReadAgentInProcess.mockImplementation((...args) => {
+      const launch = run(...args);
+      if (args[1].name === "queued") stopAfterLaunch();
+      return launch;
+    });
+    const spawn = (name: string) => harness.tools.get("spawn_agent")!.execute(name, { name, prompt: name, model_slot }, signal, undefined, ctx);
+    try {
+      await spawn("first");
+      expect((await spawn("queued")).details.queued).toBe(true);
+      harness.completions.get("first")!();
+      const result = await stopped;
+      expect(result.details.stopped).toBe(true);
+      expect(harness.shutdownTeammate).toHaveBeenCalledWith(teamName, harness.runReadAgentInProcess.mock.calls[1][1]);
+      expect(harness.runningReadAgents.has(`${teamName}:queued`)).toBe(false);
+    } finally {
+      await harness.shutdown();
+      harness.completions.get("first")?.();
+      harness.completions.get("queued")?.();
+    }
   });
 
   it("drains capacity released while an unrelated admission is failing", async () => {
@@ -927,7 +1049,7 @@ describe("public agent spawn tools", () => {
     await harness.shutdown();
   });
 
-  it("keeps a visible failed admission when notification delivery fails and continues other work", async () => {
+  it.each(["admission", "launch"])("keeps a visible failed %s when notification delivery fails and continues other work", async (failurePoint) => {
     writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
     const harness = registerTools();
     const spawn = (name: string) => harness.tools.get("spawn_agent")!.execute(name, { name, prompt: name, model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
@@ -936,16 +1058,49 @@ describe("public agent spawn tools", () => {
     await spawn("eligible");
     const originalAdd = teams.addMember;
     vi.spyOn(teams, "addMember").mockImplementation(async (team, member) => {
-      if (member.name === "failed") throw new Error("admission unavailable");
+      if (member.name === "failed" && failurePoint === "admission") throw new Error("admission unavailable");
       return originalAdd(team, member);
+    });
+    const run = harness.runReadAgentInProcess.getMockImplementation()!;
+    harness.runReadAgentInProcess.mockImplementation((...args) => {
+      if (args[1].name === "failed" && failurePoint === "launch") throw new Error("admission unavailable");
+      return run(...args);
     });
     vi.spyOn(messaging, "sendPlainMessage").mockRejectedValue(new Error("inbox unavailable"));
     harness.completions.get("first")!();
-    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(failurePoint === "admission" ? 2 : 3));
     const status = await harness.tools.get("get_agent_status")!.execute("status", { agent_name: "failed" }, new AbortController().signal, undefined, makeCtx());
     expect(status.details.statuses[0]).toMatchObject({ phase: "failed", error: "admission unavailable" });
-    expect(harness.runReadAgentInProcess.mock.calls[1][1].name).toBe("eligible");
+    expect(harness.runReadAgentInProcess.mock.calls.at(-1)![1].name).toBe("eligible");
     await harness.shutdown();
+  });
+
+  it("can cancel a queued request retained after its launch fails into quarantine", async () => {
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const teamName = "session-test-session";
+    const spawn = (name: string) => harness.tools.get("spawn_agent")!.execute(name, { name, prompt: name, model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+    await spawn("first");
+    await spawn("failed");
+    await spawn("eligible");
+    const run = harness.runReadAgentInProcess.getMockImplementation()!;
+    harness.runReadAgentInProcess.mockImplementation((...args) => {
+      if (args[1].name === "failed") {
+        const fencePath = paths.lifecycleTombstonePath(teamName, "failed");
+        fs.mkdirSync(path.dirname(fencePath), { recursive: true });
+        fs.writeFileSync(fencePath, "{corrupt");
+        throw new Error("launch unavailable");
+      }
+      return run(...args);
+    });
+    try {
+      harness.completions.get("first")!();
+      await vi.waitFor(() => expect(harness.runningReadAgents.has(`${teamName}:eligible`)).toBe(true));
+      expect(harness.teamToolsRuntime.cancelQueuedAgent(teamName, "failed")).toBe(true);
+    } finally {
+      await harness.shutdown();
+      harness.completions.get("eligible")?.();
+    }
   });
 
   it("queues read agents at the configured cap behind spawn_agent", async () => {
@@ -1145,6 +1300,7 @@ describe("public agent spawn tools", () => {
   });
 
   it("unsubscribes the lifecycle probe listener idempotently during reload shutdown", async () => {
+    teams.createTeam("session-test-session", "test-session", "lead-agent", "", "provider/model");
     const { emit, shutdown, eventUnsubscribes } = registerTools();
     const respond = vi.fn();
     const payload = { sessionId: "test-session", respond };
@@ -2162,6 +2318,38 @@ describe("public agent spawn tools", () => {
     harness.completions.get("queued-one")!();
     await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(3));
     expect(harness.runReadAgentInProcess.mock.calls[2][1].name).toBe("queued-two");
+  });
+
+  it("scopes nested child snapshots to the exact parent lifecycle run", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const parent = await admitNestedReadParent(harness);
+    const sibling = await admitNestedReadParent(harness, { name: "writer-two" });
+    const ctx = makeCtx();
+    const nestedTools = (member: Member) => new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+      teamName: "session-test-session",
+      parent: member,
+      parentRunId: member.lifecycleRunId!,
+      outerCtx: ctx,
+    }).map((tool: any) => [tool.name, tool]));
+
+    await nestedTools(parent).get("spawn_agent")!.execute("owned-running", {
+      name: "owned-running", prompt: "run", model_slot: "read-collect",
+    });
+    await nestedTools(parent).get("spawn_agent")!.execute("owned-queued", {
+      name: "owned-queued", prompt: "queue", model_slot: "read-review",
+    });
+    await nestedTools(sibling).get("spawn_agent")!.execute("sibling-queued", {
+      name: "sibling-queued", prompt: "queue", model_slot: "read-review",
+    });
+
+    expect(harness.teamToolsRuntime.nestedChildSnapshot({
+      teamName: "session-test-session", parent, parentRunId: parent.lifecycleRunId!, outerCtx: ctx,
+    })).toEqual({ running: 1, queued: 1 });
+    expect(harness.teamToolsRuntime.nestedChildSnapshot({
+      teamName: "session-test-session", parent, parentRunId: "old-run", outerCtx: ctx,
+    })).toEqual({ running: 0, queued: 0 });
   });
 
   it("releases a queued nested-name reservation when the item is dropped", async () => {

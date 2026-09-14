@@ -48,6 +48,7 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   /** Fail finalization closed so runtime, member, fence, and transcript remain recoverable. */
   finalizationBlockedReason?: string;
   session?: AgentSession;
+  moveToHerdr?(): Promise<void>;
   finished?: Promise<void>;
 }
 

@@ -19,6 +19,7 @@ import type { ReadAgentTeardownResult } from "../agents/read-agent-session-lifec
 import type { ShutdownTeammateOptions } from "../team/lifecycle";
 import {
   onLifecycleTombstoneCleared,
+  listLifecycleTombstones,
   readLifecycleTombstone,
   withLifecycleTombstoneLock,
   type LifecycleTombstoneLock,
@@ -72,8 +73,14 @@ export interface NestedReadAgentToolBinding {
   outerCtx: any;
 }
 
+export interface NestedChildSnapshot {
+  running: number;
+  queued: number;
+}
+
 export interface TeamToolsRuntime {
   createNestedReadAgentTools(binding: NestedReadAgentToolBinding): any[];
+  nestedChildSnapshot(binding: NestedReadAgentToolBinding): NestedChildSnapshot;
   cancelQueuedAgent(teamName: string, agentName: string): boolean;
 }
 
@@ -101,11 +108,16 @@ interface QueuedReadSpawn {
   pendingChildAcceptance?: PendingChildAcceptance;
   admissionError?: string;
   quarantineError?: string;
+  launchCommitted?: boolean;
 }
 
 export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamToolsRuntime {
   if (options.isTeammate) {
-    return { createNestedReadAgentTools: () => [], cancelQueuedAgent: () => false };
+    return {
+      createNestedReadAgentTools: () => [],
+      nestedChildSnapshot: () => ({ running: 0, queued: 0 }),
+      cancelQueuedAgent: () => false,
+    };
   }
 
   function emitOrchestrationResponse(requestId: string | undefined, type: string, payload: Record<string, any>): void {
@@ -295,6 +307,20 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   function readQueue(teamName: string): QueuedReadSpawn[] {
     return queuedReadSpawnsByTeam.get(teamName) ?? [];
+  }
+
+  function nestedChildSnapshot(binding: NestedReadAgentToolBinding): NestedChildSnapshot {
+    const parent = {
+      teamName: binding.teamName,
+      parentName: binding.parent.name,
+      parentRunId: binding.parentRunId,
+    };
+    const queued = readQueue(binding.teamName).filter((child) => {
+      const childParent = pendingParentForMember(binding.teamName, child.member);
+      return childParent?.parentName === parent.parentName && childParent.parentRunId === parent.parentRunId;
+    }).length;
+    const pending = pendingChildController.pendingCount(parent);
+    return { running: Math.max(0, pending - queued), queued };
   }
 
   async function listQueuedAgentStatuses(teamName: string): Promise<QueuedAgentStatus[]> {
@@ -540,6 +566,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     ctx: any,
     queuedAcceptance?: PendingChildAcceptance,
     assertPending?: () => void,
+    commitLaunch?: () => void,
   ): Promise<AdmittedReadAgentLaunch> {
     const addValidateAndLaunch = async (parentLifecycleLock?: LifecycleTombstoneLock): Promise<AdmittedReadAgentLaunch> => {
       let pendingAcceptance = queuedAcceptance;
@@ -621,6 +648,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       try {
         if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
         assertPending?.();
+        commitLaunch?.();
         const launch = options.runReadAgentInProcess(teamName, member, launchPrompt, ctx, options.readAgentOptions());
         return {
           launch: sessionContextReference
@@ -652,6 +680,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     releaseNameOnFailure = true,
     queuedAcceptance?: PendingChildAcceptance,
     assertPending?: () => void,
+    commitLaunch?: () => void,
   ): Promise<boolean> {
     const key = options.readAgentKey(teamName, member.name);
     reserveReadAdmission(teamName, key, member.role || "read");
@@ -685,7 +714,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     };
 
     try {
-      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance, assertPending);
+      const admitted = await admitAndLaunchReadAgentMember(teamName, member, prompt, ctx, queuedAcceptance, assertPending, commitLaunch);
       releaseNameReservation();
       void Promise.resolve(admitted.launch).then(
         () => drainAfterRun(admitted.pendingChildRun),
@@ -782,11 +811,13 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
             if (activeAgentCount(teamName, role, true) >= capacity.maxConcurrent) continue;
             queued.member.joinedAt = Date.now();
             await startReadAgentMember(teamName, queued.member, queued.prompt, queued.ctx,
-              queued.nameReservationId, false, queued.pendingChildAcceptance, assertPending);
+              queued.nameReservationId, false, queued.pendingChildAcceptance, assertPending,
+              () => { queued.launchCommitted = true; });
             removeQueuedReadSpawnById(teamName, queued.id, false);
             progressed = true;
           } catch (error) {
             if (!readQueue(teamName).some(item => item.id === queued.id)) continue;
+            queued.launchCommitted = false;
             const latestFence = await readLifecycleTombstone(teamName, queued.member.name).catch(() => null);
             if (latestFence && latestFence.status !== "absent") {
               queued.quarantineError = "Lifecycle quarantine appeared before admission.";
@@ -812,8 +843,38 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     return paths.sanitizeName(`session-${sessionId}`);
   }
 
+  let admittingPublicTeam: string | undefined;
+  let publicAdmissions = 0;
+  async function withPublicScope<T>(teamName: string, action: () => Promise<T>): Promise<T> {
+    if (teamName.startsWith("prompt-build-")) return action();
+    if (publicAdmissions > 0 && admittingPublicTeam !== teamName) {
+      throw new Error(`Cannot switch to ${teamName}: ${admittingPublicTeam} has unfinished agents being admitted.`);
+    }
+    admittingPublicTeam = teamName;
+    publicAdmissions += 1;
+    try {
+      return await action();
+    } finally {
+      if (--publicAdmissions === 0) admittingPublicTeam = undefined;
+    }
+  }
+
+  async function requireSettledPublicScope(nextTeamName: string): Promise<void> {
+    if (lifecycleProbeCleanedUp) throw new Error("Agent session is closing; admission cancelled.");
+    const current = options.getTeamName();
+    if (!current || current === nextTeamName || nextTeamName.startsWith("prompt-build-")) return;
+    const [config, fences, queued] = await Promise.all([
+      teams.readConfig(current), listLifecycleTombstones(current), listQueuedAgentStatuses(current),
+    ]);
+    const unfinished = config.members.some(member => member.name !== "team-lead")
+      || fences.length > 0 || queued.some(item => !item.failed)
+      || Array.from(options.runningReadAgents.values()).some(agent => agent.teamName === current && agent.teardownState !== "finalized");
+    if (unfinished) throw new Error(`Cannot switch from ${current} to ${nextTeamName}: unfinished agents must remain visible. Finish or stop them first.`);
+  }
+
   async function ensureCurrentSessionAgentGroup(ctx: any, explicitDefaultModel: string): Promise<string> {
     const sessionName = currentSessionAgentGroupName(ctx);
+    await requireSettledPublicScope(sessionName);
     if (teams.teamExists(sessionName)) {
       options.adoptTeamAsLead(sessionName, ctx);
       return sessionName;
@@ -1030,7 +1091,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     }
   }
 
-  pi.events?.on?.("pi-extended-teams:orchestration-request", async (payload: any) => {
+  async function handleOrchestrationRequest(payload: any): Promise<void> {
     const requestId = payload?.requestId;
     const type = String(payload?.type || "");
     const params = payload?.params || {};
@@ -1042,6 +1103,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       if (options.isTeammate) throw new Error("Teammates cannot satisfy orchestration requests directly.");
       if (!ctx) throw new Error("No active lead session context is available for orchestration request. If pi-extended-teams was registered after session_start, include the current Pi command context as payload.ctx.");
 
+      if (type === "ensure_team" || type === "spawn_teammate_once") {
+        await requireSettledPublicScope(paths.sanitizeName(params.team_name));
+      }
       if (type === "ensure_team") {
         const safeTeamName = paths.sanitizeName(params.team_name);
         if (teams.teamExists(safeTeamName)) {
@@ -1075,7 +1139,16 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         const safeTeamName = paths.sanitizeName(params.team_name);
         if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
         options.adoptTeamAsLead(safeTeamName, ctx);
-        const result = await spawnTeammate(params, ctx, { once: true });
+        const result = await spawnTeammate(params, ctx, {
+          once: true,
+          allowNestedReadAgents: params.allow_nested_read_agents === true,
+        });
+        emitOrchestrationResponse(requestId, type, { ok: true, details: result.details, content: result.content });
+        return;
+      }
+
+      if (type === "spawn_agent") {
+        const result = await spawnPublicAgent(params, ctx);
         emitOrchestrationResponse(requestId, type, { ok: true, details: result.details, content: result.content });
         return;
       }
@@ -1084,6 +1157,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     } catch (error) {
       emitOrchestrationResponse(requestId, type, { ok: false, error: error instanceof Error ? error.message : String(error) });
     }
+  }
+  pi.events?.on?.("pi-extended-teams:orchestration-request", (payload: any) => {
+    if (payload?.type !== "ensure_team" && payload?.type !== "spawn_teammate_once") return handleOrchestrationRequest(payload);
+    return withPublicScope(String(payload?.params?.team_name || ""), () => handleOrchestrationRequest(payload))
+      .catch(error => emitOrchestrationResponse(payload?.requestId, payload?.type, { ok: false, error: error instanceof Error ? error.message : String(error) }));
   });
 
   const levelDescription = "Required intent tier. Configured favorites take priority; an unconfigured tier inherits the current lead model and thinking. Read tiers: read-collect gathers bounded facts without owning the conclusion; read-review is the normal default for focused review, verification, and bounded synthesis; read-analyze explains behavior or root cause across connected evidence; read-critical is only for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning. Write tiers: write-patch makes a narrow localized change; write-feature implements a bounded feature with a known design; write-system owns a cross-cutting integration or refactor within explicitly claimed files; write-critical is only for high-risk security, concurrency, recovery, migration, or data-integrity changes. Prefer canonical tiers; legacy reading-*/writing-* aliases remain accepted for this minor release. Do not pass role, model, or thinking directly; see README.md.";
@@ -1110,7 +1188,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     return `agent-${Date.now().toString(36)}${position}-${crypto.randomUUID().slice(0, 8)}`;
   }
 
-  async function spawnPublicAgent(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
+  function spawnPublicAgent(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
+    return withPublicScope(currentSessionAgentGroupName(ctx), () => spawnPublicAgentInScope(params, ctx));
+  }
+
+  async function spawnPublicAgentInScope(params: any, ctx: any): Promise<{ content: any[]; details: any }> {
     if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
     if (!ctx) throw new Error("No active Pi session context is available for spawn_agent.");
 
@@ -1309,6 +1391,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   return {
     createNestedReadAgentTools,
-    cancelQueuedAgent: (teamName, agentName) => removeQueuedReadSpawnsByName(teamName, agentName).length > 0,
+    nestedChildSnapshot,
+    cancelQueuedAgent: (teamName, agentName) => {
+      // Retain the entry for admission bookkeeping, but let active teardown own cancellation after launch commits.
+      if (readQueue(teamName).some(queued => queued.member.name === agentName && queued.launchCommitted)) return false;
+      return removeQueuedReadSpawnsByName(teamName, agentName).length > 0;
+    },
   };
 }

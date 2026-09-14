@@ -138,7 +138,7 @@ describe("/agents-extensions", () => {
     expect(text).toContain("event-only extensions cannot be propagated");
     expect(text).toContain("enabled · selected · user · package · npm:selected-package");
     expect(text).toContain("disabled · off.ts · project · top-level · local");
-    expect(text).toContain("internal · extensions · user · top-level · local");
+    expect(text).toContain("internal · pi-extended-teams · user · top-level · local");
     expect(text).toContain("Configured extension is not observable in the lead Pi session: missing-extension");
 
     const setup = setupCommand();

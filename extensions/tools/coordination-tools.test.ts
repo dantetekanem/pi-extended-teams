@@ -115,6 +115,28 @@ describe("coordination tools", () => {
     await vi.advanceTimersByTimeAsync(250);
   });
 
+  it("preserves own-inbox access and nonempty report admission after a Herdr resume", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_EXTENDED_TEAMS_HERDR_RESUME", "1");
+    const teamName = "resumed";
+    writeConfig({ name: teamName, description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "lead",
+      members: [member("team-lead"), member("reader", { role: "read" })] });
+    await messaging.sendPlainMessage(teamName, "team-lead", "reader", "own message", "own");
+    const tools = new Map<string, any>();
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      agentName: "reader", isTeammate: true, terminal: null, getTeamName: () => teamName,
+      requireWriteAgentTeam: async () => teamName, requireTeamContext: () => teamName,
+      releaseAllClaimsForAgent: async () => [], drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+    });
+    const inbox = tools.get("read_inbox");
+    expect((await inbox.execute("own", {})).details.messages[0].text).toBe("own message");
+    await expect(inbox.execute("other", { agent_name: "team-lead" })).rejects.toThrow("own inbox");
+    await expect(tools.get("report_and_exit").execute("blank", { content: "   " }, undefined, undefined, { shutdown: vi.fn() }))
+      .rejects.toThrow("must not be empty");
+    expect(await readLifecycleTombstone(teamName, "reader")).toEqual({ status: "absent" });
+  });
+
   it("read_inbox defaults to returning only unread messages", async () => {
     const teamName = "inbox-team";
     await messaging.sendPlainMessage(teamName, "reader", "team-lead", "Already handled", "old");

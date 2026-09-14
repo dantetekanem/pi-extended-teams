@@ -18,12 +18,21 @@ function uniqueAgentsByName(agents: RunningReadAgent[]): RunningReadAgent[] {
   return agents.filter((agent, index) => agents.findIndex(candidate => candidate.name === agent.name) === index);
 }
 
+export function hasActiveReadAgentLifecycle(agent: RunningReadAgent): boolean {
+  return agent.teardownState !== "stopping"
+    && agent.teardownState !== "quarantined"
+    && agent.teardownState !== "persistence_failed"
+    && agent.teardownState !== "finalized";
+}
+
 /** Mirrors the activity footer's order for the running and runtime-only populations. */
 export function orderAgentNavigationEntries(
   runningAgents: RunningReadAgent[],
   runtimeAgents: RunningReadAgent[],
 ): RunningReadAgent[] {
   const uniqueRunningAgents = uniqueAgentsByName(runningAgents);
+  const activeRunningAgents = uniqueRunningAgents.filter(hasActiveReadAgentLifecycle);
+  const retainedAgents = uniqueRunningAgents.filter(agent => !hasActiveReadAgentLifecycle(agent));
   const runningNames = new Set(uniqueRunningAgents.map(agent => agent.name));
   const uniqueRuntimeAgents = uniqueAgentsByName(runtimeAgents)
     .filter(agent => !runningNames.has(agent.name));
@@ -31,10 +40,11 @@ export function orderAgentNavigationEntries(
   const isWriteAgent = (agent: RunningReadAgent) => agent.role === "write";
 
   return [
-    ...uniqueRunningAgents.filter(isWriteAgent).sort(byName),
+    ...activeRunningAgents.filter(isWriteAgent).sort(byName),
     ...uniqueRuntimeAgents.filter(isWriteAgent).sort(byName),
     ...uniqueRuntimeAgents.filter(agent => !isWriteAgent(agent)).sort(byName),
-    ...uniqueRunningAgents.filter(agent => !isWriteAgent(agent)).sort(byName),
+    ...activeRunningAgents.filter(agent => !isWriteAgent(agent)).sort(byName),
+    ...retainedAgents.sort(byName),
   ];
 }
 

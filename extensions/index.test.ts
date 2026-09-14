@@ -1719,11 +1719,20 @@ describe("extension integration", () => {
         ready: true, startedAt: now, lastHeartbeatAt: now, currentAction: "working", activeToolName: "edit",
       });
       await vi.advanceTimersByTimeAsync(1_200);
+      const widgetCall = [...ctx.ui.setWidget.mock.calls]
+        .reverse()
+        .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      const card = widgetCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
+      expect(card.indexOf("(writer)")).toBeLessThan(card.indexOf("(reader)"));
+
       const editorFactory = ctx.ui.setEditorComponent.mock.calls.at(-1)?.[0];
       const editor = editorFactory({}, {}, {});
       editor.handleInput("\x1b[B");
-      expect(followedComponent.render(120).join("\n")).toContain("(reader)");
+      expect(followedComponent.render(120).join("\n")).toContain("(writer)");
       followedComponent.handleInput("\x1b[B");
+      const readerView = followedComponent.render(120).join("\n");
+      expect(readerView).toContain("(reader)");
+      followedComponent.handleInput("\x1b[A");
       const writerView = followedComponent.render(120).join("\n");
       expect(writerView).toContain("(writer)");
       expect(writerView).toContain("Waiting for the agent's first transcript event…");
@@ -1732,6 +1741,45 @@ describe("extension integration", () => {
       expect(setup.terminal.interrupt).toHaveBeenCalledWith("%writer");
       expect(setup.terminal.kill).not.toHaveBeenCalled();
       expect((await setup.teams.readConfig(teamName)).members.find((member: any) => member.name === "writer")?.isActive).toBe(true);
+      followedComponent.dispose();
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
+  it.each(["stopping", "quarantined", "persistence_failed"])("keeps a %s writer after active readers in footer and navigation", async teardownState => {
+    const setup = await setupExtension();
+    try {
+      const ctx = makeCtx(setup.root, "cleanup-order-session");
+      let followedComponent: any;
+      ctx.ui.custom.mockImplementation(async (factory: any) => {
+        followedComponent = factory({ terminal: { rows: 30 }, requestRender: vi.fn() }, {}, {}, vi.fn());
+      });
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), {
+          runId: member.lifecycleRunId, name: member.name, teamName, startedAt: Date.now(), tokensUsed: 0,
+          status: "working", recentEvents: [], lastActivityAt: Date.now(),
+          role: member.name === "z-writer" ? "write" : "read",
+          ...(member.name === "z-writer" ? { teardownState } : {}),
+        });
+      });
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      for (const name of ["z-writer", "a-reader"]) {
+        await setup.tools.get("spawn_agent")!.execute("spawn", { name, prompt: "Inspect", model_slot: "read-review" },
+          new AbortController().signal, undefined, ctx);
+      }
+      await vi.advanceTimersByTimeAsync(1_200);
+      const widgetCall = [...ctx.ui.setWidget.mock.calls].reverse()
+        .find((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function");
+      const card = widgetCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
+      expect(card).toContain("z-writer");
+      expect(card.indexOf("a-reader")).toBeLessThan(card.indexOf("z-writer"));
+      const editor = ctx.ui.setEditorComponent.mock.calls.at(-1)![0]({}, {}, {});
+      editor.handleInput("\x1b[B");
+      expect(followedComponent.render(120).join("\n")).toContain("(a-reader)");
+      followedComponent.handleInput("\x1b[B");
+      expect(followedComponent.render(120).join("\n")).toContain("(z-writer)");
       followedComponent.dispose();
     } finally {
       setup.restoreEnv();
@@ -1781,16 +1829,17 @@ describe("extension integration", () => {
       const editorFactory = ctx.ui.setEditorComponent.mock.calls.at(-1)?.[0];
       const editor = editorFactory({}, {}, {});
       editor.handleInput("\x1b[B");
-      expect(followedComponent.render(120).join("\n")).toContain("(in-process-reader)");
-      followedComponent.handleInput("\x1b[B");
-      const runtimeReaderView = followedComponent.render(120).join("\n");
+      const firstReaderView = followedComponent.render(120).join("\n");
       if (replaced) {
-        expect(runtimeReaderView).toContain("(in-process-reader)");
-        expect(runtimeReaderView).not.toContain("(runtime-reader)");
+        expect(firstReaderView).toContain("(in-process-reader)");
+        expect(firstReaderView).not.toContain("(runtime-reader)");
       } else {
-        expect(runtimeReaderView).toContain("(runtime-reader)");
-        expect(runtimeReaderView).toContain("Reading CI logs");
+        expect(firstReaderView).toContain("(runtime-reader)");
+        expect(firstReaderView).toContain("Reading CI logs");
       }
+      followedComponent.handleInput("\x1b[B");
+      const secondReaderView = followedComponent.render(120).join("\n");
+      expect(secondReaderView).toContain("(in-process-reader)");
       followedComponent.dispose();
     } finally {
       setup.restoreEnv();

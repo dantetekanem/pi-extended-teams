@@ -14,7 +14,7 @@ import { registerFavoriteModelsCommand } from "./ui/favorite-models-command.js";
 import { registerExtensionsCommand } from "./ui/extensions-command.js";
 import { registerOnboardingCommand } from "./ui/onboarding-command.js";
 import { registerCheckpointsCommand } from "./ui/checkpoints-command.js";
-import { installAgentNavigation } from "./ui/agent-navigation.js";
+import { hasActiveReadAgentLifecycle, installAgentNavigation, orderAgentNavigationEntries } from "./ui/agent-navigation.js";
 import { buildReadHelperPrompt, registerCoordinationTools } from "./tools/coordination-tools.js";
 import { createReportProgressTool } from "./tools/agent-communication-tools.js";
 import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
@@ -232,13 +232,6 @@ export default function (pi: ExtensionAPI) {
 
   function runtimeHeartbeatIsRecent(status: runtime.AgentRuntimeStatus, now: number): boolean {
     return !!status.lastHeartbeatAt && (now - status.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
-  }
-
-  function hasActiveReadAgentLifecycle(agent: RunningReadAgent): boolean {
-    return agent.teardownState !== "stopping"
-      && agent.teardownState !== "quarantined"
-      && agent.teardownState !== "persistence_failed"
-      && agent.teardownState !== "finalized";
   }
 
   function isVisibleRuntimeOnlyMember(
@@ -1210,9 +1203,9 @@ export default function (pi: ExtensionAPI) {
         getAgents: () => {
           const readers = Array.from(runningReadAgents.values())
             .filter(agent => !teamName || agent.teamName === teamName);
-          return [...readers, ...Array.from(navigationRuntimeAgents.values())
-            .filter(agent => !teamName || agent.teamName === teamName)]
-            .filter((agent, index, agents) => agents.findIndex(candidate => candidate.name === agent.name) === index);
+          const runtimeAgents = Array.from(navigationRuntimeAgents.values())
+            .filter(agent => !teamName || agent.teamName === teamName);
+          return orderAgentNavigationEntries(readers, runtimeAgents);
         },
         interruptAgent: async (name: string) => {
           const result = await interruptTeammate(name);

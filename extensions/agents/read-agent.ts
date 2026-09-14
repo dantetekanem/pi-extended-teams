@@ -125,7 +125,8 @@ export interface RunReadAgentOptions {
     teamName: string,
     recipient: string,
     content: string,
-    expectedRecipientRunId?: string
+    expectedRecipientRunId?: string,
+    requireReceipt?: boolean
   ): Promise<boolean>;
   createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
   extensionInstanceId?: string;
@@ -364,13 +365,21 @@ export function handleReadAgentSessionEvent(
   }
 }
 
-export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | undefined, content: string): Promise<boolean> {
+export async function sendMessageToRunningReadAgent(
+  agent: RunningReadAgent | undefined,
+  content: string,
+  requireReceipt = false
+): Promise<boolean> {
   if (!agent) return false;
   if (!agent.session || !agent.acceptingMessages || agent.messageDeliveryClosed || agent.stopRequested) {
     throw new Error(`Cannot send message to ${agent.name}: agent is finishing.`);
   }
 
   const session = agent.session;
+  let received = false;
+  let acknowledge!: () => void;
+  const receipt = new Promise<void>(resolve => { acknowledge = resolve; });
+  let unsubscribe: (() => void) | undefined;
   const deliveryResult = enqueueReadAgentMessageDelivery(
     agent,
     agent.name,
@@ -380,17 +389,44 @@ export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | un
       const pendingInterrupt = agent.operationInterruptPromise;
       if (pendingInterrupt) await pendingInterrupt.catch(() => {});
       if (agent.messageDeliveryClosed || agent.stopRequested) throw new ReadAgentDeliveryCancelledError(agent.name);
+      if (requireReceipt) {
+        unsubscribe = session.subscribe(event => {
+          if (event.type !== "message_end" || event.message.role !== "user") return;
+          const body = event.message.content;
+          const text = typeof body === "string"
+            ? body
+            : body.filter(part => part.type === "text").map(part => part.text).join("\n");
+          if (text === content) {
+            received = true;
+            acknowledge();
+          }
+        });
+      }
       if (session.isStreaming) {
         await session.sendUserMessage(content, { deliverAs: "steer" as const });
-        return;
+      } else {
+        await runReadAgentSessionOperation(agent, () => session.sendUserMessage(content, undefined));
+        if (requireReceipt && !received) throw new Error(`Requester ${agent.name} finished without receiving the report.`);
       }
-      await runReadAgentSessionOperation(agent, () => session.sendUserMessage(content, undefined));
     }
   );
   signalReadAgentWake(agent);
   pendingParentWakeSignals.get(agent)?.();
-  await deliveryResult;
-  if (!agent.checkOperation) markReadAgentActivity(agent, "received lead message", "thinking");
+  try {
+    await deliveryResult;
+    if (requireReceipt && !received) {
+      // Keep the receipt wait outside the raw tail so parent finalization can cancel an unconsumed steer.
+      await Promise.race([receipt, agent.messageDeliveryCancellation!.then(() => {
+        throw new ReadAgentDeliveryCancelledError(agent.name);
+      })]);
+    }
+  } catch (error) {
+    // Reporting closes admission while the idle SDK send still awaits the model turn.
+    if (!(received && error instanceof ReadAgentDeliveryCancelledError)) throw error;
+  } finally {
+    unsubscribe?.();
+  }
+  if (!agent.checkOperation && !agent.messageDeliveryClosed) markReadAgentActivity(agent, "received lead message", "thinking");
   return true;
 }
 
@@ -531,7 +567,8 @@ async function ensureReadHelperCompletionMessages(
   color = member.color,
   options: Pick<RunReadAgentOptions, "deliverMessageToActiveAgent" | "notifyLeadOfInboxReports"> = {}
 ): Promise<void> {
-  if (!member.requestedBy) return;
+  const requestedBy = member.requestedBy;
+  if (!requestedBy) return;
 
   let requesterReceivedReport = false;
   // Direct session delivery has no inbox sender envelope. Keep identity outside the report body.
@@ -541,7 +578,7 @@ async function ensureReadHelperCompletionMessages(
     const expectedRequesterRunId = member.parentAgentName === member.requestedBy
       ? member.parentLifecycleRunId : requester?.lifecycleRunId;
     await messaging.sendPlainMessageOnceIfRunning(
-      teamName, member.name, member.requestedBy, report,
+      teamName, member.name, requestedBy, report,
       outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
       {
         color,
@@ -553,12 +590,14 @@ async function ensureReadHelperCompletionMessages(
     requesterReceivedReport = true;
     // Durability, not the requester's complete idle model run, gates helper cleanup.
     // Even an already persisted report must wake its exact requester automatically.
-    const wake = expectedRequesterRunId
-      ? options.deliverMessageToActiveAgent?.(teamName, member.requestedBy, attributedReport, expectedRequesterRunId)
-      : options.deliverMessageToActiveAgent?.(teamName, member.requestedBy, attributedReport);
-    void wake?.catch(async () => {
+    const wake = Promise.resolve().then(() => options.deliverMessageToActiveAgent?.(
+      teamName, requestedBy, attributedReport, expectedRequesterRunId, true
+    ));
+    void wake.then(delivered => {
+      if (!delivered) throw new Error("requester unavailable for automatic delivery");
+    }).catch(async error => {
       await messaging.sendPlainMessage(teamName, member.name, "team-lead",
-        `Direct report delivery to ${member.requestedBy} was interrupted or failed; its model run may still be active. The durable helper report is retained.`,
+        `Automatic report delivery to ${member.requestedBy} could not be confirmed: ${String(error)}. The full report is retained below; do not replay it automatically into a replacement run.\n\n${attributedReport}`,
         `Read helper ${member.name} wake incomplete`, color,
         { metadata: { helperWakeFailed: true, runId, requestedBy: member.requestedBy, expectedRecipientRunId: expectedRequesterRunId } });
       await options.notifyLeadOfInboxReports?.(teamName);
@@ -584,9 +623,7 @@ async function ensureReadHelperCompletionMessages(
       teamName,
       member.name,
       "team-lead",
-      outcome === "failed"
-        ? `Read helper ${member.name} failed for ${member.requestedBy}. ${delivery}`
-        : `Read helper ${member.name} completed for ${member.requestedBy}. ${delivery}`,
+      `Read helper ${member.name} ${outcome} for ${requestedBy}. ${delivery}${requesterReceivedReport ? "" : `\n\n${attributedReport}`}`,
       outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} done`,
       color,
       { metadata: { finalReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy } }

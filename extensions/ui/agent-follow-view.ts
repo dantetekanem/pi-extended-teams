@@ -4,6 +4,7 @@ import { initialContextUsage } from "../../src/utils/runtime";
 import { createFramePanelRowRenderer, framePanel, type FramePanelStyle } from "./frame";
 import { extractTextParts, formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel, sanitizePlainTuiLine, sanitizeTuiLine, sanitizeTuiText } from "./renderers";
 import { resolveExtendedTeamsTheme, type ExtendedTeamsForegroundToken, type ExtendedTeamsTheme } from "./theme";
+import { createActivityColors } from "./activity-colors";
 
 const REFRESH_INTERVAL_MS = 250;
 const MAX_NAVIGATION_AGENTS = 6;
@@ -325,6 +326,7 @@ export function createAgentFollowComponent(
   providedTheme?: ExtendedTeamsTheme
 ) {
   const theme = resolveExtendedTeamsTheme(providedTheme);
+  const colors = createActivityColors(!!providedTheme);
   // Herdr reserves plain page keys for primary-screen scrollback unless an app owns mouse input.
   const forwardHerdrPageKeys = process.env.HERDR_ENV === "1" && tui.mode !== "fullscreen" && typeof tui.terminal?.write === "function";
   if (forwardHerdrPageKeys) tui.terminal.write("\x1b[?1000h");
@@ -529,7 +531,7 @@ export function createAgentFollowComponent(
       if (navigationStart > 0) navigationLines.push(theme.fg("dim", `   … ${navigationStart} agent${navigationStart === 1 ? "" : "s"} above`));
       for (const item of visibleAgents) {
         const selected = item.name === agent.name;
-        navigationLines.push(`${selected ? theme.fg("accent", "->") : "  "} ${item.name}`);
+        navigationLines.push(`${selected ? theme.fg("accent", "->") : "  "} ${colors.color("name", item.name)}`);
       }
       const remainingAgents = agents.length - navigationStart - visibleAgents.length;
       if (remainingAgents > 0) navigationLines.push(theme.fg("dim", `↓  … ${remainingAgents} more agent${remainingAgents === 1 ? "" : "s"}`));
@@ -604,7 +606,8 @@ export function createAgentFollowComponent(
           : agent.latestProgress
             ? formatAnimatedProgress(agent.latestProgress, renderNow)
             : agent.status;
-      const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatContextUsage(agent.contextUsage)} · ${activity}`;
+      const headline = colors.metadata(`(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatContextUsage(agent.contextUsage)}`, agent.name)
+        + colors.color("text", " · ") + colors.color("message", activity);
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";
       const messageAction = options.sendMessage ? " · m message" : "";
       const interruptAction = options.interruptAgent ? " · i interrupt" : "";

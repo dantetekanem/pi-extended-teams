@@ -374,6 +374,27 @@ describe("agent follow component", () => {
     vi.unstubAllEnvs();
   });
 
+  it("refreshes tier shades and context warnings without changing navigation or clipping", () => {
+    const agent = makeAgent({ modelSlot: "write-patch", contextUsage: { tokens: 150_000, contextWindow: 200_000, percent: 75 } });
+    const component = createAgentFollowComponent({ terminal: { rows: 24 }, requestRender: vi.fn() }, vi.fn(), {
+      getAgents: () => [agent],
+    }, makeTheme());
+    try {
+      const initial = component.render(180).join("\n");
+      expect(initial).toContain("\x1b[38;2;255;214;235mwrite-patch\x1b[39m");
+      expect(initial).toContain("\x1b[38;2;255;215;0m(75%)\x1b[39m");
+      agent.modelSlot = "read-critical";
+      agent.contextUsage = { tokens: 180_000, contextWindow: 200_000, percent: 90 };
+      const updated = component.render(180).join("\n");
+      expect(updated).toContain("\x1b[38;2;255;146;200mread-critical\x1b[39m");
+      expect(updated).toContain("\x1b[38;2;255;85;85m(90%)\x1b[39m");
+      expect(stripAnsi(updated)).toContain("-> reader");
+      expect(component.render(60).every(line => visibleWidth(line) <= 60)).toBe(true);
+    } finally {
+      component.dispose();
+    }
+  });
+
   it("makes Herdr forward page keys while a regular-mode follow view is open", () => {
     vi.stubEnv("HERDR_ENV", "1");
     const terminal = { rows: 18, write: vi.fn() };
@@ -489,7 +510,7 @@ describe("agent follow component", () => {
     const component = createAgentFollowComponent(tui, done, { getAgents: () => [agent] }, theme);
 
     const first = component.render(140).join("\n");
-    expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 46k tok \(23%\) · Verifying assumptions\.{1,3}/);
+    expect(stripAnsi(first)).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 46k tok \(23%\) · Verifying assumptions\.{1,3}/);
     expect(first).not.toContain("502k tok");
     expect(first).toContain("Working now");
     expect(stripAnsi(first)).not.toContain("progress:");
@@ -503,7 +524,7 @@ describe("agent follow component", () => {
     contextPercent = 40;
     agent.latestProgress = "Writing final report";
     const updated = component.render(140).join("\n");
-    expect(updated).toMatch(/80k tok \(40%\) · Writing final report\.{1,3}/);
+    expect(stripAnsi(updated)).toMatch(/80k tok \(40%\) · Writing final report\.{1,3}/);
     expect(updated).not.toContain("2.3M tok");
     expect(stripAnsi(updated)).not.toContain("progress:");
 

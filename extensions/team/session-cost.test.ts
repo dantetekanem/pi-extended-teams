@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { createCombinedSessionCost, recordedSessionCost, COST_ENTRY_TYPE } from "./session-cost.js";
 
@@ -7,18 +8,47 @@ function harness() {
   const handlers = new Map<string, Function>();
   const entries: any[] = [];
   let root = "root-a";
-  const status = vi.fn();
+  const events = new EventEmitter();
   const pi = {
+    events: {
+      emit: vi.fn((name, data) => events.emit(name, data)),
+      on: (name: string, handler: (...args: any[]) => void) => {
+        events.on(name, handler);
+        return () => events.off(name, handler);
+      },
+    },
     on: (event: string, handler: Function) => handlers.set(event, handler),
     appendEntry: vi.fn((customType, data) => { entries.push({ type: "custom", customType, data }); }),
   };
-  const ctx = { sessionManager: { getEntries: () => entries, getSessionId: () => root }, ui: { setStatus: status } };
+  const ctx = { sessionManager: { getEntries: () => entries, getSessionId: () => root } };
   const cost = createCombinedSessionCost(pi as any);
   handlers.get("session_start")!({}, ctx);
-  return { cost, entries, pi, ctx, status, handlers, switchTo: (id: string) => { root = id; handlers.get("session_start")!({}, ctx); } };
+  return { cost, entries, pi, ctx, handlers, switchTo: (id: string) => { root = id; handlers.get("session_start")!({}, ctx); } };
 }
 
 describe("combined Pi-recorded session cost", () => {
+  it("serves live totals only to the current session's display, including incomplete and replayed costs", () => {
+    const h = harness();
+    const query = (sessionId = "root-a") => {
+      const request = { sessionId, result: undefined };
+      h.pi.events.emit("pi-extended-teams:cost-request", request);
+      return request.result;
+    };
+    h.entries.push(message("assistant", 1));
+    const run = h.cost.begin("root-a", "team", "display");
+    expect(query()).toEqual({ usd: 1, complete: false });
+    run.settle({ childSessionId: "child", costUsd: 2 }, "completed");
+    expect(query()).toEqual({ usd: 3, complete: true });
+    h.entries.push(message("assistant", 4));
+    h.handlers.get("turn_end")!({}, h.ctx);
+    expect(query()).toEqual({ usd: 7, complete: true });
+    h.switchTo("fork-b");
+    expect(query()).toBeUndefined();
+    expect(query("fork-b")).toEqual({ usd: 7, complete: true });
+    h.cost.deactivate();
+    expect(query("fork-b")).toBeUndefined();
+  });
+
   it("sums all own assistant/tool/summary usage, never retained tails or custom subtotals", () => {
     const entries = [message("assistant", 1), message("toolResult", 2), message("toolResult"),
       { type: "compaction", usage: usage(3), retainedTail: [message("assistant", 90)] },
@@ -85,9 +115,9 @@ describe("combined Pi-recorded session cost", () => {
     expect(h.handlers.has("message_end")).toBe(false);
     for (const event of ["turn_end", "agent_end", "session_compact", "session_tree"]) {
       h.entries.push(message("assistant", 1));
-      h.status.mockClear();
+      h.pi.events.emit.mockClear();
       h.handlers.get(event)!({}, h.ctx);
-      expect(h.status).toHaveBeenCalledOnce();
+      expect(h.pi.events.emit).toHaveBeenCalledWith("pi-extended-teams:cost-changed", undefined);
     }
     expect(h.cost.total()).toEqual({ usd: 4, complete: true });
     const pending = h.cost.begin("root-b", "team", "shutdown");

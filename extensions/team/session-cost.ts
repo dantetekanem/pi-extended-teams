@@ -40,7 +40,7 @@ export function recordedSessionCost(entries: readonly unknown[]): { usd: number;
   return { usd, complete };
 }
 
-export function createCombinedSessionCost(pi: Pick<ExtensionAPI, "on" | "appendEntry">) {
+export function createCombinedSessionCost(pi: Pick<ExtensionAPI, "on" | "appendEntry" | "events">) {
   let scope: { root: string; ctx: ExtensionContext; failed: Set<string>; pending: Map<string, Receipt> } | undefined;
   const receipts = (entries: readonly unknown[]) => {
     const runs = new Map<string, Receipt>();
@@ -85,12 +85,18 @@ export function createCombinedSessionCost(pi: Pick<ExtensionAPI, "on" | "appendE
       return { usd, complete };
     } catch { return { usd: 0, complete: false }; }
   };
+  let displayTotal: ReturnType<typeof recordedSessionCost> | undefined;
+  // Synchronous display-only query: native usage and durable receipts stay untouched.
+  const unsubscribe = pi.events.on("pi-extended-teams:cost-request", (value) => {
+    const request = object(value);
+    if (scope && request.sessionId === scope.root && scope.ctx.sessionManager.getSessionId() === scope.root) {
+      request.result = displayTotal;
+    }
+  });
   const refresh = () => {
-    if (!scope) return;
-    const result = total();
-    try {
-      scope.ctx.ui.setStatus("pi-extended-teams-cost", `Combined $${result.usd.toFixed(4)} USD · main + finalized in-process · Pi-recorded${result.complete ? "" : " · incomplete"}`);
-    } catch { /* Status observers must not affect lifecycle cleanup. */ }
+    displayTotal = scope ? total() : undefined;
+    try { pi.events.emit("pi-extended-teams:cost-changed", undefined); }
+    catch { /* Display observers must not affect lifecycle cleanup. */ }
   };
   pi.on("session_start", (_event, ctx) => {
     scope = { root: ctx.sessionManager.getSessionId(), ctx, failed: new Set(), pending: new Map() };
@@ -103,8 +109,9 @@ export function createCombinedSessionCost(pi: Pick<ExtensionAPI, "on" | "appendE
   return {
     total,
     deactivate() {
-      try { scope?.ctx.ui.setStatus("pi-extended-teams-cost", undefined); } catch { /* Best effort only. */ }
       scope = undefined;
+      unsubscribe();
+      refresh();
     },
     begin(rootSessionId: string, teamName: string, lifecycleRunId: string): CostRun {
       const origin = scope;

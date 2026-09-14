@@ -1220,6 +1220,7 @@ describe("in-process read agent tool wiring", () => {
     const rootEntries: any[] = [];
     const handlers = new Map<string, Function>();
     const cost = createCombinedSessionCost({
+      events: mockedPiRuntimeApi().createEventBus(),
       on: (event: string, handler: Function) => handlers.set(event, handler),
       appendEntry: (customType: string, data: any) => {
         if (outcome === "pending-write-failed" && data.phase === "pending") throw new Error("disk unavailable");
@@ -1534,6 +1535,73 @@ describe("in-process read agent tool wiring", () => {
     );
     expect(state.status).toBe("thinking");
     expect(state.recentEvents).toContain("received lead message");
+  });
+
+  it.each([false, true])("acknowledges a helper report before parent completion (streaming: %s)", async (streaming) => {
+    const session = makeSession();
+    session.isStreaming = streaming;
+    const raw = Promise.withResolvers<void>();
+    const unsubscribe = vi.fn();
+    let observe!: (event: any) => void;
+    session.subscribe.mockImplementation(handler => { observe = handler; return unsubscribe; });
+    session.sendUserMessage.mockImplementation(() => streaming ? Promise.resolve() : raw.promise);
+    const state = { name: "writer", session, acceptingMessages: true, recentEvents: [] } as unknown as RunningReadAgent;
+    const delivery = sendMessageToRunningReadAgent(state, "exact attributed report", true);
+    const outcome = delivery.then(() => "received", error => error.message);
+    await vi.waitFor(() => expect(session.sendUserMessage).toHaveBeenCalledOnce());
+    observe({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "exact attributed report" }] } });
+    const close = closeReadAgentMessageDelivery(state);
+    await expect(outcome).resolves.toBe("received");
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    raw.resolve();
+    await close.rawDeliverySettlement;
+  });
+
+  it.each(["no-receipt", "wrong-message", "provider-error"])("retains helper delivery failure for %s", async (scenario) => {
+    const session = makeSession();
+    const raw = Promise.withResolvers<void>();
+    session.isStreaming = scenario !== "provider-error";
+    const unsubscribe = vi.fn();
+    let observe!: (event: any) => void;
+    session.subscribe.mockImplementation(handler => { observe = handler; return unsubscribe; });
+    session.sendUserMessage.mockImplementation(() => session.isStreaming ? Promise.resolve() : raw.promise);
+    const state = { name: "writer", session, acceptingMessages: true, recentEvents: [] } as unknown as RunningReadAgent;
+    const outcome = sendMessageToRunningReadAgent(state, "exact attributed report", true).then(() => "received", error => error.message);
+    await vi.waitFor(() => expect(session.sendUserMessage).toHaveBeenCalledOnce());
+    if (scenario === "no-receipt") {
+      let rawSettled = false;
+      void state.messageDeliveryTail!.then(() => { rawSettled = true; });
+      await vi.waitFor(() => expect(rawSettled).toBe(true));
+    }
+    if (scenario === "wrong-message") {
+      observe({ type: "message_start", message: { role: "user", content: "exact attributed report" } });
+      observe({ type: "message_end", message: { role: "user", content: "different report" } });
+      observe({ type: "message_end", message: { role: "assistant", content: "exact attributed report" } });
+    }
+    if (scenario === "provider-error") {
+      observe({ type: "message_end", message: { role: "user", content: "exact attributed report" } });
+      raw.reject(new Error("provider failed after receipt"));
+      await expect(outcome).resolves.toBe("provider failed after receipt");
+    } else {
+      const close = closeReadAgentMessageDelivery(state);
+      await expect(outcome).resolves.toContain("was cancelled");
+      await close.rawDeliverySettlement;
+    }
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("fails an idle helper wake handled without a transcript receipt", async () => {
+    const session = makeSession();
+    session.isStreaming = false;
+    session.subscribe.mockReturnValue(() => {});
+    const state = { name: "writer", session, acceptingMessages: true, recentEvents: [] } as unknown as RunningReadAgent;
+    let outcome: string | undefined;
+    void sendMessageToRunningReadAgent(state, "exact report", true).then(() => { outcome = "received"; }, error => { outcome = error.message; });
+    try {
+      await vi.waitFor(() => expect(outcome).toContain("without receiving the report"));
+    } finally {
+      await closeReadAgentMessageDelivery(state).rawDeliverySettlement;
+    }
   });
 
   it("closes message admission without waiting for an in-flight session delivery", async () => {
@@ -4049,7 +4117,8 @@ describe("in-process read agent tool wiring", () => {
     });
   });
 
-  it.each([false, true])("finalizes a helper before its idle requester's raw run settles (reject: %s)", async (reject) => {
+  it.each(["settled", "failed", "reported"])("finalizes a helper before its idle requester's raw run settles: %s", async (ending) => {
+    const reject = ending === "failed";
     const helper = { ...fixtureMember("helper"), requestedBy: "writer", parentAgentName: "writer", parentLifecycleRunId: "writer-run" };
     writeTeamConfig("team", helper, [{ ...fixtureMember("writer", "write"), lifecycleRunId: "writer-run" }]);
     const session = makeSession();
@@ -4062,16 +4131,23 @@ describe("in-process read agent tool wiring", () => {
     requesterSession.isStreaming = false;
     const raw = Promise.withResolvers<void>();
     const awakened = Promise.withResolvers<void>();
-    requesterSession.sendUserMessage.mockImplementation(() => { awakened.resolve(); return raw.promise; });
+    let observe!: (event: any) => void;
+    requesterSession.subscribe.mockImplementation(handler => { observe = handler; return () => {}; });
+    requesterSession.sendUserMessage.mockImplementation((content = "") => {
+      observe({ type: "message_end", message: { role: "user", content } });
+      awakened.resolve();
+      return raw.promise;
+    });
     const options = makeRunOptions();
     const requester = { name: "writer", teamName: "team", runId: "writer-run", session: requesterSession,
       acceptingMessages: true, recentEvents: [], teardownState: "active" } as unknown as RunningReadAgent;
     options.runningReadAgents.set("team:writer", requester);
     let inboxAtWake: any[] = [];
-    const wake = vi.fn(async (_team: string, _name: string, content: string, runId?: string) => {
+    const wake = vi.fn(async (_team: string, _name: string, content: string, runId?: string, requireReceipt?: boolean) => {
       expect(runId).toBe(requester.runId);
+      expect(requireReceipt).toBe(true);
       inboxAtWake = await readInbox("team", "writer", false, false);
-      return sendMessageToRunningReadAgent(requester, content);
+      return sendMessageToRunningReadAgent(requester, content, requireReceipt);
     });
     const notifyLeadOfInboxReports = vi.fn(async () => {});
     let finished = false;
@@ -4093,6 +4169,11 @@ describe("in-process read agent tool wiring", () => {
       expect(options.runningReadAgents.get("team:writer")).toBe(requester);
       expect(requesterSession.dispose).not.toHaveBeenCalled();
       expect(await listTeamReportEvents("team")).toEqual([expect.objectContaining({ report: "exact helper report" })]);
+      if (ending === "reported") {
+        closeReadAgentMessageDelivery(requester);
+        await expect(wake.mock.results[0].value).resolves.toBe(true);
+        expect((await readInbox("team", "team-lead", false, false)).filter(message => message.metadata?.helperWakeFailed)).toEqual([]);
+      }
       if (reject) {
         await teams.updateMember("team", "writer", { lifecycleRunId: "replacement-run" });
         options.runningReadAgents.set("team:writer", { ...requester, runId: "replacement-run" });
@@ -4104,11 +4185,30 @@ describe("in-process read agent tool wiring", () => {
     }
     if (reject) await vi.waitFor(async () => {
       expect(await readInbox("team", "team-lead", false, false)).toContainEqual(expect.objectContaining({
-        from: "helper", metadata: expect.objectContaining({ helperWakeFailed: true, expectedRecipientRunId: "writer-run" }),
+        from: "helper", text: expect.stringContaining("exact helper report"),
+        metadata: expect.objectContaining({ helperWakeFailed: true, expectedRecipientRunId: "writer-run" }),
       }));
       expect(options.runningReadAgents.get("team:writer")?.runId).toBe("replacement-run");
       expect(requesterSession.sendUserMessage).toHaveBeenCalledOnce();
     });
+  });
+
+  it.each([false, undefined])("forwards the full helper report to the lead when direct wake is unavailable: %s", async (available) => {
+    const helper = { ...fixtureMember("helper"), requestedBy: "writer", parentAgentName: "writer", parentLifecycleRunId: "writer-run" };
+    writeTeamConfig("team", helper, [{ ...fixtureMember("writer", "write"), lifecycleRunId: "writer-run" }]);
+    piMocks.createAgentSession.mockResolvedValue({ session: makeSession() });
+    const options = { ...makeRunOptions(), deliverMessageToActiveAgent: available === false ? vi.fn(async () => false) : undefined,
+      notifyLeadOfInboxReports: vi.fn(async () => {}) };
+    await runReadAgentInProcess("team", helper, "inspect", {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, options);
+    await vi.waitFor(async () => {
+      const recovery = (await readInbox("team", "team-lead", false, false)).find(message => message.metadata?.helperWakeFailed);
+      expect(recovery?.text).toContain("final report");
+      expect(recovery?.text).toContain(`"runId":"${helper.lifecycleRunId}"`);
+      expect(recovery?.text).toContain("unavailable");
+    });
+    expect(await readInbox("team", "writer", false, false)).toEqual([expect.objectContaining({ text: "final report" })]);
   });
 
   it.each([false, true])("uses the installed Agent loop to stop an accepted report (idle continuation: %s)", async (idle) => {
@@ -4159,7 +4259,8 @@ describe("in-process read agent tool wiring", () => {
       return { session };
     });
     session.prompt.mockImplementation(async () => { await agent.prompt("inspect"); });
-    session.sendUserMessage.mockImplementation(async () => { await agent.prompt("finish"); });
+    session.subscribe.mockImplementation(handler => agent.subscribe(handler));
+    session.sendUserMessage.mockImplementation(async (content = "") => { await agent.prompt(content); });
     const member = idle ? eligibleNestedParent("loop-reporter") : fixtureMember("loop-reporter");
     writeTeamConfig("team", member);
     const options = { ...makeRunOptions(), pendingChildController: createPendingChildController() };
@@ -4168,7 +4269,7 @@ describe("in-process read agent tool wiring", () => {
       await vi.waitFor(() => expect(options.runningReadAgents.get("team:loop-reporter")?.acceptingMessages).toBe(true));
       await agent.waitForIdle();
       reporting = true;
-      await sendMessageToRunningReadAgent(options.runningReadAgents.get("team:loop-reporter"), "finish").catch(() => {});
+      await expect(sendMessageToRunningReadAgent(options.runningReadAgents.get("team:loop-reporter"), "finish", true)).resolves.toBe(true);
     }
     await run;
     expect(responses).toBe((idle ? 2 : 1) * (supportsStop ? 1 : 2));
@@ -4240,7 +4341,7 @@ describe("in-process read agent tool wiring", () => {
     });
 
     expect(options.deliverMessageToActiveAgent).toHaveBeenCalledWith("team", "writer",
-      expect.stringMatching(/^Read helper report \{"agentName":"writer-reader","runId":"[^"]+","runtimeStatus":"completed"\}\n\nfinal report$/));
+      expect.stringMatching(/^Read helper report \{"agentName":"writer-reader","runId":"[^"]+","runtimeStatus":"completed"\}\n\nfinal report$/), undefined, true);
 
     const leadInbox = await readInbox("team", "team-lead", false, false);
     expect(leadInbox).toHaveLength(2);
@@ -4429,8 +4530,10 @@ describe("in-process read agent tool wiring", () => {
     });
 
     const leadInbox = await readInbox("team", "team-lead", false, false);
-    expect(leadInbox).toHaveLength(1);
-    expect(leadInbox[0]).toMatchObject({
+    expect(leadInbox).toHaveLength(2);
+    expect(leadInbox.find(message => message.metadata?.helperWakeFailed)?.text).toContain("final report");
+    const completion = leadInbox.find(message => message.metadata?.helperCompletion)!;
+    expect(completion).toMatchObject({
       metadata: {
         finalReport: true,
         helperCompletion: true,
@@ -4438,7 +4541,7 @@ describe("in-process read agent tool wiring", () => {
         requestedBy: "writer",
       },
     });
-    expect(leadInbox[0].text).toContain("Report sent to writer");
+    expect(completion.text).toContain("Report sent to writer");
     expect(options.notifyLeadOfInboxReports).toHaveBeenCalledWith("team");
   });
 
@@ -4498,7 +4601,7 @@ describe("in-process read agent tool wiring", () => {
     await runReadAgentInProcess("team", helper, "investigate", {
       modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
     }, options);
-    const firstNotices = await readInbox("team", "team-lead", false, false);
+    const firstNotices = (await readInbox("team", "team-lead", false, false)).filter(message => message.metadata?.helperCompletion);
     expect(firstNotices).toHaveLength(1);
     const firstRunId = firstNotices[0].metadata?.runId;
     expect(firstRunId).toEqual(expect.any(String));
@@ -4520,9 +4623,10 @@ describe("in-process read agent tool wiring", () => {
     expect(classifiedNotices[1].metadata?.runId).toEqual(expect.any(String));
     expect(classifiedNotices[1].metadata?.runId).not.toBe(firstRunId);
     const unreadLead = await readInbox("team", "team-lead", true, false);
-    expect(unreadLead).toHaveLength(1);
-    expect(unreadLead[0].metadata?.runId).toBe(classifiedNotices[1].metadata?.runId);
-    expect(notifyLeadOfInboxReports).toHaveBeenCalledTimes(2);
+    expect(unreadLead).toHaveLength(2);
+    expect(unreadLead.every(message => message.metadata?.runId === classifiedNotices[1].metadata?.runId)).toBe(true);
+    expect(unreadLead.find(message => message.metadata?.helperWakeFailed)?.text).toContain("second run failed");
+    expect(notifyLeadOfInboxReports).toHaveBeenCalledTimes(4);
 
     const requesterReports = await readInbox("team", "writer", false, false);
     expect(requesterReports).toHaveLength(2);
@@ -4614,7 +4718,7 @@ describe("in-process read agent tool wiring", () => {
     expect(options.deliverMessageToActiveAgent).toHaveBeenCalledWith(
       "team",
       "writer",
-      expect.stringMatching(/^Read helper report \{"agentName":"failing-helper","runId":"[^"]+","runtimeStatus":"failed"\}\n\nRead agent failing-helper failed: source unavailable$/)
+      expect.stringMatching(/^Read helper report \{"agentName":"failing-helper","runId":"[^"]+","runtimeStatus":"failed"\}\n\nRead agent failing-helper failed: source unavailable$/), undefined, true
     );
     expect(await readInbox("team", "writer", false, false)).toEqual([expect.objectContaining({
       from: "failing-helper", text: "Read agent failing-helper failed: source unavailable",

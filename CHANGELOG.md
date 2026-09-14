@@ -4,11 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-09-14
+
 ### Added
 - Add one-shot `get_agent_status` snapshots for leads and eligible nested write parents, including active, queued, and recently completed read and edit agents.
+- Add explicitly assigned checks with source-bound results, optional bounded repair attempts, compact batch-report delivery, and saved specialist checkpoints for fresh continuations.
+- Add read-only onboarding guidance for models, favorite tiers, shared extensions, and package updates.
+- Expose combined recorded session cost to compatible footer consumers without changing native usage totals.
 
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
+- Match agent navigation to activity-row order, retaining access to agents finishing cleanup.
+- Share activity colors across compact rows and the agent view, with tier-dependent pink shades, separate model/thinking colors, muted progress, and context warnings at 75% and 90%.
+
+### Fixed
+- Distinguish confirmed helper-report receipt from cancellation during parent cleanup, avoiding false wake-failure warnings.
+- Preserve the full attributed report with the lead when requester delivery cannot be confirmed, without replaying it into a replacement run.
+- Keep admitted follow-up reports through verification, reject Herdr transfer during active checks, and reject oversized checkpoints before report acceptance.
+- Repair the cost-accounting test fixtures for the event-based footer integration.
 
 ## [2.2.12] - 2026-09-12
 

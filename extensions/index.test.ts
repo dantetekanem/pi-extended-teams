@@ -166,6 +166,7 @@ async function setupExtension(
       on: vi.fn((name: string, handler: Function) => {
         const target = name.startsWith("pi-") ? extensionEventHandlers : eventHandlers;
         target.set(name, [...(target.get(name) || []), handler]);
+        return () => target.set(name, (target.get(name) || []).filter(listener => listener !== handler));
       }),
       emit: vi.fn(),
     },
@@ -792,7 +793,7 @@ describe("extension integration", () => {
 
       expect(setup.readAgentMock.sendMessageToRunningReadAgent).toHaveBeenCalledWith(
         expect.objectContaining({ name: "writer" }),
-        expect.stringContaining("could not start for writer")
+        expect.stringContaining("could not start for writer"), false
       );
       expect(await messaging.readInbox(targetTeamName, "writer", false, false)).toEqual([]);
       let leadInbox = await messaging.readInbox(targetTeamName, "team-lead", false, false);

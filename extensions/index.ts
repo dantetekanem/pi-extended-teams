@@ -179,11 +179,12 @@ export default function (pi: ExtensionAPI) {
     targetTeamName: string,
     targetAgentName: string,
     content: string,
-    expectedRecipientRunId?: string
+    expectedRecipientRunId?: string,
+    requireReceipt = false
   ): Promise<boolean> {
     const target = runningReadAgents.get(readAgentKey(targetTeamName, targetAgentName));
     if (expectedRecipientRunId !== undefined && target?.runId !== expectedRecipientRunId) return false;
-    const delivered = await sendMessageToRunningReadAgent(target, content);
+    const delivered = await sendMessageToRunningReadAgent(target, content, requireReceipt);
     if (delivered) renderReadAgentStatus();
     return delivered;
   }

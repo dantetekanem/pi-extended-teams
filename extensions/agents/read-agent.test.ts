@@ -4239,7 +4239,8 @@ describe("in-process read agent tool wiring", () => {
       read: false,
     });
 
-    expect(options.deliverMessageToActiveAgent).toHaveBeenCalledWith("team", "writer", "final report");
+    expect(options.deliverMessageToActiveAgent).toHaveBeenCalledWith("team", "writer",
+      expect.stringMatching(/^Read helper report \{"agentName":"writer-reader","runId":"[^"]+","runtimeStatus":"completed"\}\n\nfinal report$/));
 
     const leadInbox = await readInbox("team", "team-lead", false, false);
     expect(leadInbox).toHaveLength(2);
@@ -4613,7 +4614,7 @@ describe("in-process read agent tool wiring", () => {
     expect(options.deliverMessageToActiveAgent).toHaveBeenCalledWith(
       "team",
       "writer",
-      "Read agent failing-helper failed: source unavailable"
+      expect.stringMatching(/^Read helper report \{"agentName":"failing-helper","runId":"[^"]+","runtimeStatus":"failed"\}\n\nRead agent failing-helper failed: source unavailable$/)
     );
     expect(await readInbox("team", "writer", false, false)).toEqual([expect.objectContaining({
       from: "failing-helper", text: "Read agent failing-helper failed: source unavailable",

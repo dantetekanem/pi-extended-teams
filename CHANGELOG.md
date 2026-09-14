@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-09-14
+
+### Fixed
+- Preserve running and starting agents across same-process `/reload`, reconnecting controls, reports, and cost accounting to the fresh host.
+- Count in-flight admissions before native launch and close admission before the shutdown sweep. Quit and session changes still clean up agents.
+- Preserve inherited thinking levels and costs for runs admitted during reload.
+
+### Changed
+- Configure the shared activity and agent-view palette through `activityColors` in settings, with mint-green agent names by default.
+- Allow 60 seconds for failed reload recovery before cancellation starts. Running agents keep their original implementation until an idle reload; process restart recovery is not supported.
+
 ## [2.3.0] - 2026-09-14
 
 ### Added

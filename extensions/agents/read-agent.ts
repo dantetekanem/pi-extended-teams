@@ -27,6 +27,7 @@ import { parseQualifiedModel } from "../../src/utils/model-resolution";
 import { closePersistedRecipient } from "../team/recipient-closure";
 import { generateExtensionInstanceId, generateLifecycleRunId, withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
 import { createLifecycleRuntime, type ShutdownTeammateOptions } from "../team/lifecycle";
+import { recordedSessionCost, type AgentCostSnapshot, type CostOutcome, type CostRun } from "../team/session-cost";
 import {
   createSpawnResourcePlan,
   parentProjectTrustForSpawn,
@@ -132,6 +133,7 @@ export interface RunReadAgentOptions {
   nestedChildSnapshot?(binding: NestedReadAgentToolBinding): { running: number; queued: number };
   pendingChildController?: PendingChildController;
   loadCheckOperations?: CheckRunnerOptions["loadOperations"];
+  beginCostRun?(rootSessionId: string, teamName: string, lifecycleRunId: string): CostRun;
 }
 
 function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
@@ -634,6 +636,12 @@ export async function runReadAgentInProcess(
   }
   member.lifecycleRunId = lifecycleRunId;
   const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
+  let costRun: CostRun | undefined;
+  let costSnapshot: AgentCostSnapshot | undefined;
+  let costOutcome: CostOutcome = "cancelled";
+  try {
+    costRun = options.beginCostRun?.(ctx.sessionManager.getSessionId(), readTeamName, lifecycleRunId);
+  } catch { /* Additive telemetry must not prevent an otherwise valid launch. */ }
   const state: RunningReadAgent = {
     runId: lifecycleRunId,
     name: member.name,
@@ -653,6 +661,7 @@ export async function runReadAgentInProcess(
     startupState: "pending",
     sessionCreation,
     teardownState: "active",
+    onCostSettled: () => costRun?.settle(costSnapshot, costOutcome),
   };
   let sessionCreationSettled = false;
   const settleSessionCreation = (session: AgentSession | undefined): void => {
@@ -1119,6 +1128,7 @@ export async function runReadAgentInProcess(
     childSessionManager = privateSessionDirectory
       ? SessionManager.create(member.cwd, privateSessionDirectory)
       : SessionManager.create(member.cwd);
+    try { costSnapshot = { childSessionId: childSessionManager.getSessionId(), costUsd: null }; } catch { /* Unknown provenance. */ }
     if (nestedReadBinding && options.nestedChildSnapshot) {
       const childSessionId = childSessionManager.getSessionId();
       childLifecycleProbeUnsubscribe = childEventBus.on(CHILD_AGENT_LIFECYCLE_PROBE, (payload: any) => {
@@ -1143,7 +1153,11 @@ export async function runReadAgentInProcess(
     } as Parameters<typeof createAgentSession>[0] & { modelRuntime?: unknown });
 
     state.session = session;
-    const sessionLifecycle = installReadAgentSessionLifecycle(session);
+    const sessionLifecycle = installReadAgentSessionLifecycle(session, () => {
+      if (handoffRequested) return;
+      const own = recordedSessionCost(childSessionManager.getEntries());
+      costSnapshot = { childSessionId: childSessionManager.getSessionId(), costUsd: own.complete ? own.usd : null };
+    });
     try {
       if (typeof session.bindExtensions === "function") {
         await (session.bindExtensions as (bindings: { mode: "print" }) => Promise<void>)({ mode: "print" });
@@ -1223,6 +1237,7 @@ export async function runReadAgentInProcess(
         try {
           if (!handoffRequested) {
             handoffRequested = true;
+            try { costRun?.exclude(); } catch { /* Terminal work is outside this total. */ }
             state.stopRequested = true;
             const delivery = closeReadAgentMessageDelivery(state);
             const pending = session.clearQueue();
@@ -1485,8 +1500,10 @@ export async function runReadAgentInProcess(
       ?? `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
     const recoveryReference = readAgentRecoveryReference(readTeamName, member.name, state.runId, childSessionManager);
     await deliverCompletion(completionResolution, completionSummary, recoveryAttempted, recoveryReference);
+    costOutcome = "completed";
   } catch (e) {
     await cancelAutomaticRepair().catch(() => {});
+    if (!state.stopRequested) costOutcome = "failed";
     const lastError = runtime.createRuntimeError(e);
     state.lastError = lastError;
     options.renderReadAgentStatus();

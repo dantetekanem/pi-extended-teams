@@ -8,6 +8,7 @@ import { runReadAgentInProcess, sendMessageToRunningReadAgent } from "./agents/r
 import { createWriteAgentRuntime } from "./agents/write-agent.js";
 import { registerExtensionEvents } from "./events/register-events.js";
 import { createLifecycleRuntime } from "./team/lifecycle.js";
+import { createCombinedSessionCost } from "./team/session-cost.js";
 import { buildRoster as buildTeamRoster, formatRosterForPrompt, releaseAllClaimsForAgent, requireTeamContext as resolveTeamContext, requireWriteAgentTeam as resolveWriteAgentTeam } from "./team/roster.js";
 import { createWriterScreenState, registerWriterScreenShortcut, removeWriterScreenTab, upsertWriterScreenTab, type ActiveWriterTab } from "./team/writer-screens.js";
 import { registerFavoriteModelsCommand } from "./ui/favorite-models-command.js";
@@ -45,6 +46,7 @@ export default function (pi: ExtensionAPI) {
   const agentName = process.env.PI_AGENT_NAME || "team-lead";
   const extensionInstanceId = generateExtensionInstanceId();
   const envTeamName = process.env.PI_TEAM_NAME;
+  const combinedSessionCost = isTeammate ? undefined : createCombinedSessionCost(pi);
 
   // Teammates are explicitly bound by PI_TEAM_NAME. Lead sessions are adopted
   // later at session_start only when the persisted Pi session id matches.
@@ -1159,6 +1161,7 @@ export default function (pi: ExtensionAPI) {
     try {
       await stopRunningAgentsForShutdown(reason);
     } finally {
+      combinedSessionCost?.deactivate();
       activeAgentSleepController.dispose();
     }
 
@@ -1301,6 +1304,7 @@ export default function (pi: ExtensionAPI) {
         return teamToolsRuntime?.nestedChildSnapshot(binding) ?? { running: 0, queued: 0 };
       },
       pendingChildController,
+      beginCostRun: combinedSessionCost?.begin,
     };
   }
 

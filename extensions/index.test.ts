@@ -1317,7 +1317,7 @@ describe("extension integration", () => {
     }
   });
 
-  it("removes a failed helper suffix while a real rejected-prompt run remains live for delivery", async () => {
+  it("removes a failed helper suffix while its completion notice is pending", async () => {
     const setup = await setupExtension();
     try {
       let writerState: any;
@@ -1430,13 +1430,12 @@ describe("extension integration", () => {
       const failureDeliveryGate = new Promise<void>((resolve) => { releaseFailureDelivery = resolve; });
       const helperOptions = {
         ...readAgentOptions,
-        deliverMessageToActiveAgent: vi.fn(async () => {
+        deliverMessageToActiveAgent: vi.fn(async () => true),
+        renderLeadInboxStatus: vi.fn(async () => {}),
+        notifyLeadOfInboxReports: vi.fn(async () => {
           markFailureDeliveryStarted();
           await failureDeliveryGate;
-          return true;
         }),
-        renderLeadInboxStatus: vi.fn(async () => {}),
-        notifyLeadOfInboxReports: vi.fn(async () => {}),
         createResourcePlan: vi.fn(async () => ({
           selectionMode: "default" as const,
           extensionPaths: [],
@@ -1893,6 +1892,42 @@ describe("extension integration", () => {
     } finally {
       setup.restoreEnv();
     }
+  });
+
+  it.each(["matching", "different", "failed", "corrupt"])("projects an active run with a %s fence", async (kind) => {
+    const setup = await setupExtension();
+    try {
+      const lifecycle = await import("../src/utils/lifecycle-tombstone.js");
+      let live: any;
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        live = { name: member.name, teamName, runId: member.lifecycleRunId, role: member.role,
+          startedAt: Date.now() - 60_000, tokensUsed: 0, status: "finishing", teardownState: "active",
+          recentEvents: [], lastActivityAt: Date.now(), latestProgress: "Sending exact report" };
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), live);
+      });
+      const ctx = makeCtx(setup.root, "projection-session");
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      writeFavoriteLevels(setup.root);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reporter", prompt: "inspect", cwd: setup.root, model_slot: "reading-default",
+      }, new AbortController().signal, undefined, ctx);
+      await lifecycle.withLifecycleTombstoneLock(live.teamName, live.name, async lock => {
+        const runId = kind === "different" ? "other-run" : live.runId;
+        lock.occupy({ team: live.teamName, agent: live.name, runId, role: "read", reason: "quit", extensionInstanceId: "fixture" });
+        lock.updateMatching(runId, { phase: kind === "failed" ? "cleanup_failed" : "persistence_closed" });
+      });
+      if (kind === "corrupt") {
+        const paths = await import("../src/utils/paths.js");
+        fs.writeFileSync(paths.lifecycleTombstonePath(live.teamName, live.name), "{");
+      }
+      await vi.advanceTimersByTimeAsync(1_200);
+      const call = ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === "01-pi-extended-teams-readers").at(-1);
+      const card = call![1]({ requestRender: vi.fn() }).render(160).join("\n");
+      expect(card.match(/reporter/g)).toHaveLength(kind === "matching" ? 1 : 2);
+      expect(card).toContain("Sending exact report");
+      if (kind === "matching") expect(card).toContain("Finishing cleanup");
+      if (kind === "failed" || kind === "corrupt") expect(card).toContain("Cleanup blocked");
+    } finally { setup.restoreEnv(); }
   });
 
   it.each(["closing", "persistence_closed", "finalizing", "timed_out", "cleanup_failed"] as const)(

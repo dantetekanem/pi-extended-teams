@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { findPackageJSON } from "node:module";
+import { pathToFileURL } from "node:url";
 import { execFileSync, spawnSync } from "node:child_process";
 import { CheckJournal } from "../../src/results/check-journal";
 import { createReportResult, effectiveTaskOutcome, type ReportResult } from "../../src/results/report-result";
@@ -102,6 +104,30 @@ import { createTeammateInterrupter } from "../runtime/teammate-interrupt.js";
 import { createCombinedSessionCost } from "../team/session-cost.js";
 
 let root: string;
+
+type PiFixturePackageManifest = {
+  main?: string;
+  exports?: string | null | { ".": string | { import?: string; default?: string } };
+};
+
+function resolvePiFixturePackageJson(packageName: string, parent: string): string {
+  const packageJsonPath = findPackageJSON(packageName, parent);
+  if (!packageJsonPath) throw new Error(`Package not found: ${packageName}`);
+  return fs.realpathSync(packageJsonPath);
+}
+function resolvePiFixtureEntry(packageJsonPath: string): string {
+  const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as PiFixturePackageManifest;
+  const rootExport = manifest.exports && typeof manifest.exports === "object"
+    ? manifest.exports["."]
+    : manifest.exports;
+  const entrypoint = typeof rootExport === "string"
+    ? rootExport
+    : rootExport?.import ?? rootExport?.default ?? manifest.main;
+  if (typeof entrypoint !== "string") {
+    throw new Error(`No public entrypoint in ${packageJsonPath}`);
+  }
+  return pathToFileURL(path.resolve(path.dirname(packageJsonPath), entrypoint)).href;
+}
 
 function installPathSpies() {
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName))));
@@ -4023,10 +4049,142 @@ describe("in-process read agent tool wiring", () => {
     });
   });
 
+  it.each([false, true])("finalizes a helper before its idle requester's raw run settles (reject: %s)", async (reject) => {
+    const helper = { ...fixtureMember("helper"), requestedBy: "writer", parentAgentName: "writer", parentLifecycleRunId: "writer-run" };
+    writeTeamConfig("team", helper, [{ ...fixtureMember("writer", "write"), lifecycleRunId: "writer-run" }]);
+    const session = makeSession();
+    session.prompt.mockImplementation(async () => {
+      const report = piMocks.createAgentSession.mock.calls[0][0].customTools.find((tool: any) => tool.name === "report_and_exit");
+      expect((await report.execute("report", { content: "exact helper report" })).details.accepted).toBe(true);
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const requesterSession = makeSession();
+    requesterSession.isStreaming = false;
+    const raw = Promise.withResolvers<void>();
+    const awakened = Promise.withResolvers<void>();
+    requesterSession.sendUserMessage.mockImplementation(() => { awakened.resolve(); return raw.promise; });
+    const options = makeRunOptions();
+    const requester = { name: "writer", teamName: "team", runId: "writer-run", session: requesterSession,
+      acceptingMessages: true, recentEvents: [], teardownState: "active" } as unknown as RunningReadAgent;
+    options.runningReadAgents.set("team:writer", requester);
+    let inboxAtWake: any[] = [];
+    const wake = vi.fn(async (_team: string, _name: string, content: string, runId?: string) => {
+      expect(runId).toBe(requester.runId);
+      inboxAtWake = await readInbox("team", "writer", false, false);
+      return sendMessageToRunningReadAgent(requester, content);
+    });
+    const notifyLeadOfInboxReports = vi.fn(async () => {});
+    let finished = false;
+    const run = runReadAgentInProcess("team", helper, "inspect", {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, { ...options, deliverMessageToActiveAgent: wake, notifyLeadOfInboxReports }).then(() => { finished = true; });
+    try {
+      await awakened.promise;
+      expect(inboxAtWake).toEqual([expect.objectContaining({ from: "helper", text: "exact helper report",
+        metadata: expect.objectContaining({ helperReport: true, runId: helper.lifecycleRunId }) })]);
+      await vi.waitFor(() => expect(finished).toBe(true));
+      expect(options.runningReadAgents.has("team:helper")).toBe(false);
+      expect(session.dispose).toHaveBeenCalledOnce();
+      expect(requester.activeOperationSettlementPromise).toBeDefined();
+      let deliverySettled = false;
+      void requester.messageDeliveryTail!.then(() => { deliverySettled = true; });
+      await Promise.resolve();
+      expect(deliverySettled).toBe(false);
+      expect(options.runningReadAgents.get("team:writer")).toBe(requester);
+      expect(requesterSession.dispose).not.toHaveBeenCalled();
+      expect(await listTeamReportEvents("team")).toEqual([expect.objectContaining({ report: "exact helper report" })]);
+      if (reject) {
+        await teams.updateMember("team", "writer", { lifecycleRunId: "replacement-run" });
+        options.runningReadAgents.set("team:writer", { ...requester, runId: "replacement-run" });
+      }
+    } finally {
+      if (reject) raw.reject(new Error("requester continuation failed")); else raw.resolve();
+      await requester.messageDeliveryTail;
+      await run;
+    }
+    if (reject) await vi.waitFor(async () => {
+      expect(await readInbox("team", "team-lead", false, false)).toContainEqual(expect.objectContaining({
+        from: "helper", metadata: expect.objectContaining({ helperWakeFailed: true, expectedRecipientRunId: "writer-run" }),
+      }));
+      expect(options.runningReadAgents.get("team:writer")?.runId).toBe("replacement-run");
+      expect(requesterSession.sendUserMessage).toHaveBeenCalledOnce();
+    });
+  });
+
+  it.each([false, true])("uses the installed Agent loop to stop an accepted report (idle continuation: %s)", async (idle) => {
+    const packageResolutionBase = pathToFileURL(path.join(process.cwd(), "package.json")).href;
+    const codingAgentPackageJson = resolvePiFixturePackageJson("@mariozechner/pi-coding-agent", packageResolutionBase);
+    const codingAgentModule = resolvePiFixtureEntry(codingAgentPackageJson);
+    // Override with a public current-host module URL; the default peer resolves from the coding-agent context.
+    const coreModule = process.env.PI_AGENT_CORE_CONTRACT_MODULE ?? resolvePiFixtureEntry(
+      resolvePiFixturePackageJson("@mariozechner/pi-agent-core", codingAgentModule),
+    );
+    const aiModule = resolvePiFixtureEntry(
+      resolvePiFixturePackageJson("@mariozechner/pi-ai", codingAgentModule),
+    );
+    const { Agent } = await import(coreModule);
+    const { createAssistantMessageEventStream } = await import(aiModule);
+    const session = makeSession();
+    const model = { provider: "provider", id: "model", api: "openai-completions" };
+    let responses = 0;
+    let reporting = !idle;
+    const streamFn = () => {
+      const stream = createAssistantMessageEventStream();
+      const report = reporting;
+      const progress = idle && responses === 0;
+      reporting = false;
+      responses++;
+      const message: any = {
+        role: "assistant", model: "model", provider: "provider", api: "openai-completions",
+        timestamp: Date.now(),
+        content: report ? [{ type: "toolCall", id: "report", name: "report_and_exit", arguments: { content: "authoritative loop report" } }]
+          : progress ? [{ type: "toolCall", id: "progress", name: "report_progress", arguments: { status: "Inspecting the contract" } }] : [{ type: "text", text: "idle" }],
+        stopReason: report || progress ? "toolUse" : "stop",
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0 } },
+      };
+      stream.push({ type: "done", reason: message.stopReason, message });
+      stream.end();
+      return stream;
+    };
+    const agent = new Agent({ initialState: { model }, streamFn });
+    const supportsStop = "shouldStopAfterTurn" in agent;
+    const previousHook = vi.fn(async (turn, signal) => {
+      expect(signal).toBeInstanceOf(AbortSignal);
+      return turn.toolResults.some((result: any) => result.toolName === "report_progress");
+    });
+    if (supportsStop) agent.shouldStopAfterTurn = previousHook;
+    Object.assign(session, { agent, isStreaming: false });
+    piMocks.createAgentSession.mockImplementation(async ({ customTools }) => {
+      agent.state.tools = customTools;
+      return { session };
+    });
+    session.prompt.mockImplementation(async () => { await agent.prompt("inspect"); });
+    session.sendUserMessage.mockImplementation(async () => { await agent.prompt("finish"); });
+    const member = idle ? eligibleNestedParent("loop-reporter") : fixtureMember("loop-reporter");
+    writeTeamConfig("team", member);
+    const options = { ...makeRunOptions(), pendingChildController: createPendingChildController() };
+    const run = runReadAgentInProcess("team", member, "inspect", { modelRegistry: { find: () => model } }, options);
+    if (idle) {
+      await vi.waitFor(() => expect(options.runningReadAgents.get("team:loop-reporter")?.acceptingMessages).toBe(true));
+      await agent.waitForIdle();
+      reporting = true;
+      await sendMessageToRunningReadAgent(options.runningReadAgents.get("team:loop-reporter"), "finish").catch(() => {});
+    }
+    await run;
+    expect(responses).toBe((idle ? 2 : 1) * (supportsStop ? 1 : 2));
+    if (supportsStop) expect(previousHook).toHaveBeenCalledTimes(idle ? 2 : 1);
+    expect(agent.state.messages.find((message: any) => message.role === "toolResult" && message.toolName === "report_and_exit")?.details).toMatchObject({ accepted: true });
+    expect(await listTeamReportEvents("team")).toEqual([expect.objectContaining({ report: "authoritative loop report" })]);
+    expect(options.runningReadAgents.size).toBe(0);
+    expect(session.dispose).toHaveBeenCalledOnce();
+  });
+
   it("directly wakes an active helper requester even when the helper already persisted its report", async () => {
     const session = makeSession();
     session.prompt.mockImplementation(async () => {
-      await sendPlainMessage("team", "writer-reader", "writer", "final report", "Read helper writer-reader report", "cyan");
+      const runId = runningReadAgents.get("team:writer-reader")!.runId;
+      await sendPlainMessage("team", "writer-reader", "writer", "final report", "Read helper writer-reader report", "cyan",
+        { operationId: `helper-report:${runId}`, metadata: { helperReport: true, runId } });
       await sendPlainMessage("team", "writer-reader", "team-lead", "Read helper writer-reader completed for writer. Report sent to writer.", "Read helper writer-reader done", "cyan");
     });
     piMocks.createAgentSession.mockResolvedValue({ session });
@@ -4112,7 +4270,7 @@ describe("in-process read agent tool wiring", () => {
     expect(promptText).not.toContain("send your concise report to the lead and stop");
   });
 
-  it("retains an old child report instead of delivering it to a replacement parent run", async () => {
+  it.each(["replaced", "closed"])("retains a child report when its parent run is %s", async (parentState) => {
     const helper: Member = {
       agentId: "stale-child@team",
       name: "stale-child",
@@ -4144,10 +4302,10 @@ describe("in-process read agent tool wiring", () => {
       tmuxPaneId: "",
       cwd: root,
       subscriptions: [],
-      lifecycleRunId: "writer-run-B",
+      lifecycleRunId: parentState === "replaced" ? "writer-run-B" : "writer-run-A",
       delegationDepth: 0,
       allowNestedReadAgents: true,
-      isActive: true,
+      isActive: parentState !== "closed",
     };
     writeTeamConfig("team", helper, [replacementParent]);
     const session = makeSession();
@@ -4174,12 +4332,7 @@ describe("in-process read agent tool wiring", () => {
       modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
     }, options);
 
-    expect(options.deliverMessageToActiveAgent).toHaveBeenCalledWith(
-      "team",
-      "writer",
-      "final report",
-      "writer-run-A"
-    );
+    expect(options.deliverMessageToActiveAgent).not.toHaveBeenCalled();
     expect(await readInbox("team", "writer", false, false)).toEqual([]);
     expect((await listTeamReportEvents("team")).filter(event => event.agentName === "stale-child"))
       .toEqual([expect.objectContaining({ status: "completed", report: "final report" })]);
@@ -4462,7 +4615,10 @@ describe("in-process read agent tool wiring", () => {
       "writer",
       "Read agent failing-helper failed: source unavailable"
     );
-    expect(await readInbox("team", "writer", false, false)).toEqual([]);
+    expect(await readInbox("team", "writer", false, false)).toEqual([expect.objectContaining({
+      from: "failing-helper", text: "Read agent failing-helper failed: source unavailable",
+      metadata: expect.objectContaining({ helperReport: true, outcome: "failed" }),
+    })]);
     const leadInbox = await readInbox("team", "team-lead", false, false);
     expect(leadInbox).toHaveLength(1);
     expect(leadInbox[0]).toMatchObject({

@@ -8,8 +8,7 @@ import * as runtime from "../../src/utils/runtime";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
-import { checkpointReference, saveReportCheckpoint } from "../../src/results/checkpoint-report";
-import { checkpointReportPayload } from "../../src/results/specialist-checkpoint";
+import { checkpointReference, preflightReportCheckpoint, saveReportCheckpoint } from "../../src/results/checkpoint-report";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
 import { deliverCompletionGroupReport } from "../../src/results/completion-group-delivery";
 import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails, type ReportResult, type ReportedTaskDetails } from "../../src/results/report-result";
@@ -1069,7 +1068,7 @@ export async function runReadAgentInProcess(
         if (submittedFinalReport || finalReportSubmissionInProgress) return { accepted: false };
         finalReportSubmissionInProgress = true;
         try {
-          if (member.checkpointAssignment) checkpointReportPayload(createReportResult(readTeamName, member.name, state.runId, report));
+          if (member.checkpointAssignment) preflightReportCheckpoint(readTeamName, member, createReportResult(readTeamName, member.name, state.runId, report));
           const decision = await verifyTaskResult(report, signal, submissionId ? `tool:${submissionId}` : undefined);
           if (decision.request) {
             deliveredRepairRequests.add(decision.request.id);

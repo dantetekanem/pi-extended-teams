@@ -3,7 +3,8 @@ import type { Member, TeamReportEvent } from "../utils/models";
 import { normalizeFavoriteModelSlot } from "../utils/settings";
 import { readStoredTeamReportEvent, recordReportCheckpoint, resyncStoredTeamReportEvent } from "../utils/report-events";
 import { captureSourceIdentity, type SourceIdentity } from "./source-identity";
-import { checkpointId, checkpointReportPayload, isSpecialistCheckpoint, MAX_CHECKPOINT_BYTES, saveCheckpoint, type SpecialistCheckpoint } from "./specialist-checkpoint";
+import { checkpointId, checkpointReportPayload, isSpecialistCheckpoint, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_REPORT_PATH_LENGTH, saveCheckpoint, type SpecialistCheckpoint } from "./specialist-checkpoint";
+import type { ReportResult } from "./report-result";
 
 function author(teamName: string, member: Member) {
   return { teamName, agentName: member.name, runId: member.lifecycleRunId!, modelSlot: normalizeFavoriteModelSlot(member.modelSlot)! };
@@ -21,7 +22,31 @@ function requireDraft(event: TeamReportEvent): SpecialistCheckpoint {
   return draft;
 }
 
-function snapshot(teamName: string, member: Member, event: TeamReportEvent, after: SourceIdentity): SpecialistCheckpoint {
+function checkpointBytes(record: SpecialistCheckpoint): number {
+  return Buffer.byteLength(JSON.stringify(record, null, 2));
+}
+
+export function preflightReportCheckpoint(teamName: string, member: Member, result: ReportResult): void {
+  const assignment = member.checkpointAssignment;
+  if (!assignment) return;
+  if (!assignment.sourceBefore) throw new Error("Checkpoint assignment provenance is unavailable.");
+  // JSON may escape each path character as six bytes; the final versioned path is allocated later.
+  const reservedBytes = 6 * MAX_CHECKPOINT_REPORT_PATH_LENGTH;
+  const event: TeamReportEvent = {
+    id: result.reportId, teamName, agentName: member.name, status: "completed", source: "read-agent", report: "",
+    createdAt: Number.MAX_SAFE_INTEGER - assignment.policy.retentionDays * 86_400_000,
+    reportPath: "/", checkpoint: checkpointReference(teamName, member),
+    result: { ...result, verification: { ...result.verification, state: "not-requested" }, acceptance: { state: "accepted" } },
+  };
+  // Native capture uses SHA-1/SHA-256 and an array length; stable path/scope fields must match sourceBefore.
+  const after = { ...assignment.sourceBefore, head: "f".repeat(64), fileCount: Number.MAX_SAFE_INTEGER };
+  const record = snapshot(teamName, member, event, after, reservedBytes);
+  if (checkpointBytes(record) + reservedBytes > MAX_CHECKPOINT_BYTES) {
+    throw new Error(`Checkpoint exceeds ${MAX_CHECKPOINT_BYTES} bytes including assignment and retained provenance. Correct the report fields and resubmit report_and_exit.`);
+  }
+}
+
+function snapshot(teamName: string, member: Member, event: TeamReportEvent, after: SourceIdentity, reservedBytes = 0): SpecialistCheckpoint {
   const { originalPrompt, policy, sourceBefore, parent } = member.checkpointAssignment!;
   const result = event.result!;
   if (!sourceBefore || (parent && !isSpecialistCheckpoint(parent))) throw new Error("Checkpoint assignment provenance is unavailable.");
@@ -40,7 +65,7 @@ function snapshot(teamName: string, member: Member, event: TeamReportEvent, afte
     inspectedEvidence: [...inspected, ...(parent?.inspectedEvidence.filter(item => retained.has(item.reportId)) ?? []).slice(0, Math.max(0, 128 - inspected.length))],
     questions: [...questions, ...(parent?.questions.filter(question => !questions.includes(question)) ?? []).slice(0, Math.max(0, 32 - questions.length))],
   };
-  const oversized = () => Buffer.byteLength(JSON.stringify(record, null, 2)) > MAX_CHECKPOINT_BYTES;
+  const oversized = () => checkpointBytes(record) + reservedBytes > MAX_CHECKPOINT_BYTES;
   while (oversized() && record.reports.length > 2) {
     const removed = record.reports.splice(1, 1)[0].id;
     record.findings = record.findings.filter(finding => finding.reportId !== removed);

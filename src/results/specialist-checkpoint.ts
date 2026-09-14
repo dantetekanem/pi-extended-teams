@@ -13,6 +13,7 @@ import { createReportResult, type ReportResult } from "./report-result";
 import { syncPathAndParents, writeJsonDurably } from "./durable-json";
 
 export const MAX_CHECKPOINT_BYTES = 65_536;
+export const MAX_CHECKPOINT_REPORT_PATH_LENGTH = 2048;
 const day = 86_400_000;
 const text = (maxLength = 4096) => Type.String({ minLength: 1, maxLength });
 const identity = Type.String({ pattern: "^checkpoint:[a-f0-9]{64}$", maxLength: 75 });
@@ -29,7 +30,7 @@ const recordSchema = Type.Object({
   assignment: Type.Object({ original: text(16_384), current: text(16_384) }, { additionalProperties: false }),
   policy: StoredCheckpointPolicySchema, reportId: reportIdentity,
   reports: Type.Array(Type.Object({
-    id: reportIdentity, path: text(2048),
+    id: reportIdentity, path: text(MAX_CHECKPOINT_REPORT_PATH_LENGTH),
     source: Type.Object({ before: SourceIdentitySchema, after: SourceIdentitySchema }, { additionalProperties: false }),
     verification: Type.Union((["not-requested", "pending", "passed", "failed", "stale"] as const).map(state => Type.Literal(state))),
     acceptance: Type.Union((["pending", "accepted", "rejected"] as const).map(state => Type.Literal(state))),

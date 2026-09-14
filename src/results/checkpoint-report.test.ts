@@ -8,8 +8,8 @@ import type { Member, TeamReportEvent } from "../utils/models";
 import * as source from "./source-identity";
 import * as durable from "./durable-json";
 import { createReportResult, type ReportedTaskDetails } from "./report-result";
-import { checkpointId, checkpointPath, readCheckpoint, retireCheckpoint } from "./specialist-checkpoint";
-import { checkpointReference, saveReportCheckpoint, resyncReportCheckpoint } from "./checkpoint-report";
+import { checkpointId, checkpointPath, readCheckpoint, retireCheckpoint, isSpecialistCheckpoint, MAX_CHECKPOINT_BYTES } from "./specialist-checkpoint";
+import { checkpointReference, preflightReportCheckpoint, saveReportCheckpoint, resyncReportCheckpoint } from "./checkpoint-report";
 
 let root: string;
 let member: Member;
@@ -140,6 +140,60 @@ describe("report checkpoint publication", () => {
     expect(saved.reports).toHaveLength(16);
     expect(saved.reports[0]).toEqual(parent.reports[0]);
     expect(saved.reports.at(-1)?.id).toBe(current.id);
+  });
+
+  it("budgets original provenance and prunes disposable history without dropping current findings", async () => {
+    const original = await report();
+    await saveReportCheckpoint("team", member, original);
+    const parent = readCheckpoint(original.checkpoint!.id);
+    parent.reports[0].leadDecisions = Array.from({ length: 4 }, () => "d".repeat(4096));
+    parent.reports.push(...Array.from({ length: 2 }, (_, index) => ({ ...structuredClone(parent.reports[0]),
+      id: `report:team:reviewer:history-${index}`, leadDecisions: Array.from({ length: 3 }, () => "h".repeat(4096)) })));
+    parent.author.runId = "history-1"; parent.id = checkpointId(parent.author); parent.reportId = parent.reports.at(-1)!.id;
+    expect(isSpecialistCheckpoint(parent)).toBe(true);
+    member.lifecycleRunId = "continued-run";
+    member.checkpointAssignment = { ...member.checkpointAssignment!, parent };
+    const findings = Array.from({ length: 10 }, (_, index) => ({ id: `C${index}`, text: "x".repeat(4096), evidence: [] }));
+    const result = createReportResult("team", member.name, member.lifecycleRunId, { findings });
+    expect(() => preflightReportCheckpoint("team", member, result)).toThrow(/65536.*retained provenance/);
+    result.findings = findings.slice(0, 6);
+    expect(() => preflightReportCheckpoint("team", member, result)).not.toThrow();
+    const event = await reports.appendTeamReportEvent("team", { agentName: member.name, status: "completed", source: "read-agent",
+      report: "Corrected continuation", checkpoint: checkpointReference("team", member), result });
+    await saveReportCheckpoint("team", member, event);
+    const saved = readCheckpoint(event.checkpoint!.id);
+    expect(saved.reports[0]).toEqual(parent.reports[0]);
+    expect(saved.reports.length).toBeLessThan(parent.reports.length + 1);
+    expect(saved.findings.filter(finding => finding.reportId === event.id)).toEqual(result.findings.map(finding => ({ ...finding, reportId: event.id })));
+    expect(isSpecialistCheckpoint(saved)).toBe(true);
+  });
+
+  it("publishes a near-budget accepted report with escaped paths and larger later metadata", async () => {
+    const resultFor = (length: number) => createReportResult("team", member.name, member.lifecycleRunId!, {
+      findings: Array.from({ length: 16 }, (_, index) => ({ id: `F${index}`, text: "x".repeat(length), evidence: [] })),
+    });
+    let low = 1, high = 4096;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      try { preflightReportCheckpoint("team", member, resultFor(middle)); low = middle; }
+      catch { high = middle - 1; }
+    }
+    const result = resultFor(low);
+    expect(() => preflightReportCheckpoint("team", member, result)).not.toThrow();
+    expect(() => preflightReportCheckpoint("team", member, resultFor(low + 1))).toThrow(/65536.*bytes/);
+    expect(source.captureSourceIdentity).not.toHaveBeenCalled();
+    vi.mocked(paths.reportFilesDir).mockReturnValue(path.join(root, ...Array(3).fill("\u0001".repeat(100))));
+    vi.mocked(source.captureSourceIdentity).mockResolvedValue({ ...identity(), head: "f".repeat(64), fileCount: 4_294_967_295 });
+    result.acceptance = { state: "accepted" };
+    const event = await reports.appendTeamReportEvent("team", { agentName: member.name, status: "completed", source: "read-agent",
+      report: "Near-budget report", checkpoint: checkpointReference("team", member), result });
+    expect(Buffer.byteLength(JSON.stringify(event.reportPath))).toBeGreaterThan(event.reportPath!.length);
+    await saveReportCheckpoint("team", member, event);
+    const saved = readCheckpoint(event.checkpoint!.id);
+    expect(isSpecialistCheckpoint(saved)).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(saved, null, 2))).toBeLessThanOrEqual(MAX_CHECKPOINT_BYTES);
+    expect(saved.findings).toEqual(result.findings!.map(finding => ({ ...finding, reportId: event.id })));
+    expect(saved.reports[0]).toMatchObject({ acceptance: "accepted", source: { after: { head: "f".repeat(64), fileCount: 4_294_967_295 } } });
   });
 
   it("retains historical evidence and lead decisions while binding new claims to their new report", async () => {

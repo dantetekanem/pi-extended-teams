@@ -320,11 +320,18 @@ describe("in-process read agent tool wiring", () => {
       corrected: { findings: [{ id: "F1", text: "x".repeat(4096), evidence: ["src/auth.ts:4"] }] }, error: /findings\/0\/text.*4096/ },
     { label: "33 distinct questions", invalid: { questions: Array.from({ length: 33 }, (_, index) => `Question ${index}?`) },
       corrected: { questions: Array.from({ length: 32 }, (_, index) => `Question ${index}?`) }, error: /questions.*32/ },
-  ])("rejects checkpoint $label before closure and accepts correction", async ({ invalid, corrected, error }) => {
+    { label: "aggregate findings overflow", invalid: { findings: Array.from({ length: 16 }, (_, index) => ({ id: `F${index}`, text: "x".repeat(4096), evidence: [] })) },
+      corrected: { findings: [{ id: "F0", text: "Bounded finding", evidence: [] }] }, error: /65536.*bytes/i },
+    { label: "UTF-8 aggregate overflow", invalid: { findings: Array.from({ length: 6 }, (_, index) => ({ id: `F${index}`, text: "界".repeat(4096), evidence: [] })) },
+      corrected: { findings: [{ id: "F0", text: "Bounded finding", evidence: [] }] }, error: /65536.*bytes/i },
+    { label: "assignment plus findings overflow", prompt: "p".repeat(4096),
+      invalid: { findings: Array.from({ length: 15 }, (_, index) => ({ id: `F${index}`, text: "x".repeat(4096), evidence: [] })) },
+      corrected: { findings: [{ id: "F0", text: "Bounded finding", evidence: [] }] }, error: /65536.*bytes/i },
+  ])("rejects checkpoint $label before closure and accepts correction", async ({ invalid, corrected, error, prompt = "Review" }) => {
     const observed: checkpointSource.SourceIdentity = { version: 1, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fileCount: 1, fingerprint: "a".repeat(64) };
     vi.spyOn(checkpointSource, "captureSourceIdentity").mockResolvedValue(observed);
-    const member: Member = { ...fixtureMember("reviewer"), lifecycleRunId: "checkpoint-run", prompt: "Review",
-      checkpointAssignment: { originalPrompt: "Review", policy: { inputs: ["src"], retentionDays: 30, decisions: [] }, sourceBefore: observed } };
+    const member: Member = { ...fixtureMember("reviewer"), lifecycleRunId: "checkpoint-run", prompt,
+      checkpointAssignment: { originalPrompt: prompt, policy: { inputs: ["src"], retentionDays: 30, decisions: [] }, sourceBefore: observed } };
     writeTeamConfig("team", member);
     const options = makeRunOptions();
     const session = makeSession();

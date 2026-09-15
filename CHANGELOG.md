@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-09-15
+
+### Changed
+- Rewrite the README around agent features and developer workflows, with an animated demo.
+- Move detailed setup and orchestration contracts to `docs/reference.md`; include the reference and demo in the package.
+
 ## [2.3.1] - 2026-09-14
 
 ### Fixed

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-09-16
+
+### Added
+- Show each inbox sender's current status and reply availability in tool results and compact and expanded inbox views ([#43](https://github.com/dantetekanem/pi-extended-teams/pull/43)). Status is an advisory snapshot; unread and peek behavior and saved message history are unchanged.
+
 ## [2.3.3] - 2026-09-15
 
 ### Changed

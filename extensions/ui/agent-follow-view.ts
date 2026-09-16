@@ -28,7 +28,7 @@ export interface AgentFollowTranscriptOptions {
 
 type TranscriptBlock =
   | { kind: "section"; label: "user" | "thinking" | "assistant"; text: string }
-  | { kind: "tool"; id?: string; name: string; args: unknown; result?: string; details?: unknown; isError?: boolean };
+  | { kind: "tool"; id?: string; name: string; args: unknown; result?: string; readSummary?: string; details?: unknown; isError?: boolean };
 
 function stringifyToolArgs(args: unknown): string {
   if (args === undefined) return "";
@@ -42,6 +42,7 @@ function stringifyToolArgs(args: unknown): string {
 function compactToolArgs(name: string, args: unknown): string {
   if (!args || typeof args !== "object") return sanitizeTuiLine(stringifyToolArgs(args));
   const values = args as Record<string, unknown>;
+  if (name === "ls") return compactTranscriptLine(String(values.path ?? "."));
   const primary = name === "bash"
     ? values.command
     : name === "read"
@@ -226,6 +227,14 @@ function renderToolBlock(theme: ExtendedTeamsTheme, block: Extract<TranscriptBlo
   if (compactBlock) return compactBlock;
 
   const header = renderToolHeader(theme, block);
+  if (!expandLargeToolResults && (block.name === "read" || block.name === "bash" || block.name === "ls")) {
+    const state = block.result === undefined
+      ? pendingText(theme, "working")
+      : block.isError ? failureText(theme, "✗") : successText(theme, "✓");
+    const summary = block.name === "read" && !block.isError && block.readSummary
+      ? mutedText(theme, ` · ${block.readSummary}`) : "";
+    return [boundTranscriptLine(`${header}${summary}${mutedText(theme, " · ")}${state}`, width)];
+  }
   if (block.result === undefined) {
     return [header, `${structuralText(theme, "│")} ${pendingText(theme, "waiting for result…")}`, `${structuralText(theme, "╰─")} ${pendingText(theme, "running")}`, ""];
   }
@@ -290,28 +299,40 @@ export function formatAgentFollowTranscript(messages: any[], options: AgentFollo
       const name = sanitizeTuiLine(String(message.toolName || "tool"));
       const matchingTool = (id ? toolsById.get(id) : undefined)
         ?? blocks.slice().reverse().find((block): block is Extract<TranscriptBlock, { kind: "tool" }> => block.kind === "tool" && block.result === undefined && block.name === name);
+      let readSummary: string | undefined;
+      if ((matchingTool?.name ?? name) === "read") {
+        const text = typeof message.content === "string" ? message.content
+          : (Array.isArray(message.content) ? message.content : [])
+            .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+            .map((part: any) => part.text).join("\n");
+        const lineCount = text ? text.replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n").length : 0;
+        readSummary = `${lineCount} line${lineCount === 1 ? "" : "s"} · ${formatResultSize(text)}`;
+      }
       const result = sanitizeTuiText(extractTextParts(message.content));
       const isError = typeof message.isError === "boolean" ? message.isError : undefined;
       if (matchingTool) {
         matchingTool.result = result;
+        matchingTool.readSummary = readSummary;
         matchingTool.details = message.details;
         matchingTool.isError = isError;
       } else {
-        blocks.push({ kind: "tool", id, name, args: undefined, result, details: message.details, isError });
+        blocks.push({ kind: "tool", id, name, args: undefined, result, readSummary, details: message.details, isError });
       }
     }
   }
 
-  const lines = blocks.flatMap(block => {
+  const lines: string[] = [];
+  for (const block of blocks) {
     if (block.kind === "tool") {
-      return renderToolBlock(theme, block, options.expandLargeToolResults === true, options.width);
+      lines.push(...renderToolBlock(theme, block, options.expandLargeToolResults === true, options.width));
+    } else if (block.label === "thinking") {
+      if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
+      lines.push(theme.fg("thinkingText", block.label), block.text.replace(/\*\*/g, ""), "");
+    } else {
+      const labelToken = block.label === "user" ? "customMessageLabel" : "accent";
+      lines.push(theme.fg(labelToken, block.label), block.text, "");
     }
-    if (block.label === "thinking") {
-      return [theme.fg("thinkingText", block.label), block.text.replace(/\*\*/g, ""), ""];
-    }
-    const labelToken = block.label === "user" ? "customMessageLabel" : "accent";
-    return [theme.fg(labelToken, block.label), block.text, ""];
-  });
+  }
   return lines.length > 0 ? lines : [theme.fg("dim", "Waiting for the agent's first transcript event…")];
 }
 

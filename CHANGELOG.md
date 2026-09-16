@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.3] - 2026-09-15
+
+### Changed
+- Compact read, bash, and ls rows in the agent view; keep full output available with `l`.
+- Show returned text size and line count for reads, and separate thinking blocks from preceding tool rows with a blank line.
+- Limit the focused test suite to two workers to reduce contention in timing-sensitive queue tests.
+
 ## [2.3.2] - 2026-09-15
 
 ### Changed

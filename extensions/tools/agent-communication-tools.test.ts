@@ -6,6 +6,7 @@ import { createAgentCommunicationTools } from "./agent-communication-tools.js";
 import * as paths from "../../src/utils/paths.js";
 import { readInbox, sendPlainMessage } from "../../src/utils/messaging.js";
 import { readRuntimeStatus } from "../../src/utils/runtime.js";
+import { withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone.js";
 
 let root: string;
 
@@ -15,6 +16,9 @@ type Tool = {
 };
 
 function installPathSpies() {
+  vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName, agentName) => {
+    return path.join(root, "teams", teamName, "quarantine", `${agentName}.json`);
+  });
   vi.spyOn(paths, "teamDir").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName))));
   vi.spyOn(paths, "configPath").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "config.json"));
   vi.spyOn(paths, "inboxPath").mockImplementation((teamName: unknown, agentName: unknown) => {
@@ -56,6 +60,51 @@ describe("read-agent communication tools", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["writer", "active", true],
+    ["team-lead", "lead", true],
+    ["finished-agent", "not_running", false],
+  ] as const)("read_inbox exposes current reply availability for %s", async (sender, status, canMessage) => {
+    await sendPlainMessage("session", sender, "reader", "Full report", "finding");
+    const result = await makeTools().get("read_inbox")!.execute("read", { mark_as_read: false });
+
+    expect(result.details.messages[0]).toMatchObject({ senderStatus: { status, canMessage }, read: false });
+    expect(result.content[0].text).toContain(`sender now: ${status}; can message: ${canMessage ? "yes" : "no"}`);
+    expect(result.content[0].text).toContain("Full report");
+    expect((await readInbox("session", "reader", true, false))[0]).not.toHaveProperty("senderStatus");
+  });
+
+  it("refreshes sender status when a previously active sender closes or leaves", async () => {
+    await sendPlainMessage("session", "writer", "reader", "Report before exit", "finding");
+    const inbox = makeTools().get("read_inbox")!;
+    const peek = async () => {
+      const result = await inbox.execute("peek", { mark_as_read: false });
+      return result.details.messages[0].senderStatus;
+    };
+
+    expect(await peek()).toMatchObject({ status: "active", canMessage: true });
+    await withLifecycleTombstoneLock("session", "writer", async lock => {
+      lock.occupy({
+        team: "session", agent: "writer", runId: "reader-run",
+        role: "write", reason: "quit", extensionInstanceId: "test",
+      });
+    });
+    expect(await peek()).toMatchObject({ status: "closing", canMessage: false });
+
+    fs.writeFileSync(paths.lifecycleTombstonePath("session", "writer"), "broken");
+    expect(await peek()).toMatchObject({ status: "quarantined", canMessage: false });
+
+    fs.unlinkSync(paths.lifecycleTombstonePath("session", "writer"));
+    fs.writeFileSync(paths.configPath("session"), JSON.stringify({ members: [{ name: "writer", isActive: false }] }));
+    expect(await peek()).toMatchObject({ status: "not_running", canMessage: false });
+
+    fs.writeFileSync(paths.configPath("session"), "broken");
+    expect(await peek()).toMatchObject({ status: "unknown", canMessage: null });
+
+    fs.unlinkSync(paths.configPath("session"));
+    expect(await peek()).toMatchObject({ status: "not_running", canMessage: false });
   });
 
   it("still delivers inbox messages when no lifecycle run id is available", async () => {

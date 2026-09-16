@@ -7,7 +7,12 @@ import { InboxMessage, TeamConfig } from "./models";
 import { withLock } from "./lock";
 import { configPath, inboxPath } from "./paths";
 import { readConfig } from "./teams";
-import { assertLifecycleTombstoneAbsent, withLifecycleTombstoneLock } from "./lifecycle-tombstone";
+import {
+  assertLifecycleTombstoneAbsent,
+  readLifecycleTombstoneSnapshot,
+  withLifecycleTombstoneLock,
+  type LifecycleTombstonePhase,
+} from "./lifecycle-tombstone";
 
 export interface MessageMetadataOptions {
   id?: string;
@@ -270,6 +275,57 @@ export async function readInbox(
 
     return cloneInboxMessages(result);
   });
+}
+
+export interface InboxSenderStatus {
+  status: "lead" | "active" | "not_running" | "quarantined" | "unknown" | LifecycleTombstonePhase;
+  canMessage: boolean | null;
+}
+
+export async function readInboxWithSenderStatus(
+  teamName: string,
+  agentName: string,
+  unreadOnly = false,
+  markAsRead = true
+): Promise<Array<InboxMessage & { senderStatus: InboxSenderStatus }>> {
+  const messages = await readInbox(teamName, agentName, unreadOnly, markAsRead);
+  if (messages.length === 0) return [];
+
+  // Advisory admission snapshot, not process liveness or a reservation to send.
+  // Enrich only returned copies: persisted inbox history must not cache live status.
+  let members: TeamConfig["members"] | undefined;
+  try {
+    const config = JSON.parse(fs.readFileSync(configPath(teamName), "utf-8")) as TeamConfig;
+    if (Array.isArray(config.members)) members = config.members;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") members = [];
+  }
+
+  const senders = new Map<string, InboxSenderStatus>();
+  for (const sender of new Set(messages.map(message => message.from))) {
+    let senderStatus: InboxSenderStatus = { status: "unknown", canMessage: null };
+    try {
+      if (sender === "team-lead") {
+        senderStatus = { status: "lead", canMessage: true };
+      } else {
+        const fence = readLifecycleTombstoneSnapshot(teamName, sender);
+        if (fence.status !== "absent") {
+          senderStatus = {
+            status: fence.status === "corrupt" ? "quarantined" : fence.tombstone.phase,
+            canMessage: false,
+          };
+        } else if (members) {
+          const member = members.find(member => member.name === sender);
+          const canMessage = !!member && member.isActive !== false;
+          senderStatus = { status: canMessage ? "active" : "not_running", canMessage };
+        }
+      }
+    } catch {
+      // Status lookup must not discard messages after read flags were saved.
+    }
+    senders.set(sender, senderStatus);
+  }
+  return messages.map(message => ({ ...message, senderStatus: senders.get(message.from)! }));
 }
 
 export async function markInboxMessagesRead(teamName: string, agentName: string, ids: string[]): Promise<void> {

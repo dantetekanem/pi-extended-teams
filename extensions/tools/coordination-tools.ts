@@ -333,7 +333,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
   pi.registerTool({
     name: "read_inbox",
     label: "Read Inbox",
-    description: "Read messages from the current Pi session inbox. Defaults to this agent's inbox.",
+    description: "Read messages from the current Pi session inbox with current sender message-admission status. Defaults to your inbox. Status is a snapshot, not proof of process liveness; do not send to unavailable senders.",
     parameters: Type.Object({
       agent_name: Type.Optional(Type.String({ description: "Whose inbox to read. Defaults to your own." })),
       unread_only: Type.Optional(Type.Boolean({ default: true })),
@@ -345,7 +345,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       if (process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1" && targetAgent !== options.agentName) throw new Error("A resumed subagent can only read its own inbox.");
       const markAsRead = params.mark_as_read !== false;
       const unreadOnly = params.unread_only !== false;
-      const msgs = await messaging.readInbox(targetTeamName, targetAgent, unreadOnly, markAsRead);
+      const msgs = await messaging.readInboxWithSenderStatus(targetTeamName, targetAgent, unreadOnly, markAsRead);
 
       if (markAsRead && options.isTeammate && targetAgent === options.agentName) {
         const config = await teams.readConfig(targetTeamName).catch(() => null);

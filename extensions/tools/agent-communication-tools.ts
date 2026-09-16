@@ -122,7 +122,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
     {
       name: "read_inbox",
       label: "Read Inbox",
-      description: "Read this agent's inbox in the current Pi session.",
+      description: "Read this agent's inbox with current sender message-admission status. Status is a snapshot, not proof of process liveness; do not send to unavailable senders.",
       parameters: Type.Object({
         unread_only: Type.Optional(Type.Boolean({ default: true })),
         mark_as_read: Type.Optional(Type.Boolean({ default: true, description: "Set false to peek without marking messages read." })),
@@ -131,7 +131,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         const teamName = requireCurrentSession(options);
         const markAsRead = params.mark_as_read !== false;
         const unreadOnly = params.unread_only !== false;
-        const msgs = await messaging.readInbox(teamName, options.agentName, unreadOnly, markAsRead);
+        const msgs = await messaging.readInboxWithSenderStatus(teamName, options.agentName, unreadOnly, markAsRead);
         const lifecycleRunId = options.getLifecycleRunId();
         // Do not fail after read flags are persisted; telemetry is best-effort.
         if (markAsRead && lifecycleRunId) {

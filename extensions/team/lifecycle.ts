@@ -4,6 +4,12 @@ import * as paths from "../../src/utils/paths";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
 import * as teams from "../../src/utils/teams";
+import { readStoredTeamReportEvent } from "../../src/utils/report-events";
+import { resyncReportCheckpoint } from "../../src/results/checkpoint-report";
+import { createReportResult } from "../../src/results/report-result";
+import { VerificationController } from "../../src/results/verification-controller";
+import { CompletionGroup } from "../../src/results/completion-group";
+import { enqueueCompletionGroupDeliveries } from "../../src/results/completion-group-delivery";
 import { loadSettings } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import type { RunningReadAgent } from "../runtime/types";
@@ -259,6 +265,25 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
             return;
           }
 
+          const bound = createReportResult(teamName, member.name, expectedRunId, {});
+          const report = await readStoredTeamReportEvent(teamName, bound.reportId);
+          const result = { ...bound, verification: report?.result?.verification ?? bound.verification, repair: report?.result?.repair };
+          const candidate = currentMember ?? member;
+          const controller = new VerificationController({ teamName, result, cwd: candidate.cwd,
+            checks: candidate.assignedChecks, repair: candidate.repairPolicy });
+          if (candidate.repairPolicy || result.repair || fs.existsSync(controller.journalPath)) {
+            await controller.cancelAndRequireSettled();
+          }
+          if ((candidate.checkpointAssignment || member.checkpointAssignment) && !report?.checkpoint) throw new Error("Checkpoint report provenance is unavailable.");
+          if (report?.checkpoint) await resyncReportCheckpoint(report);
+          const groupBinding = candidate.completionGroup ?? member.completionGroup ?? report?.completionGroup;
+          if (groupBinding) {
+            const group = new CompletionGroup(teamName, groupBinding.groupId);
+            if (report?.result) await group.recordReport(groupBinding.slotId, report.result, report.status);
+            else await group.apply({ type: reason === "quit" ? "cancelled" : "interrupted", ...groupBinding,
+              runId: expectedRunId, reason: `Agent lifecycle ended (${reason}) without a final report.` });
+            await enqueueCompletionGroupDeliveries(group);
+          }
           releasedClaims = await releaseClaims(teamName, member.name);
 
           // Private transcript cleanup is the first destructive recovery step.
@@ -327,6 +352,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       if (drainQueue && (member.role ?? "write") === "write") {
         void options.drainWriteQueue(teamName).catch(() => {});
       }
+      try { expectedState?.onCostSettled?.(); } catch { /* Accounting cannot alter settlement. */ }
       try {
         options.onTeammateSettled?.(teamName, { ...member, lifecycleRunId: expectedRunId });
       } catch {

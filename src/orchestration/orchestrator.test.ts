@@ -13,6 +13,7 @@ import type { SpawnTeammateOnceRequest } from "./types";
 import type { Member } from "../utils/models";
 import { createAgentStatusTool } from "../../extensions/tools/agent-status-tool";
 import type { RunningReadAgent } from "../../extensions/runtime/types";
+import { checkpointId, saveCheckpoint, type SpecialistCheckpoint } from "../results/specialist-checkpoint";
 
 let root: string;
 
@@ -26,6 +27,9 @@ function installPathSpies() {
   vi.spyOn(paths, "writeQueuePath").mockImplementation((teamName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "write-queue.json"));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: unknown, agentName: unknown) => path.join(root, "teams", paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`));
   vi.spyOn(paths, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
+  vi.spyOn(paths, "checkpointFilesDir").mockReturnValue(path.join(fs.realpathSync(root), "checkpoints"));
+  vi.spyOn(paths, "readHelperQueuePath").mockImplementation(team => path.join(root, "teams", paths.sanitizeName(team), "read-queue.json"));
+  vi.spyOn(paths, "reportEventsPath").mockImplementation(team => path.join(root, "teams", paths.sanitizeName(team), "reports.json"));
 }
 
 function writeFavoriteLevels() {
@@ -50,6 +54,33 @@ describe("orchestration primitives", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("passes fresh continuation requests to the trusted starter instead of reusing an old operation", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    const original: Member = { name: "original", agentId: "original@team", agentType: "teammate", joinedAt: 0, tmuxPaneId: "", cwd: root, subscriptions: [], metadata: { operationId: "same-operation" } };
+    await teams.addMember("team", original);
+    const author = { teamName: "team", agentName: original.name, runId: original.lifecycleRunId!, modelSlot: "read-review" as const };
+    const reportId = `report:team:original:${author.runId}`; const now = Date.now();
+    const source = { version: 1 as const, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fingerprint: "a".repeat(64), fileCount: 1 };
+    const saved: SpecialistCheckpoint = { version: 1, state: "ready", id: checkpointId(author), author, createdAt: now, expiresAt: now + 30 * 86_400_000,
+      assignment: { original: "Original review", current: "Old work" }, policy: { inputs: ["src"], retentionDays: 30, decisions: ["Old decision"] },
+      reportId, reports: [{ id: reportId, path: path.join(root, "old.md"), source: { before: source, after: source }, verification: "passed", acceptance: "accepted" }], findings: [], questions: [], inspectedEvidence: [] };
+    await saveCheckpoint(saved);
+    const start = vi.fn(async (request: SpawnTeammateOnceRequest) => ({ member: { name: request.name, agentId: `${request.name}@team`, agentType: "teammate" as const,
+      lifecycleRunId: "fresh-run", joinedAt: Date.now(), tmuxPaneId: "", cwd: root, subscriptions: [] } }));
+    const request = { teamName: "team", name: "original", prompt: "Recheck fixes", cwd: root, modelSlot: "read-analyze" as const, continueFrom: saved.id, operationId: "same-operation" };
+    const result = await spawnTeammateOnce(request, { start });
+    expect(result.status).toBe("started"); expect(start).toHaveBeenCalledOnce();
+    expect(start.mock.calls[0][0]).toMatchObject({ prompt: request.prompt, modelSlot: "read-analyze", continueFrom: saved.id, checkpoint: { inputs: ["src"], retentionDays: 30, decisions: [] } });
+    expect(start.mock.calls[0][0].name).toMatch(/^original-[a-f0-9-]{36}$/);
+    expect((await teams.readConfig("team")).members.find(member => member.name === original.name)?.lifecycleRunId).toBe(original.lifecycleRunId);
+    await expect(spawnTeammateOnce({ ...request, modelSlot: undefined } as any, { start })).rejects.toThrow(/tier/i);
+    fs.writeFileSync(path.join(paths.checkpointFilesDir(), `${saved.id.slice(11)}.json`), "{corrupt");
+    await expect(spawnTeammateOnce(request, { start })).rejects.toThrow(/corrupt|incompatible/i);
+    const ordinary = await spawnTeammateOnce({ ...request, continueFrom: undefined, metadata: { continueFrom: saved.id } }, { start });
+    expect(ordinary.status).toBe("existing"); expect(ordinary.member?.lifecycleRunId).toBe(original.lifecycleRunId);
+    expect(start).toHaveBeenCalledOnce();
   });
 
   it("uses read-review as the canonical team default while loading its legacy settings alias", async () => {
@@ -167,6 +198,31 @@ describe("orchestration primitives", () => {
 
     expect(observation.members).toHaveLength(151);
     expect(readConfigSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes an isolated checkpoint policy to the trusted start callback", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    const checkpoint = { inputs: ["src"] };
+    const start = vi.fn(async (request: SpawnTeammateOnceRequest) => {
+      expect(request.checkpoint).toEqual({ inputs: ["src"], retentionDays: 30, decisions: [] });
+      request.checkpoint!.inputs.push("changed by callback");
+      return {};
+    });
+    await spawnTeammateOnce({ teamName: "team", name: "reviewer", prompt: "Review", cwd: root, modelSlot: "read-review", checkpoint }, { start });
+    expect(start).toHaveBeenCalledOnce();
+    expect(checkpoint).toEqual({ inputs: ["src"] });
+  });
+
+  it("rejects invalid checkpoint policy before trusted once-reuse", async () => {
+    teams.createTeam("team", "session", "lead", "", "provider/model");
+    await teams.addMember("team", { name: "same", agentId: "same@team", agentType: "teammate", role: "read",
+      modelSlot: "read-review", cwd: root, joinedAt: 1, tmuxPaneId: "", subscriptions: [] });
+    const before = fs.readFileSync(paths.configPath("team"), "utf8");
+    const start = vi.fn();
+    await expect(spawnTeammateOnce({ teamName: "team", name: "same", prompt: "Review", cwd: root,
+      modelSlot: "read-review", checkpoint: { inputs: [] } }, { start })).rejects.toThrow(/checkpoint/i);
+    expect(start).not.toHaveBeenCalled();
+    expect(fs.readFileSync(paths.configPath("team"), "utf8")).toBe(before);
   });
 
   it("reuses existing members with canonical outward slots without rewriting persisted state", async () => {

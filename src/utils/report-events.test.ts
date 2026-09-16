@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { appendTeamReportEvent, listTeamReportEvents } from "./report-events";
+import { execFileSync } from "node:child_process";
+import { VerificationController } from "../results/verification-controller";
+import { appendTeamReportEvent, listTeamReportEvents, listStoredTeamReportEvents, readStoredTeamReportEvent, recordReportAcceptance } from "./report-events";
+import { createReportResult } from "../results/report-result";
 import * as paths from "./paths";
 import type { TeamReportEvent } from "./models";
 
@@ -35,6 +38,91 @@ describe("report events", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("keeps unrelated reports available when referenced check evidence is corrupt", async () => {
+    const bad = createReportResult("team", "bad", "run", {});
+    bad.verification = { state: "pending", checkIds: ["invalid-check-id"] };
+    const good = createReportResult("team", "good", "run", { outcome: "blocked" });
+    await appendTeamReportEvent("team", { agentName: "bad", status: "completed", report: "Bad evidence", result: bad, source: "read-agent" });
+    await appendTeamReportEvent("team", { agentName: "good", status: "completed", report: "Good report", result: good, source: "read-agent" });
+    const before = fs.readFileSync(reportsPath(), "utf8");
+    const reports = await listTeamReportEvents("team");
+    expect(reports).toHaveLength(2);
+    expect(reports[0].result?.verification).toMatchObject({ state: "failed", error: expect.stringContaining("Invalid check identity") });
+    expect(reports[1].result).toEqual(good);
+    expect(fs.readFileSync(reportsPath(), "utf8")).toBe(before);
+  });
+
+  it.each(["running", "corrupt"])("observes %s repair ownership without rewriting reports or hiding unrelated results", async state => {
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "tested");
+    const result = createReportResult("team", "repairer", "run", { outcome: "succeeded" });
+    const controller = new VerificationController({ teamName: "team", result, cwd,
+      checks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }], repair: { maxAttempts: 1 } });
+    const exec = vi.fn(async () => ({ exitCode: 0 }));
+    const verified = await controller.verify("initial", { loadOperations: async () => ({ exec }) });
+    const ledger = JSON.parse(fs.readFileSync(controller.journalPath, "utf8"));
+    ledger.stages[0].state = "running";
+    fs.writeFileSync(controller.journalPath, state === "corrupt" ? "{" : JSON.stringify(ledger));
+    await appendTeamReportEvent("team", { agentName: "repairer", status: "failed", report: "Recovery report", source: "read-agent",
+      result: state === "running" ? result : verified.result });
+    const good = createReportResult("team", "other", "run", { outcome: "blocked" });
+    await appendTeamReportEvent("team", { agentName: "other", status: "completed", report: "Other report", source: "read-agent", result: good });
+    const before = fs.readFileSync(reportsPath(), "utf8");
+    const [observed, unrelated] = await listTeamReportEvents("team");
+    expect(observed).toMatchObject({ result: { outcome: "succeeded", verification: { state: "pending" },
+      repair: { state: "pending", outcome: "blocked" }, acceptance: { state: "pending" } }, checks: [{ state: "passed", exitCode: 0 }] });
+    expect(unrelated.result).toEqual(good);
+    expect(fs.readFileSync(reportsPath(), "utf8")).toBe(before);
+    expect(exec).toHaveBeenCalledOnce();
+  });
+
+  it("reads exact stored recovery metadata without source observation or shared mutable results", async () => {
+    const result = createReportResult("team", "reader", "run", { outcome: "succeeded" });
+    result.verification = { state: "pending", error: "Uncertain persistence" };
+    const event = await appendTeamReportEvent("team", { agentName: "reader", status: "failed", report: "Recovery", source: "read-agent", result });
+    const observe = vi.spyOn(VerificationController, "observe");
+    const stored = await readStoredTeamReportEvent("team", result.reportId);
+    expect(stored).toEqual(event);
+    stored!.result!.verification.error = "Caller mutation";
+    expect((await readStoredTeamReportEvent("team", result.reportId))?.result).toEqual(result);
+    expect(await readStoredTeamReportEvent("team", "another-report")).toBeUndefined();
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it("withholds grouped report acknowledgment when full report synchronization fails", async () => {
+    const result = createReportResult("team", "grouped", "run", {});
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("report sync failed"); });
+    await expect(appendTeamReportEvent("team", { agentName: "grouped", source: "read-agent", status: "completed", result,
+      report: "Retained full report", completionGroup: { groupId: "group-id", slotId: "slot" } })).rejects.toThrow("report sync failed");
+    sync.mockRestore();
+    expect(await readStoredTeamReportEvent("team", result.reportId)).toBeUndefined();
+  });
+
+  it("preserves grouped durability on later ordinary appends and duplicate receipts", async () => {
+    const result = createReportResult("team", "grouped", "run", {});
+    const first = await appendTeamReportEvent("team", { agentName: "grouped", source: "read-agent", status: "completed", result,
+      report: "Full grouped report", completionGroup: { groupId: "group-id", slotId: "slot" } });
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("store sync failed"); });
+    await expect(appendTeamReportEvent("team", first)).rejects.toThrow("store sync failed");
+    await expect(appendTeamReportEvent("team", { agentName: "ordinary", source: "read-agent", status: "completed", report: "Other report" })).rejects.toThrow("store sync failed");
+    sync.mockRestore();
+    expect((await readStoredTeamReportEvent("team", first.id))?.report).toBe(first.report);
+  });
+
+  it("lists stored group ownership without source observation or mutable cached aliases", async () => {
+    const result = createReportResult("team", "reader", "run", {});
+    await appendTeamReportEvent("team", { agentName: "reader", status: "completed", report: "Full report", source: "read-agent",
+      result, metadata: { completionGroup: { groupId: "bound-group", slotId: "slot" } } });
+    const observe = vi.spyOn(VerificationController, "observe");
+    const [stored] = await listStoredTeamReportEvents("team");
+    expect(stored.metadata?.completionGroup.groupId).toBe("bound-group");
+    stored.metadata!.completionGroup.groupId = "caller mutation";
+    expect((await listStoredTeamReportEvents("team"))[0].metadata?.completionGroup.groupId).toBe("bound-group");
+    expect(observe).not.toHaveBeenCalled();
   });
 
   it("filters before applying latest-limit pagination", async () => {
@@ -142,6 +230,53 @@ describe("report events", () => {
       { id: "one", report: "first report", summary: "First", reportPath: (first as any).reportPath },
       { id: "two", report: "second report", summary: "Second", reportPath: (second as any).reportPath },
     ]);
+  });
+
+  it("persists and replays a blocked task result without sharing mutable evidence", async () => {
+    const result = createReportResult("team", "reader", "run-1", {
+      outcome: "blocked", findings: [{ id: "F1", text: "Missing input", evidence: ["file.ts:1"] }],
+    });
+    const input = { agentName: "reader", status: "completed" as const, report: "Waiting for input", source: "read-agent" as const, result };
+    const first = await appendTeamReportEvent("team", input);
+    expect(first.id).toBe(result.reportId);
+    first.result!.findings![0].text = "mutated return";
+    result.findings![0].evidence.push("mutated input");
+    const replay = await appendTeamReportEvent("team", { ...input, report: "Duplicate delivery" });
+    expect(replay).toMatchObject({
+      id: result.reportId, status: "completed", report: "Waiting for input",
+      result: { outcome: "blocked", findings: [{ id: "F1", text: "Missing input", evidence: ["file.ts:1"] }],
+        verification: { state: "not-requested" }, acceptance: { state: "pending" } },
+    });
+    expect(fs.readFileSync(replay.reportPath!, "utf8")).toBe("Waiting for input");
+    expect(await listTeamReportEvents("team")).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(reportsPath(), "utf8"))[0].result).toMatchObject({ outcome: "blocked", runId: "run-1" });
+  });
+
+  it("records explicit lead acceptance without changing the task outcome or verification", async () => {
+    const result = createReportResult("team", "reader", "run-1", { outcome: "blocked" });
+    const original = await appendTeamReportEvent("team", {
+      agentName: "reader", status: "completed", report: "Needs product input", source: "read-agent", result,
+    });
+    const accepted = await recordReportAcceptance("team", original.id, "accepted", "Blocker acknowledged");
+    expect(accepted.result).toMatchObject({
+      outcome: "blocked", verification: { state: "not-requested" },
+      acceptance: { state: "accepted", reason: "Blocker acknowledged", decidedAt: expect.any(Number) },
+    });
+    expect(accepted.reportPath).toBe(original.reportPath);
+    expect((await listTeamReportEvents("team"))[0].result).toEqual(accepted.result);
+    await expect(recordReportAcceptance("team", "missing", "accepted")).rejects.toThrow(/report/i);
+  });
+
+  it("preserves the durable result if acceptance persistence fails", async () => {
+    const result = createReportResult("team", "reader", "run-1", { outcome: "succeeded" });
+    const original = await appendTeamReportEvent("team", {
+      agentName: "reader", status: "completed", report: "Implemented", source: "read-agent", result,
+    });
+    const rename = vi.spyOn(fs, "renameSync").mockImplementationOnce(() => { throw new Error("storage unavailable"); });
+    await expect(recordReportAcceptance("team", original.id, "accepted")).rejects.toThrow("storage unavailable");
+    rename.mockRestore();
+    expect((await listTeamReportEvents("team"))[0]).toEqual(original);
+    expect(JSON.parse(fs.readFileSync(reportsPath(), "utf8"))[0].result.acceptance).toEqual({ state: "pending" });
   });
 
   it("returns the original event for duplicate ids", async () => {

@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { stripVTControlCharacters } from "node:util";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import { teamActivityStatusWidget, type TeamActivityStatusEntry, type TeamActivityStatusSnapshot } from "./status-widget.js";
 
 function makeSnapshot(overrides: Partial<TeamActivityStatusSnapshot> = {}): TeamActivityStatusSnapshot {
@@ -14,6 +16,51 @@ function makeSnapshot(overrides: Partial<TeamActivityStatusSnapshot> = {}): Team
 }
 
 describe("agent activity status widget", () => {
+  it("updates context warning colors without animating metadata or exceeding line width", () => {
+    let snapshot = makeSnapshot();
+    const theme = { fg: (_token: string, text: string) => text, bg: (_token: string, text: string) => text };
+    const requestRender = vi.fn();
+    const widget = teamActivityStatusWidget(() => snapshot, () => false, requestRender, theme);
+    try {
+      const contextColors = [
+        [74.9, "248;248;242"],
+        [75, "255;215;0"],
+        [89.9, "255;215;0"],
+        [90, "255;85;85"],
+        ["?", "248;248;242"],
+      ];
+      for (const [percent, rgb] of contextColors) {
+        const displayText = `(reader) model/high · read-review · 1s · 42k tok (${percent}%)`;
+        snapshot = makeSnapshot({ activeCount: 1, readCount: 1, entries: [{ name: "reader", role: "read", displayText }] });
+        const row = widget.render(120)[1];
+        expect(row).toContain(`\x1b[38;2;${rgb}m(${percent}%)\x1b[39m`);
+        expect(stripVTControlCharacters(row).trimEnd()).toBe(`└─ ${displayText}`);
+        expect(widget.render(36).every(line => visibleWidth(line) <= 36)).toBe(true);
+      }
+      expect(requestRender).not.toHaveBeenCalled();
+    } finally {
+      widget.dispose();
+    }
+  });
+
+  it("keeps separators inside a progress message out of the metadata", () => {
+    const message = "Reading files · checking 90% coverage";
+    const snapshot = makeSnapshot({
+      entries: [{
+        name: "reader",
+        role: "read",
+        displayText: `(reader) model/high · read-review · 1s · 42k tok (15%) · ${message}`,
+      }],
+    });
+    const theme = { fg: (_token: string, text: string) => text, bg: (_token: string, text: string) => text };
+    const widget = teamActivityStatusWidget(() => snapshot, () => false, undefined, theme);
+    try {
+      expect(widget.render(180)[1]).toContain(`\x1b[38;2;150;156;171m${message}.`);
+    } finally {
+      widget.dispose();
+    }
+  });
+
   it("uses Pi theme tokens and refreshes cached styles after invalidation", () => {
     const snapshot = makeSnapshot({
       activeCount: 1,
@@ -82,7 +129,8 @@ describe("agent activity status widget", () => {
         }],
       });
       const requestRender = vi.fn();
-      const widget = teamActivityStatusWidget(() => snapshot, () => false, requestRender);
+      const theme = { fg: (_token: string, text: string) => text, bg: (_token: string, text: string) => text };
+      const widget = teamActivityStatusWidget(() => snapshot, () => false, requestRender, theme);
       expect(widget.render(120).join("\n")).toContain("Collecting files.");
 
       snapshot = makeSnapshot({

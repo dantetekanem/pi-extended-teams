@@ -8,10 +8,18 @@ import * as runtime from "../../src/utils/runtime";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
 import * as reportEvents from "../../src/utils/report-events";
-import type { Member } from "../../src/utils/models";
+import { checkpointReference, preflightReportCheckpoint, saveReportCheckpoint } from "../../src/results/checkpoint-report";
+import type { Member, TeamReportEvent } from "../../src/utils/models";
+import { deliverCompletionGroupReport } from "../../src/results/completion-group-delivery";
+import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails, type ReportResult, type ReportedTaskDetails } from "../../src/results/report-result";
+import { assignedCheckIds, normalizeCheckPolicy, type CheckDefinition } from "../../src/results/check-policy";
+import { normalizeRepairPolicy, type RepairPolicy } from "../../src/results/repair-policy";
+import { VerificationController, type VerificationDecision } from "../../src/results/verification-controller";
+import type { CheckRunnerOptions } from "../../src/results/check-runner";
+import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
-import { createAgentCommunicationTools, type SubmittedAgentReport } from "../tools/agent-communication-tools";
+import { createAgentCommunicationTools, formatRepairRequest, type SubmittedAgentReport } from "../tools/agent-communication-tools";
 import { requireWriteAgentTeam } from "../team/roster";
 import { isPiPromptPlanningMember, shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
@@ -19,6 +27,7 @@ import { parseQualifiedModel } from "../../src/utils/model-resolution";
 import { closePersistedRecipient } from "../team/recipient-closure";
 import { generateExtensionInstanceId, generateLifecycleRunId, withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
 import { createLifecycleRuntime, type ShutdownTeammateOptions } from "../team/lifecycle";
+import { recordedSessionCost, type AgentCostSnapshot, type CostOutcome, type CostRun } from "../team/session-cost";
 import {
   createSpawnResourcePlan,
   parentProjectTrustForSpawn,
@@ -33,6 +42,7 @@ import {
   closeReadAgentMessageDelivery,
   enqueueReadAgentMessageDelivery,
   installReadAgentSessionLifecycle,
+  ReadAgentDeliveryCancelledError,
   type ReadAgentDeliveryCloseResult,
   type ReadAgentTeardownResult,
 } from "./read-agent-session-lifecycle";
@@ -50,6 +60,7 @@ import {
 export { closeReadAgentMessageDelivery } from "./read-agent-session-lifecycle";
 
 const pendingParentWakeSignals = new WeakMap<RunningReadAgent, () => void>();
+const repairCancellationHandlers = new WeakMap<RunningReadAgent, () => Promise<void>>();
 
 interface ReadAgentWakeState {
   generation: number;
@@ -114,13 +125,16 @@ export interface RunReadAgentOptions {
     teamName: string,
     recipient: string,
     content: string,
-    expectedRecipientRunId?: string
+    expectedRecipientRunId?: string,
+    requireReceipt?: boolean
   ): Promise<boolean>;
   createResourcePlan?(input: { cwd: string; projectTrusted: boolean }): SpawnResourcePlan | Promise<SpawnResourcePlan>;
   extensionInstanceId?: string;
   createNestedReadAgentTools?(binding: NestedReadAgentToolBinding): any[];
   nestedChildSnapshot?(binding: NestedReadAgentToolBinding): { running: number; queued: number };
   pendingChildController?: PendingChildController;
+  loadCheckOperations?: CheckRunnerOptions["loadOperations"];
+  beginCostRun?(rootSessionId: string, teamName: string, lifecycleRunId: string): CostRun;
 }
 
 function pushReadAgentEvent(agent: RunningReadAgent, text: string): void {
@@ -166,8 +180,9 @@ async function runReadAgentSessionOperation(
       failure = error;
     }
 
-    if (state.activeOperationGeneration === generation) state.activeOperationGeneration = undefined;
     const interrupted = state.interruptRequestedGeneration === generation;
+    if (interrupted || failure || state.stopRequested) await repairCancellationHandlers.get(state)?.();
+    if (state.activeOperationGeneration === generation) state.activeOperationGeneration = undefined;
     if (interrupted) state.interruptRequestedGeneration = undefined;
     state.completedOperationGeneration = generation;
     state.completedOperationInterrupted = interrupted;
@@ -350,30 +365,68 @@ export function handleReadAgentSessionEvent(
   }
 }
 
-export async function sendMessageToRunningReadAgent(agent: RunningReadAgent | undefined, content: string): Promise<boolean> {
+export async function sendMessageToRunningReadAgent(
+  agent: RunningReadAgent | undefined,
+  content: string,
+  requireReceipt = false
+): Promise<boolean> {
   if (!agent) return false;
   if (!agent.session || !agent.acceptingMessages || agent.messageDeliveryClosed || agent.stopRequested) {
     throw new Error(`Cannot send message to ${agent.name}: agent is finishing.`);
   }
 
   const session = agent.session;
+  let received = false;
+  let acknowledge!: () => void;
+  const receipt = new Promise<void>(resolve => { acknowledge = resolve; });
+  let unsubscribe: (() => void) | undefined;
   const deliveryResult = enqueueReadAgentMessageDelivery(
     agent,
     agent.name,
     async () => {
+      const check = agent.checkOperation;
+      if (check || !session.isStreaming) await (agent.activeOperationSettlementPromise ?? check?.settled);
       const pendingInterrupt = agent.operationInterruptPromise;
       if (pendingInterrupt) await pendingInterrupt.catch(() => {});
+      if (agent.messageDeliveryClosed || agent.stopRequested) throw new ReadAgentDeliveryCancelledError(agent.name);
+      if (requireReceipt) {
+        unsubscribe = session.subscribe(event => {
+          if (event.type !== "message_end" || event.message.role !== "user") return;
+          const body = event.message.content;
+          const text = typeof body === "string"
+            ? body
+            : body.filter(part => part.type === "text").map(part => part.text).join("\n");
+          if (text === content) {
+            received = true;
+            acknowledge();
+          }
+        });
+      }
       if (session.isStreaming) {
         await session.sendUserMessage(content, { deliverAs: "steer" as const });
-        return;
+      } else {
+        await runReadAgentSessionOperation(agent, () => session.sendUserMessage(content, undefined));
+        if (requireReceipt && !received) throw new Error(`Requester ${agent.name} finished without receiving the report.`);
       }
-      await runReadAgentSessionOperation(agent, () => session.sendUserMessage(content, undefined));
     }
   );
   signalReadAgentWake(agent);
   pendingParentWakeSignals.get(agent)?.();
-  await deliveryResult;
-  markReadAgentActivity(agent, "received lead message", "thinking");
+  try {
+    await deliveryResult;
+    if (requireReceipt && !received) {
+      // Keep the receipt wait outside the raw tail so parent finalization can cancel an unconsumed steer.
+      await Promise.race([receipt, agent.messageDeliveryCancellation!.then(() => {
+        throw new ReadAgentDeliveryCancelledError(agent.name);
+      })]);
+    }
+  } catch (error) {
+    // Reporting closes admission while the idle SDK send still awaits the model turn.
+    if (!(received && error instanceof ReadAgentDeliveryCancelledError)) throw error;
+  } finally {
+    unsubscribe?.();
+  }
+  if (!agent.checkOperation && !agent.messageDeliveryClosed) markReadAgentActivity(agent, "received lead message", "thinking");
   return true;
 }
 
@@ -415,6 +468,8 @@ function reportPersistenceBlockReason(
 }
 
 async function recordReadAgentReportEvent(
+  state: RunningReadAgent,
+  isCurrent: () => boolean,
   teamName: string,
   member: Member,
   status: "completed" | "failed",
@@ -422,17 +477,29 @@ async function recordReadAgentReportEvent(
   summary: string,
   startedAt: number,
   tokensUsed: number,
+  result: ReportResult,
   costUsd?: number,
   color?: string,
   reportMetadata: Record<string, any> = {}
-): Promise<{ persisted: true } | { persisted: false; error: unknown }> {
+): Promise<{ persisted: true; event: TeamReportEvent } | { persisted: false; error: unknown }> {
   const operation = operationMetadataFromMember(member);
   const modelSlot = canonicalPersistedModelSlot(member.modelSlot);
+  let checkpointOperation: RunningReadAgent["checkpointOperation"];
+  let settle = () => {};
   try {
-    await reportEvents.appendTeamReportEvent(teamName, {
+    if (member.checkpointAssignment) {
+      if (state.stopRequested || !isCurrent()) throw new Error("Checkpoint publication cancelled: agent run is closing.");
+      if (state.checkpointOperation) throw new Error("Checkpoint publication is already active for this run.");
+      checkpointOperation = { controller: new AbortController(), settled: new Promise<void>(resolve => { settle = resolve; }) };
+      state.checkpointOperation = checkpointOperation;
+    }
+    const event = await reportEvents.appendTeamReportEvent(teamName, {
       agentName: member.name,
+      checkpoint: checkpointReference(teamName, member),
+      completionGroup: member.completionGroup,
       role: member.role || "read",
       status,
+      result,
       report,
       summary,
       startedAt,
@@ -454,9 +521,16 @@ async function recordReadAgentReportEvent(
         ...reportMetadata,
       },
     });
-    return { persisted: true };
+    await saveReportCheckpoint(teamName, member, event, checkpointOperation?.controller.signal);
+    if (checkpointOperation && (checkpointOperation.controller.signal.aborted || state.stopRequested || !isCurrent())) throw new Error("Checkpoint publication cancelled: agent run is closing.");
+    if (event.checkpoint) result.checkpointId = event.checkpoint.id;
+    return { persisted: true, event };
   } catch (error) {
+    if (member.checkpointAssignment) state.finalizationBlockedReason ||= `Checkpoint publication failed: ${String(error)}`;
     return { persisted: false, error };
+  } finally {
+    if (checkpointOperation && state.checkpointOperation === checkpointOperation) state.checkpointOperation = undefined;
+    settle();
   }
 }
 
@@ -491,44 +565,43 @@ async function ensureReadHelperCompletionMessages(
   report: string,
   outcome: "completed" | "failed" = "completed",
   color = member.color,
-  deliverMessageToActiveAgent?: RunReadAgentOptions["deliverMessageToActiveAgent"]
+  options: Pick<RunReadAgentOptions, "deliverMessageToActiveAgent" | "notifyLeadOfInboxReports"> = {}
 ): Promise<void> {
-  if (!member.requestedBy) return;
+  const requestedBy = member.requestedBy;
+  if (!requestedBy) return;
 
-  const expectedRequesterRunId = member.parentAgentName === member.requestedBy
-    ? member.parentLifecycleRunId
-    : undefined;
   let requesterReceivedReport = false;
+  // Direct session delivery has no inbox sender envelope. Keep identity outside the report body.
+  const attributedReport = `Read helper report ${JSON.stringify({ agentName: member.name, runId, runtimeStatus: outcome })}\n\n${report}`;
   try {
-    const deliveredDirectly = expectedRequesterRunId
-      ? await deliverMessageToActiveAgent?.(teamName, member.requestedBy, report, expectedRequesterRunId) === true
-      : await deliverMessageToActiveAgent?.(teamName, member.requestedBy, report) === true;
-    if (deliveredDirectly) {
-      requesterReceivedReport = true;
-    } else {
-      requesterReceivedReport = await hasRecentMessageFrom(
-        teamName,
-        member.name,
-        member.requestedBy,
-        startedAt,
-        message => message?.metadata?.helperReport === true && message?.metadata?.runId === runId
-      );
-      if (!requesterReceivedReport) {
-        await messaging.sendPlainMessageIfRunning(
-          teamName,
-          member.name,
-          member.requestedBy,
-          report,
-          outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
-          color,
-          {
-            metadata: { helperReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy },
-            ...(expectedRequesterRunId ? { expectedRecipientRunId: expectedRequesterRunId } : {}),
-          }
-        );
-        requesterReceivedReport = true;
+    const requester = (await teams.readConfig(teamName)).members.find(item => item.name === member.requestedBy);
+    const expectedRequesterRunId = member.parentAgentName === member.requestedBy
+      ? member.parentLifecycleRunId : requester?.lifecycleRunId;
+    await messaging.sendPlainMessageOnceIfRunning(
+      teamName, member.name, requestedBy, report,
+      outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} report`,
+      {
+        color,
+        operationId: `helper-report:${runId}`,
+        expectedRecipientRunId: expectedRequesterRunId,
+        metadata: { helperReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy },
       }
-    }
+    );
+    requesterReceivedReport = true;
+    // Durability, not the requester's complete idle model run, gates helper cleanup.
+    // Even an already persisted report must wake its exact requester automatically.
+    const wake = Promise.resolve().then(() => options.deliverMessageToActiveAgent?.(
+      teamName, requestedBy, attributedReport, expectedRequesterRunId, true
+    ));
+    void wake.then(delivered => {
+      if (!delivered) throw new Error("requester unavailable for automatic delivery");
+    }).catch(async error => {
+      await messaging.sendPlainMessage(teamName, member.name, "team-lead",
+        `Automatic report delivery to ${member.requestedBy} could not be confirmed: ${String(error)}. The full report is retained below; do not replay it automatically into a replacement run.\n\n${attributedReport}`,
+        `Read helper ${member.name} wake incomplete`, color,
+        { metadata: { helperWakeFailed: true, runId, requestedBy: member.requestedBy, expectedRecipientRunId: expectedRequesterRunId } });
+      await options.notifyLeadOfInboxReports?.(teamName);
+    }).catch(() => { console.warn(`Could not record helper wake outcome for ${member.name} (${runId}).`); });
   } catch {
     requesterReceivedReport = false;
   }
@@ -550,9 +623,7 @@ async function ensureReadHelperCompletionMessages(
       teamName,
       member.name,
       "team-lead",
-      outcome === "failed"
-        ? `Read helper ${member.name} failed for ${member.requestedBy}. ${delivery}`
-        : `Read helper ${member.name} completed for ${member.requestedBy}. ${delivery}`,
+      `Read helper ${member.name} ${outcome} for ${requestedBy}. ${delivery}${requesterReceivedReport ? "" : `\n\n${attributedReport}`}`,
       outcome === "failed" ? `Read helper ${member.name} failed` : `Read helper ${member.name} done`,
       color,
       { metadata: { finalReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy } }
@@ -598,6 +669,12 @@ export async function runReadAgentInProcess(
   }
   member.lifecycleRunId = lifecycleRunId;
   const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
+  let costRun: CostRun | undefined;
+  let costSnapshot: AgentCostSnapshot | undefined;
+  let costOutcome: CostOutcome = "cancelled";
+  try {
+    costRun = options.beginCostRun?.(ctx.sessionManager.getSessionId(), readTeamName, lifecycleRunId);
+  } catch { /* Additive telemetry must not prevent an otherwise valid launch. */ }
   const state: RunningReadAgent = {
     runId: lifecycleRunId,
     name: member.name,
@@ -617,6 +694,7 @@ export async function runReadAgentInProcess(
     startupState: "pending",
     sessionCreation,
     teardownState: "active",
+    onCostSettled: () => costRun?.settle(costSnapshot, costOutcome),
   };
   let sessionCreationSettled = false;
   const settleSessionCreation = (session: AgentSession | undefined): void => {
@@ -648,7 +726,28 @@ export async function runReadAgentInProcess(
   let childSessionManager: any;
   let childLifecycleProbeUnsubscribe = (): void => {};
   let privateSessionDirectory: string | undefined;
-  let privateCompletedReportPersisted = false;
+  let completedReportPersisted = false;
+  let resolvedTaskResult: ReportResult | undefined;
+  let assignedChecks: CheckDefinition[] | undefined;
+  let repairPolicy: RepairPolicy | undefined;
+  const deliveredRepairRequests = new Set<string>();
+  let repairCancellation: Promise<void> | undefined;
+  const cancelAutomaticRepair = async (): Promise<void> => {
+    const result = resolvedTaskResult;
+    if (!repairPolicy || result?.repair?.state !== "requested") return;
+    repairCancellation ??= (async () => {
+      try {
+        await new VerificationController({ teamName: readTeamName, result, cwd: member.cwd, checks: assignedChecks, repair: repairPolicy }).cancel();
+        result.repair = { ...result.repair!, state: "cancelled", outcome: "blocked" };
+      } catch (error) {
+        state.finalizationBlockedReason = `Repair cancellation could not be persisted: ${error instanceof Error ? error.message : String(error)}`;
+        result.verification.error = state.finalizationBlockedReason;
+        closeReadAgentMessageDelivery(state);
+        throw error;
+      }
+    })();
+    await repairCancellation;
+  };
   const pendingChildController = options.pendingChildController;
   const pendingChildParent: ParentRunIdentity | undefined = isEligibleNestedReadParent(member)
     ? {
@@ -683,6 +782,79 @@ export async function runReadAgentInProcess(
     return deliveryClose;
   };
 
+  const verifyTaskResult = async (reported: ReportedTaskDetails, signal?: AbortSignal, submissionId?: string): Promise<VerificationDecision> => {
+    if (state.checkOperation) throw new Error("Check verification is already active for this run.");
+    if (assignedChecks?.length && (state.stopRequested || state.messageDeliveryClosed || state.finalizationBlockedReason || !options.isCurrentReadAgentRun(key, state))) {
+      throw new Error("Check verification cancelled: agent run is closing.");
+    }
+    const result = createReportResult(readTeamName, member.name, state.runId, reported);
+    if (resolvedTaskResult?.repair) Object.assign(result, { verification: resolvedTaskResult.verification, repair: resolvedTaskResult.repair });
+    resolvedTaskResult = result;
+    if (!assignedChecks?.length) return { result, checks: [] };
+    let decision: VerificationDecision = { result, checks: [] };
+    const verificationController = new VerificationController({
+      teamName: readTeamName, result, cwd: member.cwd, checks: assignedChecks, repair: repairPolicy,
+    });
+    result.verification = { state: "pending", checkIds: assignedCheckIds(result, assignedChecks) };
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    let settle!: () => void;
+    const operation = { controller, settled: new Promise<void>(resolve => { settle = resolve; }) };
+    state.checkOperation = operation;
+    markReadAgentActivity(state, "running assigned checks", "working", "assigned-check");
+    options.renderReadAgentStatus();
+    try {
+      try {
+        decision = await verificationController.verify(submissionId ?? "", {
+          loadOperations: options.loadCheckOperations ?? loadNativeCheckOperations,
+          signal: controller.signal,
+        });
+        Object.assign(result, decision.result);
+        decision.result = result;
+      } catch (error) {
+        state.finalizationBlockedReason = `Assigned check evidence could not be persisted: ${error instanceof Error ? error.message : String(error)}`;
+        result.verification.error = state.finalizationBlockedReason;
+        const repair = verificationController.pendingRepair(error);
+        if (repair) result.repair = repair;
+        throw error;
+      }
+      if (result.verification.state === "pending") {
+        state.finalizationBlockedReason = "Assigned checks have an unresolved execution claim; inspect the durable journal before finalizing this run.";
+        throw new Error(state.finalizationBlockedReason);
+      }
+      if (controller.signal.aborted || state.stopRequested || !options.isCurrentReadAgentRun(key, state)) {
+        await cancelAutomaticRepair();
+        throw new Error("Assigned check verification was cancelled.");
+      }
+      return decision;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      if (state.checkOperation === operation) state.checkOperation = undefined;
+      if (controller.signal.aborted && !state.messageDeliveryClosed && !state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
+        state.acceptingMessages = true;
+      }
+      settle();
+    }
+  };
+
+  const deliverGroupedReport = async (event: TeamReportEvent, leadReport: string): Promise<void> => {
+    const planning = isPiPromptPlanningMember(member);
+    const suppressed = shouldSuppressLeadReportInjection(member);
+    const emitsEvent = planning || (!suppressed && !options.isTeammate
+      && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-")));
+    const grouped = await deliverCompletionGroupReport(event, () => {
+      if (emitsEvent) options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed,
+        planning ? event.report : leadReport, event.status === "completed", true);
+    });
+    if (!grouped) throw new Error("Grouped report provenance is unavailable.");
+    if (!suppressed && !readTeamName.startsWith("prompt-build-")) {
+      await options.renderLeadInboxStatus?.().catch(() => {});
+      await options.notifyLeadOfInboxReports?.(readTeamName).catch(() => {});
+    }
+  };
+
   const deliverCompletion = async (
     resolution: ResolvedReadAgentReport,
     completionSummary: string,
@@ -692,6 +864,13 @@ export async function runReadAgentInProcess(
     const session = state.session;
     if (!session) throw new Error(`Agent ${member.name} completed without a nested session.`);
     const report = resolution.report!;
+    const result = resolvedTaskResult ?? createReportResult(readTeamName, member.name, state.runId, resolution);
+    resolvedTaskResult = result;
+    const checkpoint = checkpointReference(readTeamName, member);
+    if (checkpoint) result.checkpointId = checkpoint.id;
+    const leadReport = (assignedChecks?.length
+      ? `${report}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}${result.repair ? `; repair: ${result.repair.state}; effective task: ${effectiveTaskOutcome(result) ?? "unspecified"}` : ""}. Evidence: ${result.reportId}.`
+      : report) + (checkpoint ? `\n\nCheckpoint reference: ${checkpoint.id}.` : "");
     const completionStats = session.getSessionStats();
     // Private child transcripts are deleted after teardown; never publish pointers
     // that would outlive a successful run's recovery artifact.
@@ -711,6 +890,7 @@ export async function runReadAgentInProcess(
       name: member.name,
       role,
       status: "completed",
+      result,
       report,
       summary: completionSummary,
       completedAt: Date.now(),
@@ -740,6 +920,8 @@ export async function runReadAgentInProcess(
       ...reportMetadata,
     };
     const reportEventPersistence = await recordReadAgentReportEvent(
+      state,
+      () => options.isCurrentReadAgentRun(key, state),
       readTeamName,
       member,
       "completed",
@@ -747,6 +929,7 @@ export async function runReadAgentInProcess(
       completionSummary,
       state.startedAt,
       state.tokensUsed,
+      result,
       completionStats.cost,
       undefined,
       reportMetadata,
@@ -759,14 +942,17 @@ export async function runReadAgentInProcess(
       );
       throw new Error(state.finalizationBlockedReason);
     }
+    if (checkpoint && (state.stopRequested || !options.isCurrentReadAgentRun(key, state))) return;
+    completedReportPersisted = true;
     // The lifecycle finalizer consumes this flag only after session disposal and
     // successful lifecycle finalization, so every successful private run is removed.
     if (privateSessionDirectory) {
       state.cleanupPrivateSessionOnFinalize = true;
-      privateCompletedReportPersisted = true;
     }
     const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
-    if (member.requestedBy) {
+    if (member.completionGroup && !member.requestedBy) {
+      await deliverGroupedReport(reportEventPersistence.event, leadReport);
+    } else if (member.requestedBy) {
       await ensureReadHelperCompletionMessages(
         readTeamName,
         member,
@@ -775,7 +961,7 @@ export async function runReadAgentInProcess(
         report,
         "completed",
         member.color,
-        options.deliverMessageToActiveAgent
+        options
       );
       await options.renderLeadInboxStatus?.().catch(() => {});
       await options.notifyLeadOfInboxReports?.(readTeamName).catch(() => {});
@@ -786,13 +972,17 @@ export async function runReadAgentInProcess(
       // Workflow orchestrators consume full reports from TeamReportEvent storage.
       // Pi Prompt consumes its writer report through the private event without a lead turn.
     } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
-      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, report, true);
+      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, leadReport, true);
     } else {
-      await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, report, completionSummary, member.color, completionMetadata);
+      await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, leadReport, completionSummary, member.color, completionMetadata);
     }
   };
 
   try {
+    assignedChecks = normalizeCheckPolicy(member.assignedChecks);
+    repairPolicy = normalizeRepairPolicy(member.repairPolicy);
+    if (repairPolicy && !assignedChecks?.length) throw new Error("Repair policy requires explicitly assigned checks.");
+    if (repairPolicy) repairCancellationHandlers.set(state, cancelAutomaticRepair);
     if (pendingChildParent && !pendingChildController) {
       throw new Error(`Eligible nested read parent ${member.name} requires a pending child controller.`);
     }
@@ -888,7 +1078,9 @@ export async function runReadAgentInProcess(
               ]
             : ["You cannot spawn or create other agents. If another agent is needed, use send_message to ask team-lead; only the lead decides and performs the spawn."]),
         "NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.",
-        "When finished, use report_and_exit with the complete required deliverable in content and only a short label in summary, then stop. Never replace required output with a summary. Do not wait for the lead to kill you — report and exit cleanly.",
+        repairPolicy
+          ? `Use report_and_exit with the complete deliverable in content. The lead authorized at most ${repairPolicy.maxAttempts} additional repair attempts for assigned checks. If the tool requests repair, stay active, inspect its observed evidence and repair only within your role and assigned scope. Report blocked or failed if you cannot continue safely. Stop only after the report is accepted; never replace the deliverable with a summary.`
+          : "When finished, use report_and_exit with the complete required deliverable in content and only a short label in summary, then stop. Never replace required output with a summary. Do not wait for the lead to kill you — report and exit cleanly.",
       ],
     });
     await loader.reload();
@@ -911,19 +1103,29 @@ export async function runReadAgentInProcess(
         pushReadAgentEvent(state, status);
         options.renderReadAgentStatus();
       },
-      onReportAndExit: async report => {
+      repairEnabled: !!repairPolicy,
+      onReportAndExit: async (report, signal, submissionId) => {
         const content = nonEmptyReportText(report.content);
         if (!content) throw new Error("Final report content must not be empty.");
         if (submittedFinalReport || finalReportSubmissionInProgress) return { accepted: false };
         finalReportSubmissionInProgress = true;
         try {
+          if (member.checkpointAssignment) preflightReportCheckpoint(readTeamName, member, createReportResult(readTeamName, member.name, state.runId, report));
+          const decision = await verifyTaskResult(report, signal, submissionId ? `tool:${submissionId}` : undefined);
+          if (decision.request) {
+            deliveredRepairRequests.add(decision.request.id);
+            return { accepted: false, verification: decision.result.verification, repairRequest: decision.request };
+          }
+          const result = decision.result;
           const deliveryClose = await closeRecipient();
           submittedFinalReport = {
+            ...normalizeReportedTaskDetails(report),
             content,
             summary: nonEmptyReportText(report.summary),
           };
           return {
             accepted: true,
+            ...(assignedChecks?.length ? { verification: result.verification } : {}),
             cancelledDeliveries: deliveryClose.cancelledDeliveries,
             deliveryOutcome: deliveryClose.cancelledDeliveries > 0 ? "cancelled" : "none",
           };
@@ -959,6 +1161,7 @@ export async function runReadAgentInProcess(
     childSessionManager = privateSessionDirectory
       ? SessionManager.create(member.cwd, privateSessionDirectory)
       : SessionManager.create(member.cwd);
+    try { costSnapshot = { childSessionId: childSessionManager.getSessionId(), costUsd: null }; } catch { /* Unknown provenance. */ }
     if (nestedReadBinding && options.nestedChildSnapshot) {
       const childSessionId = childSessionManager.getSessionId();
       childLifecycleProbeUnsubscribe = childEventBus.on(CHILD_AGENT_LIFECYCLE_PROBE, (payload: any) => {
@@ -983,7 +1186,23 @@ export async function runReadAgentInProcess(
     } as Parameters<typeof createAgentSession>[0] & { modelRuntime?: unknown });
 
     state.session = session;
-    const sessionLifecycle = installReadAgentSessionLifecycle(session);
+    // Current hosts capture this public hook when a prompt starts; legacy hosts
+    // retain their existing loop behavior. Never abort from the reporting tool.
+    if (session.agent && "shouldStopAfterTurn" in session.agent) {
+      const agent = session.agent as typeof session.agent & {
+        shouldStopAfterTurn?: (...args: unknown[]) => boolean | Promise<boolean>;
+      };
+      const previous = agent.shouldStopAfterTurn;
+      agent.shouldStopAfterTurn = async (...args) => {
+        const stopped = await previous?.(...args);
+        return submittedFinalReport !== undefined || stopped === true;
+      };
+    }
+    const sessionLifecycle = installReadAgentSessionLifecycle(session, () => {
+      if (handoffRequested) return;
+      const own = recordedSessionCost(childSessionManager.getEntries());
+      costSnapshot = { childSessionId: childSessionManager.getSessionId(), costUsd: own.complete ? own.usd : null };
+    });
     try {
       if (typeof session.bindExtensions === "function") {
         await (session.bindExtensions as (bindings: { mode: "print" }) => Promise<void>)({ mode: "print" });
@@ -1016,12 +1235,23 @@ export async function runReadAgentInProcess(
         }
         await teams.updateMember(readTeamName, member.name, { herdrPaneId: id, tmuxPaneId: "" });
       });
+      const rejectActiveCheck = (): void => {
+        if (state.checkOperation) {
+          throw new Error("Cannot move agent to Herdr while an assigned check is active. Try again after it settles.");
+        }
+      };
       state.moveToHerdr = () => moving ??= (async () => {
         if (!options.isCurrentReadAgentRun(key, state) || (!handoffRequested && !state.acceptingMessages)) {
           throw new Error("The agent is already finishing.");
         }
         if (handoffRequested && !released) throw new Error("The current operation is still stopping. Try h after it settles.");
-        if (paneId) { herdrCommand("pane", "close", paneId); await recordPane(undefined); paneId = undefined; }
+        if (paneId) {
+          rejectActiveCheck();
+          herdrCommand("pane", "close", paneId);
+          await recordPane(undefined);
+          paneId = undefined;
+        }
+        rejectActiveCheck();
         const sessionFile = childSessionManager.getSessionFile();
         if (!sessionFile || !fs.existsSync(sessionFile)) throw new Error("The agent has no saved session yet.");
         if (!handoffRequested) {
@@ -1052,6 +1282,7 @@ export async function runReadAgentInProcess(
         try {
           if (!handoffRequested) {
             handoffRequested = true;
+            try { costRun?.exclude(); } catch { /* Terminal work is outside this total. */ }
             state.stopRequested = true;
             const delivery = closeReadAgentMessageDelivery(state);
             const pending = session.clearQueue();
@@ -1229,6 +1460,65 @@ export async function runReadAgentInProcess(
           }
         }
       }
+      while (assignedChecks?.length && !submittedFinalReport && !pendingChildParent
+        && !state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
+        const wakeGeneration = readAgentWakeGeneration(state);
+        // A delivery may have started before checks owned the operation gate.
+        // Drain every admitted turn before capturing or verifying its final report.
+        let deliveryTail: Promise<void> | undefined;
+        do {
+          deliveryTail = state.messageDeliveryTail;
+          if (deliveryTail) await deliveryTail.catch(() => {});
+        } while (deliveryTail !== state.messageDeliveryTail);
+        if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) break;
+        completionResolution = resolveCurrentReport();
+        if (submittedFinalReport) break;
+        if (state.completedOperationError) throw state.completedOperationError;
+        if (state.completedOperationInterrupted) {
+          if (!await waitForPostInterruptOperation(state.completedOperationGeneration!, wakeGeneration)) return;
+          continue;
+        }
+        if (completionResolution.terminalFailure || !completionResolution.report) {
+          throw unavailableReportError(completionResolution.terminalFailure ?? "No usable report is available for verification.");
+        }
+        const submissionId = `fallback:${state.completedOperationGeneration ?? 0}`;
+        let decision: VerificationDecision | undefined;
+        const verification = await runReadAgentSessionOperation(state, async () => {
+          decision = await verifyTaskResult(completionResolution!, undefined, submissionId);
+        });
+        if (verification.interrupted) {
+          if (!await waitForPostInterruptOperation(verification.generation, wakeGeneration)) return;
+        } else {
+          let deliveryTail: Promise<void> | undefined;
+          do {
+            deliveryTail = state.messageDeliveryTail;
+            if (deliveryTail) await deliveryTail.catch(() => {});
+          } while (deliveryTail !== state.messageDeliveryTail);
+          state.acceptingMessages = false;
+          const latestGeneration = state.completedOperationGeneration ?? verification.generation;
+          if (latestGeneration === verification.generation) {
+            const request = decision?.request;
+            if (!request || deliveredRepairRequests.has(request.id)) break;
+            deliveredRepairRequests.add(request.id);
+            if (state.messageDeliveryClosed || state.stopRequested || !options.isCurrentReadAgentRun(key, state)) return;
+            state.acceptingMessages = true;
+            markReadAgentActivity(state, `repairing assigned checks (attempt ${request.attempt})`, "thinking");
+            options.renderReadAgentStatus();
+            const repairWake = readAgentWakeGeneration(state);
+            const repairOperation = await runReadAgentSessionOperation(state, () => session.prompt(formatRepairRequest(request), { source: "extension" as any }));
+            refreshReadAgentStats(state, session);
+            if (repairOperation.interrupted && !await waitForPostInterruptOperation(repairOperation.generation, repairWake)) return;
+            completionResolution = resolveCurrentReport();
+            continue;
+          }
+          if (state.completedOperationError) throw state.completedOperationError;
+          if (state.completedOperationInterrupted) {
+            state.acceptingMessages = !state.messageDeliveryClosed && !state.stopRequested && options.isCurrentReadAgentRun(key, state);
+            if (!await waitForPostInterruptOperation(latestGeneration, wakeGeneration)) return;
+          }
+        }
+        completionResolution = resolveCurrentReport();
+      }
     } finally {
       state.acceptingMessages = false;
     }
@@ -1255,13 +1545,16 @@ export async function runReadAgentInProcess(
       ?? `${role === "write" ? "Edit" : "Read"} agent ${member.name} completed`;
     const recoveryReference = readAgentRecoveryReference(readTeamName, member.name, state.runId, childSessionManager);
     await deliverCompletion(completionResolution, completionSummary, recoveryAttempted, recoveryReference);
+    costOutcome = "completed";
   } catch (e) {
+    await cancelAutomaticRepair().catch(() => {});
+    if (!state.stopRequested) costOutcome = "failed";
     const lastError = runtime.createRuntimeError(e);
     state.lastError = lastError;
     options.renderReadAgentStatus();
     settleSessionCreation(state.session);
     await closeRecipient();
-    if (!state.stopRequested && options.isCurrentReadAgentRun(key, state) && !privateCompletedReportPersisted) {
+    if (!state.stopRequested && options.isCurrentReadAgentRun(key, state) && !completedReportPersisted) {
       let failureReport = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed: ${e instanceof Error ? e.message : String(e)}`;
       const failureStats = state.session?.getSessionStats();
       const reportUnavailable = e instanceof ReadAgentReportUnavailableError ? e : undefined;
@@ -1279,7 +1572,13 @@ export async function runReadAgentInProcess(
           : {}),
       };
       const failureSummary = `${role === "write" ? "Edit" : "Read"} agent ${member.name} failed`;
+      const result = resolvedTaskResult ?? createReportResult(readTeamName, member.name, state.runId, {});
+      if (!resolvedTaskResult && assignedChecks?.length) {
+        result.verification = { state: "pending", checkIds: assignedCheckIds(result, assignedChecks) };
+      }
       const failureEventPersistence = await recordReadAgentReportEvent(
+        state,
+        () => options.isCurrentReadAgentRun(key, state),
         readTeamName,
         member,
         "failed",
@@ -1287,6 +1586,7 @@ export async function runReadAgentInProcess(
         failureSummary,
         state.startedAt,
         state.tokensUsed,
+        result,
         failureStats?.cost,
         "red",
         failureReportMetadata,
@@ -1303,10 +1603,12 @@ export async function runReadAgentInProcess(
           failureReport = `${failureReport}\n\n${state.finalizationBlockedReason}`;
         }
       }
+      if (member.checkpointAssignment && (state.stopRequested || !options.isCurrentReadAgentRun(key, state))) return;
       options.rememberCompletedAgentReport(readTeamName, {
         name: member.name,
         role,
         status: "failed",
+        result,
         report: failureReport,
         summary: failureSummary,
         completedAt: Date.now(),
@@ -1336,7 +1638,9 @@ export async function runReadAgentInProcess(
         ...failureReportMetadata,
       };
       const suppressLeadReportInjection = shouldSuppressLeadReportInjection(member);
-      if (member.requestedBy) {
+      if (member.completionGroup && !member.requestedBy && failureEventPersistence.persisted) {
+        await deliverGroupedReport(failureEventPersistence.event, failureReport);
+      } else if (member.requestedBy) {
         await ensureReadHelperCompletionMessages(
           readTeamName,
           member,
@@ -1345,7 +1649,7 @@ export async function runReadAgentInProcess(
           failureReport,
           "failed",
           "red",
-          options.deliverMessageToActiveAgent
+          options
         );
         await options.renderLeadInboxStatus?.().catch(() => {});
         await options.notifyLeadOfInboxReports?.(readTeamName).catch(() => {});
@@ -1370,6 +1674,8 @@ export async function runReadAgentInProcess(
     }
   } finally {
     childLifecycleProbeUnsubscribe();
+    if (state.stopRequested) await cancelAutomaticRepair().catch(() => {});
+    repairCancellationHandlers.delete(state);
     pendingParentWakeSignals.delete(state);
     disposeReadAgentWake(state);
     settleSessionCreation(state.session);

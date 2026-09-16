@@ -4,11 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.3] - 2026-09-15
+
+### Changed
+- Compact read, bash, and ls rows in the agent view; keep full output available with `l`.
+- Show returned text size and line count for reads, and separate thinking blocks from preceding tool rows with a blank line.
+- Limit the focused test suite to two workers to reduce contention in timing-sensitive queue tests.
+
+## [2.3.2] - 2026-09-15
+
+### Changed
+- Rewrite the README around agent features and developer workflows, with an animated demo.
+- Move detailed setup and orchestration contracts to `docs/reference.md`; include the reference and demo in the package.
+
+## [2.3.1] - 2026-09-14
+
+### Fixed
+- Preserve running and starting agents across same-process `/reload`, reconnecting controls, reports, and cost accounting to the fresh host.
+- Count in-flight admissions before native launch and close admission before the shutdown sweep. Quit and session changes still clean up agents.
+- Preserve inherited thinking levels and costs for runs admitted during reload.
+
+### Changed
+- Configure the shared activity and agent-view palette through `activityColors` in settings, with mint-green agent names by default.
+- Allow 60 seconds for failed reload recovery before cancellation starts. Running agents keep their original implementation until an idle reload; process restart recovery is not supported.
+
+## [2.3.0] - 2026-09-14
+
 ### Added
 - Add one-shot `get_agent_status` snapshots for leads and eligible nested write parents, including active, queued, and recently completed read and edit agents.
+- Add explicitly assigned checks with source-bound results, optional bounded repair attempts, compact batch-report delivery, and saved specialist checkpoints for fresh continuations.
+- Add read-only onboarding guidance for models, favorite tiers, shared extensions, and package updates.
+- Expose combined recorded session cost to compatible footer consumers without changing native usage totals.
 
 ### Changed
 - Tell parent agents to end their turn for automatic report delivery and distinguish one status snapshot from repeated polling.
+- Match agent navigation to activity-row order, retaining access to agents finishing cleanup.
+- Share activity colors across compact rows and the agent view, with tier-dependent pink shades, separate model/thinking colors, muted progress, and context warnings at 75% and 90%.
+
+### Fixed
+- Distinguish confirmed helper-report receipt from cancellation during parent cleanup, avoiding false wake-failure warnings.
+- Preserve the full attributed report with the lead when requester delivery cannot be confirmed, without replaying it into a replacement run.
+- Keep admitted follow-up reports through verification, reject Herdr transfer during active checks, and reject oversized checkpoints before report acceptance.
+- Repair the cost-accounting test fixtures for the event-based footer integration.
 
 ## [2.2.12] - 2026-09-12
 

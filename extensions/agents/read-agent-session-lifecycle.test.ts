@@ -64,6 +64,31 @@ describe("nested read-agent delivery lifecycle", () => {
 });
 
 describe("nested selected-extension session shutdown", () => {
+  it.each([
+    [true, "check"], [false, "check"], [true, "operation"], [false, "operation"], [true, "checkpoint"], [false, "checkpoint"],
+  ] as const)("keeps owned work quarantined until raw settlement (session=%s, kind=%s)", async (hasSession, kind) => {
+    vi.useFakeTimers();
+    const { session } = makeSession();
+    const command = deferred();
+    const controller = new AbortController();
+    const finalize = vi.fn(async () => {});
+    const state: ManagedReadAgentLifecycleState = {
+      session: hasSession ? session : undefined,
+      ...(kind === "operation" ? { activeOperationSettlementPromise: command.promise } : { [kind === "check" ? "checkOperation" : "checkpointOperation"]: { controller, settled: command.promise } }),
+    };
+    const shutdown = requestReadAgentTeardown(state, { closePersistence: async () => {}, finalize });
+    await vi.advanceTimersByTimeAsync(NESTED_SESSION_TEARDOWN_TIMEOUT_MS);
+    expect(controller.signal.aborted).toBe(kind !== "operation");
+    await expect(shutdown).resolves.toMatchObject({ status: "timed_out", finalized: false, dispose: "deferred" });
+    expect(finalize).not.toHaveBeenCalled();
+    expect(session.dispose).not.toHaveBeenCalled();
+    command.resolve();
+    await state.teardownFinalizationPromise;
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(state.teardownState).toBe("finalized");
+    expect(session.dispose).toHaveBeenCalledTimes(hasSession ? 1 : 0);
+  });
+
   it("invokes shutdown before clear/abort and uses the first concurrent reason exactly once", async () => {
     const { session, order } = makeSession();
     const handler = deferred();
@@ -121,6 +146,30 @@ describe("nested selected-extension session shutdown", () => {
     expect(session.extensionRunner.emit).toHaveBeenCalledOnce();
     expect(session.clearQueue).toHaveBeenCalledOnce();
     expect(session.abort).toHaveBeenCalledOnce();
+    expect(session.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("snapshots late raw work immediately before disposal, isolating observer failure", async () => {
+    const { session, order } = makeSession();
+    const handler = deferred();
+    const delivery = deferred();
+    const abort = deferred();
+    let cost = 0;
+    session.extensionRunner.emit.mockImplementation(() => handler.promise.then(() => { cost += 1; }));
+    session.abort.mockImplementation(() => abort.promise.then(() => { cost += 3; }));
+    const snapshot = vi.fn(() => { order.push(`snapshot:${cost}`); throw new Error("observer failed"); });
+    const lifecycle = installReadAgentSessionLifecycle(session, snapshot);
+    const result = await lifecycle.requestShutdown("quit", delivery.promise.then(() => { cost += 2; }), 0);
+    expect(result.status).toBe("timed_out");
+    expect(snapshot).not.toHaveBeenCalled();
+    handler.resolve();
+    delivery.resolve();
+    await Promise.resolve();
+    expect(snapshot).not.toHaveBeenCalled();
+    abort.resolve();
+    await lifecycle.finalized;
+    expect(order.slice(-2)).toEqual(["snapshot:6", "dispose"]);
+    expect(snapshot).toHaveBeenCalledOnce();
     expect(session.dispose).toHaveBeenCalledOnce();
   });
 

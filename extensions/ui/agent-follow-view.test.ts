@@ -86,7 +86,7 @@ describe("agent follow transcript", () => {
         { type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } },
       ] },
       { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "Line one\nLine two" }] },
-    ]).join("\n");
+    ], { expandLargeToolResults: true }).join("\n");
     const plain = stripAnsi(lines);
 
     expect(plain).toContain("Inspect the project");
@@ -113,16 +113,31 @@ describe("agent follow transcript", () => {
     expect(lines.join("\n")).not.toContain("**");
   });
 
+  it.each(["write", "ls", "report_progress"])("separates thinking after %s with one blank line", (name) => {
+    const messages = [{ role: "assistant", content: [
+      { type: "toolCall", name, arguments: { path: "a.ts", status: "Checking" } },
+      { type: "thinking", thinking: "Next step" },
+      { type: "text", text: "Continuing" },
+      { type: "thinking", thinking: "Another step" },
+    ] }];
+    for (const expandLargeToolResults of [false, true]) {
+      const lines = formatAgentFollowTranscript(messages, { expandLargeToolResults }).map(stripAnsi);
+      for (const index of [lines.indexOf("thinking"), lines.lastIndexOf("thinking")]) {
+        expect(lines[index - 1]).toBe("");
+        expect(lines[index - 2]).not.toBe("");
+      }
+    }
+  });
+
   it("collapses large tool results with head and tail context and can expand them", () => {
     const output = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n");
     const messages = [
-      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "rg TODO src" } }] },
-      { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: output },
+      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "agentic_search", arguments: { query: "TODO" } }] },
+      { role: "toolResult", toolCallId: "call-1", toolName: "agentic_search", content: output },
     ];
 
     const collapsed = stripAnsi(formatAgentFollowTranscript(messages).join("\n"));
-    expect(collapsed.split("\n")).toContain("bash · $ rg TODO src");
-    expect(collapsed).not.toContain("╭─ bash");
+    expect(collapsed.split("\n")).toContain("agentic_search · TODO");
     expect(collapsed).toContain("9 lines hidden · press l to expand logs");
     expect(collapsed).not.toContain("│ line 10");
     expect(collapsed).toContain("│ line 20");
@@ -132,6 +147,35 @@ describe("agent follow transcript", () => {
     expect(expanded).toContain("│ line 10");
     expect(expanded).not.toContain("lines hidden");
     expect(expanded).not.toContain("collapsed");
+  });
+
+  it.each([
+    ["read", { path: "src/a.ts" }, "é\nnext\n", "read · src/a.ts · 2 lines · 8 B · ✓"],
+    ["read", { path: "empty.ts" }, "", "read · empty.ts · 0 lines · 0 B · ✓"],
+    ["bash", { command: "echo one\necho two" }, "one\ntwo", "bash · $ echo one echo two · ✓"],
+    ["ls", { path: "src", limit: 10 }, "a.ts\nb.ts", "ls · src · ✓"],
+    ["ls", {}, "a.ts", "ls · . · ✓"],
+  ])("compacts %s results and keeps output available when expanded", (name, args, output, expected) => {
+    const messages = [
+      { role: "assistant", content: [{ type: "toolCall", id: "compact", name, arguments: args }] },
+      { role: "toolResult", toolCallId: "compact", toolName: name, content: output },
+    ];
+    expect(formatAgentFollowTranscript(messages).map(stripAnsi)).toEqual([expected]);
+    const expanded = formatAgentFollowTranscript(messages, { expandLargeToolResults: true }).map(stripAnsi);
+    expect(expanded).toContain(`│ ${output.split("\n")[0] || "(no output)"}`);
+  });
+
+  it.each(["read", "bash", "ls"])("keeps %s pending and failed states on a single bounded row", (name) => {
+    const messages = [{ role: "assistant", content: [{ type: "toolCall", id: "state", name, arguments: { path: "a.ts", command: "false" } }] }];
+    expect(formatAgentFollowTranscript(messages).map(stripAnsi)[0]).toMatch(/ · working$/);
+    const failed = [...messages, { role: "toolResult", toolCallId: "state", toolName: name, content: "Failed", isError: true }];
+    expect(formatAgentFollowTranscript(failed).map(stripAnsi)[0]).toMatch(/ · ✗$/);
+    for (const input of [messages, failed]) {
+      const lines = formatAgentFollowTranscript(input, { width: 12 });
+      expect(lines).toHaveLength(1);
+      expect(visibleWidth(lines[0])).toBeLessThanOrEqual(12);
+    }
+    expect(formatAgentFollowTranscript(failed, { expandLargeToolResults: true }).map(stripAnsi)).toContain("│ Failed");
   });
 
   it("renders report_progress calls as one ordinary neutral field", () => {
@@ -156,7 +200,7 @@ describe("agent follow transcript", () => {
     expect(lines.join("\n")).not.toContain("\x1b[48;2;31;33;47m");
   });
 
-  it("places the spacer after progress and immediately before a block tool", () => {
+  it("places the spacer after progress and immediately before a compact read", () => {
     const lines = formatAgentFollowTranscript([
       { role: "assistant", content: [
         { type: "thinking", thinking: "**Planning the read**" },
@@ -169,13 +213,14 @@ describe("agent follow transcript", () => {
       { role: "toolResult", toolCallId: "read-1", toolName: "read", content: "# pi-extended-teams", isError: false },
     ]).map(stripAnsi);
     const progressIndex = lines.indexOf("Reading the requested line");
-    const readIndex = lines.indexOf("read · README.md");
+    const readSummary = "read · README.md · 1 line · 19 B · ✓";
+    const readIndex = lines.indexOf(readSummary);
 
     expect(lines.slice(0, progressIndex)).toEqual(["thinking", "Planning the read", ""]);
     expect(lines.slice(progressIndex, readIndex + 1)).toEqual([
       "Reading the requested line",
       "",
-      "read · README.md",
+      readSummary,
     ]);
   });
 
@@ -267,7 +312,7 @@ describe("agent follow transcript", () => {
       },
       { role: "toolResult", toolCallId: "edit-failure", toolName: "edit", content: "Edit failed", isError: true },
       { role: "toolResult", toolCallId: "bash-raw", toolName: "bash", content: "neutral shell output", isError: false },
-    ], { width: 80, theme });
+    ], { width: 80, theme, expandLargeToolResults: true });
 
     const pendingHeader = lines.find((line) => stripAnsi(line).startsWith("read")) || "";
     const pendingState = lines.find((line) => stripAnsi(line).includes("waiting for result")) || "";
@@ -341,11 +386,13 @@ describe("agent follow transcript", () => {
       const body = lines.find((line) => stripAnsi(line).startsWith("│ ")) || "";
       const wrapped = lines.flatMap((line) => wrapTextWithAnsi(line, width));
 
-      expect(lines).toHaveLength(4);
-      expect(wrapped).toHaveLength(4);
+      expect(lines).toHaveLength(expandLargeToolResults ? 4 : 1);
+      expect(wrapped).toHaveLength(expandLargeToolResults ? 4 : 1);
       expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
-      expect(visibleWidth(body)).toBe(width);
-      expect(stripAnsi(body)).toMatch(/^│ x+…$/);
+      if (expandLargeToolResults) {
+        expect(visibleWidth(body)).toBe(width);
+        expect(stripAnsi(body)).toMatch(/^│ x+…$/);
+      }
     }
   });
 
@@ -355,7 +402,7 @@ describe("agent follow transcript", () => {
     const lines = formatAgentFollowTranscript([
       { role: "assistant", content: [{ type: "toolCall", id: "ansi-result", name: "bash", arguments: { command: "printf color" } }] },
       { role: "toolResult", toolCallId: "ansi-result", toolName: "bash", content: output, isError: false },
-    ], { width });
+    ], { width, expandLargeToolResults: true });
     const body = lines.find((line) => stripAnsi(line).startsWith("│ ")) || "";
 
     expect(visibleWidth(body)).toBeLessThanOrEqual(width);
@@ -372,6 +419,48 @@ describe("agent follow component", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllEnvs();
+  });
+
+  it("toggles compact read and bash output with l", () => {
+    const messages = ["read", "bash"].flatMap(name => [
+      { role: "assistant", content: [{ type: "toolCall", id: name, name, arguments: name === "read" ? { path: "a.ts" } : { command: "echo result" } }] },
+      { role: "toolResult", toolCallId: name, toolName: name, content: `${name} result` },
+    ]);
+    const component = createAgentFollowComponent({ terminal: { rows: 40 }, requestRender: vi.fn() }, vi.fn(), {
+      getAgents: () => [makeAgent({ session: { messages } as any })],
+    });
+    try {
+      component.render(100);
+      component.handleInput("l");
+      const expanded = stripAnsi(component.render(100).join("\n"));
+      expect(expanded).toContain("│ read result");
+      expect(expanded).toContain("│ bash result");
+      component.handleInput("l");
+      expect(stripAnsi(component.render(100).join("\n"))).toContain("read · a.ts · 1 line · 11 B · ✓");
+    } finally {
+      component.dispose();
+    }
+  });
+
+  it("refreshes tier shades and context warnings without changing navigation or clipping", () => {
+    const agent = makeAgent({ modelSlot: "write-patch", contextUsage: { tokens: 150_000, contextWindow: 200_000, percent: 75 } });
+    const component = createAgentFollowComponent({ terminal: { rows: 24 }, requestRender: vi.fn() }, vi.fn(), {
+      getAgents: () => [agent],
+    }, makeTheme());
+    try {
+      const initial = component.render(180).join("\n");
+      expect(initial).toContain("\x1b[38;2;255;214;235mwrite-patch\x1b[39m");
+      expect(initial).toContain("\x1b[38;2;255;215;0m(75%)\x1b[39m");
+      agent.modelSlot = "read-critical";
+      agent.contextUsage = { tokens: 180_000, contextWindow: 200_000, percent: 90 };
+      const updated = component.render(180).join("\n");
+      expect(updated).toContain("\x1b[38;2;255;146;200mread-critical\x1b[39m");
+      expect(updated).toContain("\x1b[38;2;255;85;85m(90%)\x1b[39m");
+      expect(stripAnsi(updated)).toContain("-> reader");
+      expect(component.render(60).every(line => visibleWidth(line) <= 60)).toBe(true);
+    } finally {
+      component.dispose();
+    }
   });
 
   it("makes Herdr forward page keys while a regular-mode follow view is open", () => {
@@ -489,7 +578,7 @@ describe("agent follow component", () => {
     const component = createAgentFollowComponent(tui, done, { getAgents: () => [agent] }, theme);
 
     const first = component.render(140).join("\n");
-    expect(first).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 46k tok \(23%\) · Verifying assumptions\.{1,3}/);
+    expect(stripAnsi(first)).toMatch(/\(reader\) gpt-model\/high · reading-default · 1m00s · 46k tok \(23%\) · Verifying assumptions\.{1,3}/);
     expect(first).not.toContain("502k tok");
     expect(first).toContain("Working now");
     expect(stripAnsi(first)).not.toContain("progress:");
@@ -503,7 +592,7 @@ describe("agent follow component", () => {
     contextPercent = 40;
     agent.latestProgress = "Writing final report";
     const updated = component.render(140).join("\n");
-    expect(updated).toMatch(/80k tok \(40%\) · Writing final report\.{1,3}/);
+    expect(stripAnsi(updated)).toMatch(/80k tok \(40%\) · Writing final report\.{1,3}/);
     expect(updated).not.toContain("2.3M tok");
     expect(stripAnsi(updated)).not.toContain("progress:");
 

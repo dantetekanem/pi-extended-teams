@@ -2,6 +2,7 @@ import fs from "node:fs";
 import type { AgentReportSource } from "../runtime/types";
 import { getLastAssistantText } from "../ui/renderers";
 import type { SubmittedAgentReport } from "../tools/agent-communication-tools";
+import { normalizeReportedTaskDetails, type ReportedTaskDetails } from "../../src/results/report-result";
 
 export const EMPTY_REPORT_RECOVERY_PROMPT = [
   "Your previous turn ended without a usable final report.",
@@ -10,7 +11,7 @@ export const EMPTY_REPORT_RECOVERY_PROMPT = [
   "If the assignment could not be completed, call report_and_exit with a non-empty blocker or failure report explaining why.",
 ].join(" ");
 
-export interface ResolvedReadAgentReport {
+export interface ResolvedReadAgentReport extends ReportedTaskDetails {
   report?: string;
   summary?: string;
   source?: AgentReportSource;
@@ -43,6 +44,11 @@ export function nonEmptyReportText(value: unknown): string | undefined {
   return text || undefined;
 }
 
+function compatiblePersistedTaskDetails(value: unknown): ReportedTaskDetails {
+  try { return normalizeReportedTaskDetails(value); }
+  catch { return {}; }
+}
+
 function getAcceptedReportToolSubmission(messages: any[]): SubmittedAgentReport | undefined {
   const acceptedToolCallIds = new Set<string>();
   for (const message of messages || []) {
@@ -70,6 +76,7 @@ function getAcceptedReportToolSubmission(messages: any[]): SubmittedAgentReport 
       const content = nonEmptyReportText(part.arguments?.content);
       if (!content) continue;
       return {
+        ...compatiblePersistedTaskDetails(part.arguments),
         content,
         summary: nonEmptyReportText(part.arguments?.summary),
       };
@@ -126,6 +133,7 @@ export function resolveReadAgentReport(
   const submittedContent = nonEmptyReportText(submittedFinalReport?.content);
   if (submittedContent) {
     return {
+      ...normalizeReportedTaskDetails(submittedFinalReport),
       report: submittedContent,
       summary: nonEmptyReportText(submittedFinalReport?.summary),
       source: "report_and_exit",
@@ -134,11 +142,12 @@ export function resolveReadAgentReport(
 
   const immediateToolReport = getAcceptedReportToolSubmission(immediateMessages);
   if (immediateToolReport) {
-    return { report: immediateToolReport.content, summary: immediateToolReport.summary, source: "report_and_exit" };
+    return { ...normalizeReportedTaskDetails(immediateToolReport), report: immediateToolReport.content, summary: immediateToolReport.summary, source: "report_and_exit" };
   }
   const persistedToolReport = getAcceptedReportToolSubmission(persistedMessages);
   if (persistedToolReport) {
     return {
+      ...normalizeReportedTaskDetails(persistedToolReport),
       report: persistedToolReport.content,
       summary: persistedToolReport.summary,
       source: "persisted-report_and_exit",

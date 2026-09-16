@@ -10,9 +10,11 @@ import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
 import { isWorkflowSpawnedMember } from "../../src/utils/workflow-metadata";
 import { globalSettingsPath, projectSettingsPath } from "../../src/utils/settings";
+import { normalizeRepairPolicy } from "../../src/results/repair-policy";
 import { generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
 import { cleanupStaleSessionContextReferences } from "../internal/session-context-reference";
 import { cleanupStalePrivateAgentSessions } from "../internal/agent-session-files";
+import { expireCheckpoints } from "../../src/results/checkpoint-retention";
 
 export const LEAD_ORCHESTRATION_GUIDANCE = `\n\npi-extended-teams lead orchestration rules:\n- Choose tiers by the agent's intended outcome, not by vague task importance. read-review is the normal default for focused review, verification, and bounded synthesis.\n- Use read-collect when the lane gathers bounded facts without owning the conclusion. Use read-analyze when it must explain behavior or root cause across connected evidence. Reserve read-critical for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning.\n- For edits, use write-patch for a narrow localized change, write-feature for a bounded feature with a known design, write-system for a cross-cutting integration/refactor within explicitly claimed files, and write-critical only for high-risk security, concurrency, recovery, migration, or data-integrity changes.\n- Prefer the canonical read-*/write-* tiers. Legacy reading-*/writing-* names are compatibility aliases for this minor release, not intent guidance.\n- A spawned agent owns its assigned lane until it reports, blocks, fails, or the user cancels it. Do not duplicate, take over, test, edit, or synthesize that same lane in parallel; work only on clearly unrelated lanes.\n- When no unrelated work remains, end the turn. The extension resumes you when a report arrives. One get_agent_status snapshot is allowed when current status is needed; do not repeatedly call it, sleep, busy-wait, loop on inbox/status, send nudges, do dummy work, or treat healthy silence as failure.\n- Wait for the actual report before synthesizing. Intervene only on a reported blocker/error, actual health failure, or explicit user cancellation/change.\n- For durable bug, security, or testing claims from an agent report or backlog, concrete, reproducible findings with file/line evidence or a focused failing regression may proceed directly to TDD repair.
 - Use a separate read-only confirmation only when evidence is missing or weak, the claim is disputed, or irreducible high-risk uncertainty remains; never reconfirm an already confirmed finding.`;
@@ -47,6 +49,20 @@ function hasPersistedTeamSettings(ctx: any): boolean {
   return typeof ctx.cwd === "string"
     && ctx.isProjectTrusted?.() === true
     && fs.existsSync(projectSettingsPath(ctx.cwd));
+}
+
+export function registerAgentReportRenderer(pi: any): void {
+  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, _renderOptions: any, theme: any) => {
+    const d = message.details || {};
+    const meta = [
+      d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
+      typeof d.tokens === "number" ? `${formatTokenCount(d.tokens)} tok` : "",
+    ].filter(Boolean).join(" · ");
+    const mark = d.ok === false ? theme.fg("warning", "✗") : theme.fg("success", "✓");
+    const headline = `${mark} ${d.name || "agent"} reported${meta ? ` · ${meta}` : ""}`;
+    const body = typeof message.content === "string" ? message.content : "";
+    return new Text(`${theme.bold(headline)}\n\n${body}`, 0, 0);
+  });
 }
 
 export function registerExtensionEvents(pi: any, options: RegisterEventsOptions): void {
@@ -129,17 +145,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     }
   };
 
-  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, _renderOptions: any, theme: any) => {
-    const d = message.details || {};
-    const meta = [
-      d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
-      typeof d.tokens === "number" ? `${formatTokenCount(d.tokens)} tok` : "",
-    ].filter(Boolean).join(" · ");
-    const mark = d.ok === false ? theme.fg("warning", "✗") : theme.fg("success", "✓");
-    const headline = `${mark} ${d.name || "agent"} reported${meta ? ` · ${meta}` : ""}`;
-    const body = typeof message.content === "string" ? message.content : "";
-    return new Text(`${theme.bold(headline)}\n\n${body}`, 0, 0);
-  });
+  registerAgentReportRenderer(pi);
 
   pi.on("session_start", async (_event: any, ctx: any) => {
     paths.ensureDirs();
@@ -169,6 +175,11 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
         (options.cleanupStaleSessionContextReferences ?? cleanupStaleSessionContextReferences)();
       } catch {
         // Session-start janitors are best-effort and must not block initialization.
+      }
+      try {
+        for (const diagnostic of await expireCheckpoints()) ctx.ui?.notify?.(diagnostic, "warning");
+      } catch (error) {
+        ctx.ui?.notify?.(`Checkpoint expiry: ${String(error)}`, "warning");
       }
       if (!hasPersistedTeamSettings(ctx)) {
         ctx.ui?.notify?.(
@@ -401,13 +412,16 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             if (member.thinking) modelInfo += ` with thinking level: ${member.thinking}`;
             modelInfo += `. When reporting your model or thinking level, use these exact values.`;
           }
+          const repairGuidance = normalizeRepairPolicy(member?.repairPolicy)
+            ? "Call report_and_exit when finished. If it returns an unaccepted repair request, remain active, repair only the assigned scope, and resubmit. Report blocked or failed if repair is unsafe. Claims and shutdown wait for an accepted final report."
+            : undefined;
           if ((member?.role ?? "write") === "write") {
             const workflowGuard = member && isWorkflowSpawnedMember(member)
               ? "\n- Workflow mode: do not create helper fanout yourself. Ask team-lead with send_message for an explicit workflow assignment."
               : "\n- If you need read-only help, ask team-lead with send_message. The lead decides whether to spawn another agent.";
-            roleSpecificGuidance = `\n\nEdit-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.${workflowGuard}\n- Release claims with release_file as soon as you are done editing those paths.\n- When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you.`;
+            roleSpecificGuidance = `\n\nEdit-agent rules:\n- Before editing or writing any repository file, call claim_file with every path you intend to change and wait for the claim to be granted.\n- If claim_file reports conflicts, do not edit those files; coordinate with your lead instead.${workflowGuard}\n- Release claims with release_file as soon as you are done editing those paths.\n- ${repairGuidance ?? "When your work is finished, call report_and_exit. It sends your final report, releases any remaining file claims, and shuts you down. Do not wait for the lead to kill you."}`;
           } else {
-            roleSpecificGuidance = `\n\nRead-agent rules:\n- You are read-only: investigate and report. Do not edit files or make any mutating changes.\n- When finished, produce your final report and stop. Do not wait for the lead to kill you.`;
+            roleSpecificGuidance = `\n\nRead-agent rules:\n- You are read-only: investigate and report. Do not edit files or make any mutating changes.\n- ${repairGuidance ?? "When finished, produce your final report and stop. Do not wait for the lead to kill you."}`;
           }
           rosterInfo = `\n\n${options.formatRosterForPrompt(await options.buildRoster(teamName))}\nUse this roster as a snapshot. If you need updated roster or liveness details, ask team-lead with send_message. Do not poll.`;
         } catch {

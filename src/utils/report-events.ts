@@ -4,6 +4,13 @@ import crypto from "node:crypto";
 import { TeamReportEvent } from "./models";
 import * as paths from "./paths";
 import { withLock } from "./lock";
+import { writeJsonAtomic } from "./atomic-json";
+import { syncPathAndParents, writeJsonDurably } from "../results/durable-json";
+import { VerificationController } from "../results/verification-controller";
+import type { CheckRecord } from "../results/check-journal";
+import { isSpecialistCheckpoint, type SpecialistCheckpoint } from "../results/specialist-checkpoint";
+
+export type ObservedTeamReportEvent = TeamReportEvent & { checks?: CheckRecord[] };
 
 export type NewTeamReportEvent = Omit<TeamReportEvent, "id" | "teamName" | "createdAt"> & Partial<Pick<TeamReportEvent, "id" | "teamName" | "createdAt">>;
 
@@ -67,9 +74,7 @@ function compareCreatedAt(a: TeamReportEvent, b: TeamReportEvent): number {
 }
 
 function cloneTeamReportEvent(event: TeamReportEvent): TeamReportEvent {
-  const cloned = { ...event };
-  if (event.metadata !== undefined) cloned.metadata = structuredClone(event.metadata);
-  return cloned;
+  return structuredClone(event);
 }
 
 function cloneTeamReportEvents(events: readonly TeamReportEvent[]): TeamReportEvent[] {
@@ -115,7 +120,8 @@ function readEventsCache(p: string): ReportEventsCache {
 }
 
 function writeEventsRaw(p: string, events: TeamReportEvent[], options: { sorted?: boolean } = {}): void {
-  fs.writeFileSync(p, JSON.stringify(events, null, 2));
+  if (events.some(event => event.completionGroup || event.checkpoint)) writeJsonDurably(p, events);
+  else writeJsonAtomic(p, events);
   buildCache(p, events, reportEventsStatKey(p), options);
 }
 
@@ -196,27 +202,106 @@ export async function appendTeamReportEvent(teamName: string, event: NewTeamRepo
     const cache = readEventsCache(p);
     const normalized: TeamReportEvent = cloneTeamReportEvent({
       ...event,
-      id: event.id || defaultEventId(teamName, event),
+      id: event.id || event.result?.reportId || defaultEventId(teamName, event),
       teamName,
       createdAt: event.createdAt || Date.now(),
     });
 
+    if (normalized.result && normalized.result.reportId !== normalized.id) {
+      throw new Error("Structured report identity does not match its event ID.");
+    }
+    if (normalized.checkpoint && normalized.result) normalized.result.checkpointId = normalized.checkpoint.id;
     const existing = cache.byId.get(normalized.id);
-    if (existing) return cloneTeamReportEvent(existing);
+    if (existing) return existing.completionGroup || existing.checkpoint ? resyncEvent(p, existing) : cloneTeamReportEvent(existing);
 
     normalized.reportPath = writeStandaloneReport(teamName, normalized.agentName, normalized.report);
+    if (normalized.completionGroup || normalized.checkpoint) syncPathAndParents(normalized.reportPath);
     writeEventsRaw(p, insertEvent(cache.events, normalized), { sorted: true });
     return cloneTeamReportEvent(normalized);
   });
 }
 
-export async function listTeamReportEvents(
+function resyncEvent(p: string, event: TeamReportEvent | undefined): TeamReportEvent {
+  if (!event?.reportPath) throw new Error(`Full report is unavailable in ${p}.`);
+  syncPathAndParents(event.reportPath);
+  syncPathAndParents(p);
+  return cloneTeamReportEvent(event);
+}
+
+export async function resyncStoredTeamReportEvent(teamName: string, reportId: string): Promise<TeamReportEvent> {
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => resyncEvent(p, readEventsCache(p).byId.get(reportId)));
+}
+
+export async function recordReportCheckpoint(teamName: string, reportId: string, draft: SpecialistCheckpoint): Promise<TeamReportEvent> {
+  if (!isSpecialistCheckpoint(draft)) throw new Error("Invalid specialist checkpoint.");
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => {
+    const cache = readEventsCache(p);
+    const existing = cache.byId.get(reportId);
+    if (!existing?.checkpoint || existing.checkpoint.id !== draft.id || draft.reportId !== reportId
+      || draft.author.teamName !== teamName || draft.author.agentName !== existing.agentName || draft.author.runId !== existing.result?.runId
+      || draft.reports.find(report => report.id === reportId)?.path !== existing.reportPath) throw new Error("Checkpoint report binding changed.");
+    resyncEvent(p, existing);
+    if (existing.checkpoint.draft) return cloneTeamReportEvent(existing);
+    const updated = cloneTeamReportEvent({ ...existing, checkpoint: { id: draft.id, draft } });
+    writeEventsRaw(p, cache.events.map(event => event.id === reportId ? updated : event), { sorted: true });
+    return cloneTeamReportEvent(updated);
+  });
+}
+
+export async function recordReportAcceptance(
+  teamName: string,
+  reportId: string,
+  state: "accepted" | "rejected",
+  reason?: string,
+): Promise<TeamReportEvent> {
+  if (state !== "accepted" && state !== "rejected") throw new Error("Report acceptance must be accepted or rejected.");
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => {
+    const cache = readEventsCache(p);
+    const existing = cache.byId.get(reportId);
+    if (!existing?.result || existing.result.version !== 1) throw new Error(`Structured report ${reportId} is unavailable.`);
+    const updated = cloneTeamReportEvent({
+      ...existing,
+      result: { ...existing.result, acceptance: { state, reason, decidedAt: Date.now() } },
+    });
+    writeEventsRaw(p, cache.events.map(event => event.id === reportId ? updated : event), { sorted: true });
+    return cloneTeamReportEvent(updated);
+  });
+}
+
+export async function readStoredTeamReportEvent(teamName: string, reportId: string): Promise<TeamReportEvent | undefined> {
+  const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => {
+    const event = readEventsCache(p).byId.get(reportId);
+    return event ? cloneTeamReportEvent(event) : undefined;
+  });
+}
+
+export async function listStoredTeamReportEvents(
   teamName: string,
   options: ListTeamReportEventsOptions = {}
 ): Promise<TeamReportEvent[]> {
   const p = ensureReportEventsFile(teamName);
+  return withLock(p, async () => selectEvents(readEventsCache(p), options));
+}
 
-  return await withLock(p, async () => {
-    return selectEvents(readEventsCache(p), options);
-  });
+export async function listTeamReportEvents(
+  teamName: string,
+  options: ListTeamReportEventsOptions = {}
+): Promise<ObservedTeamReportEvent[]> {
+  const events = await listStoredTeamReportEvents(teamName, options);
+  return Promise.all(events.map(async event => {
+    if (!event.result) return event;
+    try {
+      const observed = await VerificationController.observe(teamName, event.result);
+      return { ...event, result: observed.result,
+        ...(observed.result.verification.state !== "not-requested" ? { checks: observed.checks } : {}) };
+    } catch (error) {
+      return { ...event, result: { ...event.result, verification: {
+        state: "failed" as const, error: error instanceof Error ? error.message : String(error),
+      } }, checks: [] };
+    }
+  }));
 }

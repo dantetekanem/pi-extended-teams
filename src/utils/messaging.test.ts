@@ -7,7 +7,9 @@ import {
   broadcastMessage,
   broadcastMessageOnce,
   findInboxMessageByOperation,
+  markInboxMessagesRead,
   peekInbox,
+  removeInboxMessagesByOperationUnderLifecycleLock,
   readInbox,
   readInboxTail,
   sendPlainMessage,
@@ -25,6 +27,14 @@ function writeInbox(agentName: string, messages: InboxMessage[]) {
   const inboxFilePath = path.join(testDir, "inboxes", `${agentName}.json`);
   fs.mkdirSync(path.dirname(inboxFilePath), { recursive: true });
   fs.writeFileSync(inboxFilePath, JSON.stringify(messages, null, 2));
+}
+
+async function reloadMessagingWithIsolatedPaths() {
+  const isolatedPaths = { ...paths };
+  vi.resetModules();
+  vi.doMock("./paths", () => isolatedPaths);
+  try { return await import("./messaging.js"); }
+  finally { vi.doUnmock("./paths"); }
 }
 
 describe("Messaging Utilities", () => {
@@ -47,6 +57,77 @@ describe("Messaging Utilities", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
+  });
+
+  it.each(["append", "running", "once", "duplicate", "read", "tail", "remove"])("preserves grouped inbox durability during %s", async operation => {
+    const groupOptions = { operationId: "group-delivery", metadata: { completionGroup: { groupId: "group", deliveryId: "group-delivery" } } };
+    await sendPlainMessageOnce("test-team", "system", "team-lead", "Index", "Group", groupOptions);
+    const perform = () => {
+      if (operation === "read") return readInbox("test-team", "team-lead", true, true);
+      if (operation === "tail") return readInboxTail("test-team", "team-lead", 1, { markAsRead: true });
+      if (operation === "remove") return removeInboxMessagesByOperationUnderLifecycleLock("test-team", "team-lead", "group-delivery");
+      if (operation === "duplicate") return sendPlainMessageOnce("test-team", "system", "team-lead", "Index", "Group", groupOptions);
+      if (operation === "once") return sendPlainMessageOnce("test-team", "writer", "team-lead", "New", "New", { operationId: "ordinary" });
+      return (operation === "running" ? sendPlainMessageIfRunning : sendPlainMessage)("test-team", "writer", "team-lead", "New", "New");
+    };
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("group inbox sync failed"); });
+    await expect(perform()).rejects.toThrow("group inbox sync failed");
+    expect((await peekInbox("test-team", "team-lead"))[0]).toMatchObject({ text: "Index", read: false });
+    sync.mockRestore();
+    await perform();
+    expect((await peekInbox("test-team", "team-lead")).length).toBe(operation === "remove" ? 0 : ["append", "running", "once"].includes(operation) ? 2 : 1);
+  });
+
+  it.each(["removal retry", "ordinary append"])("retains durability across reload for %s after uncertain last-index removal", async operation => {
+    await sendPlainMessageOnce("test-team", "system", "team-lead", "Index", "Group", { operationId: "group-delivery", metadata: { completionGroup: {} } });
+    const realSync = fs.fsyncSync;
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isDirectory()) throw new Error("removal receipt uncertain");
+      realSync(fd);
+    });
+    await expect(removeInboxMessagesByOperationUnderLifecycleLock("test-team", "team-lead", "group-delivery")).rejects.toThrow("removal receipt uncertain");
+    expect(await peekInbox("test-team", "team-lead")).toEqual([]);
+    const reloaded = await reloadMessagingWithIsolatedPaths();
+    const remove = () => reloaded.removeInboxMessagesByOperationUnderLifecycleLock("test-team", "team-lead", "group-delivery");
+    const append = () => reloaded.sendPlainMessageOnce("test-team", "writer", "team-lead", "Later", "Later", { operationId: "ordinary" });
+    await expect(operation === "removal retry" ? remove() : append()).rejects.toThrow("removal receipt uncertain");
+    sync.mockRestore();
+    expect(await remove()).toBe(0);
+    expect((await append()).delivered).toBe(operation === "removal retry");
+    expect((await reloaded.peekInbox("test-team", "team-lead")).map(message => message.text)).toEqual(["Later"]);
+  });
+
+  it("keeps never-grouped inboxes on their ordinary atomic path", async () => {
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("durability not requested"); });
+    await sendPlainMessageOnce("test-team", "sender", "receiver", "Ordinary", "Ordinary", { operationId: "ordinary" });
+    expect((await readInbox("test-team", "receiver", true, true))[0]).toMatchObject({ text: "Ordinary", read: true });
+    expect(await removeInboxMessagesByOperationUnderLifecycleLock("test-team", "receiver", "ordinary")).toBe(1);
+    expect(fs.readdirSync(path.join(testDir, "inboxes"))).toEqual(["receiver.json"]);
+    expect(sync).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges exact delivered IDs without consuming later inbox messages", async () => {
+    await sendPlainMessageOnce("test-team", "system", "team-lead", "Index", "Group", { id: "index", operationId: "group-delivery", metadata: { completionGroup: {} } });
+    await sendPlainMessage("test-team", "writer", "team-lead", "Later", "Later");
+    await markInboxMessagesRead("test-team", "team-lead", ["index"]);
+    expect((await peekInbox("test-team", "team-lead", true)).map(message => message.text)).toEqual(["Later"]);
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("receipt sync failed"); });
+    await expect(markInboxMessagesRead("test-team", "team-lead", ["index"])).rejects.toThrow("receipt sync failed");
+    sync.mockRestore();
+  });
+
+  it("requires re-sync before acknowledging an uncertain grouped read receipt", async () => {
+    await sendPlainMessageOnce("test-team", "system", "team-lead", "Index", "Group", { operationId: "group-delivery", metadata: { completionGroup: {} } });
+    const realSync = fs.fsyncSync;
+    const sync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isDirectory()) throw new Error("read receipt uncertain");
+      realSync(fd);
+    });
+    await expect(readInbox("test-team", "team-lead", true, true)).rejects.toThrow("read receipt uncertain");
+    expect((await peekInbox("test-team", "team-lead"))[0].read).toBe(true);
+    await expect(readInbox("test-team", "team-lead", true, true)).rejects.toThrow("read receipt uncertain");
+    sync.mockRestore();
+    expect(await readInbox("test-team", "team-lead", true, true)).toEqual([]);
   });
 
   it("never truncates a live inbox in place", async () => {

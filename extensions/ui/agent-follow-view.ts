@@ -4,6 +4,7 @@ import { initialContextUsage } from "../../src/utils/runtime";
 import { createFramePanelRowRenderer, framePanel, type FramePanelStyle } from "./frame";
 import { extractTextParts, formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel, sanitizePlainTuiLine, sanitizeTuiLine, sanitizeTuiText } from "./renderers";
 import { resolveExtendedTeamsTheme, type ExtendedTeamsForegroundToken, type ExtendedTeamsTheme } from "./theme";
+import { createActivityColors } from "./activity-colors";
 
 const REFRESH_INTERVAL_MS = 250;
 const MAX_NAVIGATION_AGENTS = 6;
@@ -27,7 +28,7 @@ export interface AgentFollowTranscriptOptions {
 
 type TranscriptBlock =
   | { kind: "section"; label: "user" | "thinking" | "assistant"; text: string }
-  | { kind: "tool"; id?: string; name: string; args: unknown; result?: string; details?: unknown; isError?: boolean };
+  | { kind: "tool"; id?: string; name: string; args: unknown; result?: string; readSummary?: string; details?: unknown; isError?: boolean };
 
 function stringifyToolArgs(args: unknown): string {
   if (args === undefined) return "";
@@ -41,6 +42,7 @@ function stringifyToolArgs(args: unknown): string {
 function compactToolArgs(name: string, args: unknown): string {
   if (!args || typeof args !== "object") return sanitizeTuiLine(stringifyToolArgs(args));
   const values = args as Record<string, unknown>;
+  if (name === "ls") return compactTranscriptLine(String(values.path ?? "."));
   const primary = name === "bash"
     ? values.command
     : name === "read"
@@ -225,6 +227,14 @@ function renderToolBlock(theme: ExtendedTeamsTheme, block: Extract<TranscriptBlo
   if (compactBlock) return compactBlock;
 
   const header = renderToolHeader(theme, block);
+  if (!expandLargeToolResults && (block.name === "read" || block.name === "bash" || block.name === "ls")) {
+    const state = block.result === undefined
+      ? pendingText(theme, "working")
+      : block.isError ? failureText(theme, "✗") : successText(theme, "✓");
+    const summary = block.name === "read" && !block.isError && block.readSummary
+      ? mutedText(theme, ` · ${block.readSummary}`) : "";
+    return [boundTranscriptLine(`${header}${summary}${mutedText(theme, " · ")}${state}`, width)];
+  }
   if (block.result === undefined) {
     return [header, `${structuralText(theme, "│")} ${pendingText(theme, "waiting for result…")}`, `${structuralText(theme, "╰─")} ${pendingText(theme, "running")}`, ""];
   }
@@ -289,28 +299,40 @@ export function formatAgentFollowTranscript(messages: any[], options: AgentFollo
       const name = sanitizeTuiLine(String(message.toolName || "tool"));
       const matchingTool = (id ? toolsById.get(id) : undefined)
         ?? blocks.slice().reverse().find((block): block is Extract<TranscriptBlock, { kind: "tool" }> => block.kind === "tool" && block.result === undefined && block.name === name);
+      let readSummary: string | undefined;
+      if ((matchingTool?.name ?? name) === "read") {
+        const text = typeof message.content === "string" ? message.content
+          : (Array.isArray(message.content) ? message.content : [])
+            .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+            .map((part: any) => part.text).join("\n");
+        const lineCount = text ? text.replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n").length : 0;
+        readSummary = `${lineCount} line${lineCount === 1 ? "" : "s"} · ${formatResultSize(text)}`;
+      }
       const result = sanitizeTuiText(extractTextParts(message.content));
       const isError = typeof message.isError === "boolean" ? message.isError : undefined;
       if (matchingTool) {
         matchingTool.result = result;
+        matchingTool.readSummary = readSummary;
         matchingTool.details = message.details;
         matchingTool.isError = isError;
       } else {
-        blocks.push({ kind: "tool", id, name, args: undefined, result, details: message.details, isError });
+        blocks.push({ kind: "tool", id, name, args: undefined, result, readSummary, details: message.details, isError });
       }
     }
   }
 
-  const lines = blocks.flatMap(block => {
+  const lines: string[] = [];
+  for (const block of blocks) {
     if (block.kind === "tool") {
-      return renderToolBlock(theme, block, options.expandLargeToolResults === true, options.width);
+      lines.push(...renderToolBlock(theme, block, options.expandLargeToolResults === true, options.width));
+    } else if (block.label === "thinking") {
+      if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
+      lines.push(theme.fg("thinkingText", block.label), block.text.replace(/\*\*/g, ""), "");
+    } else {
+      const labelToken = block.label === "user" ? "customMessageLabel" : "accent";
+      lines.push(theme.fg(labelToken, block.label), block.text, "");
     }
-    if (block.label === "thinking") {
-      return [theme.fg("thinkingText", block.label), block.text.replace(/\*\*/g, ""), ""];
-    }
-    const labelToken = block.label === "user" ? "customMessageLabel" : "accent";
-    return [theme.fg(labelToken, block.label), block.text, ""];
-  });
+  }
   return lines.length > 0 ? lines : [theme.fg("dim", "Waiting for the agent's first transcript event…")];
 }
 
@@ -325,6 +347,7 @@ export function createAgentFollowComponent(
   providedTheme?: ExtendedTeamsTheme
 ) {
   const theme = resolveExtendedTeamsTheme(providedTheme);
+  const colors = createActivityColors(!!providedTheme);
   // Herdr reserves plain page keys for primary-screen scrollback unless an app owns mouse input.
   const forwardHerdrPageKeys = process.env.HERDR_ENV === "1" && tui.mode !== "fullscreen" && typeof tui.terminal?.write === "function";
   if (forwardHerdrPageKeys) tui.terminal.write("\x1b[?1000h");
@@ -364,7 +387,7 @@ export function createAgentFollowComponent(
   let refreshMessageCount = -1;
   let refreshLastMessage: unknown;
   const refreshTimer = setInterval(() => {
-    const agents = options.getAgents().slice().sort((a, b) => a.name.localeCompare(b.name));
+    const agents = options.getAgents().slice();
     const agent = currentAgent(agents, selectedName);
     if (!agent) {
       const emptyKey = agents.map((item) => item.name).join("\0");
@@ -437,7 +460,7 @@ export function createAgentFollowComponent(
   messageInput.onEscape = stopComposingMessage;
   messageInput.onSubmit = (value: string) => {
     const content = value.trim();
-    const agent = currentAgent(sortedAgents(), selectedName);
+    const agent = currentAgent(navigationAgents(), selectedName);
     if (!content || !agent || !options.sendMessage || sendingMessage) {
       if (!content) messageStatus = "Write a message before sending.";
       tui.requestRender();
@@ -466,7 +489,8 @@ export function createAgentFollowComponent(
       });
   };
 
-  const sortedAgents = () => options.getAgents().slice().sort((a, b) => a.name.localeCompare(b.name));
+  // The caller supplies the activity footer's canonical teammate order.
+  const navigationAgents = () => options.getAgents().slice();
 
   const scrollTranscript = (delta: number) => {
     if (!Number.isFinite(delta)) return;
@@ -476,7 +500,7 @@ export function createAgentFollowComponent(
   };
 
   const selectRelative = (delta: number) => {
-    const agents = sortedAgents();
+    const agents = navigationAgents();
     if (agents.length === 0) return;
     const selected = currentAgent(agents, selectedName);
     const currentIndex = Math.max(0, agents.findIndex(agent => agent.name === selected?.name));
@@ -485,7 +509,7 @@ export function createAgentFollowComponent(
   };
 
   const selectPreviousOrMain = () => {
-    const agents = sortedAgents();
+    const agents = navigationAgents();
     const selected = currentAgent(agents, selectedName);
     const currentIndex = agents.findIndex(agent => agent.name === selected?.name);
     if (currentIndex <= 0) {
@@ -506,7 +530,7 @@ export function createAgentFollowComponent(
       syncInputFocus();
     },
     render(width: number): string[] {
-      const agents = sortedAgents();
+      const agents = navigationAgents();
       const agent = currentAgent(agents, selectedName);
       const innerWidth = Math.max(40, width - 4);
       const terminalRows = Math.max(12, tui.terminal?.rows ?? 24);
@@ -528,7 +552,7 @@ export function createAgentFollowComponent(
       if (navigationStart > 0) navigationLines.push(theme.fg("dim", `   … ${navigationStart} agent${navigationStart === 1 ? "" : "s"} above`));
       for (const item of visibleAgents) {
         const selected = item.name === agent.name;
-        navigationLines.push(`${selected ? theme.fg("accent", "->") : "  "} ${item.name}`);
+        navigationLines.push(`${selected ? theme.fg("accent", "->") : "  "} ${colors.color("name", item.name)}`);
       }
       const remainingAgents = agents.length - navigationStart - visibleAgents.length;
       if (remainingAgents > 0) navigationLines.push(theme.fg("dim", `↓  … ${remainingAgents} more agent${remainingAgents === 1 ? "" : "s"}`));
@@ -603,7 +627,8 @@ export function createAgentFollowComponent(
           : agent.latestProgress
             ? formatAnimatedProgress(agent.latestProgress, renderNow)
             : agent.status;
-      const headline = `(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatContextUsage(agent.contextUsage)} · ${activity}`;
+      const headline = colors.metadata(`(${agent.name}) ${model} · ${slot} · ${elapsed} · ${formatContextUsage(agent.contextUsage)}`, agent.name)
+        + colors.color("text", " · ") + colors.color("message", activity);
       const logAction = expandLargeToolResults ? "l collapse logs" : "l expand logs";
       const messageAction = options.sendMessage ? " · m message" : "";
       const interruptAction = options.interruptAgent ? " · i interrupt" : "";
@@ -774,7 +799,7 @@ export function createAgentFollowComponent(
         return;
       }
       if (data.toLowerCase() === "h" && process.env.HERDR_ENV === "1") {
-        const agent = currentAgent(sortedAgents(), selectedName);
+        const agent = currentAgent(navigationAgents(), selectedName);
         if (agent?.moveToHerdr) void agent.moveToHerdr().then(done).catch(error => {
           messageStatus = sanitizePlainTuiLine(error instanceof Error ? error.message : String(error));
           tui.requestRender();
@@ -782,7 +807,7 @@ export function createAgentFollowComponent(
         return;
       }
       if (data.toLowerCase() === "i" && options.interruptAgent) {
-        const agent = currentAgent(sortedAgents(), selectedName);
+        const agent = currentAgent(navigationAgents(), selectedName);
         if (!agent || interruptingAgents.has(agent.name)) return;
         interruptingAgents.add(agent.name);
         tui.requestRender();
@@ -796,7 +821,7 @@ export function createAgentFollowComponent(
         return;
       }
       if (data.toLowerCase() === "x" && options.stopAgent) {
-        const agent = currentAgent(sortedAgents(), selectedName);
+        const agent = currentAgent(navigationAgents(), selectedName);
         if (!agent || stoppingAgents.has(agent.name)) return;
         stoppingAgents.add(agent.name);
         tui.requestRender();

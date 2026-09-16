@@ -52,6 +52,25 @@ function writeProject(obj: unknown) {
 }
 
 describe("loadSettings", () => {
+  it("merges valid activity colors by layer without accepting terminal escapes or mutating defaults", () => {
+    writeGlobal({ activityColors: { name: "#12ab34", model: "#ABCDEF", message: "#112233" } });
+    writeProject({ activityColors: {
+      name: "#445566",
+      model: "\u001b[31m",
+      message: null,
+      tierReview: "#fedcba",
+      unknown: "#123456",
+    } });
+    const colors = loadSettings({ homeDir, projectDir }).activityColors;
+    expect(colors).toMatchObject({ name: "#445566", model: "#ABCDEF", message: "#112233", tierReview: "#fedcba" });
+    expect(colors).not.toHaveProperty("unknown");
+
+    colors.name = "#000000";
+    expect(loadSettings({ homeDir, projectDir }).activityColors.name).toBe("#445566");
+    expect(loadSettings({ homeDir }).activityColors.name).toBe("#12ab34");
+    expect(DEFAULT_SETTINGS.activityColors.name).not.toBe("#000000");
+  });
+
   it("returns defaults when no files exist", () => {
     const s = loadSettings({ homeDir, projectDir });
     expect(s.watchdog.bufferSeconds).toBe(30);

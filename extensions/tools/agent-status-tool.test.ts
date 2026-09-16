@@ -5,6 +5,8 @@ import * as reportEvents from "../../src/utils/report-events.js";
 import * as lifecycleTombstones from "../../src/utils/lifecycle-tombstone.js";
 import type { Member, TeamReportEvent } from "../../src/utils/models.js";
 import type { RunningReadAgent } from "../runtime/types.js";
+import { createReportResult } from "../../src/results/report-result";
+import { VerificationController } from "../../src/results/verification-controller";
 import { createAgentStatusTool, type QueuedAgentStatus } from "./agent-status-tool.js";
 
 function member(name: string, extras: Partial<Member> = {}): Member {
@@ -76,6 +78,7 @@ function makeTool(
 
 describe("get_agent_status", () => {
   beforeEach(() => {
+    vi.spyOn(VerificationController, "observe").mockImplementation(async (_team, result) => ({ result, checks: [] }));
     vi.spyOn(lifecycleTombstones, "readLifecycleTombstone").mockResolvedValue({ status: "absent" });
     vi.spyOn(lifecycleTombstones, "listLifecycleTombstones").mockResolvedValue([]);
   });
@@ -119,6 +122,17 @@ describe("get_agent_status", () => {
     expect(result.content[0].text).toContain("Use get_agent_status once");
     expect(result.content[0].text).not.toContain("ready");
     expect(result.content[0].text).not.toContain("nested");
+  });
+
+  it("exposes task outcome separately from completed lifecycle status", async () => {
+    mockRoster();
+    const result = createReportResult("team", "finished", "run-1", { outcome: "blocked" });
+    vi.spyOn(reportEvents, "listTeamReportEvents").mockResolvedValue([report("finished", { id: result.reportId, result })]);
+    const status = await makeTool(new Map()).execute("status", {});
+    expect(status.details.statuses).toEqual([expect.objectContaining({
+      name: "finished", phase: "completed", outcome: "blocked", runId: "run-1", reportId: result.reportId,
+      taskId: result.taskId, verification: "not-requested", acceptance: "pending",
+    })]);
   });
 
   it("prefers a persisted cleanup fence after in-memory lifecycle state is lost", async () => {

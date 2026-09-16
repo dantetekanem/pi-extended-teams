@@ -7,7 +7,15 @@ import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
 import * as reportEvents from "../../src/utils/report-events";
+import { checkpointReference, saveReportCheckpoint, resyncReportCheckpoint } from "../../src/results/checkpoint-report";
+import { createReportResult, effectiveTaskOutcome, normalizeReportedTaskDetails, ReportedTaskDetailsSchema, type ReportResult } from "../../src/results/report-result";
 import { canonicalPersistedModelSlot } from "../../src/utils/settings";
+import { normalizeCheckPolicy } from "../../src/results/check-policy";
+import { VerificationController } from "../../src/results/verification-controller";
+import { deliverCompletionGroupReport } from "../../src/results/completion-group-delivery";
+import { formatRepairRequest } from "./agent-communication-tools";
+import type { CheckRunnerOptions } from "../../src/results/check-runner";
+import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import { createFileClaimTools } from "./file-claim-tools";
 import { formatInboxMessagesForModel, renderInboxMessages } from "../ui/renderers";
 import { unlinkPidFile } from "../internal/session-files";
@@ -33,6 +41,7 @@ export interface CoordinationToolsOptions {
   resetLeadWakeNotifiedCount(): void;
   deliverMessageToActiveAgent?(teamName: string, recipient: string, content: string): Promise<boolean>;
   extensionInstanceId?: string;
+  loadCheckOperations?: CheckRunnerOptions["loadOperations"];
 }
 
 export function buildReadHelperPrompt(teamName: string, requester: string, prompt: string): string {
@@ -53,9 +62,26 @@ function requireCurrentSession(options: CoordinationToolsOptions): string {
 
 export function registerCoordinationTools(pi: any, options: CoordinationToolsOptions): void {
   const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
-  const pendingWriterFinalization = new Map<string, { teamName: string; agentName: string; runId: string }>();
+  const pendingWriterFinalization = new Map<string, { teamName: string; agentName: string; runId: string; checkpointId?: string }>();
+  const verifyingReports = new Set<string>();
+  const blockedReports = new Set<string>();
+  const pendingRepairs = new Map<string, { controller: VerificationController; result: ReportResult }>();
+  let repairCancellation: Promise<void> | undefined;
+  const cancelPendingRepairs = () => repairCancellation ??= (async () => {
+    for (const [reportId, { controller }] of pendingRepairs) {
+      try {
+        await controller.cancel();
+        pendingRepairs.delete(reportId);
+      } catch (error) {
+        blockedReports.add(reportId);
+        throw error;
+      }
+    }
+  })().finally(() => { repairCancellation = undefined; });
 
+  pi.on?.("agent_settled", cancelPendingRepairs);
   pi.on?.("session_shutdown", async () => {
+    await cancelPendingRepairs();
     const pending = Array.from(pendingWriterFinalization.values());
     for (const item of pending) {
       let cleared = false;
@@ -77,6 +103,11 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
             throw new Error(`Refusing to remove replacement runtime run ${currentRuntime.lifecycleRunId || "unknown"} of ${item.agentName}.`);
           }
 
+          if (item.checkpointId) {
+            const report = await reportEvents.readStoredTeamReportEvent(item.teamName, createReportResult(item.teamName, item.agentName, item.runId, {}).reportId);
+            if (report?.checkpoint?.id !== item.checkpointId) throw new Error("Checkpoint report provenance is unavailable.");
+            await resyncReportCheckpoint(report);
+          }
           const pidFile = path.join(paths.teamDir(item.teamName), `${item.agentName}.pid`);
           const pidFileExisted = fs.existsSync(pidFile);
           const pidFileUnlinked = unlinkPidFile(pidFile);
@@ -143,10 +174,12 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
     parameters: Type.Object({
       content: Type.String({ description: "Final report to send to the lead." }),
       summary: Type.Optional(Type.String({ description: "Short report summary." })),
+      ...ReportedTaskDetailsSchema.properties,
     }),
     async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       const targetTeamName = requireCurrentSession(options);
       if (!options.isTeammate) throw new Error("report_and_exit is only available to spawned agents.");
+      const reported = normalizeReportedTaskDetails(params);
       if (process.env.PI_EXTENDED_TEAMS_HERDR_RESUME === "1" && !params.content.trim()) throw new Error("Final report content must not be empty.");
 
       const config = await teams.readConfig(targetTeamName);
@@ -158,6 +191,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         throw new Error(`Refusing stale report run ${processRunId} for ${options.agentName}; current roster run is ${runId}.`);
       }
       member.lifecycleRunId = runId;
+      const result = createReportResult(targetTeamName, options.agentName, runId, reported);
       let runtimeStatus = await runtime.readRuntimeStatus(targetTeamName, options.agentName).catch(() => null);
       if (runtimeStatus?.lifecycleRunId && runtimeStatus.lifecycleRunId !== runId) {
         throw new Error(`Refusing to report from stale run ${runId}; runtime status belongs to ${runtimeStatus.lifecycleRunId}.`);
@@ -165,16 +199,39 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       if (runtimeStatus && !runtimeStatus.lifecycleRunId) {
         runtimeStatus = await runtime.writeRuntimeStatus(targetTeamName, options.agentName, runId, {});
       }
+      const checks = normalizeCheckPolicy(member.assignedChecks);
+      if (repairCancellation) await repairCancellation;
+      if (blockedReports.has(result.reportId)) throw new Error("Final report verification is blocked by uncertain persistence for this run.");
+      if (verifyingReports.has(result.reportId)) throw new Error("Final report verification is already in progress for this run.");
+      const previous = pendingRepairs.get(result.reportId)?.result;
+      if (previous) Object.assign(result, { verification: previous.verification, repair: previous.repair });
+      const controller = new VerificationController({ teamName: targetTeamName, result, cwd: member.cwd, checks, repair: member.repairPolicy });
+      verifyingReports.add(result.reportId);
+      try {
+        const decision = await controller.verify(`tool:${_toolCallId}`, {
+          loadOperations: options.loadCheckOperations ?? loadNativeCheckOperations, signal: _signal,
+        }).catch(error => { blockedReports.add(result.reportId); throw error; });
+        Object.assign(result, decision.result);
+        if (decision.request) pendingRepairs.set(result.reportId, { controller, result: structuredClone(result) });
+        else pendingRepairs.delete(result.reportId);
+        if (checks?.length && _signal?.aborted) {
+          await controller.cancel().catch(error => { blockedReports.add(result.reportId); throw error; });
+          pendingRepairs.delete(result.reportId);
+          throw new Error("Assigned check verification was cancelled.");
+        }
+        if (result.verification.state === "pending") throw new Error("Assigned checks have an unresolved execution claim; inspect the durable journal before finalizing this run.");
+        if (decision.request) return {
+          content: [{ type: "text", text: formatRepairRequest(decision.request) }],
+          details: { accepted: false, session: targetTeamName, repairRequest: decision.request, result },
+        };
+      } finally {
+        verifyingReports.delete(result.reportId);
+      }
       await closePersistedRecipient(targetTeamName, options.agentName, runId, {
         removeOnFailure: true,
         role: (member.role ?? "write") === "read" ? "read" : "write",
         reason: "quit",
         extensionInstanceId,
-      });
-      pendingWriterFinalization.set(`${targetTeamName}:${options.agentName}`, {
-        teamName: targetTeamName,
-        agentName: options.agentName,
-        runId,
       });
       const sessionUsage = summarizeSessionUsage(ctx);
       const tokensUsed = typeof sessionUsage.tokensUsed === "number" ? sessionUsage.tokensUsed : runtimeStatus?.tokensUsed;
@@ -198,8 +255,11 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
       try {
         const persistedReport = await reportEvents.appendTeamReportEvent(targetTeamName, {
           agentName: options.agentName,
+          checkpoint: checkpointReference(targetTeamName, member),
+          completionGroup: member.completionGroup,
           role: member?.role || "write",
           status: "completed",
+          result,
           report: params.content,
           summary: params.summary || "Final report",
           startedAt: runtimeStatus?.startedAt,
@@ -215,8 +275,18 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         });
         reportPath = persistedReport.reportPath || "";
         if (!reportPath) throw new Error("The persisted report did not provide its standalone file path.");
-        await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", params.content, params.summary || "Final report", undefined, { metadata: reportMetadata });
+        await saveReportCheckpoint(targetTeamName, member, persistedReport, _signal);
+        if (persistedReport.checkpoint) result.checkpointId = persistedReport.checkpoint.id;
+        const leadReport = (checks?.length
+          ? `${params.content}\n\nHarness verification: ${result.verification.state}; lead acceptance: ${result.acceptance.state}${result.repair ? `; repair: ${result.repair.state}; effective task: ${effectiveTaskOutcome(result) ?? "unspecified"}` : ""}. Evidence: ${result.reportId}.`
+          : params.content) + (result.checkpointId ? `\n\nCheckpoint reference: ${result.checkpointId}.` : "");
+        const grouped = await deliverCompletionGroupReport(persistedReport);
+        if (member.completionGroup && !grouped) throw new Error("Grouped report provenance is unavailable.");
+        if (!grouped) {
+          await messaging.sendPlainMessage(targetTeamName, options.agentName, "team-lead", leadReport, params.summary || "Final report", undefined, { metadata: reportMetadata });
+        }
         releasedClaims = await options.releaseAllClaimsForAgent(targetTeamName, options.agentName);
+        pendingWriterFinalization.set(`${targetTeamName}:${options.agentName}`, { teamName: targetTeamName, agentName: options.agentName, runId, checkpointId: result.checkpointId });
       } catch (error) {
         pendingWriterFinalization.delete(`${targetTeamName}:${options.agentName}`);
         await withLifecycleTombstoneLock(targetTeamName, options.agentName, async lifecycleLock => {
@@ -232,7 +302,7 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
         try { ctx.shutdown(); } catch { process.exit(0); }
       }, 250);
 
-      return { content: [{ type: "text", text: `Final report sent. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { session: targetTeamName, releasedClaims, reportPath } };
+      return { content: [{ type: "text", text: `Final report ${member.completionGroup ? "saved to its completion group" : "sent"}. Released ${releasedClaims.length} file claim(s). Exiting.` }], details: { accepted: true, session: targetTeamName, releasedClaims, reportPath, result } };
     },
   });
 

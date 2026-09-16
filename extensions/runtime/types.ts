@@ -1,4 +1,5 @@
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { ReportResult } from "../../src/results/report-result";
 import type { ContextUsageSnapshot, RuntimeError } from "../../src/utils/runtime";
 import type { ManagedReadAgentLifecycleState } from "../agents/read-agent-session-lifecycle";
 
@@ -46,6 +47,8 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   cleanupPrivateSessionOnFinalize?: boolean;
   /** Fail finalization closed so runtime, member, fence, and transcript remain recoverable. */
   finalizationBlockedReason?: string;
+  /** Optional accounting observer, called only after exact successful lifecycle settlement. */
+  onCostSettled?(): void;
   session?: AgentSession;
   moveToHerdr?(): Promise<void>;
   finished?: Promise<void>;
@@ -63,6 +66,7 @@ export interface CompletedAgentReport {
   name: string;
   role: string;
   status: "completed" | "failed";
+  result?: ReportResult;
   report: string;
   summary?: string;
   completedAt: number;

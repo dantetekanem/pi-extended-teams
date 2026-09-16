@@ -138,7 +138,41 @@ describe("read-agent communication tools", () => {
     await expect(tools.get("report_and_exit")!.execute("report", { content, summary: "Complete plan result ready" })).resolves.toMatchObject({
       details: { accepted: true, cancelledDeliveries: 2, deliveryOutcome: "cancelled" },
     });
-    expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" });
+    expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" }, undefined, "report");
+  });
+
+  it("passes validated task details to final submission without trusting claimed verification", async () => {
+    const onReportAndExit = vi.fn(async () => ({ accepted: true }));
+    const tools = createAgentCommunicationTools({
+      isTeammate: true, agentName: "reader", role: "read", getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run", authorizeWriteMember: vi.fn(async () => {}), onReportAndExit,
+    });
+    const tool = tools.find(tool => tool.name === "report_and_exit")!;
+    const signal = new AbortController().signal;
+    await tool.execute("report", {
+      content: "Waiting for a decision", outcome: "blocked", questions: ["Which API should be used?"],
+      verification: { state: "passed" }, acceptance: { state: "accepted" },
+      checks: [{ name: "evil", command: "unassigned", timeoutSeconds: 1 }],
+    }, signal);
+    expect(onReportAndExit).toHaveBeenCalledWith({
+      content: "Waiting for a decision", summary: undefined, outcome: "blocked", questions: ["Which API should be used?"],
+    }, signal, "report");
+    await expect(tool.execute("invalid", { content: "Done", outcome: "completed" })).rejects.toThrow(/reported task/i);
+    expect(onReportAndExit).toHaveBeenCalledOnce();
+  });
+
+  it("returns repair feedback with the runtime submission identity instead of accepting completion", async () => {
+    const repairRequest = { id: "repair:reserved", attempt: 1, checks: [] };
+    const onReportAndExit = vi.fn(async () => ({ accepted: false as const, verification: { state: "failed" as const }, repairRequest }));
+    const tools = createAgentCommunicationTools({
+      isTeammate: true, agentName: "reader", role: "read", getTeamName: () => "session",
+      getLifecycleRunId: () => "reader-run", authorizeWriteMember: vi.fn(async () => {}), onReportAndExit,
+    });
+    const tool = tools.find(tool => tool.name === "report_and_exit")!;
+    const signal = new AbortController().signal;
+    const feedback = await tool.execute("runtime-call", { content: "Claim", submissionId: "forged-call" }, signal);
+    expect(feedback.details).toMatchObject({ accepted: false, repairRequest, verification: { state: "failed" } });
+    expect(onReportAndExit).toHaveBeenCalledWith({ content: "Claim", summary: undefined }, signal, "runtime-call");
   });
 
   it("rejects blank final reports before closing report admission", async () => {

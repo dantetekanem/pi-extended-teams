@@ -3,14 +3,21 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { registerCoordinationTools } from "./coordination-tools.js";
 import { registerExtensionEvents } from "../events/register-events.js";
 import * as paths from "../../src/utils/paths.js";
 import * as runtime from "../../src/utils/runtime.js";
+import * as teams from "../../src/utils/teams.js";
 import * as messaging from "../../src/utils/messaging.js";
 import * as reportEvents from "../../src/utils/report-events.js";
 import type { Member, TeamConfig } from "../../src/utils/models.js";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone.js";
+import { VerificationController } from "../../src/results/verification-controller.js";
+import { CompletionGroup } from "../../src/results/completion-group.js";
+import { createReportResult } from "../../src/results/report-result.js";
+import * as checkpointSource from "../../src/results/source-identity";
+import * as checkpointStore from "../../src/results/specialist-checkpoint";
 
 let root: string;
 let teamsRoot: string;
@@ -30,6 +37,7 @@ function installPathSpies() {
   if (typeof (paths as any).reportFilesDir === "function") {
     vi.spyOn(paths as any, "reportFilesDir").mockReturnValue(path.join(root, "agent", "reports"));
   }
+  vi.spyOn(paths, "checkpointFilesDir").mockReturnValue(path.join(fs.realpathSync(root), "checkpoints"));
   vi.spyOn(paths, "lifecycleTombstonePath").mockImplementation((teamName: string, agentName: string) => {
     return path.join(teamsRoot, paths.sanitizeName(String(teamName)), "lifecycle", "quarantine", `${paths.sanitizeName(String(agentName))}.json`);
   });
@@ -74,6 +82,121 @@ describe("coordination tools", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it.each(["success", "storage-failure", "shutdown", "missing-before-shutdown"])("preserves legacy checkpoint reporting before claim release: %s", async mode => {
+    const failure = mode === "storage-failure";
+    vi.useFakeTimers(); vi.stubEnv("PI_LIFECYCLE_RUN_ID", "checkpoint-run");
+    const observed: checkpointSource.SourceIdentity = { version: 1, cwd: root, repositoryRoot: root, head: null, inputs: ["src"], fingerprint: "a".repeat(64), fileCount: 1 };
+    vi.spyOn(checkpointSource, "captureSourceIdentity").mockResolvedValue(observed);
+    const writer = member("writer", { lifecycleRunId: "checkpoint-run", modelSlot: "write-feature", prompt: "Review",
+      checkpointAssignment: { originalPrompt: "Review", policy: { inputs: ["src"], retentionDays: 30, decisions: [] }, sourceBefore: observed } });
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [member("team-lead"), writer] });
+    const tools = new Map<string, any>(); const handlers = new Map<string, () => Promise<void>>();
+    const release = vi.fn(async () => {
+      if (mode === "shutdown") {
+        await handlers.get("session_shutdown")!();
+        expect((await teams.readConfig("team")).members.some(item => item.lifecycleRunId === "checkpoint-run")).toBe(true);
+      }
+      return [] as string[];
+    });
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool), on: (event: string, handler: any) => handlers.set(event, handler) }, {
+      agentName: "writer", isTeammate: true, terminal: null, getTeamName: () => "team", requireWriteAgentTeam: async () => "team",
+      requireTeamContext: () => "team", releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+    });
+    if (failure) vi.spyOn(checkpointStore, "saveCheckpoint").mockRejectedValue(new Error("checkpoint failed"));
+    const execution = tools.get("report_and_exit").execute("report", { content: "Full legacy report", inspectedEvidence: ["src/auth.ts:4"] },
+      new AbortController().signal, undefined, { cwd: root, shutdown: vi.fn(), sessionManager: { getBranch: () => [] } });
+    if (failure) await expect(execution).rejects.toThrow("checkpoint failed"); else expect((await execution).details.accepted).toBe(true);
+    const [event] = await reportEvents.listTeamReportEvents("team");
+    expect(event.checkpoint?.draft).toBeDefined();
+    expect(fs.readFileSync(event.reportPath!, "utf8")).toBe("Full legacy report");
+    expect(release).toHaveBeenCalledTimes(failure ? 0 : 1);
+    if (!failure) {
+      expect(checkpointStore.readCheckpoint(event.checkpoint!.id).reportId).toBe(event.id);
+      if (mode === "missing-before-shutdown") fs.unlinkSync(event.reportPath!);
+      vi.mocked(checkpointSource.captureSourceIdentity).mockClear().mockRejectedValue(new Error("Source must not execute during cleanup"));
+      await handlers.get("session_shutdown")!();
+      expect(checkpointSource.captureSourceIdentity).not.toHaveBeenCalled();
+      expect((await teams.readConfig("team")).members.some(item => item.lifecycleRunId === "checkpoint-run")).toBe(mode === "missing-before-shutdown");
+    }
+    await vi.advanceTimersByTimeAsync(250);
+  });
+
+  it.each(["pending", "blocked", "suppressed", "delivery-failure", "missing-provenance"])("persists legacy group reports before compact delivery: %s", async mode => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", "group-run");
+    const group = await CompletionGroup.create({ teamName: "team", sessionId: "session", submissionId: mode,
+      policy: { delivery: "all-settled" }, members: [{ name: "writer", suppressed: mode === "suppressed" }, { name: "peer" }] });
+    if (!group) throw new Error("Expected a group");
+    await group.seal();
+    await group.apply({ type: "running", ...group.binding(0), runId: "group-run" });
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [
+      member("team-lead"), member("writer", { lifecycleRunId: "group-run", completionGroup: group.binding(0) }),
+    ] });
+    const tools = new Map<string, any>();
+    const release = vi.fn(async () => [] as string[]);
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      agentName: "writer", isTeammate: true, terminal: null, getTeamName: () => "team", requireWriteAgentTeam: async () => "team",
+      requireTeamContext: () => "team", releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+    });
+    if (mode === "delivery-failure") vi.spyOn(messaging, "sendPlainMessageOnce").mockRejectedValue(new Error("index unavailable"));
+    const ctx = { cwd: root, shutdown: vi.fn(), sessionManager: { getBranch: () => [] } };
+    if (mode === "missing-provenance") await reportEvents.appendTeamReportEvent("team", { agentName: "writer", source: "write-agent",
+      status: "completed", report: "Full legacy report", result: createReportResult("team", "writer", "group-run", { outcome: "blocked" }) });
+    const execution = tools.get("report_and_exit").execute("report", { content: "Full legacy report", outcome: mode === "pending" ? "succeeded" : "blocked" }, new AbortController().signal, undefined, ctx);
+    if (mode === "delivery-failure" || mode === "missing-provenance") await expect(execution).rejects.toThrow(mode === "delivery-failure" ? "index unavailable" : "provenance");
+    else expect((await execution).details.accepted).toBe(true);
+    const [stored] = await reportEvents.listTeamReportEvents("team");
+    expect(stored.completionGroup).toEqual(mode === "missing-provenance" ? undefined : group.binding(0));
+    expect(fs.readFileSync(stored.reportPath!, "utf8")).toBe("Full legacy report");
+    const inbox = await messaging.readInbox("team", "team-lead", false, false);
+    expect(inbox).toHaveLength(mode === "blocked" ? 1 : 0);
+    if (inbox.length) expect(JSON.parse(inbox[0].text).members[0].report.id).toBe(stored.id);
+    expect(release).toHaveBeenCalledTimes(mode === "delivery-failure" || mode === "missing-provenance" ? 0 : 1);
+    await vi.advanceTimersByTimeAsync(250);
+  });
+
+  it.each([0, 1])("observes assigned legacy-writer checks before closure (exit=%s)", async exitCode => {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", "checked-run");
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    fs.writeFileSync(path.join(cwd, "input.ts"), "input");
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [
+      member("team-lead"), member("writer", { cwd, lifecycleRunId: "checked-run",
+        assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }] }),
+    ] });
+    const tools = new Map<string, any>();
+    const seen: unknown[] = [];
+    const release = vi.fn(async () => [] as string[]);
+    const exec = vi.fn(async () => {
+      const concurrent = await tools.get("report_and_exit").execute("concurrent", { content: "Duplicate" }, new AbortController().signal)
+        .then(() => "accepted", () => "rejected");
+      seen.push({ fence: await readLifecycleTombstone("team", "writer"), concurrent, released: release.mock.calls.length });
+      return { exitCode };
+    });
+    const send = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
+      agentName: "writer", isTeammate: true, terminal: null, getTeamName: () => "team",
+      requireWriteAgentTeam: async () => "team", requireTeamContext: () => "team",
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+      loadCheckOperations: async () => ({ exec }),
+    });
+    const ctx = { cwd, shutdown: vi.fn(), sessionManager: { getBranch: () => [] } };
+    const tool = tools.get("report_and_exit");
+    const first = await tool.execute("first", { content: "Agent claims success", outcome: "succeeded" }, new AbortController().signal, undefined, ctx);
+    expect(first.details.result).toMatchObject({ outcome: "succeeded", verification: { state: exitCode ? "failed" : "passed" }, acceptance: { state: "pending" } });
+    expect(seen).toEqual([{ fence: { status: "absent" }, concurrent: "rejected", released: 0 }]);
+    await tool.execute("duplicate", { content: "Agent claims success", outcome: "succeeded" }, new AbortController().signal, undefined, ctx);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][3]).toContain(`Harness verification: ${exitCode ? "failed" : "passed"}`);
+    expect((await reportEvents.listTeamReportEvents("team"))[0].checks).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(250);
+  });
+
   it("preserves own-inbox access and nonempty report admission after a Herdr resume", async () => {
     vi.useFakeTimers();
     vi.stubEnv("PI_EXTENDED_TEAMS_HERDR_RESUME", "1");
@@ -94,6 +217,190 @@ describe("coordination tools", () => {
     await expect(tools.get("report_and_exit").execute("blank", { content: "   " }, undefined, undefined, { shutdown: vi.fn() }))
       .rejects.toThrow("must not be empty");
     expect(await readLifecycleTombstone(teamName, "reader")).toEqual({ status: "absent" });
+  });
+
+  function setupLegacyRepair() {
+    vi.useFakeTimers();
+    vi.stubEnv("PI_LIFECYCLE_RUN_ID", "repair-run");
+    const cwd = path.join(root, "repo");
+    fs.mkdirSync(cwd);
+    execFileSync("git", ["init", "--quiet"], { cwd });
+    const input = path.join(cwd, "input.ts");
+    fs.writeFileSync(input, "broken");
+    writeConfig({ name: "team", description: "", createdAt: 0, leadAgentId: "lead", leadSessionId: "session", members: [
+      member("team-lead"), member("writer", { cwd, lifecycleRunId: "repair-run",
+        assignedChecks: [{ name: "tests", command: "authorized", timeoutSeconds: 2 }], repairPolicy: { maxAttempts: 1 } }),
+    ] });
+    const tools = new Map<string, any>();
+    const events = new Map<string, (...args: any[]) => Promise<void>>();
+    const release = vi.fn(async () => [] as string[]);
+    const exec = vi.fn(async () => ({ exitCode: fs.readFileSync(input, "utf8") === "fixed" ? 0 : 1 }));
+    const send = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined as any);
+    registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool),
+      on: (name: string, handler: (...args: any[]) => Promise<void>) => events.set(name, handler) }, {
+      agentName: "writer", isTeammate: true, terminal: null, getTeamName: () => "team",
+      requireWriteAgentTeam: async () => "team", requireTeamContext: () => "team",
+      releaseAllClaimsForAgent: release, drainWriteQueue: async () => {}, resolveSkillFile: vi.fn(),
+      adoptTeamAsLead: vi.fn(), renderLeadInboxStatus: async () => {}, resetLeadWakeNotifiedCount: vi.fn(),
+      loadCheckOperations: async () => ({ exec }),
+    });
+    const ctx = { cwd, shutdown: vi.fn(), sessionManager: { getBranch: () => [] } };
+    const report = (id: string, outcome = "succeeded", signal = new AbortController().signal) =>
+      tools.get("report_and_exit").execute(id, { content: "Observed work", outcome, submissionId: "agent-controlled" }, signal, undefined, ctx);
+    return { input, events, release, exec, send, ctx, report };
+  }
+
+  it.each(["repaired", "exhausted", "declined"] as const)("keeps legacy repair open until %s", async ending => {
+    const fixture = setupLegacyRepair();
+    const first = await fixture.report("initial");
+    expect(first.details).toMatchObject({ accepted: false, repairRequest: { attempt: 1 }, result: {
+      outcome: "succeeded", verification: { state: "failed" }, repair: { state: "requested" },
+    } });
+    expect(await readLifecycleTombstone("team", "writer")).toEqual({ status: "absent" });
+    expect(fixture.release).not.toHaveBeenCalled();
+    expect(fixture.send).not.toHaveBeenCalled();
+    expect(await reportEvents.listTeamReportEvents("team")).toEqual([]);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(fixture.ctx.shutdown).not.toHaveBeenCalled();
+    expect((await fixture.report("initial")).details).toEqual(first.details);
+    expect(fixture.exec).toHaveBeenCalledOnce();
+    if (ending === "repaired") fs.writeFileSync(fixture.input, "fixed");
+    const final = await fixture.report("next", ending === "declined" ? "blocked" : "succeeded");
+    expect(final.details).toMatchObject({ accepted: true, result: {
+      outcome: ending === "declined" ? "blocked" : "succeeded",
+      repair: { state: ending, attemptsUsed: 1 }, acceptance: { state: "pending" },
+      verification: { state: ending === "repaired" ? "passed" : "failed" },
+    } });
+    expect(fixture.exec).toHaveBeenCalledTimes(ending === "declined" ? 1 : 2);
+    expect(fixture.release).toHaveBeenCalledOnce();
+    expect(fixture.send).toHaveBeenCalledOnce();
+    expect(fixture.send.mock.calls[0][3]).toContain(`repair: ${ending}; effective task: ${ending === "repaired" ? "succeeded" : "blocked"}`);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(fixture.ctx.shutdown).toHaveBeenCalledOnce();
+  });
+
+  it("continues legacy repair after a low-level agent_end before Pi settles", async () => {
+    const fixture = setupLegacyRepair();
+    await fixture.report("initial");
+    await fixture.events.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "error", errorMessage: "503 Service Unavailable" }] });
+    expect(fixture.release).not.toHaveBeenCalled();
+    expect(fixture.ctx.shutdown).not.toHaveBeenCalled();
+    fs.writeFileSync(fixture.input, "fixed");
+    const repaired = await fixture.report("retry-continuation");
+    expect(repaired.details.result).toMatchObject({
+      verification: { state: "passed" }, repair: { state: "repaired", attemptsUsed: 1 }, acceptance: { state: "pending" },
+    });
+    expect(fixture.exec).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(250);
+  });
+
+  it.each(["agent_settled", "session_shutdown", "tool-abort"])("cancels legacy repair on %s before a later report", async ending => {
+    const fixture = setupLegacyRepair();
+    await fixture.report("initial");
+    if (ending === "tool-abort") {
+      const abort = new AbortController();
+      abort.abort();
+      await expect(fixture.report("aborted", "succeeded", abort.signal)).rejects.toThrow("cancelled");
+    } else await fixture.events.get(ending)?.({ messages: [] });
+    const final = await fixture.report("later");
+    expect(final.details.result).toMatchObject({ repair: { state: "cancelled", outcome: "blocked" }, verification: { state: "failed" } });
+    expect(fixture.exec).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(250);
+  });
+
+  it("waits for legacy repair cancellation before verifying a follow-up", async () => {
+    const fixture = setupLegacyRepair();
+    await fixture.report("initial");
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const cancel = VerificationController.prototype.cancel;
+    vi.spyOn(VerificationController.prototype, "cancel").mockImplementationOnce(async function (this: VerificationController) {
+      await held;
+      await cancel.call(this);
+    });
+    const config = await teams.readConfig("team");
+    const configRead = vi.spyOn(teams, "readConfig").mockResolvedValue(config);
+    const runRead = vi.spyOn(teams, "ensureMemberLifecycleRunId").mockResolvedValue("repair-run");
+    const runtimeRead = vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue(null);
+    const verify = vi.spyOn(VerificationController.prototype, "verify");
+    const ending = fixture.events.get("agent_settled")?.();
+    const later = fixture.report("later");
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const startedBeforeCancellation = verify.mock.calls.length;
+    configRead.mockRestore();
+    runRead.mockRestore();
+    runtimeRead.mockRestore();
+    release();
+    const [, result] = await Promise.all([ending, later]);
+    expect(startedBeforeCancellation).toBe(0);
+    expect(result.details.result.repair.state).toBe("cancelled");
+    expect(fixture.exec).toHaveBeenCalledOnce();
+  });
+
+  it("persists cancellation when the tool aborts after the repair decision", async () => {
+    const fixture = setupLegacyRepair();
+    const abort = new AbortController();
+    const verify = VerificationController.prototype.verify;
+    vi.spyOn(VerificationController.prototype, "verify").mockImplementationOnce(async function (this: VerificationController, ...args) {
+      const decision = await verify.apply(this, args);
+      abort.abort();
+      return decision;
+    });
+    await expect(fixture.report("initial", "succeeded", abort.signal)).rejects.toThrow("cancelled");
+    expect((await fixture.report("later")).details.result.repair.state).toBe("cancelled");
+    expect(fixture.exec).toHaveBeenCalledOnce();
+  });
+
+  it("retains known legacy repair ownership when the ledger and native rows disappear", async () => {
+    const fixture = setupLegacyRepair();
+    const first = await fixture.report("initial");
+    fs.unlinkSync(first.details.result.repair.journalPath);
+    for (const check of first.details.repairRequest.checks) fs.unlinkSync(check.logPath.replace(/\.log$/, ".json"));
+    await expect(fixture.report("later")).rejects.toThrow(/ledger.*unavailable/i);
+    expect(fixture.exec).toHaveBeenCalledOnce();
+    expect(fixture.release).not.toHaveBeenCalled();
+    expect(fs.existsSync(first.details.result.repair.journalPath)).toBe(false);
+  });
+
+  it("retains the repaired legacy result when lead delivery fails", async () => {
+    const fixture = setupLegacyRepair();
+    await fixture.report("initial");
+    fs.writeFileSync(fixture.input, "fixed");
+    fixture.send.mockRejectedValueOnce(new Error("lead unavailable"));
+    await expect(fixture.report("repaired")).rejects.toThrow("lead unavailable");
+    expect((await reportEvents.listTeamReportEvents("team"))[0]).toMatchObject({ result: {
+      verification: { state: "passed" }, repair: { state: "repaired" }, acceptance: { state: "pending" },
+    } });
+    expect(fixture.release).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(fixture.ctx.shutdown).not.toHaveBeenCalled();
+  });
+
+  it("fences legacy verification after uncertain repair persistence", async () => {
+    const fixture = setupLegacyRepair();
+    const rename = fs.renameSync;
+    let publications = 0;
+    let feedback = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to).includes(`${path.sep}repairs${path.sep}`)) feedback = ++publications === 2;
+    });
+    const sync = fs.fsyncSync;
+    const fault = vi.spyOn(fs, "fsyncSync").mockImplementation(descriptor => {
+      if (feedback && fs.fstatSync(descriptor).isDirectory()) throw new Error("uncertain repair reservation");
+      sync(descriptor);
+    });
+    syncBuiltinESMExports();
+    await expect(fixture.report("initial")).rejects.toThrow("uncertain repair reservation");
+    fault.mockRestore();
+    syncBuiltinESMExports();
+    await expect(fixture.report("retry")).rejects.toThrow();
+    expect(fixture.exec).toHaveBeenCalledOnce();
+    expect(fixture.release).not.toHaveBeenCalled();
+    expect(fixture.send).not.toHaveBeenCalled();
   });
 
   it("read_inbox defaults to returning only unread messages", async () => {
@@ -308,7 +615,7 @@ describe("coordination tools", () => {
 
     const report = tools.get("report_and_exit").execute(
       "report",
-      { content: "done", summary: "Done" },
+      { content: "done", summary: "Done", outcome: "blocked", artifacts: [{ path: "notes.md" }] },
       new AbortController().signal,
       vi.fn(),
       ctx
@@ -357,6 +664,11 @@ describe("coordination tools", () => {
     }));
     expect(reportEventSpy.mock.invocationCallOrder[0]).toBeLessThan(sendSpy.mock.invocationCallOrder[0]);
     const [persistedReport] = await reportEvents.listTeamReportEvents(teamName, { agentName, limit: 1 });
+    expect(persistedReport).toMatchObject({
+      id: "report:exit-team:writer:writer-run", status: "completed",
+      result: { version: 1, runId, outcome: "blocked", artifacts: [{ path: "notes.md" }],
+        verification: { state: "not-requested" }, acceptance: { state: "pending" } },
+    });
     expect(result.details.reportPath).toBe(persistedReport.reportPath);
     expect(path.dirname(result.details.reportPath)).toBe(path.join(root, "agent", "reports", teamName));
     expect(path.basename(result.details.reportPath)).toBe("writer.md");

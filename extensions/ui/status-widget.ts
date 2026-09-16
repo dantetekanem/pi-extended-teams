@@ -1,6 +1,7 @@
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { formatAnimatedProgress } from "./renderers";
 import { resolveExtendedTeamsTheme, type ExtendedTeamsTheme } from "./theme";
+import { CONTEXT_USAGE_STATUS_SUFFIX, createActivityColors } from "./activity-colors";
 
 export interface TeamActivityStatusEntry {
   name: string;
@@ -28,7 +29,6 @@ const MAX_AGGREGATE_STATUS_PARTS = 4;
 const PROGRESS_ANIMATION_FRAME_MS = 60;
 const SINGLE_COLUMN_ASCII = /^[\x20-\x7E]*$/;
 const SINGLE_COLUMN_STATUS_TEXT = /^[\x20-\x7E\u00B7]*$/;
-const CONTEXT_USAGE_STATUS_SUFFIX = /^(?:\?|[\d.]+[kM]?) tok(?: \((?:\?|[\d.]+)%\))?$/;
 
 function formatCountSummary(snapshot: TeamActivityStatusSnapshot): string {
   const parts = [`${snapshot.activeCount} active`];
@@ -116,8 +116,11 @@ function currentTransitionRenderedWidth(
 
 function splitProgressDisplay(displayText: string | undefined): { prefix: string; progress: string } | null {
   if (!displayText) return null;
-  const delimiterIndex = displayText.lastIndexOf(" · ");
-  if (delimiterIndex < 0) return null;
+  const parts = displayText.split(" · ");
+  const contextIndex = parts.findIndex(part => CONTEXT_USAGE_STATUS_SUFFIX.test(part));
+  const delimiterIndex = contextIndex < 0 ? displayText.lastIndexOf(" · ")
+    : parts.slice(0, contextIndex + 1).join(" · ").length;
+  if (delimiterIndex < 0 || delimiterIndex === displayText.length) return null;
   const displayLength = displayText.length;
   if (CONTEXT_USAGE_STATUS_SUFFIX.test(displayText.slice(delimiterIndex + 3))) return null;
   let progressEnd = displayLength;
@@ -135,6 +138,10 @@ export function teamActivityStatusWidget(
   providedTheme?: ExtendedTeamsTheme
 ) {
   const theme = resolveExtendedTeamsTheme(providedTheme);
+  const { color, metadata: colorMetadata } = createActivityColors(!!providedTheme);
+  const renderEntry = (entry: TeamActivityStatusEntry): string => entry.displayText
+    ? colorMetadata(entry.displayText, entry.name)
+    : formatExpandedEntry(entry, theme);
   const transitions = new Map<string, ProgressTransition>();
   let animationTimer: NodeJS.Timeout | null = null;
   let summarySnapshot: TeamActivityStatusSnapshot | null | undefined;
@@ -188,15 +195,16 @@ export function teamActivityStatusWidget(
       if (!hasCachedTransitionEntry || transition) transitionHints[hintIndex] = transition;
     }
     if (!entry.displayText) {
-      return animationResult(`${theme.fg("border", branch)} ${formatExpandedEntry(entry, theme)}`, false, width);
+      return animationResult(`${theme.fg("border", branch)} ${renderEntry(entry)}`, false, width);
     }
 
     if (!transition || transition.source !== entry.displayText) {
       const parsed = splitProgressDisplay(entry.displayText);
       if (!parsed) {
-        return animationResult(`${theme.fg("border", branch)} ${formatExpandedEntry(entry, theme)}`, false, width);
+        return animationResult(`${theme.fg("border", branch)} ${renderEntry(entry)}`, false, width);
       }
       const branchPrefix = `${theme.fg("border", branch)} `;
+      const coloredPrefix = colorMetadata(parsed.prefix, entry.name);
       const prefixVisibleWidth = SINGLE_COLUMN_STATUS_TEXT.test(parsed.prefix)
         ? parsed.prefix.length
         : visibleWidth(parsed.prefix);
@@ -218,8 +226,8 @@ export function teamActivityStatusWidget(
           entryName: entry.name,
           source: entry.displayText,
           branch,
-          prefix: parsed.prefix,
-          linePrefix: `${branchPrefix}${parsed.prefix}`,
+          prefix: coloredPrefix,
+          linePrefix: `${branchPrefix}${coloredPrefix}`,
           linePrefixVisibleWidth,
           previous: parsed.progress,
           previousSingleColumn: progressSingleColumn,
@@ -238,8 +246,8 @@ export function teamActivityStatusWidget(
           entryName: entry.name,
           source: entry.displayText,
           branch,
-          prefix: parsed.prefix,
-          linePrefix: `${branchPrefix}${parsed.prefix}`,
+          prefix: coloredPrefix,
+          linePrefix: `${branchPrefix}${coloredPrefix}`,
           linePrefixVisibleWidth,
           previous: transition.target,
           previousSingleColumn: transition.targetSingleColumn,
@@ -259,8 +267,8 @@ export function teamActivityStatusWidget(
           entryName: entry.name,
           source: entry.displayText,
           branch,
-          prefix: parsed.prefix,
-          linePrefix: `${branchPrefix}${parsed.prefix}`,
+          prefix: coloredPrefix,
+          linePrefix: `${branchPrefix}${coloredPrefix}`,
           linePrefixVisibleWidth,
           maxRenderedWidth: progressTransitionMaxRenderedWidth(linePrefixVisibleWidth, transition.previousVisibleWidth, transition.targetVisibleWidth),
         };
@@ -282,15 +290,15 @@ export function teamActivityStatusWidget(
     if (elapsed < 200) {
       const remaining = Math.max(0, Math.ceil(transition.previous.length * (1 - elapsed / 200)));
       const progressText = transition.previous.slice(0, remaining);
-      return animationResult(`${transition.linePrefix}${theme.fg("dim", progressText)}`, true, width, currentTransitionRenderedWidth(transition, progressText, transition.previousSingleColumn, width));
+      return animationResult(`${transition.linePrefix}${color("message", progressText)}`, true, width, currentTransitionRenderedWidth(transition, progressText, transition.previousSingleColumn, width));
     }
     if (elapsed < 1000) {
       const revealed = Math.floor(transition.target.length * ((elapsed - 200) / 800));
       const progressText = transition.target.slice(0, revealed);
-      return animationResult(`${transition.linePrefix}${progressText}`, true, width, currentTransitionRenderedWidth(transition, progressText, transition.targetSingleColumn, width));
+      return animationResult(`${transition.linePrefix}${color("message", progressText)}`, true, width, currentTransitionRenderedWidth(transition, progressText, transition.targetSingleColumn, width));
     }
     const progressText = formatAnimatedProgress(transition.target, now);
-    return animationResult(`${transition.linePrefix}${progressText}`, false, width, currentTransitionRenderedWidth(transition, progressText, transition.targetSingleColumn, width));
+    return animationResult(`${transition.linePrefix}${color("message", progressText)}`, false, width, currentTransitionRenderedWidth(transition, progressText, transition.targetSingleColumn, width));
   };
 
   const stopAnimationTimer = () => {

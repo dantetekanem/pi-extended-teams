@@ -4,11 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [2.4.1] - 2026-09-16
+## [2.4.2] - 2026-09-16
 
 ### Fixed
 - Return from `send_message` when an agent receives authorization instead of waiting for its long-running job to finish. Keep later messages available and preserve job failures during queued follow-ups.
 - Block spawned agents from using user-question and Orb tools, and restrict their direct messages to `team-lead`. Keep nested helper final reports routed to their requesting writer.
+- Remove an undeclared type import from the policy test so clean CI checkouts can typecheck.
+
+## [2.4.1] - 2026-09-16
+
+Not published: CI typechecking failed before npm staging. The fixes are included in 2.4.2.
 
 ## [2.4.0] - 2026-09-16
 

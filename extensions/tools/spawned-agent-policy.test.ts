@@ -5,7 +5,6 @@ import path from "node:path";
 import { findPackageJSON } from "node:module";
 import { pathToFileURL } from "node:url";
 import { AuthStorage, createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
-import type { AssistantMessage } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { registerSpawnedAgentCommunicationGuard, USER_INTERACTION_TOOLS } from "./spawned-agent-policy";
 
@@ -70,7 +69,7 @@ describe("spawned-agent communication guard", () => {
     session.agent.streamFn = () => {
       const stream = createAssistantMessageEventStream();
       const toolTurn = turns++ === 0;
-      const message: AssistantMessage = {
+      const message = {
         role: "assistant",
         api: model.api,
         provider: model.provider,

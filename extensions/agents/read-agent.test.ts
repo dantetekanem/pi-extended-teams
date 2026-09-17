@@ -1537,6 +1537,92 @@ describe("in-process read agent tool wiring", () => {
     expect(state.recentEvents).toContain("received lead message");
   });
 
+  it("returns after authorization is received and admits steering during the long-running job", async () => {
+    const session = makeSession();
+    session.isStreaming = false;
+    const job = Promise.withResolvers<void>();
+    const listeners = new Set<(event: any) => void>();
+    session.subscribe.mockImplementation(listener => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    });
+    session.sendUserMessage.mockImplementation(async (content = "", options?: { deliverAs: string }) => {
+      if (options?.deliverAs === "steer") return;
+      session.isStreaming = true;
+      for (const listener of listeners) {
+        listener({ type: "message_end", message: { role: "user", content } });
+      }
+      await job.promise;
+      session.isStreaming = false;
+    });
+    const state = { name: "writer", session, acceptingMessages: true, recentEvents: [] } as unknown as RunningReadAgent;
+    let authorized = false;
+    let steered = false;
+    const authorization = sendMessageToRunningReadAgent(state, "Authorized; start the job").then(() => { authorized = true; });
+    let steering: Promise<void> | undefined;
+    try {
+      await vi.waitFor(() => expect(authorized).toBe(true));
+      expect(state.activeOperationGeneration).toBeDefined();
+      steering = sendMessageToRunningReadAgent(state, "Include the latest requirement").then(() => { steered = true; });
+      await vi.waitFor(() => expect(steered).toBe(true));
+      expect(session.sendUserMessage).toHaveBeenLastCalledWith("Include the latest requirement", { deliverAs: "steer" });
+      let rawSettled = false;
+      void state.messageDeliveryTail!.then(() => { rawSettled = true; });
+      await Promise.resolve();
+      expect(rawSettled).toBe(false);
+      expect(session.abort).not.toHaveBeenCalled();
+    } finally {
+      job.resolve();
+      await authorization;
+      await steering;
+      await state.messageDeliveryTail;
+    }
+    expect(state.activeOperationGeneration).toBeUndefined();
+    expect(listeners.size).toBe(0);
+  });
+
+  it.each([false, true])("reports a continuation failure after acknowledgment (queued follow-up: %s)", async queuedFollowup => {
+    const session = makeSession();
+    session.isStreaming = false;
+    const job = Promise.withResolvers<void>();
+    const listeners = new Set<(event: any) => void>();
+    session.subscribe.mockImplementation(listener => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    });
+    session.sendUserMessage.mockImplementation(async (content = "") => {
+      if (session.sendUserMessage.mock.calls.length > 1) return;
+      for (const listener of listeners) {
+        listener({ type: "message_end", message: { role: "user", content } });
+      }
+      await job.promise;
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const member = eligibleNestedParent("writer");
+    writeTeamConfig("team", member);
+    const options = { ...makeRunOptions(), pendingChildController: createPendingChildController() };
+    const run = runReadAgentInProcess("team", member, "Work", {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, options);
+    try {
+      await vi.waitFor(() => expect(options.runningReadAgents.get("team:writer")?.acceptingMessages).toBe(true));
+      const state = options.runningReadAgents.get("team:writer")!;
+      await sendMessageToRunningReadAgent(state, "Authorized");
+      const followup = queuedFollowup
+        ? sendMessageToRunningReadAgent(state, "Next requirement").then(() => "delivered", error => error.message)
+        : undefined;
+      job.reject(new Error("Long-running job failed"));
+      if (followup) await expect(followup).resolves.toBe("Long-running job failed");
+      expect(session.sendUserMessage).toHaveBeenCalledOnce();
+      await vi.waitFor(() => expect(options.emitAgentReport).toHaveBeenCalledWith(
+        "team", "writer", expect.any(Number), expect.any(Number), expect.stringContaining("Long-running job failed"), false
+      ));
+    } finally {
+      options.pendingChildController.cancelParent({ teamName: "team", parentName: "writer", parentRunId: member.lifecycleRunId! });
+      await run;
+    }
+  });
+
   it.each([false, true])("acknowledges a helper report before parent completion (streaming: %s)", async (streaming) => {
     const session = makeSession();
     session.isStreaming = streaming;
@@ -1850,7 +1936,6 @@ describe("in-process read agent tool wiring", () => {
     expect(privateSessionDir).not.toContain(path.join(".pi", "agent", "sessions"));
     expect(sessionOptions.sessionManager).toBe(piMocks.sessionManagerCreate.mock.results[0].value);
     const promptText = piMocks.loaderOptions[0].appendSystemPrompt.join("\n");
-    expect(promptText).toContain("Use send_message for direct communication and read_inbox only when you were told a reply is waiting");
     expect(promptText).toContain("If another agent is needed, use send_message to ask team-lead");
     expect(promptText).toContain("only the lead decides and performs the spawn");
     expect(promptText).toContain("Progress reporting is required, not optional UI polish");
@@ -2512,6 +2597,35 @@ describe("in-process read agent tool wiring", () => {
     expect(emitAgentReport).toHaveBeenCalledWith(
       "team", "reader", expect.any(Number), 42, failedReport.report, false,
     );
+  });
+
+  it.each(["read", "write", "nested"] as const)("filters user tools and installs execution guards in %s sessions", async mode => {
+    const session = makeSession();
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const forbidden = ["ask_user", "ask_user_batch", "orb_ask", "orb_say"];
+    piMocks.loaderExtensions.push({ tools: new Map(
+      [...forbidden, "selected_extension_tool"].map(name => [name, { definition: { name } }])
+    ) });
+    const member = {
+      ...fixtureMember("worker", mode === "write" ? "write" : "read"),
+      ...(mode === "nested" ? { delegationDepth: 1, requestedBy: "writer" } : {}),
+    };
+    writeTeamConfig("team", member);
+    await runReadAgentInProcess("team", member, "Work", {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, makeRunOptions());
+    const options = piMocks.createAgentSession.mock.calls[0][0];
+    expect(options.tools).toContain("selected_extension_tool");
+    expect(options.excludeTools).toEqual(expect.arrayContaining(forbidden));
+    const handlers: Array<(event: any) => any> = [];
+    for (const factory of piMocks.loaderOptions[0].extensionFactories ?? []) {
+      factory({ on: (name: string, handler: any) => { if (name === "tool_call") handlers.push(handler); } });
+    }
+    for (const toolName of forbidden) {
+      expect(options.tools).not.toContain(toolName);
+      expect(handlers.some(handler => handler({ toolName, input: {} })?.block)).toBe(true);
+    }
+    expect(handlers.every(handler => !handler({ toolName: "read", input: {} })?.block)).toBe(true);
   });
 
   it("loads one immutable extension selection, activates its tools, and propagates parent trust", async () => {

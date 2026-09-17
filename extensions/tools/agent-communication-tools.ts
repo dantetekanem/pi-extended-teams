@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { requireLeadRecipient } from "./spawned-agent-policy";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
@@ -104,7 +105,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
     {
       name: "send_message",
       label: "Send Message",
-      description: "Send a direct message in the current Pi session. Spawned agents default to messaging the lead.",
+      description: "Send a direct message in the current Pi session. Spawned agents may message only team-lead.",
       parameters: Type.Object({
         recipient: Type.Optional(Type.String({ description: "Recipient agent name. Defaults to team-lead for spawned agents." })),
         content: Type.String(),
@@ -114,6 +115,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         const teamName = requireCurrentSession(options);
         const recipient = params.recipient || (options.isTeammate ? "team-lead" : undefined);
         if (!recipient) throw new Error("recipient is required when the lead sends a message.");
+        if (options.isTeammate) requireLeadRecipient(recipient);
         await messaging.sendPlainMessageIfRunning(teamName, options.agentName, recipient, params.content, params.summary || "Message");
         return { content: [{ type: "text", text: `Message sent to ${recipient}.` }], details: { session: teamName, recipient } };
       },

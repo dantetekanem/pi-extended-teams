@@ -20,6 +20,7 @@ import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
 import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools, formatRepairRequest, type SubmittedAgentReport } from "../tools/agent-communication-tools";
+import { registerSpawnedAgentCommunicationGuard, SPAWNED_AGENT_COMMUNICATION_GUIDANCE, USER_INTERACTION_TOOLS } from "../tools/spawned-agent-policy";
 import { requireWriteAgentTeam } from "../team/roster";
 import { isPiPromptPlanningMember, shouldSuppressLeadReportInjection } from "../../src/utils/workflow-metadata";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../../src/utils/settings";
@@ -389,31 +390,33 @@ export async function sendMessageToRunningReadAgent(
       const pendingInterrupt = agent.operationInterruptPromise;
       if (pendingInterrupt) await pendingInterrupt.catch(() => {});
       if (agent.messageDeliveryClosed || agent.stopRequested) throw new ReadAgentDeliveryCancelledError(agent.name);
-      if (requireReceipt) {
-        unsubscribe = session.subscribe(event => {
-          if (event.type !== "message_end" || event.message.role !== "user") return;
-          const body = event.message.content;
-          const text = typeof body === "string"
-            ? body
-            : body.filter(part => part.type === "text").map(part => part.text).join("\n");
-          if (text === content) {
-            received = true;
-            acknowledge();
-          }
-        });
-      }
+      if (agent.completedOperationError) throw agent.completedOperationError;
+      unsubscribe = session.subscribe(event => {
+        if (event.type !== "message_end" || event.message.role !== "user") return;
+        const body = event.message.content;
+        const text = typeof body === "string"
+          ? body
+          : body.filter(part => part.type === "text").map(part => part.text).join("\n");
+        if (text === content) {
+          received = true;
+          acknowledge();
+        }
+      });
       if (session.isStreaming) {
         await session.sendUserMessage(content, { deliverAs: "steer" as const });
       } else {
         await runReadAgentSessionOperation(agent, () => session.sendUserMessage(content, undefined));
         if (requireReceipt && !received) throw new Error(`Requester ${agent.name} finished without receiving the report.`);
       }
-    }
+    },
+    receipt
   );
   signalReadAgentWake(agent);
   pendingParentWakeSignals.get(agent)?.();
   try {
-    await deliveryResult;
+    // A normal send acknowledges receipt, not completion of the recipient's work.
+    // The delivery tail still owns that work for finalization and error handling.
+    await (requireReceipt ? deliveryResult : Promise.race([receipt, deliveryResult]));
     if (requireReceipt && !received) {
       // Keep the receipt wait outside the raw tail so parent finalization can cancel an unconsumed steer.
       await Promise.race([receipt, agent.messageDeliveryCancellation!.then(() => {
@@ -1056,6 +1059,7 @@ export async function runReadAgentInProcess(
       settingsManager: childSettingsManager,
       noExtensions: true,
       additionalExtensionPaths: [...resourcePlan.extensionPaths],
+      extensionFactories: [registerSpawnedAgentCommunicationGuard],
       noSkills: false,
       appendSystemPrompt: [
         `You are ${roleLabel} agent '${member.name}' in Pi session '${readTeamName}', running in-process so the lead can follow and control you from Pi.`,
@@ -1065,7 +1069,7 @@ export async function runReadAgentInProcess(
         role === "write"
           ? "Use read/bash/edit/write as needed for the assignment. Prefer precise edits. Stop and report if you need broader product or architecture approval."
           : "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
-        "Use send_message for direct communication and read_inbox only when you were told a reply is waiting. Do not coordinate a peer-agent society; the lead controls orchestration.",
+        SPAWNED_AGENT_COMMUNICATION_GUIDANCE,
         "Progress reporting is required, not optional UI polish. Call report_progress before your first work tool with a concise phrase describing what you are starting. Call it again whenever you change phase or evidence source, hit a blocker, or begin synthesis; never make more than 3 work-tool calls without a fresh progress update. Use a new phrase describing what you are doing now. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.",
         ...(member.requestedBy
           ? [`You are a depth-1 read helper requested by '${member.requestedBy}'. Your report_and_exit deliverable goes to that requesting writer; the lead receives only a classified completion notice. You cannot delegate.`]
@@ -1138,7 +1142,9 @@ export async function runReadAgentInProcess(
     const communicationToolNameSet = new Set(communicationToolNames);
     const delegationToolNameSet = new Set<string>(NESTED_DELEGATION_TOOL_NAMES);
     const extensionToolNames = loader.getExtensions().extensions.flatMap(extension => {
-      return Array.from(extension.tools.keys()).filter(name => !communicationToolNameSet.has(name) && !delegationToolNameSet.has(name));
+      return Array.from(extension.tools.keys()).filter(name =>
+        !communicationToolNameSet.has(name) && !delegationToolNameSet.has(name) && !USER_INTERACTION_TOOLS.includes(name)
+      );
     });
     const nestedReadAgentToolNames = nestedReadAgentTools.map(tool => tool.name);
     const activeToolNames = Array.from(new Set([
@@ -1179,6 +1185,7 @@ export async function runReadAgentInProcess(
       modelRuntime: parentModelRuntime,
       modelRegistry: ctx.modelRegistry,
       tools: activeToolNames,
+      excludeTools: USER_INTERACTION_TOOLS,
       customTools: [...communicationTools, ...nestedReadAgentTools],
       resourceLoader: loader,
       settingsManager: childSettingsManager,
@@ -1418,6 +1425,7 @@ export async function runReadAgentInProcess(
           // its continuation may accept or settle another child wave.
           const deliveryTail = state.messageDeliveryTail;
           if (deliveryTail) await deliveryTail.catch(() => {});
+          if (state.completedOperationError) throw state.completedOperationError;
         }
       } else if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
         completionResolution = resolveCurrentReport();

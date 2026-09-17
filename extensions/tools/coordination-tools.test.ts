@@ -483,7 +483,7 @@ describe("coordination tools", () => {
     expect(await messaging.readInbox(teamName, "staged-browser-designer", false, false)).toEqual([]);
   });
 
-  it("delivers lead scope updates directly to an active in-process agent", async () => {
+  it.each([false, true])("allows direct peer delivery only from the lead (teammate: %s)", async isTeammate => {
     const teamName = "message-team";
     writeConfig({
       name: teamName,
@@ -500,8 +500,8 @@ describe("coordination tools", () => {
     const deliverMessageToActiveAgent = vi.fn(async () => true);
 
     registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
-      agentName: "team-lead",
-      isTeammate: false,
+      agentName: isTeammate ? "writer" : "team-lead",
+      isTeammate,
       terminal: undefined,
       getTeamName: () => teamName,
       requireWriteAgentTeam: async () => teamName,
@@ -515,10 +515,16 @@ describe("coordination tools", () => {
       deliverMessageToActiveAgent,
     });
 
-    const result = await tools.get("send_message").execute("send", {
+    const delivery = tools.get("send_message").execute("send", {
       recipient: "reader",
       content: "Include the new screenshot in your audit.",
     });
+    if (isTeammate) {
+      await expect(delivery).rejects.toThrow(/team-lead/);
+      expect(deliverMessageToActiveAgent).not.toHaveBeenCalled();
+      return;
+    }
+    const result = await delivery;
 
     expect(deliverMessageToActiveAgent).toHaveBeenCalledWith(
       teamName,

@@ -16,6 +16,7 @@ export interface ReadAgentDeliveryState {
   acceptingMessages?: boolean;
   messageDeliveryClosed?: boolean;
   messageDeliveryTail?: Promise<void>;
+  messageAdmissionTail?: Promise<void>;
   messageDeliveryGeneration?: number;
   messageDeliveryCancellation?: Promise<void>;
   cancelMessageDelivery?: () => void;
@@ -163,7 +164,8 @@ export function closeReadAgentMessageDelivery(state: ReadAgentDeliveryState): Re
 export async function enqueueReadAgentMessageDelivery(
   state: ReadAgentDeliveryState,
   agentName: string,
-  send: () => Promise<void>
+  send: () => Promise<void>,
+  received?: Promise<void>
 ): Promise<DeliveryOutcome> {
   if (!state.acceptingMessages || state.messageDeliveryClosed) {
     throw new Error(`Cannot send message to ${agentName}: agent is finishing.`);
@@ -175,7 +177,8 @@ export async function enqueueReadAgentMessageDelivery(
   state.pendingMessageDeliveries = (state.pendingMessageDeliveries ?? 0) + 1;
 
   const previousDelivery = state.messageDeliveryTail ?? Promise.resolve();
-  const rawOutcome = previousDelivery.catch(() => {}).then(async (): Promise<DeliveryOutcome> => {
+  const previousAdmission = state.messageAdmissionTail ?? previousDelivery;
+  const rawOutcome = previousAdmission.catch(() => {}).then(async (): Promise<DeliveryOutcome> => {
     if (state.messageDeliveryClosed || state.messageDeliveryGeneration !== generation) {
       return { status: "cancelled" };
     }
@@ -192,7 +195,10 @@ export async function enqueueReadAgentMessageDelivery(
     await rawDelivery;
     return { status: "delivered" };
   });
-  state.messageDeliveryTail = rawOutcome.then(() => {}, () => {});
+  const settled = rawOutcome.then(() => {}, () => {});
+  // Receipt releases the next send, not ownership of the model run it started.
+  state.messageAdmissionTail = received ? Promise.race([received, settled]) : settled;
+  state.messageDeliveryTail = Promise.all([previousDelivery, settled]).then(() => {});
 
   try {
     const outcome = await Promise.race([

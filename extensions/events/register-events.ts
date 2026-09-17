@@ -15,6 +15,7 @@ import { generateLifecycleRunId } from "../../src/utils/lifecycle-tombstone";
 import { cleanupStaleSessionContextReferences } from "../internal/session-context-reference";
 import { cleanupStalePrivateAgentSessions } from "../internal/agent-session-files";
 import { expireCheckpoints } from "../../src/results/checkpoint-retention";
+import { registerSpawnedAgentCommunicationGuard, SPAWNED_AGENT_COMMUNICATION_GUIDANCE } from "../tools/spawned-agent-policy";
 
 export const LEAD_ORCHESTRATION_GUIDANCE = `\n\npi-extended-teams lead orchestration rules:\n- Choose tiers by the agent's intended outcome, not by vague task importance. read-review is the normal default for focused review, verification, and bounded synthesis.\n- Use read-collect when the lane gathers bounded facts without owning the conclusion. Use read-analyze when it must explain behavior or root cause across connected evidence. Reserve read-critical for irreducible high-stakes security, architecture, concurrency, migration, or data-correctness reasoning.\n- For edits, use write-patch for a narrow localized change, write-feature for a bounded feature with a known design, write-system for a cross-cutting integration/refactor within explicitly claimed files, and write-critical only for high-risk security, concurrency, recovery, migration, or data-integrity changes.\n- Prefer the canonical read-*/write-* tiers. Legacy reading-*/writing-* names are compatibility aliases for this minor release, not intent guidance.\n- A spawned agent owns its assigned lane until it reports, blocks, fails, or the user cancels it. Do not duplicate, take over, test, edit, or synthesize that same lane in parallel; work only on clearly unrelated lanes.\n- When no unrelated work remains, end the turn. The extension resumes you when a report arrives. One get_agent_status snapshot is allowed when current status is needed; do not repeatedly call it, sleep, busy-wait, loop on inbox/status, send nudges, do dummy work, or treat healthy silence as failure.\n- Wait for the actual report before synthesizing. Intervene only on a reported blocker/error, actual health failure, or explicit user cancellation/change.\n- For durable bug, security, or testing claims from an agent report or backlog, concrete, reproducible findings with file/line evidence or a focused failing regression may proceed directly to TDD repair.
 - Use a separate read-only confirmation only when evidence is missing or weak, the claim is disputed, or irreducible high-risk uncertainty remains; never reconfirm an already confirmed finding.`;
@@ -66,6 +67,7 @@ export function registerAgentReportRenderer(pi: any): void {
 }
 
 export function registerExtensionEvents(pi: any, options: RegisterEventsOptions): void {
+  if (options.isTeammate) registerSpawnedAgentCommunicationGuard(pi);
   let teammateWakeIfUnread: (() => Promise<void>) | null = null;
   let teammatePendingInboxWake = false;
   let teammateInboxWakeTimer: NodeJS.Timeout | null = null;
@@ -387,6 +389,7 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     if (!options.isTeammate) {
       return { systemPrompt: event.systemPrompt + LEAD_ORCHESTRATION_GUIDANCE };
     }
+    const systemPrompt = `${event.systemPrompt}\n\n${SPAWNED_AGENT_COMMUNICATION_GUIDANCE}`;
     if (firstTurn) {
       firstTurn = false;
 
@@ -430,8 +433,9 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
       }
 
       return {
-        systemPrompt: event.systemPrompt + `\n\nYou are spawned agent '${options.agentName}' in Pi session '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}\n\nCore rules for every spawned agent:\n- NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.\n- You cannot spawn, promote, or create other agents. If another agent is needed, use send_message to ask team-lead to decide and spawn.\n- Use send_message for direct communication and read_inbox when the extension wakes you or you expect a reply.\n- Progress reporting is required, not optional UI polish. After reading your initial instructions, call report_progress before your first work tool with a concise phrase describing what you are starting. Call it again whenever you change phase or evidence source, hit a blocker, or begin synthesis; never make more than 3 work-tool calls without a fresh progress update. Use a new phrase describing what you are doing now. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.\n- When your work is done, report and exit cleanly. Do not wait for the lead to shut you down.${roleSpecificGuidance}${rosterInfo}\nStart by calling read_inbox to get your initial instructions.`,
+        systemPrompt: systemPrompt + `\n\nYou are spawned agent '${options.agentName}' in Pi session '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}\n\nCore rules for every spawned agent:\n- NEVER sleep, busy-wait, or poll. Do not use bash sleep, while-true, or any wait/poll loop. The extension wakes you when messages arrive.\n- You cannot spawn, promote, or create other agents. If another agent is needed, use send_message to ask team-lead to decide and spawn.\n- Use send_message for direct communication and read_inbox when the extension wakes you or you expect a reply.\n- Progress reporting is required, not optional UI polish. After reading your initial instructions, call report_progress before your first work tool with a concise phrase describing what you are starting. Call it again whenever you change phase or evidence source, hit a blocker, or begin synthesis; never make more than 3 work-tool calls without a fresh progress update. Use a new phrase describing what you are doing now. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.\n- When your work is done, report and exit cleanly. Do not wait for the lead to shut you down.${roleSpecificGuidance}${rosterInfo}\nStart by calling read_inbox to get your initial instructions.`,
       };
     }
+    return { systemPrompt };
   });
 }

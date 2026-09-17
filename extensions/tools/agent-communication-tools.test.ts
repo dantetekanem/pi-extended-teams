@@ -116,6 +116,15 @@ describe("read-agent communication tools", () => {
     expect(result.content[0].text).toContain("Initial instructions");
   });
 
+  it.each(["read", "write"] as const)("routes %s agent questions only to team-lead", async role => {
+    const send = makeTools("session", "reader", role).get("send_message")!;
+    await send.execute("default", { content: "Which approach?" });
+    await send.execute("explicit", { recipient: "team-lead", content: "Approval needed" });
+    await expect(send.execute("peer", { recipient: "writer", content: "Which approach?" })).rejects.toThrow(/team-lead/);
+    expect(await readInbox("session", "writer", false, false)).toHaveLength(0);
+    expect(await readInbox("session", "team-lead", false, false)).toHaveLength(2);
+  });
+
   it("exposes direct communication and complete final reporting to read agents", () => {
     const tools = Array.from(makeTools("session", "reader", "read").keys()).sort();
 
@@ -221,20 +230,6 @@ describe("read-agent communication tools", () => {
       summary: "finding",
       read: false,
     });
-  });
-
-  it("send_message fails when the recipient subagent is not running", async () => {
-    const configPath = paths.configPath("session");
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify({ name: "session", members: [{ name: "team-lead" }, { name: "reader" }] }));
-    const tools = makeTools("session", "reader");
-
-    await expect(tools.get("send_message")!.execute("send", {
-      recipient: "finished-agent",
-      content: "Please continue.",
-    })).rejects.toThrow("Cannot send message to finished-agent: agent is not running.");
-
-    expect(await readInbox("session", "finished-agent", false, false)).toEqual([]);
   });
 
   it("report_progress normalizes and persists progress without inbox side effects", async () => {

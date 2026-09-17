@@ -104,6 +104,22 @@ describe("extension teammate inbox wake", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it.each([true, false])("guards user interaction only for spawned sessions (teammate: %s)", async isTeammate => {
+    const { handlers, ctx } = setupEvents(() => true, { isTeammate });
+    const execute = vi.fn();
+    for (let turn = 0; turn < 2; turn++) {
+      await handlers.get("before_agent_start")![0]({ systemPrompt: "base" }, ctx);
+      for (const toolName of ["ask_user", "ask_user_batch", "orb_ask", "orb_say"]) {
+        const blocked = handlers.get("tool_call")?.some(handler => handler({ toolName, input: {} }, ctx)?.block);
+        if (!blocked) execute(toolName);
+        expect(Boolean(blocked)).toBe(isTeammate);
+      }
+      const safe = handlers.get("tool_call")?.some(handler => handler({ toolName: "read", input: {} }, ctx)?.block);
+      expect(Boolean(safe)).toBe(false);
+    }
+    expect(execute).toHaveBeenCalledTimes(isTeammate ? 0 : 8);
+  });
+
   it("renders agent report messages open even when tool expansion is collapsed", () => {
     const registerMessageRenderer = vi.fn();
     registerExtensionEvents({

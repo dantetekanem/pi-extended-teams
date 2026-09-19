@@ -8,9 +8,6 @@ import { createActivityColors } from "./activity-colors";
 
 const REFRESH_INTERVAL_MS = 250;
 const MAX_NAVIGATION_AGENTS = 6;
-const COLLAPSED_TOOL_RESULT_LINE_LIMIT = 14;
-const COLLAPSED_TOOL_RESULT_HEAD_LINES = 8;
-const COLLAPSED_TOOL_RESULT_TAIL_LINES = 3;
 
 export interface AgentFollowViewOptions {
   getAgents(): RunningReadAgent[];
@@ -227,7 +224,7 @@ function renderToolBlock(theme: ExtendedTeamsTheme, block: Extract<TranscriptBlo
   if (compactBlock) return compactBlock;
 
   const header = renderToolHeader(theme, block);
-  if (!expandLargeToolResults && (block.name === "read" || block.name === "bash" || block.name === "ls")) {
+  if (!expandLargeToolResults) {
     const state = block.result === undefined
       ? pendingText(theme, "working")
       : block.isError ? failureText(theme, "✗") : successText(theme, "✓");
@@ -241,22 +238,12 @@ function renderToolBlock(theme: ExtendedTeamsTheme, block: Extract<TranscriptBlo
 
   const result = block.result || "(no output)";
   const resultLines = result.split("\n");
-  const isCollapsed = !expandLargeToolResults && resultLines.length > COLLAPSED_TOOL_RESULT_LINE_LIMIT;
-  const visibleLines = isCollapsed
-    ? [
-        ...resultLines.slice(0, COLLAPSED_TOOL_RESULT_HEAD_LINES),
-        `… ${resultLines.length - COLLAPSED_TOOL_RESULT_HEAD_LINES - COLLAPSED_TOOL_RESULT_TAIL_LINES} lines hidden · press l to expand logs`,
-        ...resultLines.slice(-COLLAPSED_TOOL_RESULT_TAIL_LINES),
-      ]
-    : resultLines;
   const resultLineWidth = width === undefined ? undefined : Math.max(1, width - visibleWidth("│ "));
-  const boundedLines = visibleLines.map((line) => resultLineWidth === undefined
+  const boundedLines = resultLines.map((line) => resultLineWidth === undefined
     ? line
     : truncateToWidth(line, resultLineWidth, "…"));
-  const body = boundedLines.map((line, index) => isCollapsed && index === COLLAPSED_TOOL_RESULT_HEAD_LINES
-    ? `${structuralText(theme, "│")} ${mutedText(theme, line)}`
-    : `${structuralText(theme, "│")} ${line}`);
-  const summary = `${resultLines.length} line${resultLines.length === 1 ? "" : "s"} · ${formatResultSize(result)}${isCollapsed ? " · collapsed" : ""}`;
+  const body = boundedLines.map((line) => `${structuralText(theme, "│")} ${line}`);
+  const summary = `${resultLines.length} line${resultLines.length === 1 ? "" : "s"} · ${formatResultSize(result)}`;
   const renderedSummary = block.isError ? failureText(theme, summary) : successText(theme, summary);
   return [header, ...body, `${structuralText(theme, "╰─")} ${renderedSummary}`, ""];
 }

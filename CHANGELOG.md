@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.3] - 2026-09-19
+
+### Fixed
+- Collapse all tool calls by default in the agent view, including search and custom tools. Keep the `l` log expansion toggle.
+
 ## [2.4.2] - 2026-09-16
 
 ### Fixed

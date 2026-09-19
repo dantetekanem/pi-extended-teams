@@ -72,7 +72,7 @@ describe("agent follow transcript", () => {
     ]);
 
     expect(stripAnsi(lines[0] || "")).toContain("read-safe next");
-    expect(stripAnsi(lines[4] || "")).toContain("bash-safe next");
+    expect(stripAnsi(lines[1] || "")).toContain("bash-safe next");
     expect(lines.join("\n")).not.toContain("\u001b[2J");
     expect(lines.join("\n")).not.toContain("\u001b]52");
   });
@@ -129,24 +129,17 @@ describe("agent follow transcript", () => {
     }
   });
 
-  it("collapses large tool results with head and tail context and can expand them", () => {
+  it("compacts large search results to one row and expands every output line", () => {
     const output = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n");
     const messages = [
       { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "agentic_search", arguments: { query: "TODO" } }] },
       { role: "toolResult", toolCallId: "call-1", toolName: "agentic_search", content: output },
     ];
 
-    const collapsed = stripAnsi(formatAgentFollowTranscript(messages).join("\n"));
-    expect(collapsed.split("\n")).toContain("agentic_search · TODO");
-    expect(collapsed).toContain("9 lines hidden · press l to expand logs");
-    expect(collapsed).not.toContain("│ line 10");
-    expect(collapsed).toContain("│ line 20");
-    expect(collapsed).toContain("collapsed");
+    expect(formatAgentFollowTranscript(messages).map(stripAnsi)).toEqual(["agentic_search · TODO · ✓"]);
 
-    const expanded = stripAnsi(formatAgentFollowTranscript(messages, { expandLargeToolResults: true }).join("\n"));
-    expect(expanded).toContain("│ line 10");
-    expect(expanded).not.toContain("lines hidden");
-    expect(expanded).not.toContain("collapsed");
+    const expanded = formatAgentFollowTranscript(messages, { expandLargeToolResults: true }).map(stripAnsi);
+    expect(expanded.slice(1, -2)).toEqual(output.split("\n").map(line => `│ ${line}`));
   });
 
   it.each([
@@ -155,6 +148,9 @@ describe("agent follow transcript", () => {
     ["bash", { command: "echo one\necho two" }, "one\ntwo", "bash · $ echo one echo two · ✓"],
     ["ls", { path: "src", limit: 10 }, "a.ts\nb.ts", "ls · src · ✓"],
     ["ls", {}, "a.ts", "ls · . · ✓"],
+    ["agentic_search", { query: "TODO" }, "one match", "agentic_search · TODO · ✓"],
+    ["custom_tool", { value: "test" }, "custom output", 'custom_tool · {"value":"test"} · ✓'],
+    ["custom_tool", undefined, "", "custom_tool · ✓"],
   ])("compacts %s results and keeps output available when expanded", (name, args, output, expected) => {
     const messages = [
       { role: "assistant", content: [{ type: "toolCall", id: "compact", name, arguments: args }] },
@@ -165,7 +161,7 @@ describe("agent follow transcript", () => {
     expect(expanded).toContain(`│ ${output.split("\n")[0] || "(no output)"}`);
   });
 
-  it.each(["read", "bash", "ls"])("keeps %s pending and failed states on a single bounded row", (name) => {
+  it.each(["read", "bash", "ls", "agentic_search", "custom_tool"])("keeps %s pending and failed states on a single bounded row", (name) => {
     const messages = [{ role: "assistant", content: [{ type: "toolCall", id: "state", name, arguments: { path: "a.ts", command: "false" } }] }];
     expect(formatAgentFollowTranscript(messages).map(stripAnsi)[0]).toMatch(/ · working$/);
     const failed = [...messages, { role: "toolResult", toolCallId: "state", toolName: name, content: "Failed", isError: true }];
@@ -421,8 +417,9 @@ describe("agent follow component", () => {
     vi.unstubAllEnvs();
   });
 
-  it("toggles compact read and bash output with l", () => {
-    const messages = ["read", "bash"].flatMap(name => [
+  it("toggles built-in and custom tool output with l", () => {
+    const names = ["read", "bash", "agentic_search", "custom_tool"];
+    const messages = names.flatMap(name => [
       { role: "assistant", content: [{ type: "toolCall", id: name, name, arguments: name === "read" ? { path: "a.ts" } : { command: "echo result" } }] },
       { role: "toolResult", toolCallId: name, toolName: name, content: `${name} result` },
     ]);
@@ -430,13 +427,19 @@ describe("agent follow component", () => {
       getAgents: () => [makeAgent({ session: { messages } as any })],
     });
     try {
-      component.render(100);
+      const collapsed = stripAnsi(component.render(100).join("\n"));
+      for (const name of names) {
+        expect(collapsed).toMatch(new RegExp(`${name} · .* · ✓`));
+      }
+
       component.handleInput("l");
       const expanded = stripAnsi(component.render(100).join("\n"));
-      expect(expanded).toContain("│ read result");
-      expect(expanded).toContain("│ bash result");
+      for (const name of names) {
+        expect(expanded).toContain(`│ ${name} result`);
+      }
+
       component.handleInput("l");
-      expect(stripAnsi(component.render(100).join("\n"))).toContain("read · a.ts · 1 line · 11 B · ✓");
+      expect(stripAnsi(component.render(100).join("\n"))).toBe(collapsed);
     } finally {
       component.dispose();
     }

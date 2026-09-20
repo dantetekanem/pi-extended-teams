@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-09-19
+
+### Fixed
+- Keep cleanup status separate from animated progress so an agent's final footer message does not repeatedly erase and retype while exiting.
+
 ## [2.5.0] - 2026-09-19
 
 ### Added

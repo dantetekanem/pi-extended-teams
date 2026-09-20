@@ -852,7 +852,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       if (result.status === "occupied" && result.tombstone.phase === "persistence_closed"
         && runningAgents.some(agent => agent.name === quarantinedName && agent.runId === result.tombstone.runId)) {
         const entryIndex = entries.findIndex(entry => entry.name === quarantinedName);
-        footerStatuses[entryIndex] += " · Finishing cleanup";
+        entries[entryIndex].statusNote = "Finishing cleanup";
         continue;
       }
       const persistedMember = activityMembers.find(member => member.name === quarantinedName);

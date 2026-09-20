@@ -9,6 +9,7 @@ export interface TeamActivityStatusEntry {
   status?: string;
   detail?: string;
   displayText?: string;
+  statusNote?: string;
 }
 
 export type TeamActivityStatusCounts = Record<string, number>;
@@ -399,9 +400,13 @@ export function teamActivityStatusWidget(
             transitionHint = candidate;
           }
         }
-        const animated = animateEntry(entry, branch, now, width, transitionHint, index, hasCachedTransitionEntry);
+        const note = entry.statusNote ? ` · ${entry.statusNote}` : "";
+        const progressWidth = note ? Math.max(0, width - visibleWidth(note)) : width;
+        const animated = animateEntry(entry, branch, now, progressWidth, transitionHint, index, hasCachedTransitionEntry);
         animationActive ||= animated.active;
-        lines.push(animated.text);
+        lines.push(note
+          ? truncateToWidth(`${animated.text.trimEnd()}${theme.fg("dim", note)}`, width, "…", true)
+          : animated.text);
       }
       if (rosterChanged) {
         const activeKeys = new Set<string>();

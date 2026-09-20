@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Key } from "@mariozechner/pi-tui";
+import { Key, visibleWidth } from "@mariozechner/pi-tui";
 import { globalSettingsPath, LEGACY_FAVORITE_MODEL_SLOT_ALIASES, projectSettingsPath } from "../src/utils/settings";
 
 type RegisteredTool = {
@@ -2201,11 +2201,29 @@ describe("extension integration", () => {
       }
       await vi.advanceTimersByTimeAsync(1_200);
       const call = ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === "01-pi-extended-teams-readers").at(-1);
-      const card = call![1]({ requestRender: vi.fn() }).render(160).join("\n");
-      expect(card.match(/reporter/g)).toHaveLength(kind === "matching" ? 1 : 2);
-      expect(card).toContain("Sending exact report");
-      if (kind === "matching") expect(card).toContain("Finishing cleanup");
-      if (kind === "failed" || kind === "corrupt") expect(card).toContain("Cleanup blocked");
+      const widget = call![1]({ requestRender: vi.fn() });
+      try {
+        const card = widget.render(160).join("\n");
+        expect(card.match(/reporter/g)).toHaveLength(kind === "matching" ? 1 : 2);
+        expect(card).toContain("Sending exact report");
+        if (kind === "matching") {
+          expect(card).toContain("Finishing cleanup");
+          for (let tick = 0; tick < 3; tick++) {
+            await vi.advanceTimersByTimeAsync(1_000);
+            widget.render(160);
+            await vi.advanceTimersByTimeAsync(250);
+            const frame = widget.render(160).join("\n");
+            expect(frame).toContain("Sending exact report");
+            expect(frame).toContain("Finishing cleanup");
+          }
+          for (const width of [10, 40, 80]) {
+            expect(widget.render(width).every((line: string) => visibleWidth(line) <= width)).toBe(true);
+          }
+        }
+        if (kind === "failed" || kind === "corrupt") expect(card).toContain("Cleanup blocked");
+      } finally {
+        widget.dispose();
+      }
     } finally { setup.restoreEnv(); }
   });
 

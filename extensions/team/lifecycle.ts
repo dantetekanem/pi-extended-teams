@@ -10,7 +10,7 @@ import { createReportResult } from "../../src/results/report-result";
 import { VerificationController } from "../../src/results/verification-controller";
 import { CompletionGroup } from "../../src/results/completion-group";
 import { enqueueCompletionGroupDeliveries } from "../../src/results/completion-group-delivery";
-import { loadSettings } from "../../src/utils/settings";
+import { loadSettings, type WatchdogConfig } from "../../src/utils/settings";
 import type { Member } from "../../src/utils/models";
 import type { RunningReadAgent } from "../runtime/types";
 import {
@@ -46,12 +46,16 @@ export interface LifecycleRuntimeOptions {
   onTeammateClosing?(teamName: string, member: Member): void;
   onTeammateSettled?(teamName: string, member: Member): void;
   extensionInstanceId?: string;
+  notifyIdleAgent?(content: string): void | Promise<void>;
+  hasPendingChildren?(teamName: string, member: Member): boolean;
 }
 
 export interface ShutdownTeammateOptions {
   drainQueue?: boolean;
   removeMember?: boolean;
   reason?: unknown;
+  /** Revalidate automatic cancellation after asynchronous lifecycle reads. */
+  shouldStop?(): boolean;
 }
 
 interface ReapedTeammate {
@@ -68,6 +72,8 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
   let leadWatchdogTimer: NodeJS.Timeout | null = null;
   let leadWatchdogGeneration = 0;
   const extensionInstanceId = options.extensionInstanceId ?? generateExtensionInstanceId();
+  const idleObservations = new Map<string, { activityAt: number; since: number; warned: boolean; attempted: boolean }>();
+  let watchdogInFlight = false;
 
   async function finalizeTeammateRuntime(teamName: string, member: Member, expectedRunId: string): Promise<void> {
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
@@ -161,13 +167,6 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       }
       member.lifecycleRunId = expectedRunId;
     }
-    try {
-      options.onTeammateClosing?.(teamName, { ...member, lifecycleRunId: expectedRunId });
-    } catch {
-      // Lifecycle cancellation hooks are in-memory notifications only. Persisted
-      // teardown ownership remains authoritative if an observer fails.
-    }
-
     const persistedRuntime = await runtime.readRuntimeStatus(teamName, member.name).catch(() => null);
     if (persistedRuntime?.lifecycleRunId && persistedRuntime.lifecycleRunId !== expectedRunId) {
       return boundedQuarantineResult(
@@ -388,6 +387,15 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       });
     };
 
+    if (shutdownOptions.shouldStop && !shutdownOptions.shouldStop()) {
+      return { ...baseResult(), finalized: false, error: "Idle cancellation skipped: activity or ownership changed." };
+    }
+    try {
+      options.onTeammateClosing?.(teamName, { ...member, lifecycleRunId: expectedRunId });
+    } catch {
+      // Lifecycle cancellation hooks are in-memory notifications only. Persisted
+      // teardown ownership remains authoritative if an observer fails.
+    }
     if (expectedState) {
       return requestReadAgentTeardown(expectedState, {
         reason,
@@ -461,12 +469,104 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
     )));
   }
 
+  async function notifyIdleAgent(teamName: string, content: string): Promise<void> {
+    if (options.notifyIdleAgent) await options.notifyIdleAgent(content);
+    else await messaging.sendPlainMessage(teamName, "watchdog", "team-lead", content, "Agent idle watchdog", "yellow");
+  }
+
+  async function checkIdleAgent(
+    teamName: string,
+    member: Member,
+    members: Member[],
+    status: runtime.AgentRuntimeStatus | null,
+    settings: WatchdogConfig,
+    shouldContinue: () => boolean,
+  ): Promise<void> {
+    if (!shouldContinue()) return;
+    const key = options.readAgentKey(teamName, member.name);
+    const state = options.runningReadAgents.get(key);
+    const runId = member.lifecycleRunId;
+    if (!runId || member.isActive === false || (state ? state.runId !== runId : status?.lifecycleRunId !== runId)) return;
+    const activityAt = state?.lastActivityAt ?? status?.lastActivityAt;
+    if (activityAt === undefined) return; // Old terminal runtimes have no trustworthy activity evidence.
+    const identity = `${teamName}:${member.name}:${runId}`;
+    let observation = idleObservations.get(identity);
+    if (!observation || observation.activityAt !== activityAt) {
+      observation = { activityAt, since: activityAt, warned: false, attempted: false };
+      idleObservations.set(identity, observation);
+    }
+    const isProtected = () => {
+      if (options.hasPendingChildren?.(teamName, member)) return true;
+      if (state) {
+        return state.status === "starting" || state.status === "finishing" || !!state.stopRequested
+          || state.acceptingMessages === false || !!state.activeToolName || !!state.activeWork?.size
+          || !!state.checkOperation || !!state.checkpointOperation;
+      }
+      return status?.ready !== true || status.currentAction === "starting" || status.currentAction === "finishing"
+        || status.currentAction === "done" || !!status.activeToolName || !!status.activeWorkCount;
+    };
+    const hasChild = members.some(child => child.isActive !== false && child.parentAgentName === member.name
+      && child.parentLifecycleRunId === runId);
+    if (isProtected() || hasChild) {
+      observation.since = Date.now();
+      observation.warned = false;
+      observation.attempted = false;
+      return;
+    }
+    const idleMs = Date.now() - observation.since;
+    const reference = `${member.name} (team ${teamName}, run ${runId})`;
+    const context = `Last activity: ${new Date(activityAt).toISOString()}.${member.prompt ? ` Assignment: ${member.prompt.slice(0, 300)}` : ""}`;
+    if (idleMs >= settings.idleWarningMinutes * 60_000 && !observation.warned) {
+      observation.warned = true;
+      try {
+        await notifyIdleAgent(teamName, `Agent ${reference} is idle: no messages, tokens, or work activity for ${Math.floor(idleMs / 60_000)} minutes. ${context}`);
+      } catch (error) {
+        observation.warned = false;
+        throw error;
+      }
+    }
+    if (!settings.idleAutoStop || idleMs < settings.idleStopMinutes * 60_000 || observation.attempted || !shouldContinue()) return;
+    // Re-read persisted ownership before cancelling; a report or replacement may have won the race.
+    const current = (await teams.readConfig(teamName)).members.find(candidate => candidate.name === member.name);
+    if (current?.lifecycleRunId !== runId || current.isActive === false) return;
+    const fence = await readLifecycleTombstone(teamName, member.name);
+    if (fence.status !== "absent") return;
+    if (!state) {
+      const latest = await runtime.readRuntimeStatus(teamName, member.name);
+      if (latest?.lifecycleRunId !== runId || latest.lastActivityAt !== activityAt) return;
+      status = latest;
+    }
+    const stillIdle = () => shouldContinue() && !isProtected() && (state
+      ? options.runningReadAgents.get(key) === state && state.lastActivityAt === activityAt
+      : !options.runningReadAgents.has(key));
+    if (!stillIdle()) return;
+    observation.attempted = true;
+    const describeStop = (result: ReadAgentTeardownResult) => result.status === "settled" && result.finalized
+      ? `Agent ${reference} automatically stopped after ${Math.floor(idleMs / 60_000)} idle minutes.`
+      : `Agent ${reference} idle stop is not complete (${result.status}); cancellation/cleanup remains pending or failed. ${result.error ?? ""}`;
+    try {
+      const result = await shutdownTeammate(teamName, current, { shouldStop: stillIdle });
+      if (shouldContinue()) await notifyIdleAgent(teamName, describeStop(result));
+      if (!result.finalized && state?.teardownFinalizationPromise) {
+        void state.teardownFinalizationPromise.then(async final => {
+          if (shouldContinue()) await notifyIdleAgent(teamName, describeStop(final));
+        }).catch(() => {});
+      }
+    } catch (error) {
+      if (shouldContinue()) await notifyIdleAgent(teamName, `Agent ${reference} idle stop or notification failed: ${errorText(error)}`);
+    }
+  }
+
   async function runWatchdogOnce(targetTeamName: string, shouldContinue: () => boolean = () => true): Promise<void> {
     const settings = loadSettings({ projectDir: options.getSessionCwd() || process.cwd() });
     const staleMs = runtime.HEARTBEAT_STALE_MS + settings.watchdog.bufferSeconds * 1000;
     const now = Date.now();
     const config = await teams.readConfig(targetTeamName);
     const members = config.members.filter((member) => member.name !== "team-lead");
+    const identities = new Set(members.map(member => `${targetTeamName}:${member.name}:${member.lifecycleRunId}`));
+    for (const identity of idleObservations.keys()) {
+      if (identity.startsWith(`${targetTeamName}:`) && !identities.has(identity)) idleObservations.delete(identity);
+    }
     const runtimeStatusByMember = await readRuntimeStatusByMember(targetTeamName, members);
     const reaped: ReapedTeammate[] = [];
 
@@ -482,6 +582,11 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
         const key = options.readAgentKey(targetTeamName, member.name);
         const inProcessAlive = options.runningReadAgents.has(key);
 
+        if (inProcessAlive || runtimeStatus?.activeToolName || runtimeStatus?.activeWorkCount) {
+          await checkIdleAgent(targetTeamName, member, members, runtimeStatus, settings.watchdog, shouldContinue);
+          continue;
+        }
+
         if (runtimeStale && !inProcessAlive) {
           const result = await shutdownTeammate(targetTeamName, member, { drainQueue: false });
           if (result.status === "settled" && result.finalized) {
@@ -496,7 +601,9 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
           if (result.status === "settled" && result.finalized) {
             reaped.push({ member, reason: "legacy tmux screen is gone" });
           }
+          continue;
         }
+        await checkIdleAgent(targetTeamName, member, members, runtimeStatus, settings.watchdog, shouldContinue);
       }
     } finally {
       await flushReapedTeammates(targetTeamName, reaped);
@@ -510,6 +617,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
     if (leadWatchdogTimer) clearInterval(leadWatchdogTimer);
     leadWatchdogTimer = null;
     leadWatchdogStarted = false;
+    idleObservations.clear();
   }
 
   function startLeadWatchdog() {
@@ -517,13 +625,16 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
     leadWatchdogStarted = true;
     const generation = ++leadWatchdogGeneration;
     leadWatchdogTimer = setInterval(async () => {
-      if (generation !== leadWatchdogGeneration) return;
+      if (generation !== leadWatchdogGeneration || watchdogInFlight) return;
       const teamName = options.getTeamName();
       if (!teamName) return;
+      watchdogInFlight = true;
       try {
         await runWatchdogOnce(teamName, () => generation === leadWatchdogGeneration);
       } catch {
-        // Keep watchdog quiet; health is visible in the live agent view and inbox messages on actual reaps.
+        // Retry observations on the next tick; stop attempts are not repeated blindly.
+      } finally {
+        watchdogInFlight = false;
       }
     }, 30000);
   }

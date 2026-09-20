@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { buildPiCommand, getPiLaunchCommand, shellQuote } from "../internal/pi-command";
 import { herdrCommand } from "../runtime/herdr";
+import { recordAgentActivity } from "../runtime/agent-activity";
 import * as runtime from "../../src/utils/runtime";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
@@ -327,6 +328,7 @@ export function handleReadAgentSessionEvent(
   renderReadAgentStatus: () => void
 ): void {
   const eventType = event.type;
+  recordAgentActivity(state, event);
   if (eventType === "agent_start" || eventType === "turn_start") {
     markReadAgentActivity(state, "thinking", "thinking");
   }

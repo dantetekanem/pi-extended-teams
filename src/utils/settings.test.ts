@@ -73,7 +73,7 @@ describe("loadSettings", () => {
 
   it("returns defaults when no files exist", () => {
     const s = loadSettings({ homeDir, projectDir });
-    expect(s.watchdog.bufferSeconds).toBe(30);
+    expect(s.watchdog).toEqual({ bufferSeconds: 30, idleWarningMinutes: 5, idleStopMinutes: 10, idleAutoStop: true });
     expect(s.writeAgents.maxConcurrent).toBe(DEFAULT_WRITE_AGENT_MAX_CONCURRENT);
     expect(s.writeAgents.queueOverflow).toBe(true);
     expect(s.readAgents.maxConcurrent).toBe(DEFAULT_READ_AGENT_MAX_CONCURRENT);
@@ -85,6 +85,18 @@ describe("loadSettings", () => {
     expect(s.extensions.allow).toBeNull();
     expect(s.agentSessions.showInResume).toBe(false);
     expect(s.debug.enabled).toBe(false);
+  });
+
+  it("layers idle thresholds and preserves valid settings when overrides are invalid", () => {
+    writeGlobal({ watchdog: { idleWarningMinutes: 2, idleStopMinutes: 8, idleAutoStop: false } });
+    writeProject({ watchdog: { idleWarningMinutes: 3, idleStopMinutes: null, idleAutoStop: "yes" } });
+    expect(loadSettings({ homeDir, projectDir }).watchdog).toEqual({
+      bufferSeconds: 30, idleWarningMinutes: 3, idleStopMinutes: 8, idleAutoStop: false,
+    });
+    writeProject({ watchdog: { idleWarningMinutes: -1, idleStopMinutes: "4" } });
+    expect(loadSettings({ homeDir, projectDir }).watchdog.idleStopMinutes).toBe(8);
+    writeProject({ watchdog: { idleWarningMinutes: 0, idleStopMinutes: 0 } });
+    expect(loadSettings({ homeDir, projectDir }).watchdog.idleWarningMinutes).toBe(2);
   });
 
   it("does not mutate DEFAULT_SETTINGS", () => {

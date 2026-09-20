@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-09-19
+
+### Added
+- Warn the lead after five idle minutes and automatically stop agents after ten, with configurable thresholds and an auto-stop switch. Track messages, streamed tokens, and tool activity separately from heartbeats; protect active work and parents with queued or running helpers. Report pending cleanup and its eventual success or failure.
+
 ## [2.4.3] - 2026-09-19
 
 ### Fixed

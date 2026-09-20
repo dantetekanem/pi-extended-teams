@@ -5,6 +5,7 @@ import * as paths from "../../src/utils/paths";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
 import * as teams from "../../src/utils/teams";
+import { recordAgentActivity, type AgentActivity } from "../runtime/agent-activity";
 import { cleanupAgentSessionFolders, cleanupOrphanedTeams } from "../internal/session-files";
 import { summarizeSessionUsage } from "../internal/session-usage";
 import { formatElapsed, formatTokenCount } from "../ui/renderers";
@@ -76,6 +77,8 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   let teammateInboxDisposed = false;
   let teammateLifecycleRunId: string | undefined = process.env.PI_LIFECYCLE_RUN_ID;
   const teammateOneShotTimers = new Set<NodeJS.Timeout>();
+  const activity: AgentActivity = {};
+  let activityPublishedAt = 0;
 
   const scheduleTeammateOneShot = (callback: () => void, delayMs: number) => {
     const timer = setTimeout(() => {
@@ -127,6 +130,8 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     }
     return {
       ...updates,
+      lastActivityAt: activity.lastActivityAt,
+      activeWorkCount: activity.activeWork?.size ?? 0,
       ...(typeof usage.tokensUsed === "number" ? { tokensUsed: usage.tokensUsed } : {}),
       contextUsage,
     };
@@ -148,6 +153,24 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
   };
 
   registerAgentReportRenderer(pi);
+
+  if (options.isTeammate) {
+    for (const type of ["agent_start", "agent_end", "turn_start", "turn_end", "message_start", "message_update", "message_end",
+      "tool_execution_start", "tool_execution_update", "tool_execution_end", "session_before_compact", "session_compact",
+      "session_compact_failed", "ui_prompt_start", "ui_prompt_end"]) {
+      pi.on(type, async (event: any) => {
+        recordAgentActivity(activity, { ...event, type });
+        const teamName = options.getTeamName();
+        if (!teamName || !teammateLifecycleRunId || teammateInboxDisposed) return;
+        // Stream events can arrive per token; persist at most once a second.
+        if ((type === "message_update" || type === "tool_execution_update") && Date.now() - activityPublishedAt < 1000) return;
+        activityPublishedAt = Date.now();
+        await writeTeammateRuntimeStatus(teamName, {
+          lastActivityAt: activity.lastActivityAt, activeWorkCount: activity.activeWork?.size ?? 0,
+        });
+      });
+    }
+  }
 
   pi.on("session_start", async (_event: any, ctx: any) => {
     paths.ensureDirs();
@@ -194,6 +217,8 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
     if (options.isTeammate) {
       disposeTeammateInbox();
       teammateInboxDisposed = false;
+      activity.lastActivityAt = Date.now();
+      activity.activeWork = new Set();
       if (teamName) {
         if (teams.teamExists(teamName)) {
           const persistedRunId = await teams.ensureMemberLifecycleRunId(teamName, options.agentName, teammateLifecycleRunId);
@@ -213,6 +238,8 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
           pid: process.pid,
           startedAt: Date.now(),
           lastHeartbeatAt: Date.now(),
+          lastActivityAt: activity.lastActivityAt,
+          activeWorkCount: 0,
           ready: false,
           currentAction: "starting",
           activeToolName: undefined,
@@ -263,6 +290,8 @@ export function registerExtensionEvents(pi: any, options: RegisterEventsOptions)
             if (teammateInboxDisposed) return;
             await writeTeammateRuntimeStatus(teamName, {
               lastHeartbeatAt: Date.now(),
+              lastActivityAt: activity.lastActivityAt,
+              activeWorkCount: activity.activeWork?.size ?? 0,
             });
             if (unread.length > 0) {
               const content = `You have ${unread.length} new inbox message(s). Read them with read_inbox and act.`;

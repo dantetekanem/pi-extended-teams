@@ -3882,6 +3882,21 @@ describe("in-process read agent tool wiring", () => {
     expect(JSON.stringify({ state: options.rememberCompletedAgentReport.mock.calls, leadInbox, reports })).not.toContain("writing-hard");
   });
 
+  it("records reasoning activity and retains parallel tool protection in the session subscriber", () => {
+    const state: RunningReadAgent = { runId: "run", name: "reader", teamName: "team", startedAt: 0,
+      tokensUsed: 0, status: "thinking", recentEvents: [], lastActivityAt: 0 };
+    const session = { getSessionStats: () => ({ tokens: { total: 0 } }) } as any;
+    const emit = (event: any) => handleReadAgentSessionEvent(state, session, event, () => {});
+    emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "reasoning" } });
+    expect(state.lastActivityAt).toBeGreaterThan(0);
+    emit({ type: "tool_execution_start", toolCallId: "a", toolName: "bash" });
+    emit({ type: "tool_execution_start", toolCallId: "b", toolName: "read" });
+    emit({ type: "tool_execution_end", toolCallId: "b", toolName: "read" });
+    expect(state.activeWork).toEqual(new Set(["tool:a"]));
+    emit({ type: "tool_execution_end", toolCallId: "a", toolName: "bash" });
+    expect(state.activeWork?.size).toBe(0);
+  });
+
   it("preserves the full per-update assistant snippet while processing text deltas incrementally", () => {
     const state = {
       runId: "run-reader",

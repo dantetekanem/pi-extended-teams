@@ -248,6 +248,164 @@ describe("team lifecycle performance", () => {
     expect(exec).toHaveBeenCalledOnce();
   });
 
+  describe("idle watchdog", () => {
+    let now: number;
+    let state: RunningReadAgent;
+    let running: Map<string, RunningReadAgent>;
+    let notice: ReturnType<typeof vi.fn<(content: string) => void>>;
+    let lifecycle: ReturnType<typeof createLifecycleRuntime>;
+    let worker: Member;
+
+    beforeEach(() => {
+      now = 1_000_000;
+      vi.spyOn(os, "homedir").mockReturnValue(root);
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      worker = member("idle-worker", { role: "read", tmuxPaneId: "", lifecycleRunId: "idle-run", prompt: "Inspect cancellation" });
+      writeConfig({ name: "idle-team", description: "", createdAt: now, leadAgentId: "lead", leadSessionId: "session", members: [worker] });
+      state = { name: worker.name, teamName: "idle-team", runId: "idle-run", startedAt: now, lastActivityAt: now,
+        tokensUsed: 0, status: "thinking", recentEvents: [], acceptingMessages: true };
+      running = new Map([["idle-team:idle-worker", state]]);
+      notice = vi.fn();
+      lifecycle = createLifecycleRuntime({ isTeammate: false, terminal: null, runningReadAgents: running,
+        readAgentKey: (team, name) => `${team}:${name}`, isCurrentReadAgentRun: (key, agent) => running.get(key) === agent,
+        renderReadAgentStatus: vi.fn(), drainWriteQueue: async () => {}, getSessionCwd: () => root,
+        getTeamName: () => "idle-team", notifyIdleAgent: notice });
+    });
+
+    it("warns once at five minutes and stops through normal cleanup at ten", async () => {
+      await claims.claimFiles("idle-team", worker.name, ["owned.ts"]);
+      now += 299_999;
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(notice).not.toHaveBeenCalled();
+      now++;
+      await lifecycle.runWatchdogOnce("idle-team");
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(notice).toHaveBeenCalledTimes(1);
+      expect(notice.mock.calls[0][0]).toContain("idle-worker");
+      expect(notice.mock.calls[0][0]).toContain("idle-run");
+      expect(notice.mock.calls[0][0]).toContain("Inspect cancellation");
+      expect(running.size).toBe(1);
+      now += 300_000;
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(running.size).toBe(0);
+      expect(await claims.listClaims("idle-team")).toEqual([]);
+      expect(notice).toHaveBeenCalledTimes(2);
+      expect(notice.mock.calls[1][0]).toContain("stopped");
+    });
+
+    it("uses configured thresholds, resets after activity, and honors auto-stop disabled", async () => {
+      fs.mkdirSync(path.join(root, ".pi"));
+      fs.writeFileSync(path.join(root, ".pi", "pi-extended-teams.json"), JSON.stringify({ watchdog: {
+        idleWarningMinutes: 1, idleStopMinutes: 2, idleAutoStop: false,
+      } }));
+      now += 60_000;
+      await lifecycle.runWatchdogOnce("idle-team");
+      state.lastActivityAt = ++now;
+      await lifecycle.runWatchdogOnce("idle-team");
+      now += 60_000;
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(notice).toHaveBeenCalledTimes(2);
+      now += 600_000;
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(running.size).toBe(1);
+      expect(notice).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(["tool", "parallel-tools", "check", "checkpoint", "starting", "finishing", "closing", "child", "replaced"])("protects %s work", async kind => {
+      if (kind === "tool") state.activeToolName = "bash";
+      if (kind === "parallel-tools") state.activeWork = new Set(["tool:pending"]);
+      if (kind === "check") state.checkOperation = { controller: new AbortController(), settled: Promise.resolve() };
+      if (kind === "checkpoint") state.checkpointOperation = { controller: new AbortController(), settled: Promise.resolve() };
+      if (kind === "starting" || kind === "finishing") state.status = kind;
+      if (kind === "closing") state.acceptingMessages = false;
+      if (kind === "replaced") state.runId = "other-run";
+      if (kind === "child") await teams.addMember("idle-team", member("child", {
+        tmuxPaneId: "", lifecycleRunId: "child-run", parentAgentName: worker.name, parentLifecycleRunId: state.runId,
+      }));
+      now += 700_000;
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(notice).not.toHaveBeenCalled();
+      expect(running.size).toBe(1);
+    });
+
+    it("counts renewed activity during notification before deciding to stop", async () => {
+      notice.mockImplementation(() => { state.lastActivityAt = now; });
+      now += 700_000;
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(running.size).toBe(1);
+      expect(notice).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["settled", "cleanup_failed"])("reports pending cancellation and the actual late outcome: %s", async outcome => {
+      if (outcome === "cleanup_failed") vi.spyOn(claims, "releaseAllForAgent").mockRejectedValue(new Error("claim release failed"));
+      vi.useFakeTimers();
+      let finish!: () => void;
+      try {
+        state.messageDeliveryTail = new Promise<void>(resolve => { finish = resolve; });
+        await claims.claimFiles("idle-team", worker.name, ["owned.ts"]);
+        vi.setSystemTime(state.lastActivityAt + 600_000);
+        const check = lifecycle.runWatchdogOnce("idle-team");
+        await vi.advanceTimersByTimeAsync(NESTED_SESSION_TEARDOWN_TIMEOUT_MS);
+        await check;
+        expect(notice.mock.calls.at(-1)?.[0]).toContain("not complete (timed_out)");
+        expect(await claims.listClaims("idle-team")).toHaveLength(1);
+        expect(running.size).toBe(1);
+        finish();
+        await state.teardownFinalizationPromise;
+        if (outcome === "settled") {
+          expect(await claims.listClaims("idle-team")).toEqual([]);
+          expect(notice.mock.calls.at(-1)?.[0]).toContain("automatically stopped");
+        } else {
+          expect(await claims.listClaims("idle-team")).toHaveLength(1);
+          expect(notice.mock.calls.at(-1)?.[0]).toContain("cleanup_failed");
+          expect(notice.mock.calls.at(-1)?.[0]).toContain("claim release failed");
+        }
+      } finally { finish?.(); vi.useRealTimers(); }
+    });
+
+    it("abandons automatic cancellation when the watchdog is stopped during an observation", async () => {
+      let current = true;
+      notice.mockImplementation(() => { current = false; });
+      now += 700_000;
+      await lifecycle.runWatchdogOnce("idle-team", () => current);
+      expect(running.size).toBe(1);
+      expect(state.stopRequested).not.toBe(true);
+    });
+
+    it("rechecks activity after lifecycle reads, before closing the recipient", async () => {
+      now += 700_000;
+      const read = runtime.readRuntimeStatus;
+      let reads = 0;
+      vi.spyOn(runtime, "readRuntimeStatus").mockImplementation(async (...args) => {
+        const result = await read(...args);
+        if (++reads === 2) state.lastActivityAt = now;
+        return result;
+      });
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(state.acceptingMessages).toBe(true);
+      expect(state.stopRequested).not.toBe(true);
+      expect(running.size).toBe(1);
+    });
+
+    it("protects runtime-only tools and detects idle despite fresh heartbeats", async () => {
+      running.clear();
+      await runtime.writeRuntimeStatus("idle-team", worker.name, "idle-run", {
+        ready: true, currentAction: "working", lastHeartbeatAt: now, lastActivityAt: now, activeWorkCount: 1,
+      });
+      now += 700_000;
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(notice).not.toHaveBeenCalled();
+      expect((await teams.readConfig("idle-team")).members).toHaveLength(1);
+      await runtime.writeRuntimeStatus("idle-team", worker.name, "idle-run", {
+        lastHeartbeatAt: now, lastActivityAt: now, activeWorkCount: 0, currentAction: "thinking",
+      });
+      now += 300_000;
+      await runtime.writeRuntimeStatus("idle-team", worker.name, "idle-run", { lastHeartbeatAt: now });
+      await lifecycle.runWatchdogOnce("idle-team");
+      expect(notice).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("stops and restarts the lead watchdog without leaking intervals", async () => {
     vi.useFakeTimers();
     try {

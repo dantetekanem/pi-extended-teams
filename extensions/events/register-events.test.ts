@@ -104,6 +104,26 @@ describe("extension teammate inbox wake", () => {
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("persists stream activity and overlapping tools separately from heartbeats", async () => {
+    const { handlers, ctx } = setupEvents(() => true);
+    const emit = async (type: string, event = {}) => {
+      for (const handler of handlers.get(type) ?? []) await handler(event, ctx);
+    };
+    await emit("session_start");
+    const startedAt = Date.now();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect((await runtime.readRuntimeStatus("team", "writer"))?.lastActivityAt).toBe(startedAt);
+    await emit("message_update", { assistantMessageEvent: { type: "thinking_delta", delta: "still thinking" } });
+    expect((await runtime.readRuntimeStatus("team", "writer"))?.lastActivityAt).toBe(Date.now());
+    await emit("tool_execution_start", { toolCallId: "a", toolName: "bash" });
+    await emit("tool_execution_start", { toolCallId: "b", toolName: "read" });
+    await emit("tool_execution_end", { toolCallId: "b", toolName: "read" });
+    expect((await runtime.readRuntimeStatus("team", "writer"))?.activeWorkCount).toBe(1);
+    await emit("tool_execution_end", { toolCallId: "a", toolName: "bash" });
+    expect((await runtime.readRuntimeStatus("team", "writer"))?.activeWorkCount).toBe(0);
+    await emit("session_shutdown");
+  });
+
   it.each([true, false])("guards user interaction only for spawned sessions (teammate: %s)", async isTeammate => {
     const { handlers, ctx } = setupEvents(() => true, { isTeammate });
     const execute = vi.fn();

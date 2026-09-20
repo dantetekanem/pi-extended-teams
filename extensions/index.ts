@@ -139,6 +139,14 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     getSessionCwd: () => sessionCtx?.cwd,
     getTeamName: () => teamName,
     extensionInstanceId,
+    notifyIdleAgent: (content) => pi.sendMessage({
+      customType: "pi-extended-teams-idle", content, display: true,
+    }, { triggerTurn: true, deliverAs: "followUp" }),
+    hasPendingChildren: (targetTeamName, member) => !!member.lifecycleRunId && pendingChildController.hasPendingChildren({
+      teamName: targetTeamName,
+      parentName: member.name,
+      parentRunId: member.lifecycleRunId,
+    }),
     onWriterInactive: (targetTeamName, member) => {
       releaseWriteAgentSleepAssertion(targetTeamName, member);
       removeWriterScreenTab(writerScreenState, { teamName: targetTeamName, name: member.name, paneId: member.tmuxPaneId });

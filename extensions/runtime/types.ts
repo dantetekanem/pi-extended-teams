@@ -13,6 +13,8 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   status: "starting" | "thinking" | "working" | "finishing";
   recentEvents: string[];
   lastActivityAt: number;
+  /** Exact tool calls and other work spans that must not be idle-stopped. */
+  activeWork?: Set<string>;
   activeToolName?: string;
   /** Monotonic identity for the current nested AgentSession turn. */
   operationGeneration?: number;

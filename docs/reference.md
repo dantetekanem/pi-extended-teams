@@ -104,6 +104,24 @@ Public spawns respect each role's concurrency limit. Enabled overflow queues acc
 
 Spawned sessions are private by default under `~/.pi/teams/<team>/agent-sessions/`, outside Pi's normal `/resume` picker.
 
+### Idle watchdog
+
+The runtime checks agents every 30 seconds. After five idle minutes it sends the lead a visible Pi message with the agent name, team, run ID, last activity time, and assignment excerpt. After ten idle minutes it requests normal shutdown and reports whether cleanup finished or remains pending. A late cleanup result sends a confirmation or the failure details.
+
+```json
+{
+  "watchdog": {
+    "idleWarningMinutes": 5,
+    "idleStopMinutes": 10,
+    "idleAutoStop": true
+  }
+}
+```
+
+Both thresholds accept positive finite numbers in minutes. Settings are read on each check; project values override global values. Set `idleAutoStop` to `false` to keep warnings without automatic idle cancellation. Heartbeat-failure cleanup is separate and unchanged except that tracked active work is protected.
+
+Messages, streamed text or reasoning, tool activity, and progress updates reset the idle timer. Heartbeats alone do not. Active tools (including silent long-running commands), checks, compaction, and parents with accepted queued or running children are protected. Queued, starting, and finishing agents are excluded. Warnings occur once per idle period. Terminal agents need current activity telemetry; missing telemetry does not authorize an idle stop.
+
 ## Task outcomes and full reports
 
 A completed agent, a successful task, passed verification, and lead acceptance are separate facts.

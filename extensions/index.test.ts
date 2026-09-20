@@ -779,6 +779,74 @@ describe("extension integration", () => {
     }
   });
 
+  it("protects an idle writer while its accepted nested helper is queued outside the roster", async () => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    try {
+      fs.mkdirSync(path.dirname(projectSettingsPath(setup.root)), { recursive: true });
+      fs.writeFileSync(projectSettingsPath(setup.root), JSON.stringify({ readAgents: { maxConcurrent: 1 } }));
+      let nestedTools: any[] = [];
+      let childSnapshot!: () => { queued: number };
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, ctx: any, options: any) => {
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), {
+          runId: member.lifecycleRunId, name: member.name, teamName, startedAt: Date.now(), tokensUsed: 0,
+          status: "thinking", recentEvents: [], lastActivityAt: Date.now(), acceptingMessages: true,
+          activeToolName: member.name === "busy-reader" ? "bash" : undefined,
+        });
+        if (member.name === "writer") {
+          const binding = { teamName, parent: member, parentRunId: member.lifecycleRunId, outerCtx: ctx };
+          nestedTools = options.createNestedReadAgentTools(binding);
+          childSnapshot = () => options.nestedChildSnapshot(binding);
+        }
+      });
+      const ctx = makeCtx(setup.root);
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      const spawn = setup.tools.get("spawn_agent")!;
+      const signal = new AbortController().signal;
+      await spawn.execute("reader", { name: "busy-reader", prompt: "Long read", model_slot: "read-review" }, signal, undefined, ctx);
+      await spawn.execute("writer", {
+        name: "writer", prompt: "Use a helper", model_slot: "write-feature", allow_nested_read_agents: true,
+      }, signal, undefined, ctx);
+      const accepted = await nestedTools.find(tool => tool.name === "spawn_agent").execute("child", {
+        name: "queued-child", prompt: "Read one file", model_slot: "read-review",
+      });
+      expect(accepted.details.queued).toBe(true);
+      const roster = await setup.teams.readConfig("session-test-session");
+      expect(roster.members.some(member => member.name === "queued-child")).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(660_000);
+
+      expect(childSnapshot().queued).toBe(1);
+      expect((await setup.teams.readConfig("session-test-session")).members.some(member => member.name === "writer")).toBe(true);
+      expect(setup.pi.sendMessage.mock.calls.filter(([message]: any[]) => message.customType === "pi-extended-teams-idle")).toEqual([]);
+    } finally { setup.restoreEnv(); }
+  });
+
+  it("sends visible idle warnings and automatic-stop results without lead polling", async () => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    try {
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), {
+          runId: member.lifecycleRunId, name: member.name, teamName, startedAt: Date.now(), tokensUsed: 0,
+          status: "thinking", recentEvents: [], lastActivityAt: Date.now(), acceptingMessages: true,
+        });
+      });
+      const ctx = makeCtx(setup.root);
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "idle-reader", prompt: "Inspect the idle watchdog", model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(setup.pi.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+        customType: "pi-extended-teams-idle", display: true, content: expect.stringContaining("idle-reader"),
+      }), { triggerTurn: true, deliverAs: "followUp" });
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(setup.pi.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+        customType: "pi-extended-teams-idle", display: true, content: expect.stringContaining("automatically stopped"),
+      }), { triggerTurn: true, deliverAs: "followUp" });
+      expect((await setup.teams.readConfig("session-test-session")).members.some(member => member.name === "idle-reader")).toBe(false);
+    } finally { setup.restoreEnv(); }
+  });
+
   it("delivers queued helper startup failures directly and retains them when the requester closes", async () => {
     const setup = await setupExtension({}, { withSendMessage: true });
     try {

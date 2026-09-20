@@ -38,6 +38,8 @@ export interface AgentRuntimeStatus {
   pid?: number;
   startedAt?: number;
   lastHeartbeatAt?: number;
+  lastActivityAt?: number;
+  activeWorkCount?: number;
   lastInboxReadAt?: number;
   ready?: boolean;
   currentAction?: "starting" | "thinking" | "working" | "finishing" | "done";
@@ -234,7 +236,7 @@ export async function cleanupStaleRuntimeFiles(
         try {
           const status = JSON.parse(fs.readFileSync(p, "utf-8")) as AgentRuntimeStatus;
           const lastActivity = status.lastHeartbeatAt || status.startedAt || 0;
-          shouldDelete = (now - lastActivity) > RUNTIME_STALE_MS;
+          shouldDelete = !status.activeToolName && !status.activeWorkCount && (now - lastActivity) > RUNTIME_STALE_MS;
         } catch {
           shouldDelete = true;
         }

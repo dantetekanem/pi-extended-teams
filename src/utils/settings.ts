@@ -76,6 +76,9 @@ export interface CategoryConfig {
 export interface WatchdogConfig {
   /** Grace buffer (seconds) added on top of the heartbeat interval. */
   bufferSeconds: number;
+  idleWarningMinutes: number;
+  idleStopMinutes: number;
+  idleAutoStop: boolean;
 }
 
 export interface WriteAgentsConfig {
@@ -151,7 +154,7 @@ export const DEFAULT_READ_HELPER_MAX_CONCURRENT = 10;
 
 export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
   activityColors: DEFAULT_ACTIVITY_COLORS,
-  watchdog: { bufferSeconds: 30 },
+  watchdog: { bufferSeconds: 30, idleWarningMinutes: 5, idleStopMinutes: 10, idleAutoStop: true },
   writeAgents: { maxConcurrent: DEFAULT_WRITE_AGENT_MAX_CONCURRENT, queueOverflow: true },
   readAgents: { maxConcurrent: DEFAULT_READ_AGENT_MAX_CONCURRENT, queueOverflow: true },
   readHelpers: { maxConcurrent: DEFAULT_READ_HELPER_MAX_CONCURRENT, queueOverflow: true },
@@ -296,6 +299,11 @@ function applyLayer(acc: PiExtendedTeamsSettings, raw: any, options: { favoriteM
   if (raw.watchdog && typeof raw.watchdog === "object") {
     const b = Number(raw.watchdog.bufferSeconds);
     if (Number.isFinite(b) && b >= 0) acc.watchdog.bufferSeconds = b;
+    for (const key of ["idleWarningMinutes", "idleStopMinutes"] as const) {
+      const value = raw.watchdog[key];
+      if (typeof value === "number" && Number.isFinite(value) && value > 0) acc.watchdog[key] = value;
+    }
+    if (typeof raw.watchdog.idleAutoStop === "boolean") acc.watchdog.idleAutoStop = raw.watchdog.idleAutoStop;
   }
 
   if (raw.writeAgents && typeof raw.writeAgents === "object") {

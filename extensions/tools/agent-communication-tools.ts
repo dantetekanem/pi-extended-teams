@@ -169,6 +169,7 @@ export function createAgentCommunicationTools(options: AgentCommunicationToolsOp
         ? "Final report accepted. Finish immediately; the outer runner will release claims and stop this nested session."
         : "A final report was already accepted for this run. This duplicate was ignored; finish immediately.";
       return {
+        terminate: result.accepted,
         content: [{ type: "text", text }],
         details: {
           session: teamName,

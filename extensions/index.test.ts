@@ -1560,7 +1560,8 @@ describe("extension integration", () => {
       expect(liveFailureState?.lastError).toMatchObject({ message: "provider rejected prompt" });
       expect(runningAgents.get(`${teamName}:failing-helper`)).toBe(liveFailureState);
       const failedRendered = widget.render(180).join("\n");
-      expect(failedRendered).toContain("2 active · 1 read · 1 write");
+      expect(failedRendered).toContain("1 active · 1 write");
+      expect(failedRendered).toContain("failing-helper read stopping");
       expect(failedRendered).not.toMatch(/\(writer\) model\/xhigh · \+/);
 
       releaseFailureDelivery();
@@ -2181,6 +2182,7 @@ describe("extension integration", () => {
       setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
         live = { name: member.name, teamName, runId: member.lifecycleRunId, role: member.role,
           startedAt: Date.now() - 60_000, tokensUsed: 0, status: "finishing", teardownState: "active",
+          persistedRecipientClosed: kind === "matching",
           recentEvents: [], lastActivityAt: Date.now(), latestProgress: "Sending exact report" };
         options.runningReadAgents.set(options.readAgentKey(teamName, member.name), live);
       });
@@ -2205,21 +2207,24 @@ describe("extension integration", () => {
       try {
         const card = widget.render(160).join("\n");
         expect(card.match(/reporter/g)).toHaveLength(kind === "matching" ? 1 : 2);
-        expect(card).toContain("Sending exact report");
         if (kind === "matching") {
+          expect(card).toContain("0 active");
+          expect(card).toContain("stopping");
           expect(card).toContain("Finishing cleanup");
           for (let tick = 0; tick < 3; tick++) {
             await vi.advanceTimersByTimeAsync(1_000);
             widget.render(160);
             await vi.advanceTimersByTimeAsync(250);
             const frame = widget.render(160).join("\n");
-            expect(frame).toContain("Sending exact report");
+            expect(frame).toContain("0 active");
+            expect(frame).toContain("stopping");
             expect(frame).toContain("Finishing cleanup");
           }
           for (const width of [10, 40, 80]) {
             expect(widget.render(width).every((line: string) => visibleWidth(line) <= width)).toBe(true);
           }
         }
+        if (kind !== "matching") expect(card).toContain("Sending exact report");
         if (kind === "failed" || kind === "corrupt") expect(card).toContain("Cleanup blocked");
       } finally {
         widget.dispose();

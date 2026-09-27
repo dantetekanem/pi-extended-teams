@@ -145,6 +145,7 @@ describe("read-agent communication tools", () => {
     const content = JSON.stringify({ kind: "plan", document: { title: { kind: "title", body: "Plan", children: [] }, elements: [] } });
 
     await expect(tools.get("report_and_exit")!.execute("report", { content, summary: "Complete plan result ready" })).resolves.toMatchObject({
+      terminate: true,
       details: { accepted: true, cancelledDeliveries: 2, deliveryOutcome: "cancelled" },
     });
     expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" }, undefined, "report");
@@ -180,6 +181,7 @@ describe("read-agent communication tools", () => {
     const tool = tools.find(tool => tool.name === "report_and_exit")!;
     const signal = new AbortController().signal;
     const feedback = await tool.execute("runtime-call", { content: "Claim", submissionId: "forged-call" }, signal);
+    expect(feedback.terminate).not.toBe(true);
     expect(feedback.details).toMatchObject({ accepted: false, repairRequest, verification: { state: "failed" } });
     expect(onReportAndExit).toHaveBeenCalledWith({ content: "Claim", summary: undefined }, signal, "runtime-call");
   });

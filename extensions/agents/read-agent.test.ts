@@ -4340,33 +4340,54 @@ describe("in-process read agent tool wiring", () => {
     expect(await readInbox("team", "writer", false, false)).toEqual([expect.objectContaining({ text: "final report" })]);
   });
 
-  it.each([false, true])("uses the installed Agent loop to stop an accepted report (idle continuation: %s)", async (idle) => {
+  it.each(["normal", "idle", "steer", "followUp", "beforeSettle", "repair"])("stops an accepted report through the installed AgentSession (%s)", async (mode) => {
+    const idle = mode === "idle";
     const packageResolutionBase = pathToFileURL(path.join(process.cwd(), "package.json")).href;
-    const codingAgentPackageJson = resolvePiFixturePackageJson("@mariozechner/pi-coding-agent", packageResolutionBase);
+    const codingAgentPackageJson = resolvePiFixturePackageJson(
+      process.env.PI_CODING_AGENT_CONTRACT_MODULE ?? "@mariozechner/pi-coding-agent",
+      packageResolutionBase,
+    );
     const codingAgentModule = resolvePiFixtureEntry(codingAgentPackageJson);
-    // Override with a public current-host module URL; the default peer resolves from the coding-agent context.
-    const coreModule = process.env.PI_AGENT_CORE_CONTRACT_MODULE ?? resolvePiFixtureEntry(
-      resolvePiFixturePackageJson("@mariozechner/pi-agent-core", codingAgentModule),
-    );
-    const aiModule = resolvePiFixtureEntry(
-      resolvePiFixturePackageJson("@mariozechner/pi-ai", codingAgentModule),
-    );
+    const scope = JSON.parse(fs.readFileSync(codingAgentPackageJson, "utf8")).name.split("/")[0];
+    const coreModule = resolvePiFixtureEntry(resolvePiFixturePackageJson(`${scope}/pi-agent-core`, codingAgentModule));
+    const aiModule = resolvePiFixtureEntry(resolvePiFixturePackageJson(`${scope}/pi-ai`, codingAgentModule));
     const { Agent } = await import(coreModule);
     const { createAssistantMessageEventStream } = await import(aiModule);
-    const session = makeSession();
-    const model = { provider: "provider", id: "model", api: "openai-completions" };
+    const { AgentSession, SessionManager, SettingsManager, DefaultResourceLoader } = await vi.importActual<any>(codingAgentModule);
+    const model = {
+      provider: "provider", id: "model", api: "openai-completions",
+      contextWindow: 100000, maxTokens: 1000, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+    const sessionManager = SessionManager.inMemory(root);
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+    let session: InstanceType<typeof AgentSession>;
     let responses = 0;
+    const beforeSettle = vi.fn(() => ({ continue: responses < 3 }));
+    const loader = new DefaultResourceLoader({
+      cwd: root, agentDir: root, settingsManager,
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+      systemPromptOverride: () => "Test agent",
+      extensionFactories: mode === "beforeSettle" ? [(pi: any) => pi.on("agent_before_settle", beforeSettle)] : [],
+    });
+    await loader.reload();
+
+    let acceptedAtResponse: number | undefined;
     let reporting = !idle;
     const streamFn = () => {
       const stream = createAssistantMessageEventStream();
       const report = reporting;
       const progress = idle && responses === 0;
-      reporting = false;
+      reporting = mode === "repair" && responses === 0;
       responses++;
       const message: any = {
         role: "assistant", model: "model", provider: "provider", api: "openai-completions",
         timestamp: Date.now(),
-        content: report ? [{ type: "toolCall", id: "report", name: "report_and_exit", arguments: { content: "authoritative loop report" } }]
+        content: report ? [
+          { type: "toolCall", id: "progress-before-report", name: "report_progress", arguments: { status: "Delivering report" } },
+          { type: "toolCall", id: `report-${responses}`, name: "report_and_exit", arguments: { content: "authoritative loop report" } },
+          { type: "toolCall", id: "progress-after-report", name: "report_progress", arguments: { status: mode === "repair" && responses === 1 ? "Repairing" : "Should not run" } },
+        ]
           : progress ? [{ type: "toolCall", id: "progress", name: "report_progress", arguments: { status: "Inspecting the contract" } }] : [{ type: "text", text: "idle" }],
         stopReason: report || progress ? "toolUse" : "stop",
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0 } },
@@ -4375,24 +4396,49 @@ describe("in-process read agent tool wiring", () => {
       stream.end();
       return stream;
     };
-    const agent = new Agent({ initialState: { model }, streamFn });
+    const agent = new Agent({ initialState: { model }, streamFn, toolExecution: "sequential" });
+    const supportsFinish = "finishTurn" in agent;
     const supportsStop = "shouldStopAfterTurn" in agent;
     const previousHook = vi.fn(async (turn, signal) => {
       expect(signal).toBeInstanceOf(AbortSignal);
-      return turn.toolResults.some((result: any) => result.toolName === "report_progress");
+      const reported = turn.toolResults.some((result: any) => result.toolName === "report_and_exit");
+      return supportsFinish ? { action: reported ? "continue" : "end" } : !reported;
     });
-    if (supportsStop) agent.shouldStopAfterTurn = previousHook;
-    Object.assign(session, { agent, isStreaming: false });
     piMocks.createAgentSession.mockImplementation(async ({ customTools }) => {
-      agent.state.tools = customTools;
+      session = new AgentSession({
+        agent, cwd: root, sessionManager, settingsManager, resourceLoader: loader,
+        customTools, initialActiveToolNames: customTools.map((tool: any) => tool.name),
+        modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "offline-test" }), hasConfiguredAuth: () => true },
+        modelRuntime: { checkAuth: async () => true, hasConfiguredAuth: () => true },
+      });
+      if (supportsFinish) agent.finishTurn = previousHook;
+      else if (supportsStop) agent.shouldStopAfterTurn = previousHook;
+      vi.spyOn(session, "dispose");
+      // Queue while reporting is in flight, before admission closes.
+      agent.subscribe((event: any) => {
+        if (event.type === "tool_execution_end" && event.toolName === "report_and_exit" && event.result.details.accepted) {
+          acceptedAtResponse = responses;
+        }
+        if (event.type === "tool_execution_start" && event.toolName === "report_and_exit") {
+          if (mode === "steer" || mode === "followUp") {
+            agent[mode]({ role: "user", content: "queued before acceptance", timestamp: Date.now() });
+          }
+        }
+      });
       return { session };
     });
-    session.prompt.mockImplementation(async () => { await agent.prompt("inspect"); });
-    session.subscribe.mockImplementation(handler => agent.subscribe(handler));
-    session.sendUserMessage.mockImplementation(async (content = "") => { await agent.prompt(content); });
-    const member = idle ? eligibleNestedParent("loop-reporter") : fixtureMember("loop-reporter");
+    const member: Member = idle ? eligibleNestedParent("loop-reporter") : fixtureMember("loop-reporter");
+    if (mode === "repair") {
+      execFileSync("git", ["init", "--quiet"], { cwd: root });
+      member.assignedChecks = [{ name: "test", command: "offline check", timeoutSeconds: 2 }];
+      member.repairPolicy = { maxAttempts: 1 };
+    }
     writeTeamConfig("team", member);
-    const options = { ...makeRunOptions(), pendingChildController: createPendingChildController() };
+    const exec = vi.fn().mockResolvedValueOnce({ exitCode: 1 }).mockResolvedValue({ exitCode: 0 });
+    const options = {
+      ...makeRunOptions(), pendingChildController: createPendingChildController(), emitAgentProgress: vi.fn(),
+      loadCheckOperations: async () => ({ exec }),
+    };
     const run = runReadAgentInProcess("team", member, "inspect", { modelRegistry: { find: () => model } }, options);
     if (idle) {
       await vi.waitFor(() => expect(options.runningReadAgents.get("team:loop-reporter")?.acceptingMessages).toBe(true));
@@ -4401,12 +4447,21 @@ describe("in-process read agent tool wiring", () => {
       await expect(sendMessageToRunningReadAgent(options.runningReadAgents.get("team:loop-reporter"), "finish", true)).resolves.toBe(true);
     }
     await run;
-    expect(responses).toBe((idle ? 2 : 1) * (supportsStop ? 1 : 2));
-    if (supportsStop) expect(previousHook).toHaveBeenCalledTimes(idle ? 2 : 1);
-    expect(agent.state.messages.find((message: any) => message.role === "toolResult" && message.toolName === "report_and_exit")?.details).toMatchObject({ accepted: true });
+    expect(acceptedAtResponse).toBeGreaterThan(0);
+    expect(responses, JSON.stringify(options.emitAgentReport.mock.calls)).toBe(acceptedAtResponse);
+    if (supportsFinish || supportsStop) expect(previousHook).toHaveBeenCalledTimes(idle || mode === "repair" ? 2 : 1);
+    const persistedResults = sessionManager.getEntries().filter((entry: any) =>
+      entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "report_and_exit"
+    );
+    expect(persistedResults.map((entry: any) => entry.message.details.accepted)).toEqual(mode === "repair" ? [false, true] : [true]);
+    expect(agent.hasQueuedMessages()).toBe(false);
+    const progress = idle ? ["Inspecting the contract", "Delivering report"] : ["Delivering report"];
+    if (mode === "repair") progress.push("Repairing", "Delivering report");
+    expect(options.emitAgentProgress.mock.calls.map(call => call[2])).toEqual(progress);
+    if (mode === "beforeSettle") expect(beforeSettle).not.toHaveBeenCalled();
     expect(await listTeamReportEvents("team")).toEqual([expect.objectContaining({ report: "authoritative loop report" })]);
     expect(options.runningReadAgents.size).toBe(0);
-    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(session!.dispose).toHaveBeenCalledOnce();
   });
 
   it("directly wakes an active helper requester even when the helper already persisted its report", async () => {

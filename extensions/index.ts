@@ -646,14 +646,14 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
         .filter(agent => agent.teamName === activityTeamName)
         .sort((a, b) => a.name.localeCompare(b.name))
       : [];
-    const runningAgents = sessionAgents.filter(hasActiveReadAgentLifecycle);
-    const readAgents = runningAgents.filter(agent => (agent.role || "read") === "read");
-    const writeAgents = runningAgents.filter(agent => (agent.role || "read") === "write");
     const activityConfig = activityTeamName ? await teams.readConfig(activityTeamName).catch(() => null) : null;
     const activityMembers = activityConfig?.members ?? [];
     const activityTombstones = activityTeamName
       ? await listLifecycleTombstones(activityTeamName).catch(() => [])
       : [];
+    const runningAgents = sessionAgents.filter(hasActiveReadAgentLifecycle);
+    const readAgents = runningAgents.filter(agent => (agent.role || "read") === "read");
+    const writeAgents = runningAgents.filter(agent => (agent.role || "read") === "write");
     const unsettledAgents = sessionAgents.filter(agent => !hasActiveReadAgentLifecycle(agent)
       && agent.teardownState !== "finalized"
       && !activityTombstones.some(fence => fence.agentName === agent.name));
@@ -849,12 +849,6 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     }
 
     for (const { agentName: quarantinedName, result } of activityTombstones) {
-      if (result.status === "occupied" && result.tombstone.phase === "persistence_closed"
-        && runningAgents.some(agent => agent.name === quarantinedName && agent.runId === result.tombstone.runId)) {
-        const entryIndex = entries.findIndex(entry => entry.name === quarantinedName);
-        entries[entryIndex].statusNote = "Finishing cleanup";
-        continue;
-      }
       const persistedMember = activityMembers.find(member => member.name === quarantinedName);
       const role = result.status === "occupied"
         ? result.tombstone.role

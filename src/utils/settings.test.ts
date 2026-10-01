@@ -99,6 +99,16 @@ describe("loadSettings", () => {
     expect(loadSettings({ homeDir, projectDir }).watchdog.idleWarningMinutes).toBe(2);
   });
 
+  it("enables durable agents only through a boolean flag, with project values over global ones", () => {
+    expect(loadSettings({ homeDir, projectDir }).experimental.durableAgents).toBe(false);
+    writeGlobal({ experimental: { durableAgents: true } });
+    expect(loadSettings({ homeDir, projectDir }).experimental.durableAgents).toBe(true);
+    writeProject({ experimental: { durableAgents: false } });
+    expect(loadSettings({ homeDir, projectDir }).experimental.durableAgents).toBe(false);
+    writeProject({ experimental: { durableAgents: "yes" } });
+    expect(loadSettings({ homeDir, projectDir }).experimental.durableAgents).toBe(true);
+  });
+
   it("does not mutate DEFAULT_SETTINGS", () => {
     writeGlobal({ watchdog: { bufferSeconds: 99 } });
     loadSettings({ homeDir, projectDir });

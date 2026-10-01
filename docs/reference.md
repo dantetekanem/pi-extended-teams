@@ -88,7 +88,7 @@ Reports return automatically. The lead should end its turn to wait rather than p
 
 ### Reload and costs
 
-Running and starting agents survive same-process `/reload`, reconnecting controls, reports, and cost accounting. They keep their original implementation until an idle reload. Failed reconnection has a 60-second recovery window before cancellation starts. Quitting or changing sessions still cleans up agents; process-restart recovery is not supported.
+Running and starting agents survive same-process `/reload`, reconnecting controls, reports, and cost accounting. They keep their original implementation until an idle reload. Failed reconnection has a 60-second recovery window before cancellation starts. Quitting or changing sessions still cleans up agents; process-restart recovery is not supported, except for [experimental durable agents](#experimental-durable-agents).
 
 Compatible footer extensions can display combined recorded cost for the main session and finalized in-process agents without changing Pi's native usage totals. Unfinished or missing usage keeps the total incomplete. Terminal handoffs are excluded.
 
@@ -121,6 +121,33 @@ The runtime checks agents every 30 seconds. After five idle minutes it sends the
 Both thresholds accept positive finite numbers in minutes. Settings are read on each check; project values override global values. Set `idleAutoStop` to `false` to keep warnings without automatic idle cancellation. Heartbeat-failure cleanup is separate and unchanged except that tracked active work is protected.
 
 Messages, streamed text or reasoning, tool activity, and progress updates reset the idle timer. Heartbeats alone do not. Active tools (including silent long-running commands), checks, compaction, and parents with accepted queued or running children are protected. Queued, starting, and finishing agents are excluded. Warnings occur once per idle period. Terminal agents need current activity telemetry; missing telemetry does not authorize an idle stop.
+
+## Experimental durable agents
+
+Durable agents run on [Pi Durable](https://earendil.com/posts/pi-durable/) instead of in-process Pi sessions. They keep working through a crash or quit: when the same Pi session opens again, each unfinished agent continues from its last committed step. They are off by default.
+
+```json
+{
+  "experimental": { "durableAgents": true }
+}
+```
+
+After the next `/reload` or restart, the setting registers one lead tool, `durable_agents`:
+
+- `spawn` takes `name`, `prompt`, and `model_slot`, plus an optional `cwd`. Tiers resolve as they do for `spawn_agent`. Read tiers get `read` and `bash`; write tiers add `edit` and `write`.
+- `send` queues a message after the agent's current answer. With `steer: true`, the message joins the agent's current work instead.
+- `interrupt` aborts the agent's running tool calls, and the agent continues its turn. `stop` aborts its work and refuses new messages. If Pi exits before the abort finishes, the next open finishes it before any work runs.
+- `status` shows each agent's state (`working`, `queued`, `idle`, `stopping`, or `stopped`), running tools, open messages, and recorded cost.
+
+Each answer arrives as a visible message once the lead is idle, and starts a lead turn. Reports go out one per lead turn. A report counts as delivered only when it appears in the session history. A report that never gets there is sent again, at the latest when the session opens again. A steer shares the single report of the work it joined, also when that work fails. When a run fails, the agent reports the failure and moves on to its next queued message. An agent stays available after it answers, so the lead can keep sending it messages.
+
+If the runtime records a message but cannot hand it to the agent, `send` returns an error that says so. Do not send the message again: the next `spawn` or `send`, or the next open, retries it before that agent's newer messages.
+
+Each Pi session keeps its agents in `~/.pi/agent/pi-extended-teams/durable-agents/<session id>/agents.sqlite`, outside the team folders that startup cleanup removes. One Pi process owns the file at a time; a second process that opens the same session gets an error. A same-process `/reload` keeps the agents running for 60 seconds while the reloaded extension reattaches. Other session changes close the runtime, and unfinished work waits until the session opens again. A new or forked session starts without the durable agents of the session it came from.
+
+After a crash, a model request that was cut off is sent again. A tool call that was running is not repeated: the agent gets an interrupted result and decides what to do next.
+
+Durable agents see AGENTS.md files and skills. They do not load Pi extensions, team tools, file claims, checks, repair, completion groups, or checkpoints. They do not appear in the live agent view and cannot move to a Herdr pane. Use `spawn_agent` when you need any of those. Durable agent files are not deleted automatically yet.
 
 ## Task outcomes and full reports
 

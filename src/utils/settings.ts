@@ -119,6 +119,11 @@ export interface AgentSessionsConfig {
   showInResume: boolean;
 }
 
+export interface ExperimentalConfig {
+  /** Register the durable_agents tool, whose agents survive Pi restarts. */
+  durableAgents: boolean;
+}
+
 export const DEFAULT_ACTIVITY_COLORS = {
   name: "#50FA7B",
   model: "#FFD700",
@@ -146,6 +151,7 @@ export interface PiExtendedTeamsSettings {
   extensions: ExtensionsConfig;
   agentSessions: AgentSessionsConfig;
   debug: DebugConfig;
+  experimental: ExperimentalConfig;
 }
 
 export const DEFAULT_WRITE_AGENT_MAX_CONCURRENT = 100;
@@ -167,6 +173,7 @@ export const DEFAULT_SETTINGS: PiExtendedTeamsSettings = {
   extensions: { allow: null, block: [] },
   agentSessions: { showInResume: false },
   debug: { enabled: false },
+  experimental: { durableAgents: false },
 };
 
 export function globalSettingsPath(homeDir: string = os.homedir()): string {
@@ -382,6 +389,11 @@ function applyLayer(acc: PiExtendedTeamsSettings, raw: any, options: { favoriteM
     acc.debug.enabled = raw.debug;
   } else if (raw.debug && typeof raw.debug === "object" && typeof raw.debug.enabled === "boolean") {
     acc.debug.enabled = raw.debug.enabled;
+  }
+
+  if (raw.experimental && typeof raw.experimental === "object"
+    && typeof raw.experimental.durableAgents === "boolean") {
+    acc.experimental.durableAgents = raw.experimental.durableAgents;
   }
 }
 

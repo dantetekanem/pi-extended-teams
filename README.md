@@ -24,6 +24,8 @@ pi-extended-teams runs read and write agents inside Pi, with eight configurable 
 
 - Keep running agents through same-process `/reload`. Their controls and reports reconnect after the reload; process restarts are not supported.
 
+- Try agents that survive a crash or quit. The experimental `durable_agents` tool runs agents on [Pi Durable](https://earendil.com/posts/pi-durable/); when the session opens again, their unfinished work continues and their reports arrive.
+
 - Choose which of your loaded Pi extensions agents can use. Onboarding recommends models and extension settings for approval.
 
 - Check the work before accepting it. Assign verification commands, record which source they checked, and optionally allow a limited number of repair attempts. Reports distinguish the agent's claimed outcome from check results.

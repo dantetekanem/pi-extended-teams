@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Add an experimental `durable_agents` tool built on Pi Durable, enabled with `experimental.durableAgents`. Its agents survive Pi crashes and quits: reopening the session continues unfinished work. Each message is admitted once and in order, and each report is delivered at least once, deduplicated against session history.
+
 ## [2.5.1] - 2026-09-19
 
 ### Fixed

@@ -1,4 +1,4 @@
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { AgentSession, ExtensionFactory } from "@mariozechner/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -36,6 +36,7 @@ import {
   type SpawnResourcePlan,
 } from "../resources/spawn-resource-plan";
 import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
+import { createNativeExtensionFactories, isNativeExtensionPath } from "../resources/native-extensions";
 import { preparePrivateAgentSessionDirectory } from "../internal/agent-session-files";
 import { isEligibleNestedReadParent, NESTED_DELEGATION_TOOL_NAMES } from "../runtime/nested-read-agents";
 import { CHILD_AGENT_LIFECYCLE_PROBE, type NestedReadAgentToolBinding } from "../tools/team-tools";
@@ -1019,6 +1020,7 @@ export async function runReadAgentInProcess(
       }, 5000);
     }
 
+    const piRuntimeApi = await loadPiRuntimeApi();
     const {
       createAgentSession,
       createEventBus,
@@ -1026,7 +1028,7 @@ export async function runReadAgentInProcess(
       getAgentDir,
       SessionManager,
       SettingsManager,
-    } = await loadPiRuntimeApi();
+    } = piRuntimeApi;
     const agentDir = getAgentDir();
     const projectTrusted = parentProjectTrustForSpawn(ctx, member.cwd);
     const resourcePlan = await (options.createResourcePlan ?? createSpawnResourcePlan)({
@@ -1054,6 +1056,11 @@ export async function runReadAgentInProcess(
       : [];
     const nestedReadDelegationEnabled = nestedReadAgentTools.length > 0;
     const childEventBus = createEventBus();
+    const nativeExtensions = createNativeExtensionFactories(piRuntimeApi, resourcePlan.extensionPaths);
+    const extensionFactories = [
+      (pi: Parameters<ExtensionFactory>[0]) => registerSpawnedAgentCommunicationGuard(pi, () => submittedFinalReport !== undefined),
+      ...nativeExtensions,
+    ];
     const loader = new DefaultResourceLoader({
       eventBus: childEventBus,
       cwd: member.cwd,
@@ -1061,7 +1068,8 @@ export async function runReadAgentInProcess(
       settingsManager: childSettingsManager,
       noExtensions: true,
       additionalExtensionPaths: [...resourcePlan.extensionPaths],
-      extensionFactories: [registerSpawnedAgentCommunicationGuard],
+      // Named builtin descriptors exist only on capable hosts; legacy SDK types accept functions only.
+      extensionFactories: extensionFactories as ExtensionFactory[],
       noSkills: false,
       appendSystemPrompt: [
         `You are ${roleLabel} agent '${member.name}' in Pi session '${readTeamName}', running in-process so the lead can follow and control you from Pi.`,
@@ -1143,9 +1151,14 @@ export async function runReadAgentInProcess(
     const communicationToolNames = communicationTools.map(tool => tool.name);
     const communicationToolNameSet = new Set(communicationToolNames);
     const delegationToolNameSet = new Set<string>(NESTED_DELEGATION_TOOL_NAMES);
-    const extensionToolNames = loader.getExtensions().extensions.flatMap(extension => {
+    const loadedExtensions = loader.getExtensions().extensions;
+    const nativeToolNames = new Set(loadedExtensions
+      .filter(extension => isNativeExtensionPath(extension.path))
+      .flatMap(extension => Array.from(extension.tools.keys())));
+    const extensionToolNames = loadedExtensions.flatMap(extension => {
       return Array.from(extension.tools.keys()).filter(name =>
-        !communicationToolNameSet.has(name) && !delegationToolNameSet.has(name) && !USER_INTERACTION_TOOLS.includes(name)
+        !communicationToolNameSet.has(name) && !delegationToolNameSet.has(name)
+        && !USER_INTERACTION_TOOLS.includes(name) && !nativeToolNames.has(name)
       );
     });
     const nestedReadAgentToolNames = nestedReadAgentTools.map(tool => tool.name);
@@ -1186,8 +1199,12 @@ export async function runReadAgentInProcess(
       // sessions retain custom providers and runtime-scoped credentials.
       modelRuntime: parentModelRuntime,
       modelRegistry: ctx.modelRegistry,
-      tools: activeToolNames,
-      excludeTools: USER_INTERACTION_TOOLS,
+      // An SDK allowlist would hide MCP tools registered later during session_start.
+      ...(nativeExtensions.length ? {} : { tools: activeToolNames }),
+      excludeTools: [
+        ...USER_INTERACTION_TOOLS,
+        ...(nativeExtensions.length ? NESTED_DELEGATION_TOOL_NAMES.filter(name => !nestedReadAgentToolNames.includes(name)) : []),
+      ],
       customTools: [...communicationTools, ...nestedReadAgentTools],
       resourceLoader: loader,
       settingsManager: childSettingsManager,
@@ -1195,9 +1212,21 @@ export async function runReadAgentInProcess(
     } as Parameters<typeof createAgentSession>[0] & { modelRuntime?: unknown });
 
     state.session = session;
-    // Current hosts capture this public hook when a prompt starts; legacy hosts
-    // retain their existing loop behavior. Never abort from the reporting tool.
-    if (session.agent && "shouldStopAfterTurn" in session.agent) {
+    if (nativeExtensions.length) {
+      const activeNativeTools = session.getActiveToolNames().filter(name => nativeToolNames.has(name));
+      session.setActiveToolsByName([...activeToolNames, ...activeNativeTools]);
+    }
+    // Hosts capture these public hooks when a prompt starts. Never abort from the reporting tool.
+    if (session.agent && "finishTurn" in session.agent) {
+      const agent = session.agent as typeof session.agent & {
+        finishTurn?: (...args: unknown[]) => unknown;
+      };
+      const previous = agent.finishTurn;
+      agent.finishTurn = async (...args) => {
+        const decision = await previous?.(...args);
+        return submittedFinalReport !== undefined ? { action: "end" } : decision;
+      };
+    } else if (session.agent && "shouldStopAfterTurn" in session.agent) {
       const agent = session.agent as typeof session.agent & {
         shouldStopAfterTurn?: (...args: unknown[]) => boolean | Promise<boolean>;
       };

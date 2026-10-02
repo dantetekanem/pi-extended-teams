@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { loadSettings, type PiExtendedTeamsSettings } from "../../src/utils/settings";
+import { isNativeExtensionPath } from "./native-extensions";
 
 const SELF_COMMAND_NAME = "agents-extensions";
 export const EXTENSIONS_COMMAND_DESCRIPTION = "Select which observable loaded Pi extensions spawned agents receive.";
@@ -19,7 +20,7 @@ export interface ExtensionSourceInfo {
 export interface LeadExtensionSnapshot {
   /** Stable, human-readable selector when unique in the current lead snapshot. */
   name: string;
-  /** Canonical filesystem identity used for deterministic deduplication. */
+  /** Canonical filesystem path or native builtin identity used for deduplication. */
   identity: string;
   /** Pi's registered extension entrypoint path, passed to the child unchanged. */
   path: string;
@@ -81,6 +82,7 @@ export interface CreateSpawnResourcePlanOptions {
 }
 
 function canonicalPath(filePath: string): string {
+  if (isNativeExtensionPath(filePath)) return filePath;
   const absolute = path.resolve(filePath);
   try {
     return fs.realpathSync(absolute);
@@ -104,7 +106,8 @@ function usableSourceInfo(sourceInfo: ExtensionSourceInfo | undefined): sourceIn
   return !!sourceInfo
     && typeof sourceInfo.path === "string"
     && sourceInfo.path.length > 0
-    && !sourceInfo.path.startsWith("<");
+    && !sourceInfo.path.startsWith("<")
+    && (!sourceInfo.path.startsWith("builtin:") || isNativeExtensionPath(sourceInfo.path));
 }
 
 /**
@@ -130,7 +133,8 @@ export function snapshotLeadExtensions(pi: LeadRegistrationApi): readonly LeadEx
       .filter((command) => command.source === "extension")
       .map((command) => command.sourceInfo),
     ...tools
-      .filter((tool) => !GENERIC_TOOL_SOURCES.has(tool.sourceInfo?.source ?? ""))
+      .filter((tool) => !GENERIC_TOOL_SOURCES.has(tool.sourceInfo?.source ?? "")
+        || isNativeExtensionPath(tool.sourceInfo?.path ?? ""))
       .map((tool) => tool.sourceInfo),
   ].filter(usableSourceInfo);
 

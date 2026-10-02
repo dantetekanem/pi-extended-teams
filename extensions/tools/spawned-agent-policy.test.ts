@@ -14,6 +14,18 @@ describe("spawned-agent communication guard", () => {
     if (root) fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("denies new direct and nested calls once the agent has accepted a final report", () => {
+    let closed = false;
+    const handlers: Array<(event: any) => any> = [];
+    registerSpawnedAgentCommunicationGuard({ on: (_name: string, handler: any) => handlers.push(handler) } as any, () => closed);
+    const direct = { toolName: "read", input: {}, toolCallId: "read" };
+    const nested = { toolName: "read", input: {}, toolCallId: "script/1", parentToolCallId: "script" };
+    expect(handlers.every(handler => !handler(direct)?.block)).toBe(true);
+    closed = true;
+    expect(handlers.some(handler => handler(direct)?.block)).toBe(true);
+    expect(handlers.some(handler => handler(nested)?.block)).toBe(true);
+  });
+
   it("blocks activated user tools through the installed SDK while allowing lead communication", async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "spawned-agent-policy-"));
     const codingPackage = findPackageJSON("@mariozechner/pi-coding-agent", pathToFileURL(path.join(process.cwd(), "package.json")).href)!;

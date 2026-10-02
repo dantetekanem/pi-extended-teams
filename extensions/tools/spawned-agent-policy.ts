@@ -13,8 +13,14 @@ export function requireLeadRecipient(recipient: string): void {
   }
 }
 
-export function registerSpawnedAgentCommunicationGuard(pi: Pick<ExtensionAPI, "on">): void {
+export function registerSpawnedAgentCommunicationGuard(
+  pi: Pick<ExtensionAPI, "on">,
+  reportAccepted: () => boolean = () => false,
+): void {
   pi.on("tool_call", event => {
+    if (reportAccepted()) {
+      return { block: true, reason: "This agent's final report has been accepted. No further tool calls are allowed." };
+    }
     if (USER_INTERACTION_TOOLS.includes(event.toolName)) {
       return { block: true, reason: "Spawned agents cannot contact the user. Send your question to team-lead using send_message." };
     }

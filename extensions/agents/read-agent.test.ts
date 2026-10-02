@@ -31,6 +31,8 @@ const piMocks = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   loaderOptions: [] as any[],
   loaderExtensions: [] as any[],
+  nativeFactories: {} as Record<string, () => unknown>,
+  runtimeOverride: undefined as any,
   settingsManagers: [] as any[],
   sessionManagerCreate: vi.fn(),
   sessionManagerOpen: vi.fn(),
@@ -41,6 +43,7 @@ const piMocks = vi.hoisted(() => ({
 
 function mockedPiRuntimeApi() {
   return {
+  ...piMocks.nativeFactories,
   createAgentSession: piMocks.createAgentSession,
   DefaultResourceLoader: class {
     constructor(options: any) {
@@ -90,7 +93,7 @@ function mockedPiRuntimeApi() {
 
 vi.mock("@mariozechner/pi-coding-agent", mockedPiRuntimeApi);
 vi.mock("../internal/pi-runtime-api", () => ({
-  loadPiRuntimeApi: async () => mockedPiRuntimeApi(),
+  loadPiRuntimeApi: async () => piMocks.runtimeOverride ?? mockedPiRuntimeApi(),
 }));
 
 import { closeReadAgentMessageDelivery, handleReadAgentSessionEvent, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./read-agent.js";
@@ -221,6 +224,8 @@ function makeSession() {
   return {
     messages: [{ role: "assistant", content: "final report" }],
     getSessionStats: vi.fn(() => ({ tokens: { total: 42 } })),
+    getActiveToolNames: vi.fn((): string[] => ["read"]),
+    setActiveToolsByName: vi.fn(),
     subscribe: vi.fn(),
     prompt: vi.fn(async () => {}),
     bindExtensions: vi.fn(async () => {}),
@@ -254,6 +259,8 @@ describe("in-process read agent tool wiring", () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-read-agent-"));
     piMocks.loaderOptions.length = 0;
     piMocks.loaderExtensions.length = 0;
+    piMocks.nativeFactories = {};
+    piMocks.runtimeOverride = undefined;
     piMocks.settingsManagers.length = 0;
     piMocks.createAgentSession.mockReset();
     piMocks.sessionManagerCreate.mockReset();
@@ -2599,6 +2606,75 @@ describe("in-process read agent tool wiring", () => {
     );
   });
 
+  it.each([false, true])("loads selected native factories without restricting later MCP tools (codemode initially active: %s)", async codemodeActive => {
+    const session = makeSession();
+    session.getActiveToolNames.mockReturnValue(codemodeActive ? ["read", "codemode"] : ["read"]);
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const builtinPaths = ["builtin:mcp", "builtin:codemode", "builtin:tool-search"];
+    const factories = ["createMcpExtension", "createCodemodeExtension", "createToolSearchExtension"];
+    for (const name of factories) piMocks.nativeFactories[name] = vi.fn(() => () => {});
+    for (const [path, name] of [["builtin:codemode", "codemode"], ["builtin:tool-search", "tool_search"]]) {
+      piMocks.loaderExtensions.push({ path, tools: new Map([[name, { definition: { name, defaultActive: false } }]]) });
+    }
+    piMocks.loaderExtensions.push({
+      path: "/extensions/selected.ts",
+      tools: new Map([
+        ["selected_extension_tool", { definition: { name: "selected_extension_tool" } }],
+        ["spawn_agent", { definition: { name: "spawn_agent", exposure: "codemode" } }],
+      ]),
+    });
+    const options = {
+      ...makeRunOptions(),
+      createResourcePlan: async () => ({
+        selectionMode: "default" as const,
+        extensionPaths: [...builtinPaths, "/extensions/selected.ts"],
+        extensions: [], diagnostics: [], skills: "all" as const,
+        trust: { cwd: root, projectTrusted: false },
+      }),
+    };
+    let postReportDenied = false;
+    session.prompt.mockImplementation(async () => {
+      const handlers: Array<(event: any) => any> = [];
+      for (const factory of piMocks.loaderOptions[0].extensionFactories) {
+        if (typeof factory !== "function") continue;
+        factory({
+          on: (name: string, handler: any) => {
+            if (name === "tool_call") handlers.push(handler);
+          },
+        });
+      }
+      const call = { toolName: "read", input: {}, toolCallId: "script/2", parentToolCallId: "script" };
+      expect(handlers.every(handler => !handler(call)?.block)).toBe(true);
+      const report = piMocks.createAgentSession.mock.calls[0][0].customTools.find((tool: any) => tool.name === "report_and_exit");
+      await report.execute("script/1", { content: "Native agent finished" });
+      postReportDenied = handlers.some(handler => handler(call)?.block);
+    });
+    await runReadAgentInProcess("team", fixtureMember("reader"), "Inspect", {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, options);
+
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1].status).not.toBe("failed");
+    for (const name of factories) expect(piMocks.nativeFactories[name]).toHaveBeenCalledOnce();
+    expect(piMocks.loaderOptions[0]).toMatchObject({
+      noExtensions: true,
+      additionalExtensionPaths: [...builtinPaths, "/extensions/selected.ts"],
+      extensionFactories: expect.arrayContaining(builtinPaths.map(path => expect.objectContaining({
+        name: path.slice("builtin:".length),
+        builtin: true,
+        replaceable: true,
+        factory: expect.any(Function),
+      }))),
+    });
+    const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+    expect(sessionOptions.tools).toBeUndefined();
+    expect(sessionOptions.excludeTools).toEqual(expect.arrayContaining(["ask_user", "spawn_agent", "spawn_swarm_agents", "get_agent_status"]));
+    expect(session.setActiveToolsByName).toHaveBeenCalledWith(expect.arrayContaining(["read", "bash", "edit", "write", "grep", "find", "ls", "selected_extension_tool", "report_and_exit"]));
+    expect(session.setActiveToolsByName.mock.calls[0][0].includes("codemode")).toBe(codemodeActive);
+    expect(session.setActiveToolsByName.mock.calls[0][0]).not.toContain("tool_search");
+    expect(session.setActiveToolsByName.mock.invocationCallOrder[0]).toBeLessThan(session.bindExtensions.mock.invocationCallOrder[0]);
+    expect(postReportDenied).toBe(true);
+  });
+
   it.each(["read", "write", "nested"] as const)("filters user tools and installs execution guards in %s sessions", async mode => {
     const session = makeSession();
     piMocks.createAgentSession.mockResolvedValue({ session });
@@ -2690,6 +2766,8 @@ describe("in-process read agent tool wiring", () => {
     });
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
     expect(sessionOptions.tools).toContain("selected_extension_tool");
+    expect(sessionOptions.tools).toEqual(expect.arrayContaining(["read", "bash", "edit", "write", "grep", "find", "ls"]));
+    expect(session.setActiveToolsByName).not.toHaveBeenCalled();
     expect(sessionOptions.tools.filter((name: string) => name === "send_message")).toHaveLength(1);
     expect(sessionOptions.tools).not.toContain("spawn_agent");
     expect(sessionOptions.tools).not.toContain("spawn_swarm_agents");
@@ -4340,6 +4418,78 @@ describe("in-process read agent tool wiring", () => {
     expect(await readInbox("team", "writer", false, false)).toEqual([expect.objectContaining({ text: "final report" })]);
   });
 
+  it("runs a complete child through the installed legacy SDK without native factories", async () => {
+    const legacyModule = process.env.PI_LEGACY_SDK_CONTRACT_MODULE;
+    const sdk: typeof import("@mariozechner/pi-coding-agent") = legacyModule
+      ? await import(legacyModule)
+      : await vi.importActual("@mariozechner/pi-coding-agent");
+    const codingModule = legacyModule ?? resolvePiFixtureEntry(resolvePiFixturePackageJson(
+      "@mariozechner/pi-coding-agent", pathToFileURL(path.join(process.cwd(), "package.json")).href,
+    ));
+    const manifest = JSON.parse(fs.readFileSync(findPackageJSON(codingModule)!, "utf8"));
+    const aiPackage = manifest.dependencies?.["@earendil-works/pi-ai"] ? "@earendil-works/pi-ai" : "@mariozechner/pi-ai";
+    const { createAssistantMessageEventStream } = await import(resolvePiFixtureEntry(resolvePiFixturePackageJson(aiPackage, codingModule)));
+    fs.writeFileSync(path.join(root, "settings.json"), JSON.stringify({
+      cacheWarming: "off", retry: { enabled: false }, compaction: { enabled: false },
+    }));
+    const authStorage = sdk.AuthStorage.inMemory({ openai: { type: "api_key", key: "offline-unused" } });
+    const modelRegistry = sdk.ModelRegistry.inMemory(authStorage);
+    const model = modelRegistry.find("openai", "gpt-5")!;
+    expect(model).toBeDefined();
+    const member = { ...fixtureMember("reader"), model: `${model.provider}/${model.id}` };
+    writeTeamConfig("team", member);
+    const settingsPath = path.join(root, ".pi/agent/pi-extended-teams/settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    settings.favoriteModels["reading-default"].model = member.model;
+    fs.writeFileSync(settingsPath, JSON.stringify(settings));
+    let responses = 0;
+    let child: any;
+    piMocks.runtimeOverride = {
+      ...sdk,
+      getAgentDir: () => root,
+      createAgentSession: async (configuration: any) => {
+        const created = await sdk.createAgentSession({ ...configuration, agentDir: root, authStorage, modelRegistry });
+        child = created.session;
+        const streamFn = () => {
+          const stream = createAssistantMessageEventStream();
+          const reporting = responses++ === 0;
+          const message = {
+            role: "assistant",
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            timestamp: Date.now(),
+            content: reporting
+              ? [{ type: "toolCall", id: "report", name: "report_and_exit", arguments: { content: "legacy SDK report" } }]
+              : [{ type: "text", text: "done" }],
+            stopReason: reporting ? "toolUse" : "stop",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          };
+          stream.push({ type: "done", reason: message.stopReason, message });
+          stream.end();
+          return stream;
+        };
+        if ("streamFunction" in child.agent) child.agent.streamFunction = streamFn;
+        else if ("streamFn" in child.agent) child.agent.streamFn = streamFn;
+        else throw new Error("The SDK fixture requires a public stream injection hook.");
+        return created;
+      },
+    };
+    const options = makeRunOptions();
+    await runReadAgentInProcess("team", member, "Exercise the legacy SDK", { modelRegistry }, options);
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1]).toMatchObject({ report: "legacy SDK report", status: "completed" });
+    expect(responses).toBeGreaterThan(0);
+    expect(child.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "bash", "edit", "write", "report_and_exit"]));
+    expect(options.runningReadAgents.size).toBe(0);
+  });
+
   it.each([false, true])("uses the installed Agent loop to stop an accepted report (idle continuation: %s)", async (idle) => {
     const packageResolutionBase = pathToFileURL(path.join(process.cwd(), "package.json")).href;
     const codingAgentPackageJson = resolvePiFixturePackageJson("@mariozechner/pi-coding-agent", packageResolutionBase);
@@ -4376,12 +4526,15 @@ describe("in-process read agent tool wiring", () => {
       return stream;
     };
     const agent = new Agent({ initialState: { model }, streamFn });
-    const supportsStop = "shouldStopAfterTurn" in agent;
+    const supportsFinishTurn = "finishTurn" in agent;
+    const supportsStop = supportsFinishTurn || "shouldStopAfterTurn" in agent;
     const previousHook = vi.fn(async (turn, signal) => {
       expect(signal).toBeInstanceOf(AbortSignal);
-      return turn.toolResults.some((result: any) => result.toolName === "report_progress");
+      const stop = turn.toolResults.some((result: any) => result.toolName === "report_progress");
+      return supportsFinishTurn ? (stop ? { action: "end" } : undefined) : stop;
     });
-    if (supportsStop) agent.shouldStopAfterTurn = previousHook;
+    if (supportsFinishTurn) agent.finishTurn = previousHook;
+    else if (supportsStop) agent.shouldStopAfterTurn = previousHook;
     Object.assign(session, { agent, isStreaming: false });
     piMocks.createAgentSession.mockImplementation(async ({ customTools }) => {
       agent.state.tools = customTools;

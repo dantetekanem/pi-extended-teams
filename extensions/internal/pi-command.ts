@@ -135,7 +135,8 @@ export function buildPiCommand(
   selfExtensionSource?: string,
   sessionDir?: string,
 ): string {
-  const extensionArgs = buildExtensionArgs(allowedExtensions, projectTrusted, selfExtensionSource);
+  const toolArgs = allowedExtensions.includes("builtin:codemode") ? " --tools +codemode" : "";
+  const extensionArgs = buildExtensionArgs(allowedExtensions, projectTrusted, selfExtensionSource) + toolArgs;
   const sessionArgs = sessionDir ? ` --session-dir ${shellQuote(sessionDir)}` : "";
 
   if (chosenModel) {

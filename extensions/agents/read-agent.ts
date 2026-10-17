@@ -1213,7 +1213,8 @@ export async function runReadAgentInProcess(
 
     state.session = session;
     if (nativeExtensions.length) {
-      const activeNativeTools = session.getActiveToolNames().filter(name => nativeToolNames.has(name));
+      const activeNativeTools = new Set(session.getActiveToolNames().filter(name => nativeToolNames.has(name)));
+      if (nativeToolNames.has("codemode")) activeNativeTools.add("codemode");
       session.setActiveToolsByName([...activeToolNames, ...activeNativeTools]);
     }
     // Hosts capture these public hooks when a prompt starts. Never abort from the reporting tool.

@@ -2669,7 +2669,7 @@ describe("in-process read agent tool wiring", () => {
     expect(sessionOptions.tools).toBeUndefined();
     expect(sessionOptions.excludeTools).toEqual(expect.arrayContaining(["ask_user", "spawn_agent", "spawn_swarm_agents", "get_agent_status"]));
     expect(session.setActiveToolsByName).toHaveBeenCalledWith(expect.arrayContaining(["read", "bash", "edit", "write", "grep", "find", "ls", "selected_extension_tool", "report_and_exit"]));
-    expect(session.setActiveToolsByName.mock.calls[0][0].includes("codemode")).toBe(codemodeActive);
+    expect(session.setActiveToolsByName.mock.calls[0][0]).toContain("codemode");
     expect(session.setActiveToolsByName.mock.calls[0][0]).not.toContain("tool_search");
     expect(session.setActiveToolsByName.mock.invocationCallOrder[0]).toBeLessThan(session.bindExtensions.mock.invocationCallOrder[0]);
     expect(postReportDenied).toBe(true);

@@ -272,6 +272,33 @@ describe.skipIf(!nativeModule)("native SDK child tools", () => {
     modelRegistry: { runtime: modelRuntime, find: () => model },
   }, options);
 
+  it.each(["read", "write"])("enables codemode for %s agents without MCP or user defaultTools", async role => {
+    Object.assign(member, { role, modelSlot: role === "write" ? "write-feature" : "read-review" });
+    options.createResourcePlan = async () => ({
+      selectionMode: "default",
+      extensionPaths: ["builtin:codemode"],
+      extensions: [], diagnostics: [], skills: "all",
+      trust: { cwd: member.cwd, projectTrusted: false },
+    });
+    const fixturePath = path.join(member.cwd, "probe.txt");
+    fs.writeFileSync(fixturePath, "subagent-codemode-ok");
+    configure("direct", [[toolCall("codemode", { code: `
+      const result = await tools.read({ path: ${JSON.stringify(fixturePath)} });
+      if (result !== "subagent-codemode-ok") throw new Error("Read failed: " + result);
+      await tools.report_and_exit({ content: result });
+    ` })]]);
+
+    await run();
+
+    expect(session.getActiveToolNames()).toContain("codemode");
+    expect(hooks).toEqual(expect.arrayContaining([
+      { type: "tool_result", event: expect.objectContaining({ toolName: "read", parentToolCallId: "codemode" }) },
+    ]));
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1]).toMatchObject({ report: "subagent-codemode-ok", status: "completed" });
+    expect(connections).toEqual([]);
+    expect(responses).toBe(1);
+  }, 10000);
+
   it("discovers codemode MCP tools and fences forbidden and post-report nested calls", async () => {
     configure("codemode", [[toolCall("codemode", { code: `
       if (!JSON.stringify(await searchTools("echo")).includes("mcp__fixture__echo")) throw new Error("Discovery failed");

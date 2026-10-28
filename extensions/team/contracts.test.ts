@@ -87,7 +87,7 @@ describe("persisted team behavior contracts", () => {
     };
     const writerExamples = [
       exampleSlice("docs-fix", "For a bounded feature or critical writer"),
-      exampleSlice("parser-feature", "## Hot-word trigger"),
+      exampleSlice("parser-feature", "\n```"),
     ];
     for (const example of writerExamples) {
       expect(example).toContain("Mode: EDIT-ALLOWED");

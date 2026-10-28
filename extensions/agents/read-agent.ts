@@ -375,6 +375,12 @@ export async function sendMessageToRunningReadAgent(
   requireReceipt = false
 ): Promise<boolean> {
   if (!agent) return false;
+  if (agent.externalControl) {
+    if (!agent.acceptingMessages || agent.messageDeliveryClosed || agent.stopRequested) throw new Error(`Cannot send message to ${agent.name}: agent is finishing.`);
+    if (requireReceipt) throw new Error("External harnesses do not provide Pi message receipts.");
+    await enqueueReadAgentMessageDelivery(agent, agent.name, () => agent.externalControl!.message(content));
+    return true;
+  }
   if (!agent.session || !agent.acceptingMessages || agent.messageDeliveryClosed || agent.stopRequested) {
     throw new Error(`Cannot send message to ${agent.name}: agent is finishing.`);
   }

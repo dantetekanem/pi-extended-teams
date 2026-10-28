@@ -78,7 +78,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
   async function finalizeTeammateRuntime(teamName: string, member: Member, expectedRunId: string): Promise<void> {
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
     const pidFileExisted = fs.existsSync(pidFile);
-    if (member.herdrPaneId) herdrCommand("pane", "close", member.herdrPaneId);
+    if (member.herdrPaneId && !member.externalHarness) herdrCommand("pane", "close", member.herdrPaneId);
     const pidCleanup = member.herdrPaneId
       ? { pid: undefined, killError: undefined, unlinked: !pidFileExisted || unlinkPidFile(pidFile) }
       : cleanupPidFileProcess(pidFile, { skipPid: process.pid });
@@ -222,6 +222,11 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
     }
 
     const releaseClaims = options.releaseAllClaimsForAgent ?? releaseAllClaimsForAgent;
+    let externalStopAttempt: Promise<void> | undefined;
+    const externalControl = expectedState?.externalControl;
+    const stopExecution = externalControl
+      ? () => externalStopAttempt ??= externalControl.stop()
+      : undefined;
     const finalize = async (): Promise<ReadAgentFinalizationResult> => {
       let releasedClaims: string[] = [];
       let removedMember = false;
@@ -283,6 +288,12 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
               runId: expectedRunId, reason: `Agent lifecycle ended (${reason}) without a final report.` });
             await enqueueCompletionGroupDeliveries(group);
           }
+          // Reuse the coalesced stop result; never release ownership after an
+          // unverified pane close or reuse the native unguarded pane cleanup.
+          if (candidate.externalHarness && !externalControl) {
+            throw new Error("External harness controller unavailable; process exit cannot be verified.");
+          }
+          await stopExecution?.();
           releasedClaims = await releaseClaims(teamName, member.name);
 
           // Private transcript cleanup is the first destructive recovery step.
@@ -397,9 +408,19 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       // teardown ownership remains authoritative if an observer fails.
     }
     if (expectedState) {
+      if (expectedState.externalControl &&
+        expectedState.teardownResult?.status === "cleanup_failed" && !expectedState.finalizationBlockedReason) {
+        // Retry only settled external cleanup failures; live operations and native teardown stay coalesced.
+        expectedState.teardownResult = undefined;
+        expectedState.teardownPromise = undefined;
+        expectedState.teardownCleanupPromise = undefined;
+        expectedState.teardownFinalizationPromise = undefined;
+        expectedState.teardownError = undefined;
+      }
       return requestReadAgentTeardown(expectedState, {
         reason,
         closePersistence,
+        stopExecution,
         finalize,
         onBoundedResult: async result => {
           const phase = result.status === "timed_out" ? "timed_out" : "cleanup_failed";
@@ -574,7 +595,14 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       for (const member of members) {
         if (!shouldContinue()) return;
         const fence = await readLifecycleTombstone(targetTeamName, member.name);
-        if (fence.status !== "absent") continue;
+        if (fence.status !== "absent") {
+          const state = options.runningReadAgents.get(options.readAgentKey(targetTeamName, member.name));
+          if (fence.status === "occupied" && state?.externalControl &&
+            state.teardownResult?.status === "cleanup_failed" && !state.finalizationBlockedReason) {
+            await shutdownTeammate(targetTeamName, member);
+          }
+          continue;
+        }
 
         const role = member.role ?? "write";
         const runtimeStatus = runtimeStatusByMember.get(member.name) ?? null;

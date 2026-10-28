@@ -70,6 +70,13 @@ describe("read-agent status descriptions", () => {
     });
   });
 
+  it.each([301_000, 901_000])("keeps external activity unknown after %s ms", (elapsed) => {
+    const agent = makeAgent({ externalControl: {} as RunningReadAgent["externalControl"] });
+    expect(describeReadAgentStatus(agent, agent.startedAt + elapsed)).toMatchObject({
+      label: "thinking", idleLevel: "none", detail: "runtime telemetry unavailable",
+    });
+  });
+
   it("does not wake the lead for idle/hanging read agents", () => {
     expect(shouldNudgeReadAgentIdle(undefined, "none")).toBe(false);
     expect(shouldNudgeReadAgentIdle(undefined, "soft")).toBe(false);

@@ -626,6 +626,29 @@ describe("extension integration", () => {
     }
   });
 
+  it("shows a fallback notice in the user transcript without requesting a model turn", async () => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    try {
+      writeFavoriteLevels(setup.root);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader",
+        prompt: "Inspect source",
+        cwd: setup.root,
+        model_slot: "read-review",
+      }, new AbortController().signal, undefined, makeCtx(setup.root));
+      const options = setup.readAgentMock.runReadAgentInProcess.mock.calls[0]![4];
+      const content = "reader: quota exhausted; falling back read-review → read-collect (provider/model).";
+
+      options.notifyFallback(content);
+
+      expect(setup.pi.sendMessage).toHaveBeenCalledWith({
+        customType: "pi-extended-teams-fallback", content, display: true,
+      }, { triggerTurn: false });
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("emits only the minimal correlated nested-agent progress event", async () => {
     const setup = await setupExtension();
     try {
@@ -1180,7 +1203,11 @@ describe("extension integration", () => {
     }
   });
 
-  it("renders zero before provider context usage and updates without remounting", async () => {
+  it.each([
+    { modelSlot: "read-review", external: false },
+    { modelSlot: "read-review", external: true },
+    { modelSlot: "write-critical", external: true },
+  ])("updates $modelSlot context usage without remounting (external: $external)", async ({ modelSlot, external }) => {
     const setup = await setupExtension();
     try {
       let billedTokenCount = 0;
@@ -1206,6 +1233,7 @@ describe("extension integration", () => {
           thinking: member.thinking,
           modelSlot: member.modelSlot,
           latestAssistantSnippet: "secret agent thought",
+          externalControl: external ? {} : undefined,
           latestProgress: "Reviewing focused test coverage",
           progressUpdatedAt: Date.now(),
           heartbeatTimer: setInterval(heartbeatWork, 5_000),
@@ -1229,7 +1257,7 @@ describe("extension integration", () => {
         name: "reader",
         prompt: "Think about this",
         cwd: setup.root,
-        model_slot: "reading-default",
+        model_slot: modelSlot,
       }, abort, undefined, ctx);
       await vi.advanceTimersByTimeAsync(100);
 
@@ -1241,7 +1269,13 @@ describe("extension integration", () => {
       const widget = widgetCall![1]({ requestRender });
       const initialRendered = widget.render(160).join("\n");
       expect(initialRendered).toContain("agent activity");
-      expect(initialRendered).toMatch(/\(reader\) model\/high · read-review · 1s · 0 tok \(0%\) · Reviewing focused test coverage\.{1,3}/);
+      if (external) {
+        expect(initialRendered.split("\n")[1].trimEnd()).toBe(`└─ (reader) · ${modelSlot} · external agent running · 1s`);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(widget.render(160).join("\n")).toContain(`(reader) · ${modelSlot} · external agent running · 2s`);
+      } else {
+        expect(initialRendered).toMatch(/\(reader\) model\/high · read-review · 1s · 0 tok \(0%\) · Reviewing focused test coverage\.{1,3}/);
+      }
       expect(initialRendered).not.toContain("597 tok");
       expect(initialRendered).not.toContain("secret agent thought");
       expect(initialRendered).not.toContain("reader read thinking");
@@ -1251,16 +1285,18 @@ describe("extension integration", () => {
       billedTokenCount = 2_300_000;
       contextTokenCount = 80_000;
       contextPercent = 40;
+      delete runningState.externalControl;
       runningState.latestProgress = "Writing the final report";
       runningState.progressUpdatedAt = Date.now();
       await vi.advanceTimersByTimeAsync(1_000);
 
       let updatedRendered = widget.render(160).join("\n");
-      expect(updatedRendered).toContain("Reviewing focused test coverage");
-      expect(updatedRendered).not.toContain("Writing the final report");
+      expect(updatedRendered).toContain(external ? "Writing the final report" : "Reviewing focused test coverage");
+      if (!external) expect(updatedRendered).not.toContain("Writing the final report");
       await vi.advanceTimersByTimeAsync(1_000);
       updatedRendered = widget.render(160).join("\n");
-      expect(updatedRendered).toMatch(/\(reader\) model\/high · read-review · 3s · 80k tok \(40%\) · Writing the final report\.{1,3}/);
+      const elapsed = external ? "4s" : "3s";
+      expect(updatedRendered).toContain(`(reader) model/${runningState.thinking} · ${modelSlot} · ${elapsed} · 80k tok (40%) · Writing the final report`);
       expect(updatedRendered).not.toContain("2.3M tok");
       expect(requestRender).toHaveBeenCalled();
       expect(ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function")).toHaveLength(1);
@@ -2164,10 +2200,10 @@ describe("extension integration", () => {
       expect(latestActivityCall?.[1]).toBeTypeOf("function");
       const card = latestActivityCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
       expect(card).toContain("reader");
-      expect(card).toContain("stalled");
+      expect(card).toContain(telemetry === "stale" ? "stalled" : "unknown");
       expect(card).toContain(telemetry === "stale" ? "heartbeat stale" : "telemetry unavailable");
       const snapshot = await setup.tools.get("get_agent_status")!.execute("status", { agent_name: "reader" }, abort, undefined, ctx);
-      expect(snapshot.details.statuses).toMatchObject([{ name: "reader", phase: "stalled" }]);
+      expect(snapshot.details.statuses).toMatchObject([{ name: "reader", phase: telemetry === "stale" ? "stalled" : "unknown" }]);
     } finally {
       setup.restoreEnv();
     }

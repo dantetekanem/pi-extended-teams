@@ -315,8 +315,12 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     contextUsage: string,
     latestProgress: string | undefined,
     now: number,
-    activeReadHelperCount = 0
+    activeReadHelperCount = 0,
+    isExternal = false
   ): string {
+    if (isExternal) {
+      return [`(${name})`, modelSlot, "external agent running", elapsed].filter(Boolean).join(" · ");
+    }
     const shortModel = model ? model.split("/").pop() || model : "";
     const modelAndThinking = [shortModel, thinking].filter(Boolean).join("/");
     const identity = modelAndThinking ? `(${name}) ${modelAndThinking}` : `(${name})`;
@@ -755,8 +759,8 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       const contextUsage = formatRunningContextUsage(agent.contextUsage);
       const detail = [modelLabel, slotLabel, elapsed, contextUsage, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
-      entries.push({ name: agent.name, role: "write", status: status.label, detail });
-      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now, activeReadHelperCounts.get(agent.name)));
+      entries.push({ name: agent.name, role: "write", status: status.label, detail, animateProgress: !agent.externalControl });
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now, activeReadHelperCounts.get(agent.name), !!agent.externalControl));
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyWriteMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
@@ -825,8 +829,8 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       const contextUsage = formatRunningContextUsage(agent.contextUsage);
       const detail = [modelLabel, slotLabel, elapsed, contextUsage, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
-      entries.push({ name: agent.name, role: "read", status: status.label, detail });
-      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now));
+      entries.push({ name: agent.name, role: "read", status: status.label, detail, animateProgress: !agent.externalControl });
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now, 0, !!agent.externalControl));
     }
 
     for (const { member, runtimeStatus } of unobservedMembers) {
@@ -1363,6 +1367,10 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       rememberCompletedAgentReport,
       emitAgentReport,
       emitAgentProgress,
+      notifyFallback: (content: string) => pi.sendMessage(
+        { customType: "pi-extended-teams-fallback", content, display: true },
+        { triggerTurn: false },
+      ),
       releaseAllClaimsForAgent,
       shutdownTeammate,
       agentName,

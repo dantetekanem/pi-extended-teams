@@ -69,6 +69,8 @@ export interface ReadAgentTeardownResult extends Omit<NestedSessionTeardownResul
 export interface ReadAgentTeardownOptions {
   reason?: unknown;
   closePersistence(): Promise<void>;
+  /** Non-Pi execution is stopped only after exact recipient closure. */
+  stopExecution?(): Promise<void>;
   finalize(): Promise<ReadAgentFinalizationResult | void>;
   onBoundedResult?(result: ReadAgentTeardownResult): Promise<void> | void;
 }
@@ -493,7 +495,10 @@ export function requestReadAgentTeardown(
       }
     );
 
-    const observedOperations = Promise.all([observedDelivery, operationSettlement]).then(() => {});
+    // Observe external stop with the same bounded settlement budget. The finalizer
+    // rechecks its result before releasing claims or roster ownership.
+    const externalStop = options.stopExecution ? Promise.resolve().then(options.stopExecution) : Promise.resolve();
+    const observedOperations = Promise.all([observedDelivery, operationSettlement, externalStop.catch(() => {})]).then(() => {});
     let session = state.session;
     if (state.startupState === "pending" && state.sessionCreation) {
       let startupSettled = false;

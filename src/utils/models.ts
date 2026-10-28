@@ -5,6 +5,7 @@ import type { RepairPolicy } from "../results/repair-policy";
 import type { CompletionGroupBinding } from "../results/completion-group";
 import type { CheckpointAssignment } from "../results/checkpoint-assignment";
 import type { SpecialistCheckpoint } from "../results/specialist-checkpoint";
+import type { ExternalHarnessProfile } from "./external-harness-config";
 
 export const THINKING_LEVELS = THINKING_LEVEL_NAMES;
 export type ThinkingLevel = ThinkingLevelName;
@@ -29,6 +30,8 @@ export interface Member {
   checkpointAssignment?: CheckpointAssignment;
   completionGroup?: CompletionGroupBinding;
   backendType?: string;
+  /** Explicit global profile snapshot; absent means native Pi execution. */
+  externalHarness?: ExternalHarnessProfile;
   isActive?: boolean;
   /** Optional programmatic orchestration/idempotency metadata. */
   metadata?: Record<string, any>;
@@ -122,7 +125,7 @@ export interface TeamReportEvent {
   modelSlot?: string;
   color?: string;
   requestedBy?: string;
-  source: "read-agent" | "write-agent" | "lead-inbox" | "tool" | "workflow";
+  source: "read-agent" | "write-agent" | "lead-inbox" | "tool" | "workflow" | "external-harness";
   operationId?: string;
   workflowRunId?: string;
   metadata?: Record<string, any>;

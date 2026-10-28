@@ -12,7 +12,7 @@ export interface TeammateInterruptResult {
   message: string;
   agentKind?: "read" | "write";
   lifecycleRunId?: string;
-  mechanism?: "agent-session-abort" | "assigned-check-abort" | "tmux-escape";
+  mechanism?: "agent-session-abort" | "assigned-check-abort" | "tmux-escape" | "herdr-escape";
   reason?: "no-active-session" | "session-not-created" | "lifecycle-closing"
     | "missing-pane" | "missing-runtime-proof" | "terminal-interrupt-unavailable";
   error?: string;
@@ -213,6 +213,11 @@ export function createTeammateInterrupter(options: TeammateInterrupterOptions): 
       if (!member) return result("not_found", agentName, `Agent ${agentName} is not active in this session.`);
 
       const state = options.runningReadAgents.get(options.readAgentKey(teamName, agentName));
+      if (state?.externalControl) {
+        if (state.runId !== member.lifecycleRunId || readLifecycleClosing(state)) return result("unsupported", agentName, "External agent is closing or was replaced.");
+        await state.externalControl.interrupt();
+        return result("interrupt_sent", agentName, "Sent Escape to the external harness; command settlement is not confirmed.", { lifecycleRunId: state.runId, mechanism: "herdr-escape" });
+      }
       if (state) return interruptReadAgent(state, member, options);
       if (member.role === "write") return interruptWriter(teamName, member, options);
       return result("unsupported", agentName, `Cannot interrupt ${agentName}: no live in-process session is available.`, {

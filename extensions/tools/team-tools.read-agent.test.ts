@@ -25,6 +25,7 @@ import * as sourceIdentity from "../../src/results/source-identity.js";
 import { checkpointId, checkpointPath, retireCheckpoint, saveCheckpoint, type SpecialistCheckpoint } from "../../src/results/specialist-checkpoint";
 import { claimFiles } from "../../src/utils/claims";
 import * as continuationRecipients from "../../src/results/continuation-recipient";
+import * as externalProfiles from "../../src/utils/external-harness-config";
 
 type RegisteredTool = {
   name: string;
@@ -125,7 +126,7 @@ function makeRunningAgent(teamName: string, member: Member): RunningReadAgent {
   };
 }
 
-function registerTools(host: { isHostAttached?(): boolean; waitForHost?(): Promise<void>; getSessionCtx?(): any } = {}) {
+function registerTools(host: { isHostAttached?(): boolean; waitForHost?(): Promise<void>; getSessionCtx?(): any; setSessionCtx?(ctx: any): void; runExternalAgent?: (...args: any[]) => Promise<void> } = {}) {
   const tools = new Map<string, RegisteredTool>();
   const eventHandlers = new Map<string, Array<(payload: any) => void>>();
   const sessionHandlers = new Map<string, Array<(event: any) => void | Promise<void>>>();
@@ -246,6 +247,220 @@ async function admitNestedReadParent(
 }
 
 describe("public agent spawn tools", () => {
+  function configureTierHarness(slot = "write-critical") {
+    externalProfile();
+    writeGlobalSettings({ favoriteModels: { [slot]: { harness: "claude-review" } } });
+  }
+
+  it.each(["single", "swarm"])("routes a configured harness tier through %s spawning without a Pi model", async mode => {
+    configureTierHarness();
+    const external = vi.fn(async (_team: string, _member: Member) => {});
+    const harness = registerTools({ runExternalAgent: external });
+    const ctx = { ...makeCtx(), model: undefined, modelRegistry: undefined };
+    const agent = { name: "critical", prompt: "Work", model_slot: "write-critical" };
+    const params = mode === "swarm"
+      ? { defaults: { model_slot: agent.model_slot }, agents: [{ name: agent.name, prompt: agent.prompt }] }
+      : agent;
+    const tool = harness.tools.get(mode === "swarm" ? "spawn_swarm_agents" : "spawn_agent")!;
+
+    const response = await tool.execute("tier", params, new AbortController().signal, undefined, ctx);
+
+    expect(external).toHaveBeenCalledOnce();
+    expect(external.mock.calls[0][1]).toMatchObject({ role: "write", externalHarness: { name: "claude-review" } });
+    expect(mode === "swarm" ? response.details.spawned[0].mode : response.details.mode).toBe("external-harness");
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unbound tier native when another tier uses a harness", async () => {
+    configureTierHarness();
+    const external = vi.fn(async () => {});
+    const harness = registerTools({ runExternalAgent: external });
+    await harness.tools.get("spawn_agent")!.execute("native", { name: "native", prompt: "Work", model_slot: "write-feature" }, new AbortController().signal, undefined, makeCtx());
+    expect(external).not.toHaveBeenCalled();
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledOnce();
+  });
+
+  it.each(["public", "nested"])("rejects harness overrides at every %s tool boundary before admission", async scope => {
+    configureTierHarness();
+    const external = vi.fn(async () => {});
+    const harness = registerTools({ runExternalAgent: external });
+    let tools = harness.tools;
+    if (scope === "nested") {
+      const parent = await admitNestedReadParent(harness);
+      tools = new Map(harness.teamToolsRuntime.createNestedReadAgentTools({
+        teamName: "session-test-session", parent, parentRunId: parent.lifecycleRunId!, outerCtx: makeCtx(),
+      }).map(tool => [tool.name, tool]));
+    }
+    const swarmSchema = tools.get("spawn_swarm_agents")!.parameters;
+    const schemas = [
+      tools.get("spawn_agent")!.parameters,
+      swarmSchema,
+      swarmSchema.properties.defaults,
+      swarmSchema.properties.agents.items,
+    ];
+    for (const schema of schemas) {
+      expect(schema.properties).not.toHaveProperty("harness");
+      expect(schema.additionalProperties).toBe(false);
+    }
+    const agent = { name: "blocked", prompt: "Inspect", model_slot: "read-review" };
+    for (const value of ["other", null, undefined]) {
+      const override = { harness: value };
+      const attempts = [
+        ["spawn_agent", { ...agent, ...override }],
+        ["spawn_swarm_agents", { agents: [agent], ...override }],
+        ["spawn_swarm_agents", { defaults: override, agents: [agent] }],
+        ["spawn_swarm_agents", { agents: [agent, { ...agent, name: "blocked-too", ...override }] }],
+      ] as const;
+      for (const [name, params] of attempts) {
+        const tool = tools.get(name)!;
+        await expect(tool.execute("override", params, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/harness/);
+      }
+    }
+    expect(external).not.toHaveBeenCalled();
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+    expect(harness.shutdownTeammate).not.toHaveBeenCalled();
+    if (scope === "public") {
+      expect(teams.teamExists("session-test-session")).toBe(false);
+    } else {
+      const members = (await teams.readConfig("session-test-session")).members;
+      expect(members.map(member => member.name)).toEqual(["team-lead", "writer"]);
+    }
+  });
+
+  it.each(["spawn_agent", "spawn_teammate_once"])("rejects harness overrides from the %s orchestration bridge", async type => {
+    configureTierHarness();
+    const external = vi.fn(async () => {});
+    const setSessionCtx = vi.fn();
+    const harness = registerTools({ runExternalAgent: external, setSessionCtx });
+    teams.createTeam("session-test-session", "test-session", "lead-agent", "", "provider/model");
+    await harness.emitAsync("pi-extended-teams:orchestration-request", {
+      requestId: "override", type, ctx: makeCtx(),
+      params: { team_name: "session-test-session", name: "blocked", prompt: "Work", model_slot: "write-critical", harness: "other" },
+    });
+    expect(harness.piEventEmit).toHaveBeenCalledWith("pi-extended-teams:orchestration-response", expect.objectContaining({ ok: false, error: expect.stringMatching(/harness/) }));
+    expect(harness.adoptTeamAsLead).not.toHaveBeenCalled();
+    expect(setSessionCtx).not.toHaveBeenCalled();
+    expect(external).not.toHaveBeenCalled();
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+  });
+
+  it("isolates invalid harness bindings from native spawning and rejects the affected tier", async () => {
+    writeGlobalSettings({ favoriteModels: { "write-critical": { harness: 123 } } });
+    const harness = registerTools();
+    const spawn = harness.tools.get("spawn_agent")!;
+    await spawn.execute("native", { name: "native", prompt: "Work", model_slot: "write-feature" }, new AbortController().signal, undefined, makeCtx());
+    await expect(spawn.execute("invalid", { name: "native", prompt: "Work", model_slot: "write-critical" }, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/write-critical.*harness/i);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledOnce();
+    expect(harness.shutdownTeammate).not.toHaveBeenCalled();
+  });
+
+  it.each(["outside Herdr", "native checks", "workflow", "missing profile"])("rejects an unusable harness tier before admission: %s", async failure => {
+    configureTierHarness();
+    if (failure === "outside Herdr") vi.stubEnv("HERDR_ENV", "");
+    if (failure === "missing profile") {
+      vi.mocked(externalProfiles.resolveExternalHarness).mockImplementation(() => {
+        throw new Error("External harness profile missing");
+      });
+    }
+    const harness = registerTools();
+    const params = {
+      name: "critical", prompt: "Work", model_slot: "write-critical",
+      ...(failure === "native checks" ? { checks: [{ name: "check", command: "true", timeoutSeconds: 1 }] } : {}),
+      ...(failure === "workflow" ? { metadata: { workflowRunId: "workflow" } } : {}),
+    };
+
+    await expect(harness.tools.get("spawn_agent")!.execute("invalid", params, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/harness|Herdr/i);
+
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+    expect(teams.teamExists("session-test-session")).toBe(false);
+  });
+
+  function externalProfile() {
+    vi.stubEnv("HERDR_ENV", "1");
+    return vi.spyOn(externalProfiles, "resolveExternalHarness").mockReturnValue({ name: "claude-review", kind: "claude", command: "/bin/claude", args: [], instructions: "Read source" });
+  }
+
+  it.each(["single", "swarm", "nested", "nested-swarm"])("routes optional external %s spawns without Pi model resolution", async mode => {
+    configureTierHarness("read-review");
+    const external = vi.fn(async () => {});
+    const harness = registerTools({ runExternalAgent: external });
+    const ctx = { ...makeCtx(), model: undefined, modelRegistry: undefined };
+    const params = { name: "external", prompt: "Inspect", model_slot: "read-review" };
+    let response;
+    if (mode.startsWith("nested")) {
+      const parent = await admitNestedReadParent(harness);
+      const tools = harness.teamToolsRuntime.createNestedReadAgentTools({ teamName: "session-test-session", parent, parentRunId: parent.lifecycleRunId!, outerCtx: ctx });
+      response = await tools.find(t => t.name === (mode === "nested-swarm" ? "spawn_swarm_agents" : "spawn_agent"))!.execute("external", mode === "nested-swarm" ? { defaults: { model_slot: params.model_slot }, agents: [{ name: params.name, prompt: params.prompt }] } : params);
+    } else {
+      response = await harness.tools.get(mode === "swarm" ? "spawn_swarm_agents" : "spawn_agent")!.execute("external", mode === "swarm" ? { defaults: { model_slot: params.model_slot }, agents: [{ name: params.name, prompt: params.prompt }] } : params, new AbortController().signal, undefined, ctx);
+    }
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
+    expect(external).toHaveBeenCalledOnce();
+    const member = (external.mock.calls[0] as unknown as [string, Member])[1];
+    expect(member).toMatchObject({ role: "read", externalHarness: { name: "claude-review" }, backendType: "external-harness" });
+    expect(member.model).toBeUndefined();
+    if (mode.startsWith("nested")) expect(member.parentLifecycleRunId).toBeTruthy();
+    else expect(mode === "swarm" ? response.details.spawned[0].mode : response.details.mode).toBe("external-harness");
+  });
+
+  it("keeps external runs in role capacity and preserves queued profile selection", async () => {
+    externalProfile(); writeGlobalSettings({ favoriteModels: { "read-review": { harness: "claude-review" } }, readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const finishes = new Map<string, () => Promise<void>>();
+    const external = vi.fn((team: string, member: Member) => {
+      harness.runningReadAgents.set(`${team}:${member.name}`, makeRunningAgent(team, member));
+      return new Promise<void>(resolve => finishes.set(member.name, async () => {
+        harness.runningReadAgents.delete(`${team}:${member.name}`);
+        await teams.removeMemberMatchingRun(team, member.name, member.lifecycleRunId!); resolve();
+      }));
+    });
+    const harness = registerTools({ runExternalAgent: external });
+    const spawn = (name: string) => harness.tools.get("spawn_agent")!.execute(name, { name, prompt: "Inspect", model_slot: "read-review" }, new AbortController().signal, undefined, makeCtx());
+    await spawn("first"); const queued = await spawn("second");
+    expect(queued.details).toMatchObject({ queuePosition: 1, harness: "claude-review", mode: "external-harness" });
+    expect(external).toHaveBeenCalledOnce();
+    await finishes.get("first")!();
+    await vi.waitFor(() => expect(external).toHaveBeenCalledTimes(2));
+    expect(external.mock.calls[1][1].externalHarness?.name).toBe("claude-review");
+    await finishes.get("second")!();
+  });
+
+  it.each([
+    { checks: [{ name: "check", command: "true", timeoutSeconds: 1 }] },
+    { repair: { maxAttempts: 1 } }, { checkpoint: { inputs: ["src"] } },
+    { continue_from: "old" }, { allow_nested_read_agents: true },
+  ])("rejects unsupported external policies before admission: %j", async policy => {
+    configureTierHarness("read-review"); const external = vi.fn(async () => {}); const harness = registerTools({ runExternalAgent: external });
+    await expect(harness.tools.get("spawn_agent")!.execute("external", { name: "external", prompt: "Inspect", model_slot: "read-review", ...policy }, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/external|harness/i);
+    expect(external).not.toHaveBeenCalled();
+    expect(teams.teamExists("session-test-session")).toBe(false);
+  });
+
+  it.each([{ workflowRunId: "workflow" }, { piPromptPlanning: { version: 1 } }])("preserves an existing agent when rejecting external workflow metadata: %j", async metadata => {
+    externalProfile();
+    const harness = registerTools();
+    const spawn = harness.tools.get("spawn_agent")!;
+    const ctx = makeCtx();
+    const params = { name: "reviewer", prompt: "Inspect", model_slot: "read-review" };
+    await spawn.execute("native", params, new AbortController().signal, undefined, ctx);
+    const existing = harness.runningReadAgents.get("session-test-session:reviewer");
+
+    writeGlobalSettings({ favoriteModels: { "read-review": { harness: "claude-review" } } });
+    await expect(spawn.execute("external", { ...params, metadata }, new AbortController().signal, undefined, ctx)).rejects.toThrow(/workflow/);
+
+    expect(harness.shutdownTeammate).not.toHaveBeenCalled();
+    expect(harness.runningReadAgents.get("session-test-session:reviewer")).toBe(existing);
+    expect(harness.runReadAgentInProcess).toHaveBeenCalledOnce();
+  });
+
+  it("rejects grouped external spawns and non-Herdr requests before creating a team", async () => {
+    configureTierHarness("read-review"); const harness = registerTools();
+    const params = { prompt: "Inspect", model_slot: "read-review" };
+    await expect(harness.tools.get("spawn_swarm_agents")!.execute("external", { agents: [params], completion_group: { delivery: "all-settled" } }, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/external|harness/i);
+    vi.stubEnv("HERDR_ENV", "");
+    await expect(harness.tools.get("spawn_agent")!.execute("external", params, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/Herdr/);
+    expect(teams.teamExists("session-test-session")).toBe(false);
+  });
+
   it.each(["single", "single-writer", "swarm", "trusted"])("continues with fresh identity and current authority through %s", async mode => {
     writeFavoriteLevels(); const saved = await savedContinuation();
     vi.spyOn(sourceIdentity, "captureSourceIdentity").mockResolvedValue(checkpointSource());
@@ -348,6 +563,7 @@ describe("public agent spawn tools", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     if (root && fs.existsSync(root)) fs.rmSync(root, { recursive: true, force: true });
   });

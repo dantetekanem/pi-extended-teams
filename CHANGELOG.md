@@ -2,11 +2,6 @@
 
 All notable changes to this project will be documented in this file.
 
-## [2.7.0] - 2026-10-27
-
-### Changed
-- Honor explicit requests for a scoped agent before optional planning. Keep other delegation focused on independent work.
-
 ## [2.6.0] - 2026-10-27
 
 ### Added
@@ -15,6 +10,9 @@ All notable changes to this project will be documented in this file.
 - Validate private, run-bound report artifacts before saving and delivering results to the spawning owner. Route a departed owner's report to the lead rather than a replacement agent; Herdr idle/done is not a completion receipt.
 - Keep external agents in role capacity and the activity view, with pane focus, messaging, interrupts, and same-process reload support. Retain ownership when pane cleanup cannot be verified.
 - Include an external-harness setup guide with native CLI configuration, permissions, and supported controls.
+
+### Changed
+- Honor explicit requests for a scoped agent before optional planning. Keep other delegation focused on independent work.
 
 ### Limits
 - External harnesses require Herdr and an installed CLI; missing prerequisites do not trigger fallback. Claude quota/capacity fallback to the immediately lower native tier is opt-in. They use their own permissions and do not expose Pi transcripts or usage telemetry. Assigned checks, automatic repair, checkpoints, batch-report grouping, and delegation from an external agent are not supported. Process-restart recovery remains unsupported.

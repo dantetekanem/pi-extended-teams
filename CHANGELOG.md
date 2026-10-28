@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.7.0] - 2026-10-27
+
+### Changed
+- Honor explicit requests for a scoped agent before optional planning. Keep other delegation focused on independent work.
+
 ## [2.6.0] - 2026-10-27
 
 ### Added

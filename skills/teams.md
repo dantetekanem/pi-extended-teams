@@ -1,6 +1,6 @@
 ---
 name: teams
-description: Multiply a coding session with genuine independent read-only lanes (and optional isolated edit lanes) via pi-extended-teams. Use whenever the user asks to investigate, review, test, audit, validate, get parallel coverage, or use agents. Hot words like "agents", "spawn agents", "use agents", and "send agents" trigger outcome-to-lane mapping before spawning. Never use while autoresearch mode/session is active. The lead owns integration and final acceptance and executes work when only one substantive execution lane exists.
+description: "Coordinate independent agent lanes with pi-extended-teams. Use when planning or managing delegation, not for every investigation or test. An explicit scoped spawn uses the available tool contract first. Never use during active autoresearch."
 ---
 
 # pi-extended-teams
@@ -17,25 +17,27 @@ If agents would otherwise be useful, stop and ask the user to turn off or finish
 
 ## The balance
 
-- **The lead owns the result.** The lead retains integration, cross-lane decisions, scope tradeoffs, verification synthesis, and final acceptance. If only one substantive execution lane exists, the lead executes it.
+- **The lead owns the result.** The lead retains integration, cross-lane decisions, scope tradeoffs, verification synthesis, and final acceptance. By default, the lead executes a single substantive lane; an explicit user request to delegate it takes precedence.
 - **Read agents multiply genuine independent coverage.** Use them for bounded investigation, review, testing, audits, and second opinions only when each lane returns distinct useful evidence.
 - **Edit agents are optional and rare.** A writer owns exactly one isolated sub-outcome with non-overlapping files. Use `write-system` for normal complex implementation, integration, or refactoring inside that lane; reserve `write-critical` for rare high-risk security, concurrency, recovery, migration, or data-integrity work. Neither tier allows broad cross-stack ownership. Edit agents must claim files before writing and report every changed path.
 - **Nested read helpers require explicit opt-in.** Only a depth-0 `write-feature` or `write-critical` spawn with `allow_nested_read_agents: true` receives restricted read-only spawn tools. It may use any canonical `read-*` tier and any helper count subject to global capacity; children report to that writer and cannot delegate. Read agents, depth-1 children, `write-patch`, and `write-system` remain denied.
 
-## Mandatory outcome-to-lane gate
+## Routing
 
-Before spawning for substantial work:
+For an explicitly requested, already-scoped agent, call `spawn_agent` with the known mission and user limits before optional skill reads, task setup, or investigation. Ask only about missing scope or authorization. This also permits delegating the single execution lane when the user explicitly requests it; the lead still owns acceptance. Tool-enforced roles and the autoresearch guard remain binding.
+
+Otherwise, before choosing delegation for substantial work:
 
 1. Enumerate every unfinished substantive outcome in the User's request as an inspectable behavior, artifact, decision, or evidence result.
 2. Map each candidate lane to exactly one bounded sub-outcome or independent question, its owned surface, and its expected evidence. The whole User request cannot be a lane.
 3. Keep integration, cross-lane decisions, and final acceptance with the lead.
 4. Reject overlapping or fake parallel lanes. Agents are useful only for genuine independent lanes.
 5. Reject any plan in which one teammate owns every unfinished substantive outcome. Re-split only where outcomes are genuinely independent; do not rename the whole request as one lane.
-6. If only one substantive execution lane exists, the lead must execute it rather than spawn a replacement writer. Independent read-only review or evidence lanes remain allowed when they add distinct value.
+6. Without an explicit request to delegate, keep a single execution lane lead-owned. Independent read-only evidence lanes remain useful when they add distinct value.
 
 ## Default flow
 
-Run the outcome-to-lane gate first, then use `spawn_agent` for one genuine helper lane or `spawn_swarm_agents` for a batch of independent lanes. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by canonical `model_slot` intent tier only; never pass `role`, raw `model`, or `thinking` directly. `/agents-favorite-models` can map the eight tiers—`read-collect`, `read-review`, `read-analyze`, `read-critical`, `write-patch`, `write-feature`, `write-system`, and `write-critical`—to specific models and effort. Until a tier is configured, it uses the current lead-session model and thinking level. See `README.md` for tier-selection examples.
+Use the routing policy above, then `spawn_agent` for one genuine helper lane or `spawn_swarm_agents` for a batch of independent lanes. The current Pi session is the implicit container; do not create or manage a separate team. Spawn by canonical `model_slot` intent tier only; never pass `role`, raw `model`, or `thinking` directly. `/agents-favorite-models` can map the eight tiers—`read-collect`, `read-review`, `read-analyze`, `read-critical`, `write-patch`, `write-feature`, `write-system`, and `write-critical`—to specific models and effort. Until a tier is configured, it uses the current lead-session model and thinking level. See `README.md` for tier-selection examples.
 
 ```text
 spawn_swarm_agents({
@@ -125,16 +127,16 @@ Claim only src/parser/config.ts and test/parser/config.test.ts, implement and ru
 })
 ```
 
-## Hot-word trigger: "agents"
+## Explicit agent requests
 
-When the user says "agents", "use agents", "spawn agents", "send agents", "agents to investigate/review/test", or any phrase meaning "delegate to helpers", immediately run intake and map the requested outcomes to candidate lanes. Do not wait for the user to explain the extension mechanics, but do not invent a 2–3-agent swarm. Spawn only the genuine independent lanes the map supports. The whole request cannot be assigned as one lane, and a plan where one teammate owns every unfinished substantive outcome is invalid. If the map contains only one substantive execution lane, the lead executes it instead of spawning a replacement writer; use an agent only for a separate read-only question or review that adds distinct value. Exception: if the autoresearch conflict guard is active, spawn nothing and explain that agent delegation is disabled until autoresearch is off.
+Use the requested tier and bounded assignment, without preliminary implementation or an invented swarm. If the request needs decomposition, identify independent lanes from the context already available. General mentions of testing, review, or investigation do not by themselves require delegation. The autoresearch guard still applies.
 
 ## Lead rules
 
 - Never spawn agents, teams, subagents, or reviewer agents while autoresearch mode/session is active, running, or being resumed.
-- Complete outcome-to-lane mapping before delegation; agents are useful only for genuine independent lanes.
+- Use the explicit-spawn fast path for a clear requested assignment; otherwise delegate only genuine independent lanes.
 - Keep integration, cross-lane decisions, and final acceptance in the lead.
-- Keep implementation in the lead when there is only one substantive execution lane. Otherwise, a writer may own only one isolated sub-outcome.
+- Keep a single execution lane lead-owned unless the user explicitly delegates it. Otherwise, give each writer one isolated sub-outcome.
 - When no unrelated work remains, end the turn. The extension resumes the lead when reports arrive.
 - One `get_agent_status` snapshot is allowed when current status is needed. Never call it repeatedly, sleep, busy-wait, or loop on inbox/status.
 - Trust quiet agents. Do not ping, message, or check an agent just because it has been quiet for less than several minutes; active status remains visible in the activity card and Down-key live view.

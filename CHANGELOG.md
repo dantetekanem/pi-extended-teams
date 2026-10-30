@@ -17,6 +17,9 @@ All notable changes to this project will be documented in this file.
 ### Limits
 - External harnesses require Herdr and an installed CLI; missing prerequisites do not trigger fallback. Claude quota/capacity fallback to the immediately lower native tier is opt-in. They use their own permissions and do not expose Pi transcripts or usage telemetry. Assigned checks, automatic repair, checkpoints, batch-report grouping, and delegation from an external agent are not supported. Process-restart recovery remains unsupported.
 
+### Added
+- Add an experimental `durable_agents` tool built on Pi Durable, enabled with `experimental.durableAgents`. Its agents survive Pi crashes and quits: reopening the session continues unfinished work. Each message is admitted once and in order, and each report is delivered at least once, deduplicated against session history.
+
 ## [2.5.1] - 2026-09-19
 
 ### Fixed

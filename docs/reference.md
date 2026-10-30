@@ -92,6 +92,10 @@ Running and starting agents survive same-process `/reload`, reconnecting control
 
 Compatible footer extensions can display combined recorded cost for the main session and finalized in-process agents without changing Pi's native usage totals. Unfinished or missing usage keeps the total incomplete. Terminal handoffs are excluded.
 
+Final `pi-extended-teams-cost-v1` custom receipts optionally include `telemetry` (schema version 1): agent name/role, start and final pre-disposal timestamps, parent lifecycle run ID and model slot when available, and own native usage entries with stable IDs. Entries retain only usage, observed provider/model and available timing fields, never message content or tool arguments. Pi 1.4 standalone usage entries are included; retained tails and descendant custom receipts are not. Each nested helper has its own root receipt, so do not add descendant-inclusive subtotals again. Legacy receipts without telemetry remain valid.
+
+These are Pi-recorded costs, not verified provider invoices. Missing usage, model attribution or duration stays unknown; summary entries can combine requests, and reasoning tokens are a subset of output. Configured model slots are not observed model identities. Overlapping agent durations are not review wall-clock time. Failed cleanup leaves the receipt pending, not a final zero.
+
 ## Configuration
 
 Global settings live at `~/.pi/agent/pi-extended-teams/settings.json`. Project overrides live at `.pi/pi-extended-teams.json`. Favorite tiers are global so the picker and spawning use the same choices.
@@ -280,6 +284,16 @@ pi.events.emit("pi-extended-teams:orchestration-request", {
 ```
 
 The correlated response is `{ requestId, type, ok: true, details, content }` or `{ requestId, type, ok: false, error }`. `prompt` is a direct string; it may reference a packaged prompt file, but there is no `prompt_file` API. Normal tier/capacity/lifecycle rules and the extension allowlist apply. This is a lead-session event-bus integration, not external RPC; teammate sessions cannot satisfy requests.
+
+### Host-only native child startup policy
+
+Trusted in-process hosts may import `registerNativeChildPolicy` from `pi-extended-teams/src/native-child-policy.ts` and register against the actual parent `ctx.sessionManager` before requesting children. This is not a spawn parameter or model tool. Unregistered parents keep normal behavior.
+
+The policy supplies `prepare(input)`, `enroll(session)`, and `assertReady(session)`. Preparation runs before ambient child resource/settings construction. Input includes parent/session identity, cwd, role, the running Pi API, event bus, mandatory extension factories, and role prompt. Return an already-loaded `resourceLoader`, explicit `settingsManager`, and `tools` allowlist, with optional `excludeTools` and `customTools`. Execute the mandatory factories and preserve every role-prompt entry in `getAppendSystemPrompt()`.
+
+Teams retains required communication/reporting tools, configured tier/model/thinking, and the parent's model runtime. Enrollment receives the actual SDK session before extension binding; `assertReady` must verify final resources and tools after binding. Missing services, hook errors, or tool-set violations deny startup through normal teardown. Policy-backed children cannot transfer to an unguarded terminal session.
+
+Registration is scoped to the parent manager and session ID, shared across package copies in the same process, and retained for queued launches. Call the returned retirement function when the host finishes: it leaves a denial marker for that identity instead of restoring ambient defaults. Re-registering the same identity is rejected. Registered or retired policies reject configured external-harness dispatch instead of bypassing the native guard or overriding the tier. This hook is not an OS sandbox and does not persist across process restart.
 
 ## Security and data access
 

@@ -1238,27 +1238,32 @@ describe("in-process read agent tool wiring", () => {
       ui: { setStatus: vi.fn() }, modelRegistry: { find: () => ({ provider: "provider", id: "model" }) } };
     handlers.get("session_start")!({}, ctx);
     const options = { ...makeRunOptions(), beginCostRun: cost.begin };
+    const getEntries = vi.fn(() => {
+      if (outcome === "snapshot-failed") throw new Error("snapshot unavailable");
+      return entries;
+    });
+    let startedAt: number | undefined;
+    let snapshotTime: number | undefined;
     if (outcome === "cleanup-blocked") vi.spyOn(reportEvents, "appendTeamReportEvent").mockRejectedValue(new Error("report store unavailable"));
     piMocks.createAgentSession.mockImplementation(async ({ sessionManager }) => {
       if (outcome === "startup-failed") throw new Error("session creation failed");
-      sessionManager.getEntries = () => {
-        if (outcome === "snapshot-failed") throw new Error("snapshot unavailable");
-        return entries;
-      };
+      sessionManager.getEntries = getEntries;
       return { session };
     });
     session.prompt.mockImplementation(async () => {
       expect(cost.total()).toEqual({ usd: 0, complete: false });
-      entries.push({ type: "message", message: { role: "assistant", usage: { cost: { total: 1 } } } });
+      startedAt = options.runningReadAgents.get("team:reader")!.startedAt;
+      entries.push({ id: "assistant-1", type: "message", message: { role: "assistant", provider: "p", model: "observed-first", usage: { cost: { total: 1 } }, content: "private" } });
       if (outcome === "failed") throw new Error("provider failure");
       if (outcome === "cancelled") options.runningReadAgents.get("team:reader")!.stopRequested = true;
     });
     session.abort.mockImplementation(async () => {
       expect(cost.total()).toEqual({ usd: 0, complete: false });
-      entries.push({ type: "compaction", usage: { cost: { total: 2 } } });
+      entries.push({ id: "abort-usage", type: "usage", kind: "cache-warm", provider: "p", model: "observed-late", usage: { cost: { total: 2 } }, note: "private" });
+      snapshotTime = Date.now();
     });
     session.dispose.mockImplementation(() => expect(cost.total().complete).toBe(false));
-    await runReadAgentInProcess("team", fixtureMember("reader"), "inspect", ctx, options);
+    await runReadAgentInProcess("team", { ...fixtureMember("reader"), parentLifecycleRunId: "parent-run" }, "inspect", ctx, options);
     if (outcome === "cleanup-blocked") {
       expect(cost.total()).toEqual({ usd: 0, complete: false });
       expect(rootEntries.at(-1).data.phase).toBe("pending");
@@ -1269,6 +1274,17 @@ describe("in-process read agent tool wiring", () => {
       expect(rootEntries.at(-1).data).toMatchObject({
         outcome: outcome === "failed" || outcome === "startup-failed" ? "failed" : outcome === "cancelled" ? "cancelled" : "completed",
         childSessionId: "child-session-1", costUsd: unknown ? null : 3 });
+      const telemetry = rootEntries.at(-1).data.telemetry;
+      if (unknown) expect(telemetry).toBeUndefined();
+      else {
+        expect(getEntries).toHaveBeenCalledOnce();
+        expect(telemetry).toEqual({ schemaVersion: 1, agentName: "reader", role: "read", startedAt,
+          completedAt: expect.any(Number), parentLifecycleRunId: "parent-run", modelSlot: "read-review", entries: [
+            { id: "assistant-1", type: "message", message: { role: "assistant", provider: "p", model: "observed-first", usage: { cost: { total: 1 } } } },
+            { id: "abort-usage", type: "usage", kind: "cache-warm", provider: "p", model: "observed-late", usage: { cost: { total: 2 } } },
+          ] });
+        expect(telemetry.completedAt).toBeGreaterThanOrEqual(snapshotTime!);
+      }
       expect(options.runningReadAgents.size).toBe(0);
       expect(await readLifecycleTombstone("team", "reader")).toEqual({ status: "absent" });
     }

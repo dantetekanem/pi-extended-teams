@@ -2,7 +2,56 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 
 export const COST_ENTRY_TYPE = "pi-extended-teams-cost-v1";
 export type CostOutcome = "completed" | "failed" | "cancelled";
-export interface AgentCostSnapshot { childSessionId: string; costUsd: number | null }
+export interface RecordedUsage {
+  input?: number | null;
+  output?: number | null;
+  cacheRead?: number | null;
+  cacheWrite?: number | null;
+  totalTokens?: number | null;
+  /** Reasoning tokens are a subset of output, never an additional contribution. */
+  reasoning?: number | null;
+  cost?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    total?: number;
+  } | null;
+}
+export interface RecordedUsageEntry {
+  id?: string;
+  type: "message" | "compaction" | "branch_summary" | "usage";
+  timestamp?: string | number;
+  message?: {
+    role: "assistant" | "toolResult";
+    provider?: string;
+    model?: string;
+    responseModel?: string;
+    timestamp?: number;
+    durationMs?: number;
+    stopReason?: string;
+    usage?: RecordedUsage | null;
+  };
+  kind?: string;
+  provider?: string;
+  model?: string;
+  usage?: RecordedUsage | null;
+}
+export interface AgentUsageTelemetry {
+  schemaVersion: 1;
+  agentName: string;
+  role: "read" | "write";
+  startedAt: number;
+  completedAt: number;
+  parentLifecycleRunId?: string;
+  modelSlot?: string;
+  entries: RecordedUsageEntry[];
+}
+export interface AgentCostSnapshot {
+  childSessionId: string;
+  costUsd: number | null;
+  telemetry?: AgentUsageTelemetry;
+}
 export interface CostRun {
   settle(snapshot: AgentCostSnapshot | undefined, outcome: CostOutcome): void;
   exclude(): void;
@@ -17,6 +66,7 @@ interface Receipt {
   childSessionId?: string;
   costUsd?: number | null;
   outcome?: CostOutcome;
+  telemetry?: AgentUsageTelemetry;
 }
 interface Scope {
   root: string;
@@ -28,6 +78,67 @@ const object = (value: unknown): Record<string, unknown> =>
 const validCost = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
 const identity = (receipt: Receipt) => JSON.stringify([receipt.rootSessionId, receipt.teamName, receipt.lifecycleRunId]);
 
+function recordedUsage(value: unknown): RecordedUsage | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object") return undefined;
+  const source = object(value);
+  const usage: RecordedUsage = {};
+  for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "reasoning"] as const) {
+    if (source[key] === null || validCost(source[key])) usage[key] = source[key];
+  }
+  if (source.cost === null) usage.cost = null;
+  else if (source.cost && typeof source.cost === "object") {
+    usage.cost = {};
+    const cost = object(source.cost);
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
+      if (validCost(cost[key])) usage.cost[key] = cost[key];
+    }
+  }
+  return usage;
+}
+
+/** Own native evidence only: never recurse into content, retained tails or descendant receipts. */
+export function recordedUsageEntries(entries: readonly unknown[]): RecordedUsageEntry[] {
+  const result: RecordedUsageEntry[] = [];
+  for (const item of entries) {
+    const entry = object(item);
+    const message = object(entry.message);
+    if (entry.type !== "message" && entry.type !== "compaction" && entry.type !== "branch_summary" && entry.type !== "usage") {
+      continue;
+    }
+    if (entry.type === "message" && message.role !== "assistant" && !(message.role === "toolResult" && message.usage !== undefined)) {
+      continue;
+    }
+    const selected: RecordedUsageEntry = { type: entry.type };
+    if (typeof entry.id === "string") selected.id = entry.id;
+    if (typeof entry.timestamp === "string" || validCost(entry.timestamp)) selected.timestamp = entry.timestamp;
+    if (entry.type === "message") {
+      const own: NonNullable<RecordedUsageEntry["message"]> = { role: message.role as "assistant" | "toolResult" };
+      if (message.role === "assistant") {
+        for (const key of ["provider", "model", "responseModel", "stopReason"] as const) {
+          if (typeof message[key] === "string") own[key] = message[key];
+        }
+        for (const key of ["timestamp", "durationMs"] as const) {
+          if (validCost(message[key])) own[key] = message[key];
+        }
+      }
+      const usage = recordedUsage(message.usage);
+      if (usage !== undefined) own.usage = usage;
+      selected.message = own;
+    } else {
+      if (entry.type === "usage") {
+        for (const key of ["kind", "provider", "model"] as const) {
+          if (typeof entry[key] === "string") selected[key] = entry[key];
+        }
+      }
+      const usage = recordedUsage(entry.usage);
+      if (usage !== undefined) selected.usage = usage;
+    }
+    result.push(selected);
+  }
+  return result;
+}
+
 export function recordedSessionCost(entries: readonly unknown[]): { usd: number; complete: boolean } {
   let usd = 0;
   let complete = true;
@@ -37,8 +148,9 @@ export function recordedSessionCost(entries: readonly unknown[]): { usd: number;
     const summary = entry.type === "compaction" || entry.type === "branch_summary";
     const assistant = entry.type === "message" && message.role === "assistant";
     const tool = entry.type === "message" && message.role === "toolResult";
-    if (!summary && !assistant && !tool) continue;
-    const usage = summary ? entry.usage : message.usage;
+    const standalone = entry.type === "usage";
+    if (!summary && !assistant && !tool && !standalone) continue;
+    const usage = summary || standalone ? entry.usage : message.usage;
     if (tool && usage === undefined) continue; // Optional native nested-tool accounting.
     const cost = object(object(usage).cost).total;
     if (validCost(cost) && validCost(usd + cost)) usd += cost;
@@ -216,8 +328,14 @@ export function createCombinedSessionCost(initialHost: CostHost) {
         } catch { origin.failed.add(key); origin.pending.set(key, receipt); refresh(); }
       };
       return {
-        settle: (snapshot, outcome) => finish({ ...pending, phase: "final", outcome,
-          childSessionId: snapshot?.childSessionId, costUsd: snapshot?.costUsd ?? null }),
+        settle: (snapshot, outcome) => finish({
+          ...pending,
+          phase: "final",
+          outcome,
+          childSessionId: snapshot?.childSessionId,
+          costUsd: snapshot?.costUsd ?? null,
+          ...(snapshot?.telemetry ? { telemetry: snapshot.telemetry } : {}),
+        }),
         exclude: () => finish({ ...pending, phase: "excluded" }),
       };
     },

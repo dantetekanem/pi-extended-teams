@@ -6,6 +6,7 @@ import { getCurrentQualifiedModel, getModelSelectionState, requireQualifiedKnown
 import { getPiSessionId } from "../internal/session-files";
 import { createSessionContextReference, removeSessionContextReference } from "../internal/session-context-reference";
 import * as paths from "../../src/utils/paths";
+import { hasNativeChildPolicy } from "../../src/native-child-policy";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
@@ -184,10 +185,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     return slot;
   }
 
-  function externalHarnessForSpawn(params: any) {
+  function externalHarnessForSpawn(params: any, ctx: any) {
     const slot = requireSpawnLevel(params, "spawn_agent");
     const harness = loadSettings().favoriteModels[slot]?.harness;
     if (harness === undefined) return undefined;
+    if (hasNativeChildPolicy(ctx?.sessionManager)) throw new Error("Native child policy cannot admit an external harness.");
     if (!harness.trim()) throw new Error(`Favorite tier "${slot}" harness must name an external profile.`);
     if (process.env.HERDR_ENV !== "1") throw new Error("External harnesses require Herdr; no native fallback is performed.");
     if (shouldSuppressLeadReportInjection({ metadata: operationMetadataFromParams(params) })) {
@@ -201,7 +203,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   function configuredFavoriteModelForSpawn(params: any, ctx: any, context = "spawn_agent"): string | undefined {
     const slot = requireSpawnLevel(params, context);
-    if (externalHarnessForSpawn(params)) return undefined;
+    if (externalHarnessForSpawn(params, ctx)) return undefined;
     const settings = loadSettings({ projectDir: params.cwd || ctx.cwd });
     const configured = settings.favoriteModels[slot];
     if (configured?.model && configured.thinking) return configured.model;
@@ -1046,7 +1048,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   async function spawnTeammate(params: any, ctx: any, spawnOptions: SpawnTeammateOptions = {}): Promise<{ content: any[]; details: any }> {
-    const externalHarness = externalHarnessForSpawn(params);
+    const externalHarness = externalHarnessForSpawn(params, ctx);
     if (externalHarness && spawnOptions.completionGroup) throw new Error("External harnesses do not support completion groups.");
     const checkpointAssignment = createCheckpointAssignment(params.checkpoint, params.prompt, params.continue_from);
     const assignedChecks = normalizeCheckPolicy(params.checks);
@@ -1356,7 +1358,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
     if (!ctx) throw new Error("No active Pi session context is available for spawn_agent.");
 
-    externalHarnessForSpawn(params);
+    externalHarnessForSpawn(params, ctx);
     params = { ...params, checkpoint: createCheckpointAssignment(params.checkpoint, params.prompt, params.continue_from)?.policy };
     const name = params.continue_from === undefined ? params.name || generatedAgentName() : freshContinuationName(params.name || "agent");
     const sessionDefaultModel = configuredFavoriteModelForSpawn(params, ctx);
@@ -1517,7 +1519,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         const mergedAgents = params.agents.map((agent: any, index: number) => {
           rejectDirectModelSelection(agent, `spawn_swarm_agents agent ${index + 1}`);
           const merged = mergeSwarmAgentParams(params.defaults || {}, agent);
-          externalHarnessForSpawn({ ...merged, ...(groupPolicy ? { completion_group: groupPolicy } : {}) });
+          externalHarnessForSpawn({ ...merged, ...(groupPolicy ? { completion_group: groupPolicy } : {}) }, ctx);
           merged.checkpoint = createCheckpointAssignment(merged.checkpoint, merged.prompt, merged.continue_from)?.policy;
           if (merged.continue_from !== undefined) merged.name = freshContinuationName(merged.name || "agent", JSON.stringify([sessionId, _toolCallId, index, merged.continue_from]));
           return merged;

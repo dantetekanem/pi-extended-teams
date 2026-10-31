@@ -120,7 +120,6 @@ describe("host-only native child policy", () => {
     expect(sdk.loaders).not.toHaveBeenCalled();
     expect(prepareInput).toMatchObject({ parentSessionId: "parent", teamName: "team", agentName: "reader", cwd: root, role: "read" });
     expect(prepareInput.rolePrompt.join("\n")).toContain("read-only agent");
-    expect(prepareInput.rolePrompt.join("\n")).toContain("Communicate only with team-lead");
     const created = sdk.create.mock.calls[0][0];
     expect(created.modelRuntime).toBe(ctx.modelRegistry.runtime);
     expect(created.modelRegistry).toBe(ctx.modelRegistry);

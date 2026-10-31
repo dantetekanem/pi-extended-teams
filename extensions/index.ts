@@ -22,7 +22,7 @@ import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools, type TeamToolsRuntime } from "./tools/team-tools.js";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
 import { parseQualifiedModel } from "../src/utils/model-resolution";
-import { formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel } from "./ui/renderers.js";
+import { formatAnimatedProgress, formatContextUsage, formatElapsed, formatInboxMessagesForModel, formatModelLabel } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 import { createPendingChildController } from "./runtime/pending-child-controller.js";
 import { createTeamHost } from "./runtime/team-host";
@@ -69,6 +69,8 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
   // Track whether lead inbox/helper polling has been started (to avoid duplicates)
   let leadPollingStarted = false;
   let leadInboxPollTimer: NodeJS.Timeout | null = null;
+  let leadInboxWatcher: fs.FSWatcher | undefined;
+  let leadInboxWatchedTeam: string | undefined;
   let readHelperQueueWatchedTeam: string | null = null;
   let readHelperQueueWatcher: fs.FSWatcher | null = null;
   let readHelperQueueFallbackStarted = false;
@@ -216,6 +218,20 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     const delivered = await sendMessageToRunningReadAgent(target, content, requireReceipt);
     if (delivered) renderReadAgentStatus();
     return delivered;
+  }
+
+  async function notifyMessageSent(targetTeamName: string, recipient: string, message: messaging.SendPlainMessageOnceResult["message"]): Promise<void> {
+    if (recipient === "team-lead") return notifyLeadOfInboxReports(targetTeamName);
+    const target = runningReadAgents.get(readAgentKey(targetTeamName, recipient));
+    const expectedRecipientRunId = message.metadata?.recipientRunId;
+    if (expectedRecipientRunId !== undefined && target?.runId !== expectedRecipientRunId) return;
+    // Same-process notification avoids filesystem watcher latency; watchers also cover terminal senders.
+    if (target?.inbox) return target.inbox.refresh();
+    if (target?.externalControl) {
+      void deliverMessageToActiveAgent(targetTeamName, recipient, formatInboxMessagesForModel([message]), expectedRecipientRunId).then(async delivered => {
+        if (delivered && message.id) await messaging.markInboxMessagesRead(targetTeamName, recipient, [message.id]);
+      }).catch(error => { target.lastError = runtime.createRuntimeError(error); renderReadAgentStatus(); });
+    }
   }
 
   function memberActivityRole(member: Member): "read" | "write" {
@@ -475,7 +491,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       ? `A teammate finished and sent its final report: ${label} is ready in the ${teamName} inbox.`
       : `Check your agent messages now: ${label} is ready in the ${teamName} inbox.`;
     quietTrigger(
-      `${opening} Call read_inbox once, integrate the new information, and continue the active task. The reporting agent is self-exiting; do not call stop_teammate after a final report. This is an automatic user-style follow-up; do not sleep or poll.`
+      `${opening} Call read_inbox once, integrate the new information, and continue the active task.${hasFinalReport ? " The reporting agent is self-exiting; do not call stop_teammate after a final report." : ""} This is an automatic user-style follow-up; do not sleep or poll.`
     );
   }
 
@@ -1071,6 +1087,28 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
   function startLeadInboxPolling() {
     if (isTeammate || !sessionCtx) return;
     startReadHelperQueueDraining();
+    if (teamName && leadInboxWatchedTeam !== teamName) {
+      leadInboxWatcher?.close();
+      const watchedTeam = teamName;
+      const file = teamPaths.inboxPath(watchedTeam, agentName);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const notify = () => {
+        if (!extensionShuttingDown && teamName === watchedTeam) void notifyLeadOfInboxReports(watchedTeam).catch(() => {});
+      };
+      try {
+        leadInboxWatcher = fs.watch(path.dirname(file), (_event, filename) => {
+          if (!filename || filename.toString() === path.basename(file)) notify();
+        });
+        leadInboxWatcher.on("error", () => {
+          leadInboxWatcher?.close();
+          leadInboxWatchedTeam = undefined;
+        });
+        leadInboxWatchedTeam = watchedTeam;
+      } catch {
+        leadInboxWatcher = undefined;
+        leadInboxWatchedTeam = undefined;
+      }
+    }
     if (leadPollingStarted) return;
     leadPollingStarted = true;
 
@@ -1213,6 +1251,9 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     if (readAgentStatusTimer) clearInterval(readAgentStatusTimer);
     if (teamActivityRenderTimer) clearTimeout(teamActivityRenderTimer);
     if (leadInboxPollTimer) clearInterval(leadInboxPollTimer);
+    leadInboxWatcher?.close();
+    leadInboxWatcher = undefined;
+    leadInboxWatchedTeam = undefined;
     if (readHelperQueueFallbackTimer) clearInterval(readHelperQueueFallbackTimer);
     readHelperQueueWatcher?.close();
 
@@ -1377,6 +1418,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       renderLeadInboxStatus,
       notifyLeadOfInboxReports,
       deliverMessageToActiveAgent,
+      notifyMessageSent,
       createResourcePlan: createCurrentSpawnResourcePlan,
       extensionInstanceId,
       createNestedReadAgentTools: (binding: Parameters<TeamToolsRuntime["createNestedReadAgentTools"]>[0]) => {
@@ -1435,7 +1477,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     adoptTeamAsLead,
     renderLeadInboxStatus,
     resetLeadWakeNotifiedCount: () => { leadWakeNotifiedMessageKeys.clear(); },
-    deliverMessageToActiveAgent,
+    notifyMessageSent,
     extensionInstanceId,
   };
   if (isTeammate) registerCoordinationTools(pi, coordination);

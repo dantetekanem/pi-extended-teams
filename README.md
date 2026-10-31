@@ -14,7 +14,7 @@ pi-extended-teams runs read and write agents inside Pi, with eight configurable 
 
 - Let a native Pi writer call in specialists. A `write-feature` or `write-critical` agent can spawn read helpers when explicitly enabled. Helpers can use Pi or an external harness, report to that writer, and cannot delegate further.
 
-- Direct agent-to-agent messaging lets readers send findings straight to writers, without making the lead relay them.
+- Direct agent-to-agent messaging lets readers send findings straight to writers. Spawned groups receive a shared assignment snapshot, and native Pi agents can wait up to 60 seconds for a clarification reply without polling.
 
 - Follow native Pi agents from the editor. The activity card shows progress, tier, model, elapsed time, and context usage. Down opens the transcript, with theme-aware panels, configurable colors, and expandable tool results. External agents appear in the activity view; `h` focuses their Herdr pane.
 

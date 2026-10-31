@@ -1888,6 +1888,32 @@ describe("in-process read agent tool wiring", () => {
     expect(observed!.messageDeliveryClosed).toBe(true);
   });
 
+  it("delivers peer inbox messages to a running native session without a polling tick", async () => {
+    const session = makeSession();
+    let start!: () => void;
+    let finish!: () => void;
+    const started = new Promise<void>(resolve => { start = resolve; });
+    const finished = new Promise<void>(resolve => { finish = resolve; });
+    session.prompt.mockImplementation(async () => { start(); await finished; });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const member = fixtureMember("reader");
+    writeTeamConfig("team", member);
+    const running = runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, makeRunOptions());
+    try {
+      await started;
+      await sendPlainMessageIfRunning("team", "writer", "reader", "Found the API contract", "finding");
+      await vi.waitFor(() => expect(session.sendUserMessage).toHaveBeenCalledWith(
+        expect.stringContaining("Found the API contract"), { deliverAs: "steer" },
+      ));
+      expect(session.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("writer"), { deliverAs: "steer" });
+    } finally {
+      finish();
+      await running;
+    }
+  });
+
   it("injects teammate-safe communication tools and guidance into nested read-agent sessions", async () => {
     const session = makeSession();
     piMocks.createAgentSession.mockResolvedValue({ session });

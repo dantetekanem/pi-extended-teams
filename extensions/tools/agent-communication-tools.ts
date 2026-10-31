@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import { requireLeadRecipient } from "./spawned-agent-policy";
+import { createSendMessageTool, type SendMessageOptions } from "./send-message";
 import * as messaging from "../../src/utils/messaging";
 import * as runtime from "../../src/utils/runtime";
 import * as claims from "../../src/utils/claims";
@@ -27,7 +27,7 @@ export function formatRepairRequest(request: RepairRequest): string {
   ].join("\n");
 }
 
-export interface AgentCommunicationToolsOptions {
+export interface AgentCommunicationToolsOptions extends SendMessageOptions {
   isTeammate: boolean;
   agentName: string;
   role: "read" | "write";
@@ -102,24 +102,7 @@ export function createReportProgressTool(options: Pick<AgentCommunicationToolsOp
 
 export function createAgentCommunicationTools(options: AgentCommunicationToolsOptions): any[] {
   const communicationTools = [
-    {
-      name: "send_message",
-      label: "Send Message",
-      description: "Send a direct message in the current Pi session. Spawned agents may message only team-lead.",
-      parameters: Type.Object({
-        recipient: Type.Optional(Type.String({ description: "Recipient agent name. Defaults to team-lead for spawned agents." })),
-        content: Type.String(),
-        summary: Type.Optional(Type.String()),
-      }),
-      async execute(_toolCallId: string, params: any) {
-        const teamName = requireCurrentSession(options);
-        const recipient = params.recipient || (options.isTeammate ? "team-lead" : undefined);
-        if (!recipient) throw new Error("recipient is required when the lead sends a message.");
-        if (options.isTeammate) requireLeadRecipient(recipient);
-        await messaging.sendPlainMessageIfRunning(teamName, options.agentName, recipient, params.content, params.summary || "Message");
-        return { content: [{ type: "text", text: `Message sent to ${recipient}.` }], details: { session: teamName, recipient } };
-      },
-    },
+    createSendMessageTool(options),
     createReportProgressTool(options),
     {
       name: "read_inbox",

@@ -7,12 +7,6 @@ export const SPAWNED_AGENT_COMMUNICATION_GUIDANCE = readFileSync(
   path.join(__dirname, "../prompts/spawned-agent-communication.md"), "utf8"
 ).trim();
 
-export function requireLeadRecipient(recipient: string): void {
-  if (recipient !== "team-lead") {
-    throw new Error("Spawned agents may send messages only to team-lead.");
-  }
-}
-
 export function registerSpawnedAgentCommunicationGuard(
   pi: Pick<ExtensionAPI, "on">,
   reportAccepted: () => boolean = () => false,

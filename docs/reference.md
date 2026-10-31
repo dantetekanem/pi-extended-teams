@@ -50,7 +50,17 @@ Only a depth-0 `write-feature` or `write-critical` agent with explicit opt-in re
 
 ### Messages and context
 
-Agents can address another running agent with `send_message({ recipient, content })`. Omitting the recipient addresses `team-lead`; missing or stopped recipients fail. Messaging does not grant orchestration authority. The lead owns scope, integration, and acceptance.
+Agents can address another running agent with `send_message({ recipient, content })`. Omitting the recipient addresses `team-lead` for spawned agents; missing or stopped recipients fail. Native Pi messages notify the recipient immediately, with filesystem notifications for messages from terminal Pi sessions. Delivery does not guarantee an immediate model response. Messaging does not grant orchestration authority: the lead owns scope, integration, and acceptance.
+
+Each spawn receives a compact snapshot of known peer assignments. A swarm includes every planned member before its first launch, including queued members. Nested batches name the requesting writer as coordinator. The snapshot lists recipient names, tiers, and up to 400 characters from each assignment; put responsibility, file boundaries, and dependencies first. Planned membership does not prove that an agent is running.
+
+For clarification that blocks progress:
+
+```text
+send_message({ recipient: "api-reader", content: "Which API contract applies?", wait_for_reply: true, timeout_seconds: 60 })
+```
+
+The recipient answers with `send_message({ recipient: "requester", reply_to: "<message ID>", content: "..." })`. The waiting tool returns the matching reply or `timed_out`. Waits default to 60 seconds and cannot exceed 60 seconds; cancellation ends the wait. They do not poll or make model calls while suspended. A late reply arrives as an ordinary message. Timeout grants no permission: continue independent work, or report blocked if the missing answer is essential. Native Pi agents show the wait in their progress text. External harnesses retain their existing message controls; their CLI does not gain these Pi tools.
 
 Each agent starts with an isolated conversation. Include the goal, file boundaries, decisions, evidence already collected, and the result you need. `session_context: "lazy"` exposes a bounded, filtered snapshot of the lead's active branch for on-demand reading. It does not eagerly copy the conversation or replace a useful assignment. See [the teams skill](../skills/teams.md) for handoff examples.
 

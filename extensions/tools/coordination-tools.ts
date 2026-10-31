@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@sinclair/typebox";
-import { requireLeadRecipient } from "./spawned-agent-policy";
+import { createSendMessageTool, type SendMessageOptions } from "./send-message";
 import * as paths from "../../src/utils/paths";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
@@ -40,7 +40,7 @@ export interface CoordinationToolsOptions {
   adoptTeamAsLead(teamName: string, ctx?: any): void;
   renderLeadInboxStatus(): Promise<void>;
   resetLeadWakeNotifiedCount(): void;
-  deliverMessageToActiveAgent?(teamName: string, recipient: string, content: string): Promise<boolean>;
+  notifyMessageSent?: SendMessageOptions["notifySent"];
   extensionInstanceId?: string;
   loadCheckOperations?: CheckRunnerOptions["loadOperations"];
 }
@@ -307,30 +307,22 @@ export function registerCoordinationTools(pi: any, options: CoordinationToolsOpt
     },
   });
 
-  pi.registerTool({
-    name: "send_message",
-    label: "Send Message",
-    description: "Send a direct message in the current Pi session. Spawned agents may message only team-lead.",
-    parameters: Type.Object({
-      recipient: Type.Optional(Type.String({ description: "Recipient agent name. Defaults to team-lead for spawned agents." })),
-      content: Type.String(),
-      summary: Type.Optional(Type.String()),
-    }),
-    async execute(_toolCallId: string, params: any) {
-      const targetTeamName = requireCurrentSession(options);
-      const recipient = params.recipient || (options.isTeammate ? "team-lead" : undefined);
-      if (!recipient) throw new Error("recipient is required when the lead sends a message.");
-      if (options.isTeammate) requireLeadRecipient(recipient);
-      const deliveredDirectly = await options.deliverMessageToActiveAgent?.(targetTeamName, recipient, params.content) === true;
-      if (!deliveredDirectly) {
-        await messaging.sendPlainMessageIfRunning(targetTeamName, options.agentName, recipient, params.content, params.summary || "Message");
-      }
-      return {
-        content: [{ type: "text", text: `Message sent to ${recipient}.` }],
-        details: { session: targetTeamName, recipient, delivery: deliveredDirectly ? "active-session" : "inbox" },
-      };
+  pi.registerTool(createSendMessageTool({
+    agentName: options.agentName,
+    isTeammate: options.isTeammate,
+    getTeamName: options.getTeamName,
+    getLifecycleRunId: () => options.isTeammate ? process.env.PI_LIFECYCLE_RUN_ID : undefined,
+    notifySent: options.notifyMessageSent,
+    onWait: (recipient, waiting) => {
+      if (!options.isTeammate) return;
+      const teamName = options.getTeamName();
+      const runId = process.env.PI_LIFECYCLE_RUN_ID;
+      if (teamName && runId) void runtime.writeRuntimeStatus(teamName, options.agentName, runId, {
+        latestProgress: waiting ? `Waiting for reply from ${recipient} (max 60s)` : "Resuming assignment",
+        progressUpdatedAt: Date.now(),
+      }).catch(() => {});
     },
-  });
+  }));
 
   pi.registerTool({
     name: "read_inbox",

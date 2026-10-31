@@ -8,6 +8,7 @@ import { recordAgentActivity } from "../runtime/agent-activity";
 import * as runtime from "../../src/utils/runtime";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
+import { AgentInbox } from "../../src/utils/agent-inbox";
 import * as reportEvents from "../../src/utils/report-events";
 import { checkpointReference, preflightReportCheckpoint, saveReportCheckpoint } from "../../src/results/checkpoint-report";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
@@ -19,7 +20,7 @@ import { VerificationController, type VerificationDecision } from "../../src/res
 import type { CheckRunnerOptions } from "../../src/results/check-runner";
 import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
-import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
+import { extractTextParts, formatInboxMessagesForModel, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools, formatRepairRequest, type SubmittedAgentReport } from "../tools/agent-communication-tools";
 import { registerSpawnedAgentCommunicationGuard, SPAWNED_AGENT_COMMUNICATION_GUIDANCE, USER_INTERACTION_TOOLS } from "../tools/spawned-agent-policy";
 import { requireWriteAgentTeam } from "../team/roster";
@@ -123,6 +124,7 @@ export interface RunReadAgentOptions {
     options?: ShutdownTeammateOptions
   ): Promise<ReadAgentTeardownResult>;
   agentName?: string;
+  notifyMessageSent?: import("../tools/send-message").SendMessageOptions["notifySent"];
   renderLeadInboxStatus?(): Promise<void>;
   notifyLeadOfInboxReports?(teamName: string): Promise<void>;
   deliverMessageToActiveAgent?(
@@ -737,6 +739,7 @@ export async function runReadAgentInProcess(
   let submittedFinalReport: SubmittedAgentReport | undefined;
   let finalReportSubmissionInProgress = false;
   let childSessionManager: any;
+  let inbox: AgentInbox | undefined;
   let childLifecycleProbeUnsubscribe = (): void => {};
   let privateSessionDirectory: string | undefined;
   let completedReportPersisted = false;
@@ -1109,7 +1112,25 @@ export async function runReadAgentInProcess(
     });
     if (!prepared) await loader.reload();
 
+    inbox = new AgentInbox(readTeamName, member.name, state.runId, async message => {
+      if (!options.isCurrentReadAgentRun(key, state)) throw new Error("Agent run changed before message delivery.");
+      await sendMessageToRunningReadAgent(state, formatInboxMessagesForModel([message]));
+    }, error => {
+      if (!state.stopRequested && !state.messageDeliveryClosed) {
+        state.lastError = runtime.createRuntimeError(error);
+        options.renderReadAgentStatus();
+      }
+    });
     const communicationTools = createAgentCommunicationTools({
+      inbox,
+      notifySent: options.notifyMessageSent,
+      onWait: (recipient, waiting) => {
+        const status = waiting ? `Waiting for reply from ${recipient} (max 60s)` : "Resuming assignment";
+        state.latestProgress = status;
+        state.progressUpdatedAt = Date.now();
+        options.emitAgentProgress?.(readTeamName, member.name, status, state.progressUpdatedAt);
+        options.renderReadAgentStatus();
+      },
       isTeammate: true,
       agentName: member.name,
       role,
@@ -1393,6 +1414,8 @@ export async function runReadAgentInProcess(
         }
       })().catch(error => { moving = undefined; throw error; });
     }
+    state.inbox = inbox;
+    inbox.start();
     markReadAgentActivity(state, "started", "thinking");
     options.renderReadAgentStatus();
 
@@ -1749,6 +1772,8 @@ export async function runReadAgentInProcess(
       }
     }
   } finally {
+    inbox?.close();
+    state.inbox = undefined;
     childLifecycleProbeUnsubscribe();
     if (state.stopRequested) await cancelAutomaticRepair().catch(() => {});
     repairCancellationHandlers.delete(state);

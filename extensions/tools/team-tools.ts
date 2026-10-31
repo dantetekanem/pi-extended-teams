@@ -51,6 +51,7 @@ import {
 import { publicTeamToolMetadata } from "./public-team-tools";
 import { resolveExternalHarness } from "../../src/utils/external-harness-config";
 import { runExternalAgent } from "../agents/external-agent";
+import { formatPeerPlan } from "../team/roster";
 
 export const CHILD_AGENT_LIFECYCLE_PROBE = "pi-extended-teams:child-agent-lifecycle-probe";
 
@@ -105,6 +106,7 @@ export interface TeamToolsRuntime {
 }
 
 interface SpawnTeammateOptions {
+  peerPlan?: string;
   once?: boolean;
   signal?: AbortSignal;
   completionGroup?: CompletionGroupBinding;
@@ -749,9 +751,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         }
       }
       const continuedPrompt = continuationPrompt(member.checkpointAssignment, prompt);
-      const launchPrompt = sessionContextReference
-        ? `${continuedPrompt}${sessionContextReference.promptSuffix}`
-        : continuedPrompt;
+      const launchPrompt = [
+        member.peerPlan,
+        continuedPrompt,
+        sessionContextReference?.promptSuffix,
+      ].filter(Boolean).join("\n\n");
       const removeReference = () => {
         try {
           removeSessionContextReference(sessionContextReference);
@@ -1207,6 +1211,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       cwd,
       subscriptions: [],
       prompt: params.prompt,
+      peerPlan: spawnOptions.peerPlan ?? formatPeerPlan(spawnOptions.nestedParent?.name ?? "team-lead", [
+        ...teamConfig.members.filter(peer => peer.name !== "team-lead" && peer.isActive !== false),
+        ...readQueue(safeTeamName).map(queued => queued.member),
+        { name: safeName, prompt: params.prompt, modelSlot },
+      ]),
       color: role === "read" ? "cyan" : "blue",
       thinking: chosenThinking,
       planModeRequired: params.plan_mode_required,
@@ -1345,6 +1354,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       .catch(error => emitOrchestrationResponse(payload?.requestId, payload?.type, { ok: false, error: error instanceof Error ? error.message : String(error) }));
   });
 
+  function requireUniquePeerNames(names: string[]): void {
+    if (new Set(names.map(name => name.toLowerCase())).size !== names.length) {
+      throw new Error("Duplicate agent names in the same batch.");
+    }
+  }
+
   function generatedAgentName(index?: number): string {
     const position = index === undefined ? "" : `-${index + 1}`;
     return `agent-${Date.now().toString(36)}${position}-${crypto.randomUUID().slice(0, 8)}`;
@@ -1360,7 +1375,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
     externalHarnessForSpawn(params, ctx);
     params = { ...params, checkpoint: createCheckpointAssignment(params.checkpoint, params.prompt, params.continue_from)?.policy };
-    const name = params.continue_from === undefined ? params.name || generatedAgentName() : freshContinuationName(params.name || "agent");
+    const name = paths.sanitizeName(params.continue_from === undefined ? params.name || generatedAgentName() : freshContinuationName(params.name || "agent"));
     const sessionDefaultModel = configuredFavoriteModelForSpawn(params, ctx);
     const sessionName = await ensureCurrentSessionAgentGroup(ctx, sessionDefaultModel);
     const result = await spawnTeammate({
@@ -1389,20 +1404,21 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     model_slot: Type.Optional(StringEnum(NESTED_READ_MODEL_SLOTS, { description: "Canonical read-* tier, or inherit defaults.model_slot." })),
   };
 
-  function spawnNestedReadAgent(params: any, binding: NestedReadAgentToolBinding, context = "spawn_agent") {
-    return trackAdmission(() => spawnNestedReadAgentInScope(params, binding, context));
+  function spawnNestedReadAgent(params: any, binding: NestedReadAgentToolBinding, context = "spawn_agent", peerPlan?: string) {
+    return trackAdmission(() => spawnNestedReadAgentInScope(params, binding, context, peerPlan));
   }
 
   async function spawnNestedReadAgentInScope(
     params: any,
     binding: NestedReadAgentToolBinding,
-    context = "spawn_agent"
+    context = "spawn_agent",
+    peerPlan?: string,
   ): Promise<{ content: any[]; details: any }> {
     rejectUnexpectedNestedParams(params, ["name", "prompt", "model_slot"], context);
     requireNestedReadSpawnLevel(params, context);
     if (options.isHostAttached?.() === false) await options.waitForHost?.();
     await assertNestedParentAuthorized(binding.teamName, binding.parent.name, binding.parentRunId, binding.parent.cwd);
-    const name = params.name || generatedAgentName();
+    const name = paths.sanitizeName(params.name || generatedAgentName());
     const result = await spawnTeammate({
       name,
       prompt: params.prompt,
@@ -1410,6 +1426,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       team_name: binding.teamName,
       cwd: binding.parent.cwd,
     }, options.isHostAttached ? options.getSessionCtx?.() ?? binding.outerCtx : binding.outerCtx, {
+      peerPlan,
       nestedParent: {
         teamName: binding.teamName,
         name: binding.parent.name,
@@ -1471,13 +1488,18 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
           });
           await assertNestedParentAuthorized(binding.teamName, binding.parent.name, binding.parentRunId, binding.parent.cwd);
 
+          const names = mergedAgents.map((agent: any, index: number) => paths.sanitizeName(agent.name || generatedAgentName(index)));
+          requireUniquePeerNames(names);
+          const peerPlan = formatPeerPlan(binding.parent.name, mergedAgents.map((agent: any, index: number) => ({
+            name: names[index], prompt: agent.prompt, modelSlot: agent.model_slot,
+          })));
           const spawned: any[] = [];
           const failed: Array<{ name: string; error: string }> = [];
           for (let index = 0; index < mergedAgents.length; index += 1) {
             const merged = mergedAgents[index];
-            const name = merged.name || generatedAgentName(index);
+            const name = names[index];
             try {
-              const result = await spawnNestedReadAgent({ ...merged, name }, binding, `spawn_swarm_agents agent ${name}`);
+              const result = await spawnNestedReadAgent({ ...merged, name }, binding, `spawn_swarm_agents agent ${name}`, peerPlan);
               spawned.push({ ...result.details, name });
             } catch (error) {
               failed.push({ name, error: error instanceof Error ? error.message : String(error) });
@@ -1529,6 +1551,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
           configuredFavoriteModelForSpawn(mergedAgents[index], ctx, `spawn_swarm_agents agent ${mergedAgents[index].name || index + 1}`);
         }
         const sessionName = await ensureCurrentSessionAgentGroup(ctx, defaultModel);
+        const names = mergedAgents.map((agent: any, index: number) => paths.sanitizeName(agent.name || (groupPolicy
+          ? `agent-${crypto.createHash("sha256").update(`${_toolCallId}:${index}`).digest("hex").slice(0, 12)}`
+          : generatedAgentName(index))));
+        requireUniquePeerNames(names);
         let group: CompletionGroup | undefined;
         if (groupPolicy && sessionId) {
           const identity = { teamName: sessionName, sessionId, submissionId: `tool:${_toolCallId}` };
@@ -1544,7 +1570,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
             ...entries.map((entry: any) => entry.message?.details?.completionGroup)];
           if (references.some(binding => binding?.groupId === groupId)) new CompletionGroup(sessionName, groupId).read();
           group = await CompletionGroup.create({ ...identity, policy: groupPolicy, members: mergedAgents.map((agent: any, index: number) => ({
-            name: paths.sanitizeName(agent.name || `agent-${crypto.createHash("sha256").update(`${_toolCallId}:${index}`).digest("hex").slice(0, 12)}`),
+            name: names[index],
             assignmentKey: crypto.createHash("sha256").update(JSON.stringify([agent, ctx.cwd])).digest("hex"),
             suppressed: sessionName.startsWith("prompt-build-") || shouldSuppressLeadReportInjection(agent),
           })) });
@@ -1554,18 +1580,21 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
               idempotent: true, spawned: [], failed: [], members: group.read().members },
           };
         }
+        const peerPlan = formatPeerPlan("team-lead", mergedAgents.map((agent: any, index: number) => ({
+          name: names[index], prompt: agent.prompt, modelSlot: agent.model_slot,
+        })));
         const spawned: any[] = [];
         const failed: Array<{ name: string; error: string }> = [];
 
         for (let index = 0; index < mergedAgents.length; index += 1) {
           const merged = mergedAgents[index];
-          const name = group?.read().members[index].name || merged.name || generatedAgentName(index);
+          const name = names[index];
           try {
             const result = await spawnTeammate({
               ...merged,
               name,
               team_name: sessionName,
-            }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index), signal: _signal });
+            }, ctx, { peerPlan, allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index), signal: _signal });
             spawned.push({ ...result.details, name });
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);

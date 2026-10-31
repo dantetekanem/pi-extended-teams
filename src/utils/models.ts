@@ -22,6 +22,8 @@ export interface Member {
   cwd: string;
   subscriptions: any[];
   prompt?: string;
+  /** Runtime-owned planned-peer context, retained across queued admission. */
+  peerPlan?: string;
   color?: string;
   thinking?: ThinkingLevel;
   planModeRequired?: boolean;

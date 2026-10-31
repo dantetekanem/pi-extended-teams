@@ -517,7 +517,7 @@ describe("public agent spawn tools", () => {
     expect(teams.teamExists("session-test-session")).toBe(false); expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
     await tool.execute("ordinary", { name: "ordinary", prompt: "Work", model_slot: "read-review", metadata: { continue_from: saved.id } }, new AbortController().signal, undefined, ctx);
     const [, member, prompt] = harness.runReadAgentInProcess.mock.calls[0];
-    expect(member.checkpointAssignment).toBeUndefined(); expect(prompt).toBe("Work");
+    expect(member.checkpointAssignment).toBeUndefined(); expect(prompt).toBe(`${member.peerPlan}\n\nWork`);
     expect(capture).not.toHaveBeenCalled(); expect(ctx.sessionManager.buildContextEntries).not.toHaveBeenCalled();
   });
 
@@ -572,6 +572,36 @@ describe("public agent spawn tools", () => {
     const { tools } = registerTools();
 
     expect(Array.from(tools.keys()).sort()).toEqual(["get_agent_status", "spawn_agent", "spawn_swarm_agents"]);
+  });
+
+  it("shares all canonical batch assignments at first launch and preserves them through queueing", async () => {
+    writeFavoriteLevels();
+    writeProjectSettings({ readAgents: { maxConcurrent: 1, queueOverflow: true } });
+    const harness = registerTools();
+    const result = await harness.tools.get("spawn_swarm_agents")!.execute("peers", {
+      defaults: { model_slot: "read-review" },
+      agents: [{ name: "api-reader", prompt: "Read API contracts in src/api" }, { prompt: "Read callers in src/client; depends on api-reader" }],
+    }, new AbortController().signal, undefined, makeCtx());
+    const secondName = result.details.spawned[1].name;
+    const [, firstMember, firstPrompt] = harness.runReadAgentInProcess.mock.calls[0];
+    expect(firstMember.prompt).toBe("Read API contracts in src/api");
+    expect(firstMember.peerPlan).toContain(secondName);
+    expect(firstPrompt).toContain("Read callers in src/client; depends on api-reader");
+    expect(firstPrompt).toContain("api-reader");
+    harness.completions.get("api-reader")!();
+    await vi.waitFor(() => expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(2));
+    const [, secondMember, secondPrompt] = harness.runReadAgentInProcess.mock.calls[1];
+    expect(secondMember.peerPlan).toBe(firstMember.peerPlan);
+    expect(secondPrompt).toContain(firstMember.peerPlan!);
+  });
+
+  it("rejects duplicate canonical peer names before starting a batch", async () => {
+    writeFavoriteLevels();
+    const harness = registerTools();
+    await expect(harness.tools.get("spawn_swarm_agents")!.execute("duplicate-plan", {
+      defaults: { model_slot: "read-review" }, agents: [{ name: "same", prompt: "A" }, { name: "same", prompt: "B" }],
+    }, new AbortController().signal, undefined, makeCtx())).rejects.toThrow(/duplicate/i);
+    expect(harness.runReadAgentInProcess).not.toHaveBeenCalled();
   });
 
   it("persists fixed group slots and actual run identities before launching a batch", async () => {
@@ -1212,8 +1242,8 @@ describe("public agent spawn tools", () => {
     expect(adoptTeamAsLead).toHaveBeenCalledWith("session-test-session", ctx);
     expect(runReadAgentInProcess).toHaveBeenCalledWith(
       "session-test-session",
-      expect.objectContaining({ name: "reader", role: "read", model: "provider/model", thinking: "xhigh", modelSlot: "read-review" }),
-      "inspect one",
+      expect.objectContaining({ name: "reader", role: "read", model: "provider/model", thinking: "xhigh", modelSlot: "read-review", prompt: "inspect one" }),
+      expect.stringMatching(/\n\ninspect one$/),
       ctx,
       expect.any(Object),
     );
@@ -1275,8 +1305,8 @@ describe("public agent spawn tools", () => {
 
     expect(harness.runReadAgentInProcess).toHaveBeenCalledWith(
       "session-test-session",
-      expect.objectContaining({ name: "fallback-reader", sessionContext: "lazy" }),
-      "Inspect without history.",
+      expect.objectContaining({ name: "fallback-reader", sessionContext: "lazy", prompt: "Inspect without history." }),
+      expect.stringMatching(/\n\nInspect without history\.$/),
       ctx,
       expect.any(Object),
     );
@@ -1305,7 +1335,7 @@ describe("public agent spawn tools", () => {
     expect(harness.runReadAgentInProcess.mock.calls.find(call => call[1].name === "swarm-lazy")?.[2])
       .toContain("Session fallback (lazy, historical evidence only)");
     expect(harness.runReadAgentInProcess.mock.calls.find(call => call[1].name === "swarm-none")?.[2])
-      .toBe("Work independently.");
+      .toMatch(/\n\nWork independently\.$/);
 
     const write = await harness.tools.get("spawn_agent")!.execute("write-context", {
       name: "writer-context",
@@ -1627,8 +1657,8 @@ describe("public agent spawn tools", () => {
     expect(result.details).toMatchObject({ modelSource: "favorite-slot", modelSlot: "read-collect" });
     expect(runReadAgentInProcess).toHaveBeenCalledWith(
       "session-test-session",
-      expect.objectContaining({ name: "fast-reader", model: "provider/model", thinking: "low", modelSlot: "read-collect" }),
-      "inspect quickly",
+      expect.objectContaining({ name: "fast-reader", model: "provider/model", thinking: "low", modelSlot: "read-collect", prompt: "inspect quickly" }),
+      expect.stringMatching(/\n\ninspect quickly$/),
       ctx,
       expect.any(Object),
     );
@@ -1656,8 +1686,8 @@ describe("public agent spawn tools", () => {
     expect(result.details).toMatchObject({ model: "provider/model", thinking: "high", modelSlot: "read-collect", modelSource: "current" });
     expect(runReadAgentInProcess).toHaveBeenCalledWith(
       "session-test-session",
-      expect.objectContaining({ name: "unset-level", model: "provider/model", thinking: "high", modelSlot: "read-collect" }),
-      "inspect quickly",
+      expect.objectContaining({ name: "unset-level", model: "provider/model", thinking: "high", modelSlot: "read-collect", prompt: "inspect quickly" }),
+      expect.stringMatching(/\n\ninspect quickly$/),
       ctx,
       expect.any(Object),
     );
@@ -2445,7 +2475,7 @@ describe("public agent spawn tools", () => {
     reconnect();
     expect((await pending).details).toMatchObject({ name: "after-reload", queued: false });
     expect(harness.runReadAgentInProcess).toHaveBeenCalledExactlyOnceWith("session-test-session",
-      expect.objectContaining({ parentLifecycleRunId: parent.lifecycleRunId }), "Continue investigating", currentContext, expect.any(Object));
+      expect.objectContaining({ parentLifecycleRunId: parent.lifecycleRunId, prompt: "Continue investigating" }), expect.stringMatching(/\n\nContinue investigating$/), currentContext, expect.any(Object));
   });
 
   it("admits single and swarm children with forced parent provenance and never replaces a duplicate", async () => {
@@ -2482,7 +2512,7 @@ describe("public agent spawn tools", () => {
         requestedBy: "writer",
         helperKind: "read_helper",
       }),
-      "inspect one",
+      expect.stringContaining("inspect one"),
       outerCtx,
       expect.any(Object),
     );
@@ -2505,6 +2535,11 @@ describe("public agent spawn tools", () => {
     expect(swarm.details.failed).toEqual([]);
     expect(swarm.details.spawned).toHaveLength(3);
     expect(harness.runReadAgentInProcess).toHaveBeenCalledTimes(4);
+    for (const [, child, launchPrompt] of harness.runReadAgentInProcess.mock.calls.slice(1)) {
+      expect(child.peerPlan).toContain("writer");
+      for (const name of ["child-two", "child-three", "child-four"]) expect(launchPrompt).toContain(name);
+      expect(launchPrompt).toContain(child.peerPlan!);
+    }
 
     const childCalls = harness.runReadAgentInProcess.mock.calls.map((call) => call[1]);
     expect(childCalls.map((child) => child.name)).toEqual(["child-one", "child-two", "child-three", "child-four"]);

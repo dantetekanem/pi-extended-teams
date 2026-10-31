@@ -52,6 +52,7 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   /** Optional accounting observer, called only after exact successful lifecycle settlement. */
   onCostSettled?(): void;
   session?: AgentSession;
+  inbox?: import("../../src/utils/agent-inbox").AgentInbox;
   externalControl?: {
     stop(): Promise<void>;
     message(content: string): Promise<void>;

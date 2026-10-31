@@ -192,7 +192,7 @@ Scope and retention are inherited unless overridden; old decisions are not reaut
 
 ## Context handoff contract
 
-Agents start in isolated sessions and know only what their mission tells them. A short prompt is not automatically a good prompt: omit irrelevant history, but include the intent and prior state needed to avoid repeating work or violating a decision.
+Agents start in isolated sessions with their mission and a compact planned-peer snapshot. A batch snapshot includes all planned names, tiers, and the first 400 characters of each assignment, including queued peers. Put responsibility, file boundaries, and dependencies first; the snapshot is not proof of liveness or a substitute for the full handoff. A short prompt is not automatically a good prompt: omit irrelevant history, but include the intent and prior state needed to avoid repeating work or violating a decision.
 
 Before writing the mission, make a context-selection pass over the active request and session:
 
@@ -269,7 +269,8 @@ Good edit missions use the same card. The complete `docs-fix` and `parser-featur
 ## When you are spawned as an agent
 
 - Start by reading your initial instructions.
-- Use `send_message` for direct communication and `read_inbox` when the extension wakes you or you expect a reply.
+- Use `send_message` to contact a running peer or the coordinator named in your shared plan. Ask for missing facts, clarification, or additional help instead of guessing. Answer questions with `reply_to` set to the received message ID.
+- For a blocking question, set `wait_for_reply: true`; `timeout_seconds` defaults to 60 and is capped at 60. The tool suspends without polling and resumes on the matching reply or timeout. After timeout, continue independent work within scope; report blocked if the answer is essential. Silence is not permission. Use `read_inbox` when notified of other messages.
 - Never sleep, busy-wait, or poll. An opted-in nested parent may use one `get_agent_status` snapshot when current child status is needed, but must not call it repeatedly.
 - Unless you are an explicitly opted-in depth-0 `write-feature` / `write-critical` writer, you cannot spawn other agents; ask the lead with `send_message`.
 - If opted in, use only the restricted status and spawn tools for depth-1 read helpers within your lane. Any canonical `read-*` tier and helper count is allowed subject to global capacity; children report to you and cannot delegate. Give each child the same Context handoff contract because it does not inherit your conversation or implementation context.

@@ -53,7 +53,7 @@ export function registerLeadAttachment(pi: ExtensionAPI, createOwner: () => Team
     adoptTeamAsLead: (name, ctx) => execution().coordination.adoptTeamAsLead(name, ctx && execution().host.snapshot(ctx)),
     renderLeadInboxStatus: () => execution().coordination.renderLeadInboxStatus(),
     resetLeadWakeNotifiedCount: () => execution().coordination.resetLeadWakeNotifiedCount(),
-    deliverMessageToActiveAgent: (...args) => execution().coordination.deliverMessageToActiveAgent!(...args),
+    notifyMessageSent: (...args) => execution().coordination.notifyMessageSent!(...args),
   });
   registerTaskRuntimeTools(pi, {
     isTeammate: false,

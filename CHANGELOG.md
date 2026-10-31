@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.6.1] - 2026-10-31
+
+### Added
+- Let native Pi agents message peers directly and wait for a matching clarification reply for up to 60 seconds without polling.
+- Give spawned agents a shared assignment snapshot, including every planned batch member before launch and through queueing.
+
+### Fixed
+- End reply waits on cancellation or timeout even when message storage or notification is still pending, and keep notifications bound to the intended agent run.
+- Keep team adoption and inbox polling working when the lead's filesystem watcher cannot start.
+
 ## [2.6.0] - 2026-10-27
 
 ### Added

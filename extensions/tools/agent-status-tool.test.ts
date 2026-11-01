@@ -221,7 +221,7 @@ describe("get_agent_status", () => {
     ]);
   });
 
-  it("does not join state or runtime telemetry from a different lifecycle run", async () => {
+  it("reports unknown without joining state or runtime telemetry from a different lifecycle run", async () => {
     const writer = member("writer", { role: "write", lifecycleRunId: "writer-old-run" });
     mockRoster(writer);
     vi.spyOn(runtime, "readRuntimeStatus").mockResolvedValue({
@@ -249,9 +249,11 @@ describe("get_agent_status", () => {
       expect.objectContaining({
         name: "writer",
         role: "write",
-        phase: "stalled",
+        phase: "unknown",
         progress: undefined,
         activeTool: undefined,
+        activityAgeMs: undefined,
+        heartbeatAgeMs: undefined,
       }),
     ]);
   });

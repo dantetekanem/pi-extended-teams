@@ -160,12 +160,13 @@ describe("orchestration primitives", () => {
       readAgentKey: (team, name) => `${team}:${name}`, terminal: null, listQueuedAgents: () => [],
     }).execute("status", { agent_name: "writer" });
     const expectedPhase = scenario === "current" || scenario === "no-telemetry" ? "thinking"
-      : scenario === "old-run" || scenario === "hung" || scenario === "detached" ? "stalled" : "quarantined";
+      : scenario === "old-run" ? "unknown"
+        : scenario === "hung" || scenario === "detached" ? "stalled" : "quarantined";
     expect(observed.phase).toBe(expectedPhase);
     expect(publicResult.details.statuses[0].phase).toBe(expectedPhase);
     if (scenario === "current" || scenario === "no-telemetry") expect(observed).toMatchObject({ alive: true, health: "healthy", agentLoopReady: true });
     if (scenario === "old-run") {
-      expect(observed).toMatchObject({ hasRecentHeartbeat: false, runtime: null, agentLoopReady: false });
+      expect(observed).toMatchObject({ alive: null, health: "unknown", hasRecentHeartbeat: false, runtime: null, agentLoopReady: false });
       expect(publicResult.details.statuses[0].progress).toBeUndefined();
     }
     if (scenario === "detached") expect(observed).toMatchObject({ alive: null, health: "unknown", agentLoopReady: false });

@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.6.3] - 2026-11-04
+
+### Changed
+- Show finished agent reports in Pi's tool-call box, with the agent name, status, elapsed time, token count, and summary. Expand the box to read the full report; failed agents use the tool error background. Reports without a saved summary keep their existing layout (#52).
+
 ## [2.6.2] - 2026-11-04
 
 ### Changed

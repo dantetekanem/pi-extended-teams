@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.6.2] - 2026-11-04
+
+### Changed
+- Show compact grey agent-completion notices in the lead conversation.
+- Update delegation guidance to use bounded execution lanes for substantial independent work and explicit team-leader requests.
+
 ## [2.6.1] - 2026-10-31
 
 ### Added

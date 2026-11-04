@@ -1,6 +1,6 @@
 ---
 name: teams
-description: "Coordinate independent agent lanes with pi-extended-teams. Use when planning or managing delegation, not for every investigation or test. An explicit scoped spawn uses the available tool contract first. Never use during active autoresearch."
+description: "Coordinate independent agent lanes with pi-extended-teams. Proactively delegate suitable lanes for substantial work with independent outcomes. When the user explicitly invokes team-leader, delegate a substantive execution lane, even if it is the only lane. Keep small unrequested tasks direct. Never use during active autoresearch."
 ---
 
 # pi-extended-teams
@@ -17,23 +17,25 @@ If agents would otherwise be useful, stop and ask the user to turn off or finish
 
 ## The balance
 
-- **The lead owns the result.** The lead retains integration, cross-lane decisions, scope tradeoffs, verification synthesis, and final acceptance. By default, the lead executes a single substantive lane; an explicit user request to delegate it takes precedence.
+- **The lead owns the result.** Keep scope, integration, cross-lane decisions, and final acceptance with the lead. Proactively delegate suitable execution lanes for substantial work with independent outcomes. Keep small or genuinely single-lane work lead-owned by default unless team-leader delegation is explicitly requested.
 - **Read agents multiply genuine independent coverage.** Use them for bounded investigation, review, testing, audits, and second opinions only when each lane returns distinct useful evidence.
-- **Edit agents are optional and rare.** A writer owns exactly one isolated sub-outcome with non-overlapping files. Use `write-system` for normal complex implementation, integration, or refactoring inside that lane; reserve `write-critical` for rare high-risk security, concurrency, recovery, migration, or data-integrity work. Neither tier allows broad cross-stack ownership. Edit agents must claim files before writing and report every changed path.
+- **Edit agents own bounded execution.** Delegate substantive implementation lanes for substantial work with independent outcomes, or when the user explicitly requests team-leader delegation. Keep writers on isolated sub-outcomes and non-overlapping files. Use `write-system` for normal complex implementation, integration, or refactoring inside that lane; reserve `write-critical` for rare high-risk security, concurrency, recovery, migration, or data-integrity work. Neither tier allows broad cross-stack ownership. Edit agents must claim files before writing and report every changed path.
 - **Nested read helpers require explicit opt-in.** Only a depth-0 `write-feature` or `write-critical` spawn with `allow_nested_read_agents: true` receives restricted read-only spawn tools. It may use any canonical `read-*` tier and any helper count subject to global capacity; children report to that writer and cannot delegate. Read agents, depth-1 children, `write-patch`, and `write-system` remain denied.
 
 ## Routing
 
 For an explicitly requested, already-scoped agent, call `spawn_agent` with the known mission and user limits before optional skill reads, task setup, or investigation. Ask only about missing scope or authorization. This also permits delegating the single execution lane when the user explicitly requests it; the lead still owns acceptance. Tool-enforced roles and the autoresearch guard remain binding.
 
+When the user explicitly asks to use team-leader without naming an agent, delegate at least one bounded substantive execution lane. If there is only one substantive outcome, it may be the sole lane. Loading this skill or delegating only a review of lead-written implementation does not satisfy an implementation request. For a read-only request, delegate the substantive investigation or review itself. The lead retains scope and acceptance.
+
 Otherwise, before choosing delegation for substantial work:
 
 1. Enumerate every unfinished substantive outcome in the User's request as an inspectable behavior, artifact, decision, or evidence result.
-2. Map each candidate lane to exactly one bounded sub-outcome or independent question, its owned surface, and its expected evidence. The whole User request cannot be a lane.
+2. Map each candidate lane to a bounded substantive outcome or independent question, its owned surface, and expected evidence. Keep distinct outcomes in separate lanes.
 3. Keep integration, cross-lane decisions, and final acceptance with the lead.
 4. Reject overlapping or fake parallel lanes. Agents are useful only for genuine independent lanes.
-5. Reject any plan in which one teammate owns every unfinished substantive outcome. Re-split only where outcomes are genuinely independent; do not rename the whole request as one lane.
-6. Without an explicit request to delegate, keep a single execution lane lead-owned. Independent read-only evidence lanes remain useful when they add distinct value.
+5. For multiple independent outcomes, do not assign all execution to one teammate or invent extra lanes to fill a swarm. For an explicit team-leader request with one substantive outcome, one teammate may own that execution lane; the lead retains acceptance.
+6. Proactively delegate bounded execution lanes for substantial work with genuinely independent outcomes; keep coordination proportionate. Keep small or genuinely single-lane work lead-owned by default, unless the user explicitly requests team-leader delegation. Independent read-only evidence lanes remain useful when they add distinct value.
 
 ## Default flow
 
@@ -134,9 +136,9 @@ Use the requested tier and bounded assignment, without preliminary implementatio
 ## Lead rules
 
 - Never spawn agents, teams, subagents, or reviewer agents while autoresearch mode/session is active, running, or being resumed.
-- Use the explicit-spawn fast path for a clear requested assignment; otherwise delegate only genuine independent lanes.
+- Use the explicit-spawn fast path for a clear requested assignment; otherwise proactively delegate suitable substantive lanes for substantial work with independent outcomes.
 - Keep integration, cross-lane decisions, and final acceptance in the lead.
-- Keep a single execution lane lead-owned unless the user explicitly delegates it. Otherwise, give each writer one isolated sub-outcome.
+- Keep small or genuinely single-lane work lead-owned by default. When the user explicitly requests team-leader, delegate a substantive execution lane even if it is the only one. Give each writer one isolated sub-outcome.
 - When no unrelated work remains, end the turn. The extension resumes the lead when reports arrive.
 - One `get_agent_status` snapshot is allowed when current status is needed. Never call it repeatedly, sleep, busy-wait, or loop on inbox/status.
 - Trust quiet agents. Do not ping, message, or check an agent just because it has been quiet for less than several minutes; active status remains visible in the activity card and Down-key live view.
@@ -242,7 +244,7 @@ Require every final report to answer its expected delta, cite evidence, list ins
 
 Give every agent:
 
-- one bounded independent sub-outcome or question (never the whole User request),
+- one bounded independent sub-outcome or question; for an explicit team-leader request with one substantive outcome, that may be the request's sole execution lane,
 - the compact context handoff card above,
 - relevant files, symbols, or search boundaries,
 - the right `model_slot` tier (`read-*` for read-only, `write-*` for edit-allowed),

@@ -399,13 +399,17 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     }
   }
 
-  // Deliver a finished agent's report into the lead's context without adding
-  // the full body to the transcript. Hidden custom messages still participate
-  // in LLM context (see convertToLlm), and triggerTurn makes the lead synthesize
-  // the report automatically — no read_inbox, no manual polling.
-  function emitAgentReport(reportTeamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection = false): void {
+  // One message carries the full report to the lead model and renders a compact
+  // completion notice. Keep the existing follow-up turn and suppression rules.
+  function emitAgentReport(reportTeamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection = false, summary?: string): void {
     const api = pi as any;
-    const details = { name, elapsedMs: Date.now() - startedAt, tokens, ok };
+    const details = {
+      name,
+      elapsedMs: Date.now() - startedAt,
+      tokens,
+      ok,
+      summary: summary?.trim() || report.split(/\r?\n/).find(line => line.trim())?.trim() || "Report available.",
+    };
     pi.events?.emit?.("pi-extended-teams:agent-report", { teamName: reportTeamName, name, startedAt, tokens, report, ok, details });
 
     // pi-prompt prompt-build teams are extension-controlled fanout jobs. Their
@@ -416,7 +420,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
 
     if (typeof api.sendMessage === "function") {
       api.sendMessage(
-        { customType: "pi-extended-teams-report", content: report, display: false, details },
+        { customType: "pi-extended-teams-report", content: report, display: true, details },
         { triggerTurn: true, deliverAs: "followUp" }
       );
     } else {

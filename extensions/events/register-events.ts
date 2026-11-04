@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Text } from "@mariozechner/pi-tui";
+import { Container, Spacer, Text, TruncatedText } from "@mariozechner/pi-tui";
 import * as paths from "../../src/utils/paths";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
@@ -54,8 +54,19 @@ function hasPersistedTeamSettings(ctx: any): boolean {
 }
 
 export function registerAgentReportRenderer(pi: any): void {
-  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, _renderOptions: any, theme: any) => {
+  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, renderOptions: any, theme: any) => {
     const d = message.details || {};
+    if (typeof d.summary === "string") {
+      const summary = d.summary.replace(/\s+/g, " ").trim();
+      const notice = theme.fg("muted", `${d.name || "agent"} ${d.ok === false ? "failed" : "finished"} — ${summary}`);
+      const block = new Container();
+      block.addChild(new TruncatedText(notice));
+      if (renderOptions.expanded && typeof message.content === "string") {
+        block.addChild(new Text(`\n${message.content}`, 0, 0));
+      }
+      block.addChild(new Spacer(1));
+      return block;
+    }
     const meta = [
       d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
       typeof d.tokens === "number" ? `${formatTokenCount(d.tokens)} tok` : "",

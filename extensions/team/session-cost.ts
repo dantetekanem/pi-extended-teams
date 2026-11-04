@@ -52,6 +52,23 @@ export interface AgentCostSnapshot {
   costUsd: number | null;
   telemetry?: AgentUsageTelemetry;
 }
+export interface AgentCostBreakdown {
+  rootSessionId: string;
+  teamName: string;
+  lifecycleRunId: string;
+  phase: "pending" | "final" | "excluded";
+  childSessionId?: string;
+  agentName?: string;
+  modelSlot?: string;
+  costUsd: number | null;
+  accounting: "included" | "duplicate" | "excluded" | "incomplete";
+}
+export interface SessionCostBreakdown {
+  usd: number;
+  complete: boolean;
+  own: { usd: number; complete: boolean };
+  runs: AgentCostBreakdown[];
+}
 export interface CostRun {
   settle(snapshot: AgentCostSnapshot | undefined, outcome: CostOutcome): void;
   exclude(): void;
@@ -165,6 +182,7 @@ export function createCombinedSessionCost(initialHost: CostHost) {
   let context: SessionCostContext | undefined;
   let displayTotal: ReturnType<typeof recordedSessionCost> | undefined;
   let unsubscribeDisplay: (() => void) | undefined;
+  let unsubscribeBreakdown: (() => void) | undefined;
   let listenerGeneration = 0;
   const receipts = (entries: readonly unknown[]) => {
     const runs = new Map<string, Receipt>();
@@ -187,28 +205,63 @@ export function createCombinedSessionCost(initialHost: CostHost) {
     return { runs, complete };
   };
   const active = () => !!scope && !!host && !!context && context.sessionManager.getSessionId() === scope.root;
-  const total = () => {
+  const snapshot = (includeRuns = false): SessionCostBreakdown => {
+    const unavailable = (): SessionCostBreakdown => ({
+      usd: 0, complete: false, own: { usd: 0, complete: false }, runs: [],
+    });
     try {
-      if (!active() || !scope || !context) return { usd: 0, complete: false };
+      if (!active() || !scope || !context) return unavailable();
       const entries = context.sessionManager.getEntries();
       const own = recordedSessionCost(entries);
       const replay = receipts(entries);
       let complete = own.complete && replay.complete && scope.failed.size === 0;
       let usd = own.usd;
       const sessions = new Set([scope.root]);
+      const runs: AgentCostBreakdown[] = [];
       for (const [key, receipt] of new Map([...replay.runs, ...scope.pending])) {
-        if (receipt.phase === "excluded") continue;
-        if (scope.failed.has(key) || receipt.phase !== "final" || !validCost(receipt.costUsd) || !receipt.childSessionId) {
+        let accounting: AgentCostBreakdown["accounting"];
+        if (receipt.phase === "excluded") {
+          accounting = "excluded";
+        } else if (scope.failed.has(key) || receipt.phase !== "final" || !validCost(receipt.costUsd) || !receipt.childSessionId) {
+          accounting = "incomplete";
           complete = false;
-          continue;
+        } else if (sessions.has(receipt.childSessionId)) {
+          accounting = "duplicate";
+        } else {
+          sessions.add(receipt.childSessionId);
+          if (validCost(usd + receipt.costUsd)) {
+            usd += receipt.costUsd;
+            accounting = "included";
+          } else {
+            accounting = "incomplete";
+            complete = false;
+          }
         }
-        if (sessions.has(receipt.childSessionId)) continue;
-        sessions.add(receipt.childSessionId);
-        if (validCost(usd + receipt.costUsd)) usd += receipt.costUsd;
-        else complete = false;
+        if (includeRuns && typeof receipt.phase === "string") {
+          const run: AgentCostBreakdown = {
+            rootSessionId: receipt.rootSessionId,
+            teamName: receipt.teamName,
+            lifecycleRunId: receipt.lifecycleRunId,
+            phase: receipt.phase,
+            costUsd: receipt.phase === "final" && validCost(receipt.costUsd) ? receipt.costUsd : null,
+            accounting,
+          };
+          if (typeof receipt.childSessionId === "string") run.childSessionId = receipt.childSessionId;
+          const telemetry = object(receipt.telemetry);
+          if (telemetry.schemaVersion === 1) {
+            for (const field of ["agentName", "modelSlot"] as const) {
+              if (typeof telemetry[field] === "string") run[field] = telemetry[field];
+            }
+          }
+          runs.push(run);
+        }
       }
-      return { usd, complete };
-    } catch { return { usd: 0, complete: false }; }
+      return { usd, complete, own, runs };
+    } catch { return unavailable(); }
+  };
+  const total = () => {
+    const { usd, complete } = snapshot();
+    return { usd, complete };
   };
   const refresh = () => {
     if (!host) {
@@ -243,6 +296,11 @@ export function createCombinedSessionCost(initialHost: CostHost) {
       if (generation === listenerGeneration && scope && context && request.sessionId === scope.root
         && context.sessionManager.getSessionId() === scope.root) request.result = displayTotal;
     });
+    unsubscribeBreakdown = nextHost.events.on("pi-extended-teams:cost-breakdown-request", (value) => {
+      const request = object(value);
+      if (generation === listenerGeneration && scope && context && request.sessionId === scope.root
+        && context.sessionManager.getSessionId() === scope.root) request.result = snapshot(true);
+    });
     nextHost.on("session_start", (_event, nextContext) => {
       if (generation !== listenerGeneration) return;
       const root = nextContext.sessionManager.getSessionId();
@@ -272,6 +330,8 @@ export function createCombinedSessionCost(initialHost: CostHost) {
     listenerGeneration++;
     unsubscribeDisplay?.();
     unsubscribeDisplay = undefined;
+    unsubscribeBreakdown?.();
+    unsubscribeBreakdown = undefined;
     host = undefined;
     context = undefined;
     displayTotal = undefined;

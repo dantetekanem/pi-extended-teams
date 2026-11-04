@@ -417,7 +417,7 @@ describe("in-process read agent tool wiring", () => {
     let receipt: any;
     session.prompt.mockImplementation(async () => {
       const tool = piMocks.createAgentSession.mock.calls.at(-1)![0].customTools.find((item: any) => item.name === "report_and_exit");
-      receipt = await tool.execute("ordinary", { content: "Complete ordinary report", ...details });
+      receipt = await tool.execute("ordinary", { content: "Complete ordinary report", summary: "Checked the requested findings.", ...details });
     });
     piMocks.createAgentSession.mockResolvedValue({ session });
     const options = makeRunOptions();
@@ -425,6 +425,9 @@ describe("in-process read agent tool wiring", () => {
     expect(receipt.details.accepted).toBe(true);
     const [event] = await listTeamReportEvents("team");
     expect(event.result).toMatchObject(details);
+    expect(options.emitAgentReport).toHaveBeenCalledExactlyOnceWith(
+      "team", "reviewer", expect.any(Number), 42, "Complete ordinary report", true, false, "Checked the requested findings.",
+    );
     expect(options.runningReadAgents.size).toBe(0);
     expect(session.dispose).toHaveBeenCalledOnce();
   });
@@ -1998,7 +2001,7 @@ describe("in-process read agent tool wiring", () => {
     expect(session.bindExtensions).toHaveBeenCalledWith({ mode: "print" });
     expect(session.bindExtensions.mock.invocationCallOrder[0]).toBeLessThan(session.prompt.mock.invocationCallOrder[0]);
     expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
-    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, "final report", true);
+    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, "final report", true, false, undefined);
     expect(await readInbox("team", "team-lead", true, false)).toEqual([]);
     expect(await readInbox("team", "team-lead", false, false)).toEqual([]);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader");
@@ -2463,7 +2466,7 @@ describe("in-process read agent tool wiring", () => {
     expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionId");
     expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionFile");
     expect(emitAgentReport).toHaveBeenCalledWith(
-      "team", "reader", expect.any(Number), 42, "Recovered on the report-only turn", true,
+      "team", "reader", expect.any(Number), 42, "Recovered on the report-only turn", true, false, "Recovered",
     );
   });
 
@@ -2536,7 +2539,7 @@ describe("in-process read agent tool wiring", () => {
     expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionId");
     expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionFile");
     expect(emitAgentReport).toHaveBeenCalledWith(
-      "team", "reader", expect.any(Number), 42, "Recovered durable report", true,
+      "team", "reader", expect.any(Number), 42, "Recovered durable report", true, false, "Durable",
     );
     const reports = await listTeamReportEvents("team");
     expect(reports.at(-1)).toMatchObject({
@@ -3437,7 +3440,7 @@ describe("in-process read agent tool wiring", () => {
       ...communicationToolNames,
     ]);
     expect(sessionOptions.customTools.map((tool: any) => tool.name).sort()).toEqual([...communicationToolNames].sort());
-    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "writer", expect.any(Number), 42, "final report", true);
+    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "writer", expect.any(Number), 42, "final report", true, false, undefined);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledTimes(1);
     expect(session.abort).toHaveBeenCalledTimes(1);
     expect(session.dispose).toHaveBeenCalledTimes(1);
@@ -4230,7 +4233,7 @@ describe("in-process read agent tool wiring", () => {
       },
     }, options);
 
-    expect(options.emitAgentReport).toHaveBeenCalledWith("prompt-build-123", "prompt-branch-1", expect.any(Number), 42, "final report", true);
+    expect(options.emitAgentReport).toHaveBeenCalledWith("prompt-build-123", "prompt-branch-1", expect.any(Number), 42, "final report", true, false, undefined);
     const leadInbox = await readInbox("prompt-build-123", "team-lead", false, false);
     expect(leadInbox).toEqual([]);
   });
@@ -4502,7 +4505,7 @@ describe("in-process read agent tool wiring", () => {
             model: model.id,
             timestamp: Date.now(),
             content: reporting
-              ? [{ type: "toolCall", id: "report", name: "report_and_exit", arguments: { content: "legacy SDK report" } }]
+              ? [{ type: "toolCall", id: "report", name: "report_and_exit", arguments: { content: "legacy SDK report", summary: "Verified the SDK completion path." } }]
               : [{ type: "text", text: "done" }],
             stopReason: reporting ? "toolUse" : "stop",
             usage: {
@@ -4527,6 +4530,9 @@ describe("in-process read agent tool wiring", () => {
     const options = makeRunOptions();
     await runReadAgentInProcess("team", member, "Exercise the legacy SDK", { modelRegistry }, options);
     expect(options.rememberCompletedAgentReport.mock.calls[0][1]).toMatchObject({ report: "legacy SDK report", status: "completed" });
+    expect(options.emitAgentReport).toHaveBeenCalledExactlyOnceWith(
+      "team", "reader", expect.any(Number), expect.any(Number), "legacy SDK report", true, false, "Verified the SDK completion path.",
+    );
     expect(responses).toBeGreaterThan(0);
     expect(child.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "bash", "edit", "write", "report_and_exit"]));
     expect(options.runningReadAgents.size).toBe(0);

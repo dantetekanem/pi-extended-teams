@@ -115,7 +115,7 @@ export interface RunReadAgentOptions {
   ensureReadAgentStatusTicker(): void;
   renderReadAgentStatus(): void;
   rememberCompletedAgentReport(teamName: string, report: CompletedAgentReport): void;
-  emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection?: boolean): void;
+  emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection?: boolean, summary?: string): void;
   emitAgentProgress?(teamName: string, name: string, status: string, updatedAt: number): void;
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
   shutdownTeammate?(
@@ -988,7 +988,7 @@ export async function runReadAgentInProcess(
       // Workflow orchestrators consume full reports from TeamReportEvent storage.
       // Pi Prompt consumes its writer report through the private event without a lead turn.
     } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
-      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, leadReport, true);
+      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, leadReport, true, false, resolution.summary);
     } else {
       await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, leadReport, completionSummary, member.color, completionMetadata);
     }

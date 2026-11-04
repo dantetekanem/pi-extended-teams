@@ -443,7 +443,7 @@ describe("extension integration", () => {
     }
   });
 
-  it("delivers completed read reports to lead context without rendering their bodies", async () => {
+  it("delivers a visible completion summary once while keeping the full report in lead context", async () => {
     const setup = await setupExtension({}, { withSendMessage: true });
     try {
       writeFavoriteLevels(setup.root);
@@ -464,6 +464,8 @@ describe("extension integration", () => {
         42,
         "Full report body for the lead model.",
         true,
+        false,
+        "Verified the project checks.",
       );
 
       expect(setup.pi.events.emit).toHaveBeenCalledWith(
@@ -480,8 +482,8 @@ describe("extension integration", () => {
         {
           customType: "pi-extended-teams-report",
           content: "Full report body for the lead model.",
-          display: false,
-          details: { name: "reader", elapsedMs: 1_000, tokens: 42, ok: true },
+          display: true,
+          details: { name: "reader", elapsedMs: 1_000, tokens: 42, ok: true, summary: "Verified the project checks." },
         },
         { triggerTurn: true, deliverAs: "followUp" },
       );

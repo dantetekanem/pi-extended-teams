@@ -29,6 +29,7 @@ import { createTeamHost } from "./runtime/team-host";
 import { registerLeadAttachment, type TeamExecutionOwner } from "./runtime/lead-attachment";
 import { createActiveAgentSleepController, runWithActiveAgentSleepAssertion } from "./runtime/active-agent-sleep.js";
 import { createTeammateInterrupter } from "./runtime/teammate-interrupt.js";
+import { registerDurableAgents } from "./durable/durable-agents";
 export { panelBgFill, framePanel, frameWidget, frameWidgetFullWidth, logWindowStart } from "./ui/frame.js";
 import * as messaging from "../src/utils/messaging";
 import { requestCompletionGroupWake, observeCompletionGroupWakes } from "../src/results/completion-group-wake";
@@ -49,6 +50,7 @@ export default function (pi: ExtensionAPI): void {
     const host = createTeamHost();
     return createExecutionRuntime(host.api as unknown as ExtensionAPI, host);
   });
+  registerDurableAgents(pi);
 }
 
 function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof createTeamHost>): TeamExecutionOwner {

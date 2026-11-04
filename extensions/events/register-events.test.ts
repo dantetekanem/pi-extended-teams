@@ -172,6 +172,52 @@ describe("extension teammate inbox wake", () => {
     expect(output).not.toContain("ctrl+o");
   });
 
+  it("renders completion summaries in the tool-call shell and shows the report only when expanded", () => {
+    const registerMessageRenderer = vi.fn();
+    registerExtensionEvents({
+      registerMessageRenderer,
+      on: vi.fn(),
+    }, {
+      isTeammate: false,
+      agentName: "team-lead",
+      getTeamName: () => "team",
+      setSessionCtx: vi.fn(),
+      terminal: {},
+      quietTrigger: vi.fn(),
+      startLeadInboxPolling: vi.fn(),
+      startLeadWatchdog: vi.fn(),
+      buildRoster: vi.fn(async () => ({ teamName: "team", members: [] })),
+      formatRosterForPrompt: vi.fn(() => "Roster: empty"),
+    });
+
+    const renderer = registerMessageRenderer.mock.calls.find((call) => call[0] === "pi-extended-teams-report")?.[1];
+    const theme = {
+      fg: (name: string, text: string) => `<${name}>${text}</${name}>`,
+      bg: (name: string, text: string) => `[${name}]${text}`,
+      bold: (text: string) => `*${text}*`,
+    };
+    const render = (ok: boolean, expanded: boolean): string[] => renderer({
+      content: "Report line one\nReport line two",
+      details: { name: "reader", tokens: 42, elapsedMs: 1000, ok, summary: "Checked  the\nproject." },
+    }, { expanded }, theme).render(160);
+
+    const collapsed = render(true, false);
+    expect(collapsed).toHaveLength(4);
+    expect(collapsed.every(line => line.startsWith("[toolSuccessBg]"))).toBe(true);
+    expect(collapsed[1]).toContain("<toolTitle>*reader*</toolTitle> <muted>finished \u00b7 1s \u00b7 42 tok</muted>");
+    expect(collapsed[2]).toContain("<toolOutput>Checked the project.</toolOutput>");
+    expect(collapsed.join("\n")).not.toContain("Report line one");
+
+    const expanded = render(true, true);
+    expect(expanded).toHaveLength(7);
+    expect(expanded[4]).toContain("<toolOutput>Report line one</toolOutput>");
+    expect(expanded[5]).toContain("<toolOutput>Report line two</toolOutput>");
+
+    const failed = render(false, false);
+    expect(failed.every(line => line.startsWith("[toolErrorBg]"))).toBe(true);
+    expect(failed[1]).toContain("<muted>failed \u00b7 1s \u00b7 42 tok</muted>");
+  });
+
   it.each(["lead", "teammate", "unsafe-root"])("runs checkpoint expiry only at lead startup and isolates diagnostics: %s", async mode => {
     const expire = vi.spyOn(retention, "expireCheckpoints").mockResolvedValue(["Retained corrupt checkpoint"]);
     if (mode === "unsafe-root") expire.mockRejectedValue(new Error("Unsafe checkpoint root"));

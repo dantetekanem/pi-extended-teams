@@ -63,6 +63,7 @@ async function setup(parentRun?: string) {
   });
   const control = {
     reportPath: path.join(root, "external", "report.json"),
+    startupDiagnosticPath: undefined as string | undefined,
     start: vi.fn(async () => {}),
     result,
     stop: vi.fn(async () => { reject(new Error("Stopped")); }),
@@ -284,8 +285,34 @@ describe("external agent ownership and reports", () => {
     expect(f.options.emitAgentReport).toHaveBeenCalledWith("test", "reader", expect.any(Number), 0, expect.stringContaining("Reviewed"), true);
   });
 
+  it.each(["missing", "diagnostic", "symlink"])("reports only real startup artifacts: %s", async artifact => {
+    const f = await setup();
+    fs.mkdirSync(path.dirname(f.control.reportPath), { recursive: true });
+    if (artifact === "diagnostic") {
+      f.control.startupDiagnosticPath = path.join(root, "external", "startup-failure.json");
+      fs.writeFileSync(f.control.startupDiagnosticPath, JSON.stringify({ reason: "unknown" }));
+    }
+    if (artifact === "symlink") fs.symlinkSync(__filename, f.control.reportPath);
+    f.control.start.mockRejectedValue(new Error("Herdr agent start failed: agent_not_ready; reason unknown"));
+    void f.control.result.catch(() => {});
+
+    await f.launch();
+
+    const [report] = await reports.listStoredTeamReportEvents("test");
+    expect(report.result).toMatchObject({ outcome: "failed", artifacts: artifact === "diagnostic"
+      ? [{ path: f.control.startupDiagnosticPath, label: "External harness startup diagnostic" }]
+      : [],
+    });
+    expect(report.report).toContain("agent_not_ready");
+    expect(report.report).not.toContain(f.control.reportPath);
+    expect(f.options.runNativeAgent).not.toHaveBeenCalled();
+    if (artifact === "diagnostic") expect(report.report).toContain(f.control.startupDiagnosticPath);
+  });
+
   it("persists the report location when the external result fails validation", async () => {
     const f = await setup();
+    fs.mkdirSync(path.dirname(f.control.reportPath), { recursive: true });
+    fs.writeFileSync(f.control.reportPath, "invalid report");
     const work = f.launch();
     await vi.waitFor(() => expect(f.control.start).toHaveBeenCalled());
     f.fail(new Error("Invalid external report: invalid report artifacts"));
@@ -303,6 +330,8 @@ describe("external agent ownership and reports", () => {
 
   it("retains identity and artifacts when canonical persistence fails", async () => {
     const f = await setup();
+    fs.mkdirSync(path.dirname(f.control.reportPath), { recursive: true });
+    fs.writeFileSync(f.control.reportPath, "external report");
     vi.spyOn(reports, "appendTeamReportEvent").mockRejectedValue(new Error("disk full"));
     const work = f.launch();
     f.complete();

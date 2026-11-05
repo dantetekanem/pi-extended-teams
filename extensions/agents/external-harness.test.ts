@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { createExternalHarnessRun, type ExternalHarnessTransport } from "./external-harness";
 import { createReportResult } from "../../src/results/report-result";
+
+vi.mock("node:child_process", async importOriginal => ({
+  ...await importOriginal<typeof import("node:child_process")>(),
+  execFile: vi.fn(),
+}));
 
 let root: string;
 const runs: Array<ReturnType<typeof createExternalHarnessRun>> = [];
@@ -71,6 +76,88 @@ async function submit(prompt: string, completion: unknown, report: unknown) {
 }
 
 describe("external Herdr harness transport", () => {
+  it.each(["agent_not_ready", "agent_blocked", "unrecognized", "malformed", "invalid-response"])("keeps CLI failures private while retaining whitelisted code: %s", async code => {
+    const f = await fixture();
+    const secret = "https://auth.invalid/?code=private-code TOKEN=private-key";
+    vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+      const callback = args[3] as (error: Error | null, stdout: string, stderr: string) => void;
+      callback(code === "invalid-response" ? null : new Error(secret), secret,
+        code === "malformed" ? secret : JSON.stringify({ error: { code, message: secret } }));
+      return {} as ReturnType<typeof execFile>;
+    });
+    const run = f.make({ transport: undefined });
+
+    const failure = await run.start().catch(error => error as Error);
+
+    const expectedCode = code.startsWith("agent_") ? code : "unknown";
+    expect(String(failure)).toContain(code === "invalid-response" ? "Invalid Herdr response" : expectedCode);
+    expect(String(failure)).not.toContain(secret);
+    expect(execFile).toHaveBeenCalledWith("herdr", ["pane", "current", "--current"],
+      expect.objectContaining({ timeout: 5000, maxBuffer: 1024 * 1024 }), expect.any(Function));
+  });
+
+  it.each(["blocked", "unknown", "malformed-status", "replacement", "unavailable", "write-failed"])("preserves safe startup facts before cleanup: %s", async scenario => {
+    const f = await fixture();
+    const original = f.transport.call;
+    const secret = "https://auth.invalid/?code=private-code TOKEN=private-key";
+    let diagnosticAtClose: string | undefined;
+    const run = f.make();
+    f.transport.call = async (...args) => {
+      if (args[0] === "pane" && args[1] === "close") {
+        diagnosticAtClose = await fs.readFile(path.join(path.dirname(run.reportPath!), "startup-failure.json"), "utf8").catch(() => undefined);
+      }
+      const response = await original(...args);
+      if (args[0] === "agent" && args[1] === "start") {
+        if (scenario === "write-failed") vi.spyOn(fs, "writeFile").mockRejectedValue(new Error(secret));
+        throw Object.assign(new Error(secret), { code: "agent_not_ready" });
+      }
+      if (args[0] === "agent" && args[1] === "get") {
+        if (scenario === "unavailable") throw new Error(secret);
+        return { agent: {
+          ...response.agent as object,
+          terminal_id: scenario === "replacement" ? "other" : "term-900",
+          agent_status: scenario === "malformed-status" ? ["blocked"] : scenario === "unknown" ? secret : "blocked",
+          interactive_ready: false, launch_pending: true,
+          state_labels: { reason: "workspace trust", token: secret }, terminal_title: secret,
+        } };
+      }
+      return response;
+    };
+
+    const failure = await run.start().catch(error => error as Error);
+    expect(String(failure)).toContain("agent_not_ready");
+    expect(String(failure)).not.toContain(secret);
+    await expect(run.result).rejects.toThrow("agent_not_ready");
+    expect(f.calls.filter(call => call[0] === "agent" && call[1] === "start")).toHaveLength(1);
+    expect(f.calls.some(call => ["prompt", "send-keys", "read", "explain"].includes(call[1]))).toBe(false);
+
+    const diagnosticPath = path.join(path.dirname(run.reportPath!), "startup-failure.json");
+    if (scenario === "write-failed") {
+      await expect(fs.stat(diagnosticPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(String(failure)).toContain("diagnostic unavailable");
+      expect(String(failure)).not.toContain(diagnosticPath);
+    } else {
+      const diagnostic = await fs.readFile(diagnosticPath, "utf8");
+      const verified = ["blocked", "unknown", "malformed-status"].includes(scenario);
+      expect(JSON.parse(diagnostic)).toEqual({
+        runId: "run-123", harness: "claude", stage: "agent_start", code: "agent_not_ready", reason: "unknown",
+        agentStatus: scenario === "blocked" ? "blocked" : "unknown",
+        interactiveReady: verified ? false : null, launchPending: verified ? true : null,
+      });
+      expect(Buffer.byteLength(diagnostic)).toBeLessThan(1024);
+      expect((await fs.stat(diagnosticPath)).mode & 0o777).toBe(0o600);
+      expect(String(failure)).toContain(diagnosticPath);
+      if (verified) expect(diagnosticAtClose).toBe(diagnostic);
+    }
+    if (scenario === "replacement" || scenario === "unavailable") {
+      await expect(run.stop()).rejects.toThrow(/identity/);
+      expect(f.calls.some(call => call[1] === "close")).toBe(false);
+    } else {
+      await expect(run.stop()).resolves.toBeUndefined();
+      expect(f.calls.filter(call => call[1] === "close")).toHaveLength(1);
+    }
+  });
+
   it.each(["rate_limit", "overloaded"])("observes the real StopFailure hook for %s without treating it as success", async error => {
     const f = await fixture();
     const run = f.make({ profile: { ...f.profile, nativeFallback: { modelSlot: "read-collect", model: "openai/test-model", thinking: "high" } } });

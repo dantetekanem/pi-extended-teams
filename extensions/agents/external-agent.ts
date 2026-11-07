@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
@@ -81,7 +81,19 @@ export async function runExternalAgent(
   const tellLead = (text: string, ok: boolean) => {
     options.emitAgentReport(teamName, member.name, state.startedAt, 0, text, ok);
   };
-  const reportReference = () => control.reportPath ? ` Report file: ${control.reportPath}.` : "";
+  const retainedArtifacts = async (): Promise<ExternalHarnessResult["artifacts"]> => {
+    const artifacts: ExternalHarnessResult["artifacts"] = [];
+    for (const [filename, label] of [
+      [control.reportPath, "External harness report"],
+      [control.startupDiagnosticPath, "External harness startup diagnostic"],
+    ]) {
+      if (filename && (await lstat(filename).catch(() => undefined))?.isFile()) {
+        artifacts.push({ path: filename, label });
+      }
+    }
+    return artifacts;
+  };
+  const reportReference = (artifacts: ExternalHarnessResult["artifacts"]) => artifacts.map(item => ` ${item.label}: ${item.path}.`).join("");
   const publish = async (external: ExternalHarnessResult) => {
     const result = createReportResult(teamName, member.name, runId, { outcome: external.outcome, artifacts: external.artifacts });
     const status = external.outcome === "failed" ? "failed" : "completed";
@@ -107,7 +119,7 @@ export async function runExternalAgent(
         },
       });
     } catch (error) {
-      state.finalizationBlockedReason = `External report persistence failed: ${String(error)}. Temporary artifacts are retained.${reportReference()}`;
+      state.finalizationBlockedReason = `External report persistence failed: ${String(error)}. Temporary artifacts are retained.${reportReference(await retainedArtifacts())}`;
       throw new Error(state.finalizationBlockedReason);
     }
     options.rememberCompletedAgentReport(teamName, {
@@ -205,10 +217,11 @@ export async function runExternalAgent(
       if (state.finalizationBlockedReason) {
         tellLead(state.finalizationBlockedReason, false);
       } else {
+        const artifacts = await retainedArtifacts();
         const publishing = publish({
           outcome: "failed",
-          content: `External harness ${profile.kind} failed: ${String(error)}${reportReference()}`,
-          artifacts: control.reportPath ? [{ path: control.reportPath, label: "External harness report" }] : [],
+          content: `External harness ${profile.kind} failed: ${String(error)}${reportReference(artifacts)}`,
+          artifacts,
         });
         state.activeOperationSettlementPromise = publishing.catch(() => {});
         await publishing.catch(persistError => tellLead(String(persistError), false));

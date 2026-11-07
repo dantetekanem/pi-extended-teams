@@ -25,6 +25,10 @@ export interface ExternalHarnessTransport {
   call(...args: string[]): Promise<Record<string, unknown>>;
 }
 
+function safeHerdrCode(value: unknown): string {
+  return value === "agent_not_ready" || value === "agent_blocked" ? value : "unknown";
+}
+
 const cli: ExternalHarnessTransport = {
   call: (...args) => new Promise((resolve, reject) => {
     const options = {
@@ -34,15 +38,21 @@ const cli: ExternalHarnessTransport = {
     };
     execFile("herdr", args, options, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(`Herdr ${args[0]} ${args[1]} failed: ${stderr.trim() || error.message}`));
+        let code = "unknown";
+        try {
+          code = safeHerdrCode(object(object(JSON.parse(stderr)).error).code);
+        } catch {
+          // CLI syntax/transport errors are not structured and may contain secrets.
+        }
+        reject(Object.assign(new Error(`Herdr ${args[0]} ${args[1]} failed: ${code}`), { code }));
         return;
       }
       try {
         const envelope = JSON.parse(stdout) as { result?: Record<string, unknown> };
         if (!envelope.result || typeof envelope.result !== "object") throw new Error("missing result");
         resolve(envelope.result);
-      } catch (cause) {
-        reject(new Error(`Invalid Herdr response: ${String(cause)}`));
+      } catch {
+        reject(new Error("Invalid Herdr response"));
       }
     });
   }),
@@ -109,6 +119,8 @@ export function createExternalHarnessRun({ profile, cwd, prompt, runId, agentNam
   let markerPath: string | undefined;
   let reportPath: string | undefined;
   let capacityPath: string | undefined;
+  let agentStartFailureCode: string | undefined;
+  let startupDiagnosticPath: string | undefined;
 
   function settle(value: ExternalHarnessResult | Error) {
     if (settled) return;
@@ -247,6 +259,43 @@ export function createExternalHarnessRun({ profile, cwd, prompt, runId, agentNam
     cleanupComplete = true;
   }
 
+  async function retainStartupDiagnostic(): Promise<string> {
+    if (!directory || agentStartFailureCode === undefined) return "";
+    const diagnostic = {
+      runId,
+      harness: profile.kind,
+      stage: "agent_start",
+      code: agentStartFailureCode,
+      reason: "unknown",
+      agentStatus: "unknown",
+      interactiveReady: null as boolean | null,
+      launchPending: null as boolean | null,
+    };
+    try {
+      const agent = object((await transport.call("agent", "get", agentName)).agent);
+      if (
+        agent.pane_id === paneId && agent.terminal_id === terminalId &&
+        agent.agent === profile.kind && await ownedPane()
+      ) {
+        if (typeof agent.agent_status === "string" && ["idle", "working", "blocked", "done", "unknown"].includes(agent.agent_status)) {
+          diagnostic.agentStatus = agent.agent_status;
+        }
+        if (typeof agent.interactive_ready === "boolean") diagnostic.interactiveReady = agent.interactive_ready;
+        if (typeof agent.launch_pending === "boolean") diagnostic.launchPending = agent.launch_pending;
+      }
+    } catch {
+      // Missing or unverified ownership leaves the observation unknown, not inferred.
+    }
+    try {
+      const filename = path.join(directory, "startup-failure.json");
+      await files.writeFile(filename, JSON.stringify(diagnostic), { mode: 0o600, flag: "wx" });
+      startupDiagnosticPath = filename;
+      return ` Startup diagnostic: ${filename}.`;
+    } catch {
+      return " Startup diagnostic unavailable.";
+    }
+  }
+
   async function performStart() {
     if (!herdrEnv) throw new Error("External harness requires Herdr (HERDR_ENV=1).");
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(agentName)) throw new Error("Invalid Herdr agent name.");
@@ -293,6 +342,9 @@ export function createExternalHarnessRun({ profile, cwd, prompt, runId, agentNam
     launchAttempted = true;
     try {
       await transport.call("agent", "start", agentName, "--kind", profile.kind, "--pane", paneId, "--timeout", "30000", "--", ...args);
+    } catch (error) {
+      agentStartFailureCode = safeHerdrCode(error && typeof error === "object" && "code" in error ? error.code : undefined);
+      throw new Error(`Herdr agent start failed: ${agentStartFailureCode}; reason unknown.`);
     } finally {
       // A blocked startup can still leave an agent. Capture its process identity if present.
       const info = await transport.call("pane", "process-info", "--pane", paneId).catch(() => undefined);
@@ -313,7 +365,8 @@ export function createExternalHarnessRun({ profile, cwd, prompt, runId, agentNam
     if (starting) return starting;
     if (stopped) return Promise.reject(new Error("External harness already stopped."));
     starting = performStart().catch(async error => {
-      const failure = new Error(`${String(error)}${directory ? ` Artifacts retained at ${directory}.` : ""}`);
+      const diagnosticReference = await retainStartupDiagnostic();
+      const failure = new Error(`${String(error)}${diagnosticReference}${directory ? ` Artifacts retained at ${directory}.` : ""}`);
       settle(failure);
       try {
         await closeOwnedPane();
@@ -355,6 +408,7 @@ export function createExternalHarnessRun({ profile, cwd, prompt, runId, agentNam
 
   return {
     get reportPath() { return reportPath; },
+    get startupDiagnosticPath() { return startupDiagnosticPath; },
     start, result, stop,
     focus: () => control("focus"),
     message: (content: string) => control("message", content),

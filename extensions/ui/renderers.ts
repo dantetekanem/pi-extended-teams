@@ -117,7 +117,8 @@ export function formatInboxMessagesForModel(messages: any[]): string {
   return messages.map((message, index) => {
     const header = `[${index + 1}] ${summarizeInboxMessage(message)}`;
     const text = String(message?.text || "").trim() || "(empty message)";
-    return `${header}\n${text}`;
+    const identity = message.id ? `Message ID: ${message.id}${message.metadata?.replyTo ? `; reply to: ${message.metadata.replyTo}` : ""}\n` : "";
+    return `${header}\n${identity}${text}`;
   }).join("\n\n");
 }
 

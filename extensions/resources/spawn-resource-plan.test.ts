@@ -67,6 +67,35 @@ describe("lead extension snapshots", () => {
     expect(Object.isFrozen(snapshot[0]?.sourceInfo)).toBe(true);
   });
 
+  it("inherits native MCP and execution resources by stable builtin identity, respecting explicit selection", () => {
+    const root = tempRoot();
+    const builtin = (name: string) => sourceInfo(`builtin:${name}`, { source: "builtin", scope: "temporary" });
+    const snapshot = snapshotLeadExtensions({
+      getCommands: () => [
+        { name: "mcp", source: "extension", sourceInfo: builtin("mcp") },
+        { name: "other-native", source: "extension", sourceInfo: builtin("unsupported") },
+      ],
+      getAllTools: () => [
+        { name: "read", sourceInfo: builtin("read") },
+        { name: "codemode", sourceInfo: builtin("codemode") },
+        { name: "tool_search", sourceInfo: builtin("tool-search") },
+        { name: "mcp__fixture__echo", sourceInfo: builtin("mcp") },
+      ],
+    });
+    const nativePaths = ["builtin:mcp", "builtin:codemode", "builtin:tool-search"];
+    expect(snapshot.map(extension => extension.identity)).toEqual(nativePaths);
+    expect(snapshot.map(extension => extension.path)).toEqual(nativePaths);
+
+    const settings = structuredClone(DEFAULT_SETTINGS);
+    expect(createSpawnResourcePlan({ cwd: root, projectTrusted: false, settings, leadExtensions: snapshot }).extensionPaths)
+      .toEqual(nativePaths);
+    settings.extensions.allow = ["builtin:mcp", "builtin:codemode"];
+    settings.extensions.block = ["builtin:mcp"];
+    const explicit = createSpawnResourcePlan({ cwd: root, projectTrusted: false, settings, leadExtensions: snapshot });
+    expect(explicit.extensionPaths).toEqual(["builtin:codemode"]);
+    expect(explicit.diagnostics).toEqual([expect.objectContaining({ code: "blocked-selection", configuredEntry: "builtin:mcp" })]);
+  });
+
   it("identifies self by its public command description when invocation names collide", () => {
     const root = tempRoot();
     const other = touch(path.join(root, "other.ts"));

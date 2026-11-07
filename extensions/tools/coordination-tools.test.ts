@@ -483,7 +483,7 @@ describe("coordination tools", () => {
     expect(await messaging.readInbox(teamName, "staged-browser-designer", false, false)).toEqual([]);
   });
 
-  it.each([false, true])("allows direct peer delivery only from the lead (teammate: %s)", async isTeammate => {
+  it.each([false, true])("persists peer messages and requests immediate notification (teammate: %s)", async isTeammate => {
     const teamName = "message-team";
     writeConfig({
       name: teamName,
@@ -494,10 +494,11 @@ describe("coordination tools", () => {
       members: [
         member("team-lead"),
         member("reader", { role: "read", tmuxPaneId: "" }),
+        member("writer"),
       ],
     });
     const tools = new Map<string, any>();
-    const deliverMessageToActiveAgent = vi.fn(async () => true);
+    const notifyMessageSent = vi.fn(async () => {});
 
     registerCoordinationTools({ registerTool: (tool: any) => tools.set(tool.name, tool) }, {
       agentName: isTeammate ? "writer" : "team-lead",
@@ -512,27 +513,21 @@ describe("coordination tools", () => {
       adoptTeamAsLead: vi.fn(),
       renderLeadInboxStatus: vi.fn(async () => {}),
       resetLeadWakeNotifiedCount: vi.fn(),
-      deliverMessageToActiveAgent,
+      notifyMessageSent,
     });
 
     const delivery = tools.get("send_message").execute("send", {
       recipient: "reader",
       content: "Include the new screenshot in your audit.",
     });
-    if (isTeammate) {
-      await expect(delivery).rejects.toThrow(/team-lead/);
-      expect(deliverMessageToActiveAgent).not.toHaveBeenCalled();
-      return;
-    }
     const result = await delivery;
-
-    expect(deliverMessageToActiveAgent).toHaveBeenCalledWith(
-      teamName,
-      "reader",
-      "Include the new screenshot in your audit."
-    );
-    expect(result.details.delivery).toBe("active-session");
-    expect(await messaging.readInbox(teamName, "reader", false, false)).toEqual([]);
+    expect(result.details.status).toBe("sent");
+    const [stored] = await messaging.readInbox(teamName, "reader", false, false);
+    expect(stored).toMatchObject({
+      id: result.details.messageId, from: isTeammate ? "writer" : "team-lead",
+      text: "Include the new screenshot in your audit.",
+    });
+    expect(notifyMessageSent).toHaveBeenCalledWith(teamName, "reader", expect.objectContaining({ id: stored.id, text: stored.text, from: stored.from }));
   });
 
   it("keeps trailing report events fenced, then verifies matching cleanup and clears the tombstone last on shutdown", async () => {

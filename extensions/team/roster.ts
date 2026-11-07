@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import * as teams from "../../src/utils/teams";
 import * as tasks from "../../src/utils/tasks";
 import * as messaging from "../../src/utils/messaging";
@@ -10,6 +12,16 @@ import type { RunningReadAgent } from "../runtime/types";
 import { listLifecycleTombstones } from "../../src/utils/lifecycle-tombstone";
 
 type RosterTask = Pick<TaskFile, "id" | "subject" | "status">;
+
+const peerPlanTemplate = fs.readFileSync(path.join(__dirname, "../prompts/peer-plan.md"), "utf8");
+export function formatPeerPlan(coordinator: string, peers: Array<{ name: string; prompt?: string; modelSlot?: string }>): string {
+  const uniquePeers = new Map(peers.map(peer => [peer.name, peer]));
+  const assignments = [...uniquePeers.values()].map(peer => {
+    const summary = (peer.prompt || "").replace(/\s+/g, " ").trim();
+    return `- ${peer.name} (${peer.modelSlot || "assigned agent"}): ${summary.slice(0, 400)}${summary.length > 400 ? " [excerpt shortened]" : ""}`;
+  }).join("\n");
+  return peerPlanTemplate.replace("{{coordinator}}", () => coordinator).replace("{{assignments}}", () => assignments).trim();
+}
 
 export interface BuildRosterOptions {
   terminal: any;

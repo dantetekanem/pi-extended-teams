@@ -116,12 +116,13 @@ describe("read-agent communication tools", () => {
     expect(result.content[0].text).toContain("Initial instructions");
   });
 
-  it.each(["read", "write"] as const)("routes %s agent questions only to team-lead", async role => {
+  it.each(["read", "write"] as const)("routes %s agent questions to the lead or an active peer", async role => {
     const send = makeTools("session", "reader", role).get("send_message")!;
     await send.execute("default", { content: "Which approach?" });
     await send.execute("explicit", { recipient: "team-lead", content: "Approval needed" });
-    await expect(send.execute("peer", { recipient: "writer", content: "Which approach?" })).rejects.toThrow(/team-lead/);
-    expect(await readInbox("session", "writer", false, false)).toHaveLength(0);
+    const peer = await send.execute("peer", { recipient: "writer", content: "Which approach?" });
+    expect(peer.details.messageId).toEqual(expect.any(String));
+    expect(await readInbox("session", "writer", false, false)).toMatchObject([{ from: "reader", text: "Which approach?" }]);
     expect(await readInbox("session", "team-lead", false, false)).toHaveLength(2);
   });
 
@@ -145,6 +146,7 @@ describe("read-agent communication tools", () => {
     const content = JSON.stringify({ kind: "plan", document: { title: { kind: "title", body: "Plan", children: [] }, elements: [] } });
 
     await expect(tools.get("report_and_exit")!.execute("report", { content, summary: "Complete plan result ready" })).resolves.toMatchObject({
+      terminate: true,
       details: { accepted: true, cancelledDeliveries: 2, deliveryOutcome: "cancelled" },
     });
     expect(onReportAndExit).toHaveBeenCalledWith({ content, summary: "Complete plan result ready" }, undefined, "report");
@@ -180,6 +182,7 @@ describe("read-agent communication tools", () => {
     const tool = tools.find(tool => tool.name === "report_and_exit")!;
     const signal = new AbortController().signal;
     const feedback = await tool.execute("runtime-call", { content: "Claim", submissionId: "forged-call" }, signal);
+    expect(feedback.terminate).not.toBe(true);
     expect(feedback.details).toMatchObject({ accepted: false, repairRequest, verification: { state: "failed" } });
     expect(onReportAndExit).toHaveBeenCalledWith({ content: "Claim", summary: undefined }, signal, "runtime-call");
   });
@@ -221,7 +224,7 @@ describe("read-agent communication tools", () => {
       summary: "finding",
     });
 
-    expect(result.details).toEqual({ session: "session", recipient: "team-lead" });
+    expect(result.details).toMatchObject({ session: "session", recipient: "team-lead", messageId: expect.any(String) });
     const inbox = await readInbox("session", "team-lead", false, false);
     expect(inbox).toHaveLength(1);
     expect(inbox[0]).toMatchObject({

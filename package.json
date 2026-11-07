@@ -1,6 +1,6 @@
 {
   "name": "pi-extended-teams",
-  "version": "2.5.1",
+  "version": "2.6.3",
   "description": "Control-first, session-connected subagents for Pi with live navigation and intent-tier routing",
   "repository": {
     "type": "git",
@@ -54,12 +54,13 @@
     "SECURITY.md",
     "docs/access.md",
     "docs/reference.md",
+    "docs/external-harnesses.md",
     "assets/pi-extended-teams-demo.gif"
   ],
   "dependencies": {
     "@earendil-works/chord": "1.0.0",
     "@earendil-works/pi-durable": "1.0.0",
-    "uuid": "^11.1.0"
+    "uuid": "^14.0.3"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
@@ -77,10 +78,10 @@
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.0.0",
-    "@types/node": "^25.3.0",
+    "@types/node": "^26.6.6",
     "jiti": "2.7.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.18"
+    "vitest": "^5.1.0"
   }
 }

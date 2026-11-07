@@ -6,6 +6,7 @@ import { getCurrentQualifiedModel, getModelSelectionState, requireQualifiedKnown
 import { getPiSessionId } from "../internal/session-files";
 import { createSessionContextReference, removeSessionContextReference } from "../internal/session-context-reference";
 import * as paths from "../../src/utils/paths";
+import { hasNativeChildPolicy } from "../../src/native-child-policy";
 import * as teams from "../../src/utils/teams";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
@@ -48,6 +49,9 @@ import {
 } from "./agent-status-tool";
 
 import { publicTeamToolMetadata } from "./public-team-tools";
+import { resolveExternalHarness } from "../../src/utils/external-harness-config";
+import { runExternalAgent } from "../agents/external-agent";
+import { formatPeerPlan } from "../team/roster";
 
 export const CHILD_AGENT_LIFECYCLE_PROBE = "pi-extended-teams:child-agent-lifecycle-probe";
 
@@ -65,6 +69,7 @@ export interface TeamToolsOptions {
   readAgentOptions(): any;
   runReadAgentInProcess(teamName: string, member: Member, prompt: string, ctx: any, options: any): Promise<void> | void;
   startWriteAgent(teamName: string, member: Member, prompt: string): Promise<string>;
+  runExternalAgent?: typeof runExternalAgent;
   shutdownTeammate(teamName: string, member: Member, options?: ShutdownTeammateOptions): Promise<ReadAgentTeardownResult>;
   adoptTeamAsLead(teamName: string, ctx?: any): void;
   onCompletionGroupUse?(groupId: string): void;
@@ -101,6 +106,7 @@ export interface TeamToolsRuntime {
 }
 
 interface SpawnTeammateOptions {
+  peerPlan?: string;
   once?: boolean;
   signal?: AbortSignal;
   completionGroup?: CompletionGroupBinding;
@@ -160,7 +166,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   function rejectDirectModelSelection(params: any, context: string): void {
-    const forbidden = ["model", "thinking", "role"].filter((key) => hasOwnParam(params, key));
+    const forbidden = ["model", "thinking", "role", "harness"].filter((key) => hasOwnParam(params, key));
     if (forbidden.length === 0) return;
     throw new Error(
       `${context} must use model_slot only. Do not pass ${forbidden.join(", ")}; choose an intent tier. Configured favorites are optional; see README.md for tier examples.`
@@ -181,8 +187,25 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     return slot;
   }
 
-  function configuredFavoriteModelForSpawn(params: any, ctx: any, context = "spawn_agent"): string {
+  function externalHarnessForSpawn(params: any, ctx: any) {
+    const slot = requireSpawnLevel(params, "spawn_agent");
+    const harness = loadSettings().favoriteModels[slot]?.harness;
+    if (harness === undefined) return undefined;
+    if (hasNativeChildPolicy(ctx?.sessionManager)) throw new Error("Native child policy cannot admit an external harness.");
+    if (!harness.trim()) throw new Error(`Favorite tier "${slot}" harness must name an external profile.`);
+    if (process.env.HERDR_ENV !== "1") throw new Error("External harnesses require Herdr; no native fallback is performed.");
+    if (shouldSuppressLeadReportInjection({ metadata: operationMetadataFromParams(params) })) {
+      throw new Error("External harnesses do not support workflow-owned report suppression.");
+    }
+    const unsupported = ["checks", "repair", "checkpoint", "continue_from", "completion_group"].filter(key => params[key] !== undefined);
+    if (params.allow_nested_read_agents === true) unsupported.push("allow_nested_read_agents");
+    if (unsupported.length) throw new Error(`External harnesses do not support ${unsupported.join(", ")}.`);
+    return resolveExternalHarness(harness, { modelSlot: slot });
+  }
+
+  function configuredFavoriteModelForSpawn(params: any, ctx: any, context = "spawn_agent"): string | undefined {
     const slot = requireSpawnLevel(params, context);
+    if (externalHarnessForSpawn(params, ctx)) return undefined;
     const settings = loadSettings({ projectDir: params.cwd || ctx.cwd });
     const configured = settings.favoriteModels[slot];
     if (configured?.model && configured.thinking) return configured.model;
@@ -236,6 +259,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       resolvedCategory: category,
       requestedModelSlot: canonicalPersistedModelSlot(params.model_slot) ?? null,
       modelSlot: canonicalPersistedModelSlot(member.modelSlot) ?? null,
+      ...(member.externalHarness ? { harness: member.externalHarness.name, harnessKind: member.externalHarness.kind } : {}),
       sessionContext: member.sessionContext ?? "none",
       sessionContextAvailable: null,
       model: member.model ?? null,
@@ -526,7 +550,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
 
   function queuedReadResolutionDetails(queued: QueuedReadSpawn, params: any, extras: Record<string, any> = {}): Record<string, any> {
     return spawnResolutionDetails(queued.member, params, queued.resolved, {
-      mode: "in-process",
+      mode: queued.member.externalHarness ? "external-harness" : "in-process",
       terminalId: null,
       queued: true,
       queueId: queued.id,
@@ -727,9 +751,11 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         }
       }
       const continuedPrompt = continuationPrompt(member.checkpointAssignment, prompt);
-      const launchPrompt = sessionContextReference
-        ? `${continuedPrompt}${sessionContextReference.promptSuffix}`
-        : continuedPrompt;
+      const launchPrompt = [
+        member.peerPlan,
+        continuedPrompt,
+        sessionContextReference?.promptSuffix,
+      ].filter(Boolean).join("\n\n");
       const removeReference = () => {
         try {
           removeSessionContextReference(sessionContextReference);
@@ -743,7 +769,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         assertPending?.();
         if (member.checkpointAssignment?.parent) readCheckpoint(member.checkpointAssignment.parent.id);
         commitLaunch?.();
-        const launch = options.runReadAgentInProcess(teamName, member, launchPrompt, ctx, options.readAgentOptions());
+        const runner = member.externalHarness ? options.runExternalAgent ?? runExternalAgent : options.runReadAgentInProcess;
+        const launch = runner(teamName, member, launchPrompt, ctx, options.readAgentOptions());
         return {
           launch: sessionContextReference
             ? Promise.resolve(launch).finally(removeReference)
@@ -1001,7 +1028,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     if (unfinished) throw new Error(`Cannot switch from ${current} to ${nextTeamName}: unfinished agents must remain visible. Finish or stop them first.`);
   }
 
-  async function ensureCurrentSessionAgentGroup(ctx: any, explicitDefaultModel: string): Promise<string> {
+  async function ensureCurrentSessionAgentGroup(ctx: any, explicitDefaultModel?: string): Promise<string> {
     const sessionName = currentSessionAgentGroupName(ctx);
     await requireSettledPublicScope(sessionName);
     if (teams.teamExists(sessionName)) {
@@ -1009,9 +1036,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       return sessionName;
     }
 
-    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [explicitDefaultModel]);
-    const defaultModel = requireQualifiedKnownModel(explicitDefaultModel, availableModels, "model_slot");
-    if (!defaultModel) throw new Error("Agent sessions require a configured model_slot level before spawning.");
+    let defaultModel: string | undefined;
+    if (explicitDefaultModel !== undefined) {
+      const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [explicitDefaultModel]);
+      defaultModel = requireQualifiedKnownModel(explicitDefaultModel, availableModels, "model_slot") ?? undefined;
+      if (!defaultModel) throw new Error("Agent sessions require a configured model_slot level before spawning.");
+    }
     try {
       teams.createTeamIfAbsent(sessionName, getPiSessionId(ctx) || "local-session", "lead-agent", "Pi session agents", defaultModel);
     } catch (error) {
@@ -1022,6 +1052,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
   }
 
   async function spawnTeammate(params: any, ctx: any, spawnOptions: SpawnTeammateOptions = {}): Promise<{ content: any[]; details: any }> {
+    const externalHarness = externalHarnessForSpawn(params, ctx);
+    if (externalHarness && spawnOptions.completionGroup) throw new Error("External harnesses do not support completion groups.");
     const checkpointAssignment = createCheckpointAssignment(params.checkpoint, params.prompt, params.continue_from);
     const assignedChecks = normalizeCheckPolicy(params.checks);
     const repairPolicy = normalizeRepairPolicy(params.repair);
@@ -1144,8 +1176,8 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const configuredFavorite = settings.favoriteModels[modelSlot];
     const requestedFavoriteModel = configuredFavorite?.model && configuredFavorite.thinking ? configuredFavorite.model : undefined;
     const currentModel = getCurrentQualifiedModel(ctx);
-    const { availableModels } = await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, requestedFavoriteModel, currentModel].filter(Boolean) as string[]);
-    const resolved = resolveModel(settings, {
+    const { availableModels } = externalHarness ? { availableModels: [] } : await getModelSelectionState(ctx, ctx.cwd, [teamConfig.defaultModel, requestedFavoriteModel, currentModel].filter(Boolean) as string[]);
+    const resolved = externalHarness ? { model: null, thinking: null, modelSource: "none" as const } : resolveModel(settings, {
       role,
       modelSlot,
       explicitModel: null,
@@ -1155,14 +1187,14 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       currentThinking: ctx.thinkingLevel,
     });
 
-    const chosenModel = requireQualifiedKnownModel(resolved.model ?? undefined, availableModels, "resolved model");
-    if (!chosenModel) {
+    const chosenModel = externalHarness ? undefined : requireQualifiedKnownModel(resolved.model ?? undefined, availableModels, "resolved model");
+    if (!externalHarness && !chosenModel) {
       throw new Error(
         `Agent ${safeName} could not resolve model_slot "${modelSlot}": it is not configured and neither the team nor current lead session has a model.`
       );
     }
 
-    const chosenThinking = (resolved.thinking ?? ctx.thinkingLevel ?? null) as Member["thinking"];
+    const chosenThinking = (externalHarness ? undefined : resolved.thinking ?? ctx.thinkingLevel ?? null) as Member["thinking"];
     const debugLogPath = role === "write" && isTeamsDebugEnabled(settings) ? teamDebugLogPath(safeTeamName) : undefined;
 
     const member: Member = {
@@ -1173,11 +1205,17 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       category: params.category,
       modelSlot,
       model: chosenModel,
+      ...(externalHarness ? { externalHarness, backendType: "external-harness" } : {}),
       joinedAt: Date.now(),
       tmuxPaneId: "",
       cwd,
       subscriptions: [],
       prompt: params.prompt,
+      peerPlan: spawnOptions.peerPlan ?? formatPeerPlan(spawnOptions.nestedParent?.name ?? "team-lead", [
+        ...teamConfig.members.filter(peer => peer.name !== "team-lead" && peer.isActive !== false),
+        ...readQueue(safeTeamName).map(queued => queued.member),
+        { name: safeName, prompt: params.prompt, modelSlot },
+      ]),
       color: role === "read" ? "cyan" : "blue",
       thinking: chosenThinking,
       planModeRequired: params.plan_mode_required,
@@ -1217,7 +1255,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     }
 
     const sessionContextAvailable = await startReadAgentMember(safeTeamName, member, params.prompt, ctx, nestedNameReservationId, true, undefined, undefined, spawnOptions.signal);
-    if (role === "write") {
+    if (role === "write" && !externalHarness) {
       await writeTeamsDebugEvent(safeTeamName, "write-agent.spawn.success", {
         agentName: safeName, cwd, requestedRole: role, model: chosenModel,
         modelSource: resolved.modelSource, thinking: chosenThinking ?? null,
@@ -1229,9 +1267,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     options.renderReadAgentStatus();
     const debugSuffix = debugLogPath ? ` Debug log: ${debugLogPath}.` : "";
     return {
-      content: [{ type: "text", text: `${role === "write" ? "Edit agent" : "Read teammate"} ${params.name} started in-process and is followable from Pi.${debugSuffix}` }],
+      content: [{ type: "text", text: `${role === "write" ? "Edit agent" : "Read teammate"} ${params.name} ${externalHarness ? `is starting ${externalHarness.kind} in Herdr` : "started in-process and is followable from Pi"}.${debugSuffix}` }],
       details: spawnResolutionDetails(member, params, resolved, {
-        mode: "in-process", terminalId: null, queued: false, debugLogPath, sessionContextAvailable,
+        mode: externalHarness ? "external-harness" : "in-process", terminalId: null, queued: false, debugLogPath, sessionContextAvailable,
       }),
     };
     } finally {
@@ -1247,9 +1285,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     const params = payload?.params || {};
     const requestCtx = payload?.ctx;
     const ctx = requestCtx || options.getSessionCtx?.();
-    if (requestCtx) options.setSessionCtx?.(requestCtx);
 
     try {
+      if (type === "spawn_agent" || type === "spawn_teammate_once") rejectDirectModelSelection(params, type);
+      if (requestCtx) options.setSessionCtx?.(requestCtx);
       if (options.isTeammate) throw new Error("Teammates cannot satisfy orchestration requests directly.");
       if (!ctx) throw new Error("No active lead session context is available for orchestration request. If pi-extended-teams was registered after session_start, include the current Pi command context as payload.ctx.");
 
@@ -1315,6 +1354,12 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       .catch(error => emitOrchestrationResponse(payload?.requestId, payload?.type, { ok: false, error: error instanceof Error ? error.message : String(error) }));
   });
 
+  function requireUniquePeerNames(names: string[]): void {
+    if (new Set(names.map(name => name.toLowerCase())).size !== names.length) {
+      throw new Error("Duplicate agent names in the same batch.");
+    }
+  }
+
   function generatedAgentName(index?: number): string {
     const position = index === undefined ? "" : `-${index + 1}`;
     return `agent-${Date.now().toString(36)}${position}-${crypto.randomUUID().slice(0, 8)}`;
@@ -1328,8 +1373,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
     if (!ctx) throw new Error("No active Pi session context is available for spawn_agent.");
 
+    externalHarnessForSpawn(params, ctx);
     params = { ...params, checkpoint: createCheckpointAssignment(params.checkpoint, params.prompt, params.continue_from)?.policy };
-    const name = params.continue_from === undefined ? params.name || generatedAgentName() : freshContinuationName(params.name || "agent");
+    const name = paths.sanitizeName(params.continue_from === undefined ? params.name || generatedAgentName() : freshContinuationName(params.name || "agent"));
     const sessionDefaultModel = configuredFavoriteModelForSpawn(params, ctx);
     const sessionName = await ensureCurrentSessionAgentGroup(ctx, sessionDefaultModel);
     const result = await spawnTeammate({
@@ -1358,20 +1404,21 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
     model_slot: Type.Optional(StringEnum(NESTED_READ_MODEL_SLOTS, { description: "Canonical read-* tier, or inherit defaults.model_slot." })),
   };
 
-  function spawnNestedReadAgent(params: any, binding: NestedReadAgentToolBinding, context = "spawn_agent") {
-    return trackAdmission(() => spawnNestedReadAgentInScope(params, binding, context));
+  function spawnNestedReadAgent(params: any, binding: NestedReadAgentToolBinding, context = "spawn_agent", peerPlan?: string) {
+    return trackAdmission(() => spawnNestedReadAgentInScope(params, binding, context, peerPlan));
   }
 
   async function spawnNestedReadAgentInScope(
     params: any,
     binding: NestedReadAgentToolBinding,
-    context = "spawn_agent"
+    context = "spawn_agent",
+    peerPlan?: string,
   ): Promise<{ content: any[]; details: any }> {
     rejectUnexpectedNestedParams(params, ["name", "prompt", "model_slot"], context);
     requireNestedReadSpawnLevel(params, context);
     if (options.isHostAttached?.() === false) await options.waitForHost?.();
     await assertNestedParentAuthorized(binding.teamName, binding.parent.name, binding.parentRunId, binding.parent.cwd);
-    const name = params.name || generatedAgentName();
+    const name = paths.sanitizeName(params.name || generatedAgentName());
     const result = await spawnTeammate({
       name,
       prompt: params.prompt,
@@ -1379,6 +1426,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       team_name: binding.teamName,
       cwd: binding.parent.cwd,
     }, options.isHostAttached ? options.getSessionCtx?.() ?? binding.outerCtx : binding.outerCtx, {
+      peerPlan,
       nestedParent: {
         teamName: binding.teamName,
         name: binding.parent.name,
@@ -1411,7 +1459,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         name: "spawn_agent",
         label: "Spawn Read Agent",
         description: "Spawn one depth-1 read-only child in this writer's team and cwd. Only canonical read-* model_slot values are accepted. The child reports back to this writer and cannot delegate.",
-        parameters: Type.Object(nestedReadAgentParams),
+        parameters: Type.Object(nestedReadAgentParams, { additionalProperties: false }),
         async execute(_toolCallId: string, params: any) {
           return spawnNestedReadAgent(params, binding);
         },
@@ -1423,9 +1471,9 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
         parameters: Type.Object({
           defaults: Type.Optional(Type.Object({
             model_slot: Type.Optional(StringEnum(NESTED_READ_MODEL_SLOTS, { description: "Shared canonical read-* tier." })),
-          })),
-          agents: Type.Array(Type.Object(nestedSwarmAgentParams), { description: "Read-only child assignments." }),
-        }),
+          }, { additionalProperties: false })),
+          agents: Type.Array(Type.Object(nestedSwarmAgentParams, { additionalProperties: false }), { description: "Read-only child assignments." }),
+        }, { additionalProperties: false }),
         async execute(_toolCallId: string, params: any) {
           rejectUnexpectedNestedParams(params, ["defaults", "agents"], "spawn_swarm_agents");
           rejectUnexpectedNestedParams(params.defaults || {}, ["model_slot"], "spawn_swarm_agents defaults");
@@ -1440,13 +1488,18 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
           });
           await assertNestedParentAuthorized(binding.teamName, binding.parent.name, binding.parentRunId, binding.parent.cwd);
 
+          const names = mergedAgents.map((agent: any, index: number) => paths.sanitizeName(agent.name || generatedAgentName(index)));
+          requireUniquePeerNames(names);
+          const peerPlan = formatPeerPlan(binding.parent.name, mergedAgents.map((agent: any, index: number) => ({
+            name: names[index], prompt: agent.prompt, modelSlot: agent.model_slot,
+          })));
           const spawned: any[] = [];
           const failed: Array<{ name: string; error: string }> = [];
           for (let index = 0; index < mergedAgents.length; index += 1) {
             const merged = mergedAgents[index];
-            const name = merged.name || generatedAgentName(index);
+            const name = names[index];
             try {
-              const result = await spawnNestedReadAgent({ ...merged, name }, binding, `spawn_swarm_agents agent ${name}`);
+              const result = await spawnNestedReadAgent({ ...merged, name }, binding, `spawn_swarm_agents agent ${name}`, peerPlan);
               spawned.push({ ...result.details, name });
             } catch (error) {
               failed.push({ name, error: error instanceof Error ? error.message : String(error) });
@@ -1478,13 +1531,17 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
       return trackAdmission(async () => {
         if (options.isTeammate) throw new Error("Only the lead session can spawn agents.");
         if (!ctx) throw new Error("No active Pi session context is available for spawn_swarm_agents.");
+        rejectDirectModelSelection(params, "spawn_swarm_agents");
+        rejectDirectModelSelection(params.defaults, "spawn_swarm_agents defaults");
         if (!Array.isArray(params.agents) || params.agents.length === 0) throw new Error("spawn_swarm_agents requires at least one agent.");
 
         const groupPolicy = normalizeCompletionGroupPolicy(params.completion_group);
         const sessionId = getPiSessionId(ctx);
         if (groupPolicy && (!sessionId || !_toolCallId?.trim())) throw new Error("Completion groups require a bound session and runtime submission identity.");
         const mergedAgents = params.agents.map((agent: any, index: number) => {
+          rejectDirectModelSelection(agent, `spawn_swarm_agents agent ${index + 1}`);
           const merged = mergeSwarmAgentParams(params.defaults || {}, agent);
+          externalHarnessForSpawn({ ...merged, ...(groupPolicy ? { completion_group: groupPolicy } : {}) }, ctx);
           merged.checkpoint = createCheckpointAssignment(merged.checkpoint, merged.prompt, merged.continue_from)?.policy;
           if (merged.continue_from !== undefined) merged.name = freshContinuationName(merged.name || "agent", JSON.stringify([sessionId, _toolCallId, index, merged.continue_from]));
           return merged;
@@ -1494,6 +1551,10 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
           configuredFavoriteModelForSpawn(mergedAgents[index], ctx, `spawn_swarm_agents agent ${mergedAgents[index].name || index + 1}`);
         }
         const sessionName = await ensureCurrentSessionAgentGroup(ctx, defaultModel);
+        const names = mergedAgents.map((agent: any, index: number) => paths.sanitizeName(agent.name || (groupPolicy
+          ? `agent-${crypto.createHash("sha256").update(`${_toolCallId}:${index}`).digest("hex").slice(0, 12)}`
+          : generatedAgentName(index))));
+        requireUniquePeerNames(names);
         let group: CompletionGroup | undefined;
         if (groupPolicy && sessionId) {
           const identity = { teamName: sessionName, sessionId, submissionId: `tool:${_toolCallId}` };
@@ -1509,7 +1570,7 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
             ...entries.map((entry: any) => entry.message?.details?.completionGroup)];
           if (references.some(binding => binding?.groupId === groupId)) new CompletionGroup(sessionName, groupId).read();
           group = await CompletionGroup.create({ ...identity, policy: groupPolicy, members: mergedAgents.map((agent: any, index: number) => ({
-            name: paths.sanitizeName(agent.name || `agent-${crypto.createHash("sha256").update(`${_toolCallId}:${index}`).digest("hex").slice(0, 12)}`),
+            name: names[index],
             assignmentKey: crypto.createHash("sha256").update(JSON.stringify([agent, ctx.cwd])).digest("hex"),
             suppressed: sessionName.startsWith("prompt-build-") || shouldSuppressLeadReportInjection(agent),
           })) });
@@ -1519,18 +1580,21 @@ export function registerTeamTools(pi: any, options: TeamToolsOptions): TeamTools
               idempotent: true, spawned: [], failed: [], members: group.read().members },
           };
         }
+        const peerPlan = formatPeerPlan("team-lead", mergedAgents.map((agent: any, index: number) => ({
+          name: names[index], prompt: agent.prompt, modelSlot: agent.model_slot,
+        })));
         const spawned: any[] = [];
         const failed: Array<{ name: string; error: string }> = [];
 
         for (let index = 0; index < mergedAgents.length; index += 1) {
           const merged = mergedAgents[index];
-          const name = group?.read().members[index].name || merged.name || generatedAgentName(index);
+          const name = names[index];
           try {
             const result = await spawnTeammate({
               ...merged,
               name,
               team_name: sessionName,
-            }, ctx, { allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index), signal: _signal });
+            }, ctx, { peerPlan, allowNestedReadAgents: merged.allow_nested_read_agents === true, completionGroup: group?.binding(index), signal: _signal });
             spawned.push({ ...result.details, name });
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);

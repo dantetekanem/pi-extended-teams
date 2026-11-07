@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Text } from "@mariozechner/pi-tui";
+import { Box, Text } from "@mariozechner/pi-tui";
 import * as paths from "../../src/utils/paths";
 import * as runtime from "../../src/utils/runtime";
 import * as messaging from "../../src/utils/messaging";
@@ -54,8 +54,22 @@ function hasPersistedTeamSettings(ctx: any): boolean {
 }
 
 export function registerAgentReportRenderer(pi: any): void {
-  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, _renderOptions: any, theme: any) => {
+  pi.registerMessageRenderer?.("pi-extended-teams-report", (message: any, renderOptions: any, theme: any) => {
     const d = message.details || {};
+    if (typeof d.summary === "string") {
+      const failed = d.ok === false;
+      const status = [
+        failed ? "failed" : "finished",
+        d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
+        typeof d.tokens === "number" ? `${formatTokenCount(d.tokens)} tok` : "",
+      ].filter(Boolean).join(" · ");
+      const box = new Box(renderOptions.outputPad ?? 1, 1, (text: string) => theme.bg(failed ? "toolErrorBg" : "toolSuccessBg", text));
+      box.addChild(new Text(`${theme.fg("toolTitle", theme.bold(d.name || "agent"))} ${theme.fg("muted", status)}`, 0, 0));
+      const output = [d.summary.replace(/\s+/g, " ").trim()];
+      if (renderOptions.expanded && typeof message.content === "string") output.push("", ...message.content.split(/\r?\n/));
+      box.addChild(new Text(output.map(line => theme.fg("toolOutput", line)).join("\n"), 0, 0));
+      return box;
+    }
     const meta = [
       d.elapsedMs ? formatElapsed(d.elapsedMs) : "",
       typeof d.tokens === "number" ? `${formatTokenCount(d.tokens)} tok` : "",

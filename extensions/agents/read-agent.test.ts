@@ -31,6 +31,8 @@ const piMocks = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   loaderOptions: [] as any[],
   loaderExtensions: [] as any[],
+  nativeFactories: {} as Record<string, () => unknown>,
+  runtimeOverride: undefined as any,
   settingsManagers: [] as any[],
   sessionManagerCreate: vi.fn(),
   sessionManagerOpen: vi.fn(),
@@ -41,6 +43,7 @@ const piMocks = vi.hoisted(() => ({
 
 function mockedPiRuntimeApi() {
   return {
+  ...piMocks.nativeFactories,
   createAgentSession: piMocks.createAgentSession,
   DefaultResourceLoader: class {
     constructor(options: any) {
@@ -90,7 +93,7 @@ function mockedPiRuntimeApi() {
 
 vi.mock("@mariozechner/pi-coding-agent", mockedPiRuntimeApi);
 vi.mock("../internal/pi-runtime-api", () => ({
-  loadPiRuntimeApi: async () => mockedPiRuntimeApi(),
+  loadPiRuntimeApi: async () => piMocks.runtimeOverride ?? mockedPiRuntimeApi(),
 }));
 
 import { closeReadAgentMessageDelivery, handleReadAgentSessionEvent, runReadAgentInProcess, sendMessageToRunningReadAgent } from "./read-agent.js";
@@ -221,6 +224,8 @@ function makeSession() {
   return {
     messages: [{ role: "assistant", content: "final report" }],
     getSessionStats: vi.fn(() => ({ tokens: { total: 42 } })),
+    getActiveToolNames: vi.fn((): string[] => ["read"]),
+    setActiveToolsByName: vi.fn(),
     subscribe: vi.fn(),
     prompt: vi.fn(async () => {}),
     bindExtensions: vi.fn(async () => {}),
@@ -254,6 +259,8 @@ describe("in-process read agent tool wiring", () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extended-teams-read-agent-"));
     piMocks.loaderOptions.length = 0;
     piMocks.loaderExtensions.length = 0;
+    piMocks.nativeFactories = {};
+    piMocks.runtimeOverride = undefined;
     piMocks.settingsManagers.length = 0;
     piMocks.createAgentSession.mockReset();
     piMocks.sessionManagerCreate.mockReset();
@@ -410,7 +417,7 @@ describe("in-process read agent tool wiring", () => {
     let receipt: any;
     session.prompt.mockImplementation(async () => {
       const tool = piMocks.createAgentSession.mock.calls.at(-1)![0].customTools.find((item: any) => item.name === "report_and_exit");
-      receipt = await tool.execute("ordinary", { content: "Complete ordinary report", ...details });
+      receipt = await tool.execute("ordinary", { content: "Complete ordinary report", summary: "Checked the requested findings.", ...details });
     });
     piMocks.createAgentSession.mockResolvedValue({ session });
     const options = makeRunOptions();
@@ -418,6 +425,9 @@ describe("in-process read agent tool wiring", () => {
     expect(receipt.details.accepted).toBe(true);
     const [event] = await listTeamReportEvents("team");
     expect(event.result).toMatchObject(details);
+    expect(options.emitAgentReport).toHaveBeenCalledExactlyOnceWith(
+      "team", "reviewer", expect.any(Number), 42, "Complete ordinary report", true, false, "Checked the requested findings.",
+    );
     expect(options.runningReadAgents.size).toBe(0);
     expect(session.dispose).toHaveBeenCalledOnce();
   });
@@ -1231,27 +1241,32 @@ describe("in-process read agent tool wiring", () => {
       ui: { setStatus: vi.fn() }, modelRegistry: { find: () => ({ provider: "provider", id: "model" }) } };
     handlers.get("session_start")!({}, ctx);
     const options = { ...makeRunOptions(), beginCostRun: cost.begin };
+    const getEntries = vi.fn(() => {
+      if (outcome === "snapshot-failed") throw new Error("snapshot unavailable");
+      return entries;
+    });
+    let startedAt: number | undefined;
+    let snapshotTime: number | undefined;
     if (outcome === "cleanup-blocked") vi.spyOn(reportEvents, "appendTeamReportEvent").mockRejectedValue(new Error("report store unavailable"));
     piMocks.createAgentSession.mockImplementation(async ({ sessionManager }) => {
       if (outcome === "startup-failed") throw new Error("session creation failed");
-      sessionManager.getEntries = () => {
-        if (outcome === "snapshot-failed") throw new Error("snapshot unavailable");
-        return entries;
-      };
+      sessionManager.getEntries = getEntries;
       return { session };
     });
     session.prompt.mockImplementation(async () => {
       expect(cost.total()).toEqual({ usd: 0, complete: false });
-      entries.push({ type: "message", message: { role: "assistant", usage: { cost: { total: 1 } } } });
+      startedAt = options.runningReadAgents.get("team:reader")!.startedAt;
+      entries.push({ id: "assistant-1", type: "message", message: { role: "assistant", provider: "p", model: "observed-first", usage: { cost: { total: 1 } }, content: "private" } });
       if (outcome === "failed") throw new Error("provider failure");
       if (outcome === "cancelled") options.runningReadAgents.get("team:reader")!.stopRequested = true;
     });
     session.abort.mockImplementation(async () => {
       expect(cost.total()).toEqual({ usd: 0, complete: false });
-      entries.push({ type: "compaction", usage: { cost: { total: 2 } } });
+      entries.push({ id: "abort-usage", type: "usage", kind: "cache-warm", provider: "p", model: "observed-late", usage: { cost: { total: 2 } }, note: "private" });
+      snapshotTime = Date.now();
     });
     session.dispose.mockImplementation(() => expect(cost.total().complete).toBe(false));
-    await runReadAgentInProcess("team", fixtureMember("reader"), "inspect", ctx, options);
+    await runReadAgentInProcess("team", { ...fixtureMember("reader"), parentLifecycleRunId: "parent-run" }, "inspect", ctx, options);
     if (outcome === "cleanup-blocked") {
       expect(cost.total()).toEqual({ usd: 0, complete: false });
       expect(rootEntries.at(-1).data.phase).toBe("pending");
@@ -1262,6 +1277,17 @@ describe("in-process read agent tool wiring", () => {
       expect(rootEntries.at(-1).data).toMatchObject({
         outcome: outcome === "failed" || outcome === "startup-failed" ? "failed" : outcome === "cancelled" ? "cancelled" : "completed",
         childSessionId: "child-session-1", costUsd: unknown ? null : 3 });
+      const telemetry = rootEntries.at(-1).data.telemetry;
+      if (unknown) expect(telemetry).toBeUndefined();
+      else {
+        expect(getEntries).toHaveBeenCalledOnce();
+        expect(telemetry).toEqual({ schemaVersion: 1, agentName: "reader", role: "read", startedAt,
+          completedAt: expect.any(Number), parentLifecycleRunId: "parent-run", modelSlot: "read-review", entries: [
+            { id: "assistant-1", type: "message", message: { role: "assistant", provider: "p", model: "observed-first", usage: { cost: { total: 1 } } } },
+            { id: "abort-usage", type: "usage", kind: "cache-warm", provider: "p", model: "observed-late", usage: { cost: { total: 2 } } },
+          ] });
+        expect(telemetry.completedAt).toBeGreaterThanOrEqual(snapshotTime!);
+      }
       expect(options.runningReadAgents.size).toBe(0);
       expect(await readLifecycleTombstone("team", "reader")).toEqual({ status: "absent" });
     }
@@ -1865,6 +1891,32 @@ describe("in-process read agent tool wiring", () => {
     expect(observed!.messageDeliveryClosed).toBe(true);
   });
 
+  it("delivers peer inbox messages to a running native session without a polling tick", async () => {
+    const session = makeSession();
+    let start!: () => void;
+    let finish!: () => void;
+    const started = new Promise<void>(resolve => { start = resolve; });
+    const finished = new Promise<void>(resolve => { finish = resolve; });
+    session.prompt.mockImplementation(async () => { start(); await finished; });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const member = fixtureMember("reader");
+    writeTeamConfig("team", member);
+    const running = runReadAgentInProcess("team", member, "investigate", {
+      modelRegistry: { find: vi.fn(() => ({ provider: "provider", id: "model" })) },
+    }, makeRunOptions());
+    try {
+      await started;
+      await sendPlainMessageIfRunning("team", "writer", "reader", "Found the API contract", "finding");
+      await vi.waitFor(() => expect(session.sendUserMessage).toHaveBeenCalledWith(
+        expect.stringContaining("Found the API contract"), { deliverAs: "steer" },
+      ));
+      expect(session.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("writer"), { deliverAs: "steer" });
+    } finally {
+      finish();
+      await running;
+    }
+  });
+
   it("injects teammate-safe communication tools and guidance into nested read-agent sessions", async () => {
     const session = makeSession();
     piMocks.createAgentSession.mockResolvedValue({ session });
@@ -1949,7 +2001,7 @@ describe("in-process read agent tool wiring", () => {
     expect(session.bindExtensions).toHaveBeenCalledWith({ mode: "print" });
     expect(session.bindExtensions.mock.invocationCallOrder[0]).toBeLessThan(session.prompt.mock.invocationCallOrder[0]);
     expect(session.prompt).toHaveBeenCalledWith("investigate", { source: "extension" });
-    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, "final report", true);
+    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "reader", expect.any(Number), 42, "final report", true, false, undefined);
     expect(await readInbox("team", "team-lead", true, false)).toEqual([]);
     expect(await readInbox("team", "team-lead", false, false)).toEqual([]);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledWith("team", "reader");
@@ -2414,7 +2466,7 @@ describe("in-process read agent tool wiring", () => {
     expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionId");
     expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionFile");
     expect(emitAgentReport).toHaveBeenCalledWith(
-      "team", "reader", expect.any(Number), 42, "Recovered on the report-only turn", true,
+      "team", "reader", expect.any(Number), 42, "Recovered on the report-only turn", true, false, "Recovered",
     );
   });
 
@@ -2487,7 +2539,7 @@ describe("in-process read agent tool wiring", () => {
     expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionId");
     expect(rememberCompletedAgentReport.mock.calls[0][1]).not.toHaveProperty("recoverySessionFile");
     expect(emitAgentReport).toHaveBeenCalledWith(
-      "team", "reader", expect.any(Number), 42, "Recovered durable report", true,
+      "team", "reader", expect.any(Number), 42, "Recovered durable report", true, false, "Durable",
     );
     const reports = await listTeamReportEvents("team");
     expect(reports.at(-1)).toMatchObject({
@@ -2599,6 +2651,75 @@ describe("in-process read agent tool wiring", () => {
     );
   });
 
+  it.each([false, true])("loads selected native factories without restricting later MCP tools (codemode initially active: %s)", async codemodeActive => {
+    const session = makeSession();
+    session.getActiveToolNames.mockReturnValue(codemodeActive ? ["read", "codemode"] : ["read"]);
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const builtinPaths = ["builtin:mcp", "builtin:codemode", "builtin:tool-search"];
+    const factories = ["createMcpExtension", "createCodemodeExtension", "createToolSearchExtension"];
+    for (const name of factories) piMocks.nativeFactories[name] = vi.fn(() => () => {});
+    for (const [path, name] of [["builtin:codemode", "codemode"], ["builtin:tool-search", "tool_search"]]) {
+      piMocks.loaderExtensions.push({ path, tools: new Map([[name, { definition: { name, defaultActive: false } }]]) });
+    }
+    piMocks.loaderExtensions.push({
+      path: "/extensions/selected.ts",
+      tools: new Map([
+        ["selected_extension_tool", { definition: { name: "selected_extension_tool" } }],
+        ["spawn_agent", { definition: { name: "spawn_agent", exposure: "codemode" } }],
+      ]),
+    });
+    const options = {
+      ...makeRunOptions(),
+      createResourcePlan: async () => ({
+        selectionMode: "default" as const,
+        extensionPaths: [...builtinPaths, "/extensions/selected.ts"],
+        extensions: [], diagnostics: [], skills: "all" as const,
+        trust: { cwd: root, projectTrusted: false },
+      }),
+    };
+    let postReportDenied = false;
+    session.prompt.mockImplementation(async () => {
+      const handlers: Array<(event: any) => any> = [];
+      for (const factory of piMocks.loaderOptions[0].extensionFactories) {
+        if (typeof factory !== "function") continue;
+        factory({
+          on: (name: string, handler: any) => {
+            if (name === "tool_call") handlers.push(handler);
+          },
+        });
+      }
+      const call = { toolName: "read", input: {}, toolCallId: "script/2", parentToolCallId: "script" };
+      expect(handlers.every(handler => !handler(call)?.block)).toBe(true);
+      const report = piMocks.createAgentSession.mock.calls[0][0].customTools.find((tool: any) => tool.name === "report_and_exit");
+      await report.execute("script/1", { content: "Native agent finished" });
+      postReportDenied = handlers.some(handler => handler(call)?.block);
+    });
+    await runReadAgentInProcess("team", fixtureMember("reader"), "Inspect", {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, options);
+
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1].status).not.toBe("failed");
+    for (const name of factories) expect(piMocks.nativeFactories[name]).toHaveBeenCalledOnce();
+    expect(piMocks.loaderOptions[0]).toMatchObject({
+      noExtensions: true,
+      additionalExtensionPaths: [...builtinPaths, "/extensions/selected.ts"],
+      extensionFactories: expect.arrayContaining(builtinPaths.map(path => expect.objectContaining({
+        name: path.slice("builtin:".length),
+        builtin: true,
+        replaceable: true,
+        factory: expect.any(Function),
+      }))),
+    });
+    const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
+    expect(sessionOptions.tools).toBeUndefined();
+    expect(sessionOptions.excludeTools).toEqual(expect.arrayContaining(["ask_user", "spawn_agent", "spawn_swarm_agents", "get_agent_status"]));
+    expect(session.setActiveToolsByName).toHaveBeenCalledWith(expect.arrayContaining(["read", "bash", "edit", "write", "grep", "find", "ls", "selected_extension_tool", "report_and_exit"]));
+    expect(session.setActiveToolsByName.mock.calls[0][0]).toContain("codemode");
+    expect(session.setActiveToolsByName.mock.calls[0][0]).not.toContain("tool_search");
+    expect(session.setActiveToolsByName.mock.invocationCallOrder[0]).toBeLessThan(session.bindExtensions.mock.invocationCallOrder[0]);
+    expect(postReportDenied).toBe(true);
+  });
+
   it.each(["read", "write", "nested"] as const)("filters user tools and installs execution guards in %s sessions", async mode => {
     const session = makeSession();
     piMocks.createAgentSession.mockResolvedValue({ session });
@@ -2690,6 +2811,8 @@ describe("in-process read agent tool wiring", () => {
     });
     const sessionOptions = piMocks.createAgentSession.mock.calls[0][0];
     expect(sessionOptions.tools).toContain("selected_extension_tool");
+    expect(sessionOptions.tools).toEqual(expect.arrayContaining(["read", "bash", "edit", "write", "grep", "find", "ls"]));
+    expect(session.setActiveToolsByName).not.toHaveBeenCalled();
     expect(sessionOptions.tools.filter((name: string) => name === "send_message")).toHaveLength(1);
     expect(sessionOptions.tools).not.toContain("spawn_agent");
     expect(sessionOptions.tools).not.toContain("spawn_swarm_agents");
@@ -3317,7 +3440,7 @@ describe("in-process read agent tool wiring", () => {
       ...communicationToolNames,
     ]);
     expect(sessionOptions.customTools.map((tool: any) => tool.name).sort()).toEqual([...communicationToolNames].sort());
-    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "writer", expect.any(Number), 42, "final report", true);
+    expect(options.emitAgentReport).toHaveBeenCalledWith("team", "writer", expect.any(Number), 42, "final report", true, false, undefined);
     expect(options.releaseAllClaimsForAgent).toHaveBeenCalledTimes(1);
     expect(session.abort).toHaveBeenCalledTimes(1);
     expect(session.dispose).toHaveBeenCalledTimes(1);
@@ -4110,7 +4233,7 @@ describe("in-process read agent tool wiring", () => {
       },
     }, options);
 
-    expect(options.emitAgentReport).toHaveBeenCalledWith("prompt-build-123", "prompt-branch-1", expect.any(Number), 42, "final report", true);
+    expect(options.emitAgentReport).toHaveBeenCalledWith("prompt-build-123", "prompt-branch-1", expect.any(Number), 42, "final report", true, false, undefined);
     const leadInbox = await readInbox("prompt-build-123", "team-lead", false, false);
     expect(leadInbox).toEqual([]);
   });
@@ -4340,33 +4463,129 @@ describe("in-process read agent tool wiring", () => {
     expect(await readInbox("team", "writer", false, false)).toEqual([expect.objectContaining({ text: "final report" })]);
   });
 
-  it.each([false, true])("uses the installed Agent loop to stop an accepted report (idle continuation: %s)", async (idle) => {
+  it("runs a complete child through the installed legacy SDK without native factories", async () => {
+    const legacyModule = process.env.PI_LEGACY_SDK_CONTRACT_MODULE;
+    const sdk: typeof import("@mariozechner/pi-coding-agent") = legacyModule
+      ? await import(legacyModule)
+      : await vi.importActual("@mariozechner/pi-coding-agent");
+    const codingModule = legacyModule ?? resolvePiFixtureEntry(resolvePiFixturePackageJson(
+      "@mariozechner/pi-coding-agent", pathToFileURL(path.join(process.cwd(), "package.json")).href,
+    ));
+    const manifest = JSON.parse(fs.readFileSync(findPackageJSON(codingModule)!, "utf8"));
+    const aiPackage = manifest.dependencies?.["@earendil-works/pi-ai"] ? "@earendil-works/pi-ai" : "@mariozechner/pi-ai";
+    const { createAssistantMessageEventStream } = await import(resolvePiFixtureEntry(resolvePiFixturePackageJson(aiPackage, codingModule)));
+    fs.writeFileSync(path.join(root, "settings.json"), JSON.stringify({
+      cacheWarming: "off", retry: { enabled: false }, compaction: { enabled: false },
+    }));
+    const authStorage = sdk.AuthStorage.inMemory({ openai: { type: "api_key", key: "offline-unused" } });
+    const modelRegistry = sdk.ModelRegistry.inMemory(authStorage);
+    const model = modelRegistry.find("openai", "gpt-5")!;
+    expect(model).toBeDefined();
+    const member = { ...fixtureMember("reader"), model: `${model.provider}/${model.id}` };
+    writeTeamConfig("team", member);
+    const settingsPath = path.join(root, ".pi/agent/pi-extended-teams/settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    settings.favoriteModels["reading-default"].model = member.model;
+    fs.writeFileSync(settingsPath, JSON.stringify(settings));
+    let responses = 0;
+    let child: any;
+    piMocks.runtimeOverride = {
+      ...sdk,
+      getAgentDir: () => root,
+      createAgentSession: async (configuration: any) => {
+        const created = await sdk.createAgentSession({ ...configuration, agentDir: root, authStorage, modelRegistry });
+        child = created.session;
+        const streamFn = () => {
+          const stream = createAssistantMessageEventStream();
+          const reporting = responses++ === 0;
+          const message = {
+            role: "assistant",
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            timestamp: Date.now(),
+            content: reporting
+              ? [{ type: "toolCall", id: "report", name: "report_and_exit", arguments: { content: "legacy SDK report", summary: "Verified the SDK completion path." } }]
+              : [{ type: "text", text: "done" }],
+            stopReason: reporting ? "toolUse" : "stop",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          };
+          stream.push({ type: "done", reason: message.stopReason, message });
+          stream.end();
+          return stream;
+        };
+        if ("streamFunction" in child.agent) child.agent.streamFunction = streamFn;
+        else if ("streamFn" in child.agent) child.agent.streamFn = streamFn;
+        else throw new Error("The SDK fixture requires a public stream injection hook.");
+        return created;
+      },
+    };
+    const options = makeRunOptions();
+    await runReadAgentInProcess("team", member, "Exercise the legacy SDK", { modelRegistry }, options);
+    expect(options.rememberCompletedAgentReport.mock.calls[0][1]).toMatchObject({ report: "legacy SDK report", status: "completed" });
+    expect(options.emitAgentReport).toHaveBeenCalledExactlyOnceWith(
+      "team", "reader", expect.any(Number), expect.any(Number), "legacy SDK report", true, false, "Verified the SDK completion path.",
+    );
+    expect(responses).toBeGreaterThan(0);
+    expect(child.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "bash", "edit", "write", "report_and_exit"]));
+    expect(options.runningReadAgents.size).toBe(0);
+  });
+
+  it.each(["normal", "idle", "steer", "followUp", "beforeSettle", "repair"])("stops an accepted report through the installed AgentSession (%s)", async (mode) => {
+    const idle = mode === "idle";
     const packageResolutionBase = pathToFileURL(path.join(process.cwd(), "package.json")).href;
-    const codingAgentPackageJson = resolvePiFixturePackageJson("@mariozechner/pi-coding-agent", packageResolutionBase);
+    const codingAgentPackageJson = resolvePiFixturePackageJson(
+      process.env.PI_CODING_AGENT_CONTRACT_MODULE ?? "@mariozechner/pi-coding-agent",
+      packageResolutionBase,
+    );
     const codingAgentModule = resolvePiFixtureEntry(codingAgentPackageJson);
-    // Override with a public current-host module URL; the default peer resolves from the coding-agent context.
-    const coreModule = process.env.PI_AGENT_CORE_CONTRACT_MODULE ?? resolvePiFixtureEntry(
-      resolvePiFixturePackageJson("@mariozechner/pi-agent-core", codingAgentModule),
-    );
-    const aiModule = resolvePiFixtureEntry(
-      resolvePiFixturePackageJson("@mariozechner/pi-ai", codingAgentModule),
-    );
+    const scope = JSON.parse(fs.readFileSync(codingAgentPackageJson, "utf8")).name.split("/")[0];
+    const coreModule = resolvePiFixtureEntry(resolvePiFixturePackageJson(`${scope}/pi-agent-core`, codingAgentModule));
+    const aiModule = resolvePiFixtureEntry(resolvePiFixturePackageJson(`${scope}/pi-ai`, codingAgentModule));
     const { Agent } = await import(coreModule);
     const { createAssistantMessageEventStream } = await import(aiModule);
-    const session = makeSession();
-    const model = { provider: "provider", id: "model", api: "openai-completions" };
+    const { AgentSession, SessionManager, SettingsManager, DefaultResourceLoader } = await vi.importActual<any>(codingAgentModule);
+    const model = {
+      provider: "provider", id: "model", api: "openai-completions",
+      contextWindow: 100000, maxTokens: 1000, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+    const sessionManager = SessionManager.inMemory(root);
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+    let session: InstanceType<typeof AgentSession>;
     let responses = 0;
+    const beforeSettle = vi.fn(() => ({ continue: responses < 3 }));
+    const loader = new DefaultResourceLoader({
+      cwd: root, agentDir: root, settingsManager,
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+      systemPromptOverride: () => "Test agent",
+      extensionFactories: mode === "beforeSettle" ? [(pi: any) => pi.on("agent_before_settle", beforeSettle)] : [],
+    });
+    await loader.reload();
+
+    let acceptedAtResponse: number | undefined;
     let reporting = !idle;
     const streamFn = () => {
       const stream = createAssistantMessageEventStream();
       const report = reporting;
       const progress = idle && responses === 0;
-      reporting = false;
+      reporting = mode === "repair" && responses === 0;
       responses++;
       const message: any = {
         role: "assistant", model: "model", provider: "provider", api: "openai-completions",
         timestamp: Date.now(),
-        content: report ? [{ type: "toolCall", id: "report", name: "report_and_exit", arguments: { content: "authoritative loop report" } }]
+        content: report ? [
+          { type: "toolCall", id: "progress-before-report", name: "report_progress", arguments: { status: "Delivering report" } },
+          { type: "toolCall", id: `report-${responses}`, name: "report_and_exit", arguments: { content: "authoritative loop report" } },
+          { type: "toolCall", id: "progress-after-report", name: "report_progress", arguments: { status: mode === "repair" && responses === 1 ? "Repairing" : "Should not run" } },
+        ]
           : progress ? [{ type: "toolCall", id: "progress", name: "report_progress", arguments: { status: "Inspecting the contract" } }] : [{ type: "text", text: "idle" }],
         stopReason: report || progress ? "toolUse" : "stop",
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0 } },
@@ -4375,24 +4594,49 @@ describe("in-process read agent tool wiring", () => {
       stream.end();
       return stream;
     };
-    const agent = new Agent({ initialState: { model }, streamFn });
+    const agent = new Agent({ initialState: { model }, streamFn, toolExecution: "sequential" });
+    const supportsFinish = "finishTurn" in agent;
     const supportsStop = "shouldStopAfterTurn" in agent;
     const previousHook = vi.fn(async (turn, signal) => {
       expect(signal).toBeInstanceOf(AbortSignal);
-      return turn.toolResults.some((result: any) => result.toolName === "report_progress");
+      const reported = turn.toolResults.some((result: any) => result.toolName === "report_and_exit");
+      return supportsFinish ? { action: reported ? "continue" : "end" } : !reported;
     });
-    if (supportsStop) agent.shouldStopAfterTurn = previousHook;
-    Object.assign(session, { agent, isStreaming: false });
     piMocks.createAgentSession.mockImplementation(async ({ customTools }) => {
-      agent.state.tools = customTools;
+      session = new AgentSession({
+        agent, cwd: root, sessionManager, settingsManager, resourceLoader: loader,
+        customTools, initialActiveToolNames: customTools.map((tool: any) => tool.name),
+        modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "offline-test" }), hasConfiguredAuth: () => true },
+        modelRuntime: { checkAuth: async () => true, hasConfiguredAuth: () => true },
+      });
+      if (supportsFinish) agent.finishTurn = previousHook;
+      else if (supportsStop) agent.shouldStopAfterTurn = previousHook;
+      vi.spyOn(session, "dispose");
+      // Queue while reporting is in flight, before admission closes.
+      agent.subscribe((event: any) => {
+        if (event.type === "tool_execution_end" && event.toolName === "report_and_exit" && event.result.details.accepted) {
+          acceptedAtResponse = responses;
+        }
+        if (event.type === "tool_execution_start" && event.toolName === "report_and_exit") {
+          if (mode === "steer" || mode === "followUp") {
+            agent[mode]({ role: "user", content: "queued before acceptance", timestamp: Date.now() });
+          }
+        }
+      });
       return { session };
     });
-    session.prompt.mockImplementation(async () => { await agent.prompt("inspect"); });
-    session.subscribe.mockImplementation(handler => agent.subscribe(handler));
-    session.sendUserMessage.mockImplementation(async (content = "") => { await agent.prompt(content); });
-    const member = idle ? eligibleNestedParent("loop-reporter") : fixtureMember("loop-reporter");
+    const member: Member = idle ? eligibleNestedParent("loop-reporter") : fixtureMember("loop-reporter");
+    if (mode === "repair") {
+      execFileSync("git", ["init", "--quiet"], { cwd: root });
+      member.assignedChecks = [{ name: "test", command: "offline check", timeoutSeconds: 2 }];
+      member.repairPolicy = { maxAttempts: 1 };
+    }
     writeTeamConfig("team", member);
-    const options = { ...makeRunOptions(), pendingChildController: createPendingChildController() };
+    const exec = vi.fn().mockResolvedValueOnce({ exitCode: 1 }).mockResolvedValue({ exitCode: 0 });
+    const options = {
+      ...makeRunOptions(), pendingChildController: createPendingChildController(), emitAgentProgress: vi.fn(),
+      loadCheckOperations: async () => ({ exec }),
+    };
     const run = runReadAgentInProcess("team", member, "inspect", { modelRegistry: { find: () => model } }, options);
     if (idle) {
       await vi.waitFor(() => expect(options.runningReadAgents.get("team:loop-reporter")?.acceptingMessages).toBe(true));
@@ -4401,12 +4645,21 @@ describe("in-process read agent tool wiring", () => {
       await expect(sendMessageToRunningReadAgent(options.runningReadAgents.get("team:loop-reporter"), "finish", true)).resolves.toBe(true);
     }
     await run;
-    expect(responses).toBe((idle ? 2 : 1) * (supportsStop ? 1 : 2));
-    if (supportsStop) expect(previousHook).toHaveBeenCalledTimes(idle ? 2 : 1);
-    expect(agent.state.messages.find((message: any) => message.role === "toolResult" && message.toolName === "report_and_exit")?.details).toMatchObject({ accepted: true });
+    expect(acceptedAtResponse).toBeGreaterThan(0);
+    expect(responses, JSON.stringify(options.emitAgentReport.mock.calls)).toBe(acceptedAtResponse);
+    if (supportsFinish || supportsStop) expect(previousHook).toHaveBeenCalledTimes(idle || mode === "repair" ? 2 : 1);
+    const persistedResults = sessionManager.getEntries().filter((entry: any) =>
+      entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "report_and_exit"
+    );
+    expect(persistedResults.map((entry: any) => entry.message.details.accepted)).toEqual(mode === "repair" ? [false, true] : [true]);
+    expect(agent.hasQueuedMessages()).toBe(false);
+    const progress = idle ? ["Inspecting the contract", "Delivering report"] : ["Delivering report"];
+    if (mode === "repair") progress.push("Repairing", "Delivering report");
+    expect(options.emitAgentProgress.mock.calls.map(call => call[2])).toEqual(progress);
+    if (mode === "beforeSettle") expect(beforeSettle).not.toHaveBeenCalled();
     expect(await listTeamReportEvents("team")).toEqual([expect.objectContaining({ report: "authoritative loop report" })]);
     expect(options.runningReadAgents.size).toBe(0);
-    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(session!.dispose).toHaveBeenCalledOnce();
   });
 
   it("directly wakes an active helper requester even when the helper already persisted its report", async () => {

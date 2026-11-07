@@ -78,6 +78,7 @@ export function summarizeReadAgentStatuses(
 }
 
 function classifyReadAgentStatus(agent: RunningReadAgent, now: number): ReadAgentStatusClassification {
+  if (agent.externalControl) return { label: agent.status, idleLevel: "none", idleMs: 0 };
   const lastActivityAt = agent.lastActivityAt || agent.startedAt;
   const idleMs = Math.max(0, now - lastActivityAt);
 
@@ -117,6 +118,7 @@ function describeReadAgentStatusFromClassification(
 }
 
 function describeActiveReadAgentWork(agent: RunningReadAgent): string {
+  if (agent.externalControl) return "runtime telemetry unavailable";
   if (agent.status === "starting") return "starting session";
   if (agent.status === "finishing") return "sending report";
   if (agent.status === "working") {

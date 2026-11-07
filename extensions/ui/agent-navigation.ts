@@ -19,7 +19,8 @@ function uniqueAgentsByName(agents: RunningReadAgent[]): RunningReadAgent[] {
 }
 
 export function hasActiveReadAgentLifecycle(agent: RunningReadAgent): boolean {
-  return agent.teardownState !== "stopping"
+  return !agent.persistedRecipientClosed
+    && agent.teardownState !== "stopping"
     && agent.teardownState !== "quarantined"
     && agent.teardownState !== "persistence_failed"
     && agent.teardownState !== "finalized";

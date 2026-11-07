@@ -22,7 +22,7 @@ import { registerTaskRuntimeTools } from "./tools/task-runtime-tools.js";
 import { registerTeamTools, type TeamToolsRuntime } from "./tools/team-tools.js";
 import { canonicalPersistedModelSlot, loadSettings, requireFavoriteModelLevel } from "../src/utils/settings";
 import { parseQualifiedModel } from "../src/utils/model-resolution";
-import { formatAnimatedProgress, formatContextUsage, formatElapsed, formatModelLabel } from "./ui/renderers.js";
+import { formatAnimatedProgress, formatContextUsage, formatElapsed, formatInboxMessagesForModel, formatModelLabel } from "./ui/renderers.js";
 import type { CompletedAgentReport, RunningReadAgent } from "./runtime/types.js";
 import { createPendingChildController } from "./runtime/pending-child-controller.js";
 import { createTeamHost } from "./runtime/team-host";
@@ -71,6 +71,8 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
   // Track whether lead inbox/helper polling has been started (to avoid duplicates)
   let leadPollingStarted = false;
   let leadInboxPollTimer: NodeJS.Timeout | null = null;
+  let leadInboxWatcher: fs.FSWatcher | undefined;
+  let leadInboxWatchedTeam: string | undefined;
   let readHelperQueueWatchedTeam: string | null = null;
   let readHelperQueueWatcher: fs.FSWatcher | null = null;
   let readHelperQueueFallbackStarted = false;
@@ -220,6 +222,20 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     return delivered;
   }
 
+  async function notifyMessageSent(targetTeamName: string, recipient: string, message: messaging.SendPlainMessageOnceResult["message"]): Promise<void> {
+    if (recipient === "team-lead") return notifyLeadOfInboxReports(targetTeamName);
+    const target = runningReadAgents.get(readAgentKey(targetTeamName, recipient));
+    const expectedRecipientRunId = message.metadata?.recipientRunId;
+    if (expectedRecipientRunId !== undefined && target?.runId !== expectedRecipientRunId) return;
+    // Same-process notification avoids filesystem watcher latency; watchers also cover terminal senders.
+    if (target?.inbox) return target.inbox.refresh();
+    if (target?.externalControl) {
+      void deliverMessageToActiveAgent(targetTeamName, recipient, formatInboxMessagesForModel([message]), expectedRecipientRunId).then(async delivered => {
+        if (delivered && message.id) await messaging.markInboxMessagesRead(targetTeamName, recipient, [message.id]);
+      }).catch(error => { target.lastError = runtime.createRuntimeError(error); renderReadAgentStatus(); });
+    }
+  }
+
   function memberActivityRole(member: Member): "read" | "write" {
     if (member.role === "read" || member.role === "write") return member.role;
     return member.modelSlot?.startsWith("reading-") ? "read" : "write";
@@ -317,8 +333,12 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     contextUsage: string,
     latestProgress: string | undefined,
     now: number,
-    activeReadHelperCount = 0
+    activeReadHelperCount = 0,
+    isExternal = false
   ): string {
+    if (isExternal) {
+      return [`(${name})`, modelSlot, "external agent running", elapsed].filter(Boolean).join(" · ");
+    }
     const shortModel = model ? model.split("/").pop() || model : "";
     const modelAndThinking = [shortModel, thinking].filter(Boolean).join("/");
     const identity = modelAndThinking ? `(${name}) ${modelAndThinking}` : `(${name})`;
@@ -381,13 +401,17 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     }
   }
 
-  // Deliver a finished agent's report into the lead's context without adding
-  // the full body to the transcript. Hidden custom messages still participate
-  // in LLM context (see convertToLlm), and triggerTurn makes the lead synthesize
-  // the report automatically — no read_inbox, no manual polling.
-  function emitAgentReport(reportTeamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection = false): void {
+  // One message carries the full report to the lead model and renders a compact
+  // completion notice. Keep the existing follow-up turn and suppression rules.
+  function emitAgentReport(reportTeamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection = false, summary?: string): void {
     const api = pi as any;
-    const details = { name, elapsedMs: Date.now() - startedAt, tokens, ok };
+    const details = {
+      name,
+      elapsedMs: Date.now() - startedAt,
+      tokens,
+      ok,
+      summary: summary?.trim() || report.split(/\r?\n/).find(line => line.trim())?.trim() || "Report available.",
+    };
     pi.events?.emit?.("pi-extended-teams:agent-report", { teamName: reportTeamName, name, startedAt, tokens, report, ok, details });
 
     // pi-prompt prompt-build teams are extension-controlled fanout jobs. Their
@@ -398,7 +422,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
 
     if (typeof api.sendMessage === "function") {
       api.sendMessage(
-        { customType: "pi-extended-teams-report", content: report, display: false, details },
+        { customType: "pi-extended-teams-report", content: report, display: true, details },
         { triggerTurn: true, deliverAs: "followUp" }
       );
     } else {
@@ -473,7 +497,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       ? `A teammate finished and sent its final report: ${label} is ready in the ${teamName} inbox.`
       : `Check your agent messages now: ${label} is ready in the ${teamName} inbox.`;
     quietTrigger(
-      `${opening} Call read_inbox once, integrate the new information, and continue the active task. The reporting agent is self-exiting; do not call stop_teammate after a final report. This is an automatic user-style follow-up; do not sleep or poll.`
+      `${opening} Call read_inbox once, integrate the new information, and continue the active task.${hasFinalReport ? " The reporting agent is self-exiting; do not call stop_teammate after a final report." : ""} This is an automatic user-style follow-up; do not sleep or poll.`
     );
   }
 
@@ -648,14 +672,14 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
         .filter(agent => agent.teamName === activityTeamName)
         .sort((a, b) => a.name.localeCompare(b.name))
       : [];
-    const runningAgents = sessionAgents.filter(hasActiveReadAgentLifecycle);
-    const readAgents = runningAgents.filter(agent => (agent.role || "read") === "read");
-    const writeAgents = runningAgents.filter(agent => (agent.role || "read") === "write");
     const activityConfig = activityTeamName ? await teams.readConfig(activityTeamName).catch(() => null) : null;
     const activityMembers = activityConfig?.members ?? [];
     const activityTombstones = activityTeamName
       ? await listLifecycleTombstones(activityTeamName).catch(() => [])
       : [];
+    const runningAgents = sessionAgents.filter(hasActiveReadAgentLifecycle);
+    const readAgents = runningAgents.filter(agent => (agent.role || "read") === "read");
+    const writeAgents = runningAgents.filter(agent => (agent.role || "read") === "write");
     const unsettledAgents = sessionAgents.filter(agent => !hasActiveReadAgentLifecycle(agent)
       && agent.teardownState !== "finalized"
       && !activityTombstones.some(fence => fence.agentName === agent.name));
@@ -757,8 +781,8 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       const contextUsage = formatRunningContextUsage(agent.contextUsage);
       const detail = [modelLabel, slotLabel, elapsed, contextUsage, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
-      entries.push({ name: agent.name, role: "write", status: status.label, detail });
-      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now, activeReadHelperCounts.get(agent.name)));
+      entries.push({ name: agent.name, role: "write", status: status.label, detail, animateProgress: !agent.externalControl });
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now, activeReadHelperCounts.get(agent.name), !!agent.externalControl));
     }
 
     for (const { member, runtimeStatus } of runtimeOnlyWriteMembers.sort((a, b) => a.member.name.localeCompare(b.member.name))) {
@@ -827,8 +851,8 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       const contextUsage = formatRunningContextUsage(agent.contextUsage);
       const detail = [modelLabel, slotLabel, elapsed, contextUsage, status.detail].filter(Boolean).join(" · ");
       countStatus(status.label);
-      entries.push({ name: agent.name, role: "read", status: status.label, detail });
-      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now));
+      entries.push({ name: agent.name, role: "read", status: status.label, detail, animateProgress: !agent.externalControl });
+      footerStatuses.push(formatAgentProgressStatus(agent.name, agent.model, agent.thinking, agent.modelSlot, elapsed, contextUsage, agent.latestProgress, now, 0, !!agent.externalControl));
     }
 
     for (const { member, runtimeStatus } of unobservedMembers) {
@@ -851,12 +875,6 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     }
 
     for (const { agentName: quarantinedName, result } of activityTombstones) {
-      if (result.status === "occupied" && result.tombstone.phase === "persistence_closed"
-        && runningAgents.some(agent => agent.name === quarantinedName && agent.runId === result.tombstone.runId)) {
-        const entryIndex = entries.findIndex(entry => entry.name === quarantinedName);
-        entries[entryIndex].statusNote = "Finishing cleanup";
-        continue;
-      }
       const persistedMember = activityMembers.find(member => member.name === quarantinedName);
       const role = result.status === "occupied"
         ? result.tombstone.role
@@ -1069,6 +1087,28 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
   function startLeadInboxPolling() {
     if (isTeammate || !sessionCtx) return;
     startReadHelperQueueDraining();
+    if (teamName && leadInboxWatchedTeam !== teamName) {
+      leadInboxWatcher?.close();
+      const watchedTeam = teamName;
+      const file = teamPaths.inboxPath(watchedTeam, agentName);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const notify = () => {
+        if (!extensionShuttingDown && teamName === watchedTeam) void notifyLeadOfInboxReports(watchedTeam).catch(() => {});
+      };
+      try {
+        leadInboxWatcher = fs.watch(path.dirname(file), (_event, filename) => {
+          if (!filename || filename.toString() === path.basename(file)) notify();
+        });
+        leadInboxWatcher.on("error", () => {
+          leadInboxWatcher?.close();
+          leadInboxWatchedTeam = undefined;
+        });
+        leadInboxWatchedTeam = watchedTeam;
+      } catch {
+        leadInboxWatcher = undefined;
+        leadInboxWatchedTeam = undefined;
+      }
+    }
     if (leadPollingStarted) return;
     leadPollingStarted = true;
 
@@ -1211,6 +1251,9 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     if (readAgentStatusTimer) clearInterval(readAgentStatusTimer);
     if (teamActivityRenderTimer) clearTimeout(teamActivityRenderTimer);
     if (leadInboxPollTimer) clearInterval(leadInboxPollTimer);
+    leadInboxWatcher?.close();
+    leadInboxWatcher = undefined;
+    leadInboxWatchedTeam = undefined;
     if (readHelperQueueFallbackTimer) clearInterval(readHelperQueueFallbackTimer);
     readHelperQueueWatcher?.close();
 
@@ -1365,12 +1408,17 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
       rememberCompletedAgentReport,
       emitAgentReport,
       emitAgentProgress,
+      notifyFallback: (content: string) => pi.sendMessage(
+        { customType: "pi-extended-teams-fallback", content, display: true },
+        { triggerTurn: false },
+      ),
       releaseAllClaimsForAgent,
       shutdownTeammate,
       agentName,
       renderLeadInboxStatus,
       notifyLeadOfInboxReports,
       deliverMessageToActiveAgent,
+      notifyMessageSent,
       createResourcePlan: createCurrentSpawnResourcePlan,
       extensionInstanceId,
       createNestedReadAgentTools: (binding: Parameters<TeamToolsRuntime["createNestedReadAgentTools"]>[0]) => {
@@ -1429,7 +1477,7 @@ function createExecutionRuntime(pi: ExtensionAPI, host?: ReturnType<typeof creat
     adoptTeamAsLead,
     renderLeadInboxStatus,
     resetLeadWakeNotifiedCount: () => { leadWakeNotifiedMessageKeys.clear(); },
-    deliverMessageToActiveAgent,
+    notifyMessageSent,
     extensionInstanceId,
   };
   if (isTeammate) registerCoordinationTools(pi, coordination);

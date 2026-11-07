@@ -9,6 +9,7 @@ export interface TeamActivityStatusEntry {
   status?: string;
   detail?: string;
   displayText?: string;
+  animateProgress?: boolean;
   statusNote?: string;
 }
 
@@ -195,7 +196,7 @@ export function teamActivityStatusWidget(
       transition = transitions.get(key);
       if (!hasCachedTransitionEntry || transition) transitionHints[hintIndex] = transition;
     }
-    if (!entry.displayText) {
+    if (!entry.displayText || entry.animateProgress === false) {
       return animationResult(`${theme.fg("border", branch)} ${renderEntry(entry)}`, false, width);
     }
 

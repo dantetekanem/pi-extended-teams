@@ -35,6 +35,7 @@ export function createActivityColors(enabled: boolean) {
         return color("name", identity) + label;
       }
       if (/^(?:read|write|reading|writing)-[\w-]+$/.test(part)) return tier(part);
+      if (part === "external agent running") return color("message", part);
       if (CONTEXT_USAGE_STATUS_SUFFIX.test(part)) {
         const percent = part.match(/\((\?|[\d.]+)%\)$/);
         if (percent?.index !== undefined) {

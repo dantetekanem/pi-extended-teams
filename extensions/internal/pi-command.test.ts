@@ -106,6 +106,23 @@ describe("pi command helpers", () => {
     expect(args.match(/'\/tmp\/external\.ts'/g)).toHaveLength(1);
   });
 
+  it("preserves native builtin identities separately from filesystem paths during handoff", () => {
+    const builtinIds = ["builtin:mcp", "builtin:codemode", "builtin:tool-search"];
+    const filePath = path.resolve("builtin:mcp");
+    const args = buildExtensionArgs([...builtinIds, filePath, "builtin:mcp"], false, "/self.ts");
+    expect(args).toBe(`--no-approve --no-extensions --extension '/self.ts' --extension 'builtin:mcp' --extension 'builtin:codemode' --extension 'builtin:tool-search' --extension '${filePath}'`);
+  });
+
+  it("activates selected codemode for terminal agents without replacing the other tools", () => {
+    const command = buildPiCommand("pi", "provider/model", "high", ["builtin:codemode"]);
+    expect(command).toContain("--extension 'builtin:codemode'");
+    expect(command).toContain("--tools +codemode");
+    expect(command).toContain("--model 'provider/model:high'");
+    expect(buildPiCommand("pi", undefined, "high", ["builtin:codemode"])).toContain("--tools +codemode");
+    expect(buildPiCommand("pi", undefined, undefined, ["builtin:codemode"])).toContain("--tools +codemode");
+    expect(buildPiCommand("pi")).not.toContain("--tools");
+  });
+
   it("canonical-dedupes self and selected extension symlinks", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pet-pi-extension-args-"));
     try {

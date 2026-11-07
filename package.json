@@ -58,7 +58,7 @@
     "assets/pi-extended-teams-demo.gif"
   ],
   "dependencies": {
-    "uuid": "^11.1.0"
+    "uuid": "^14.0.3"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

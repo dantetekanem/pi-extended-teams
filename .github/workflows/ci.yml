@@ -23,4 +23,5 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:focused
+      - run: pnpm exec vitest run --maxWorkers=2 src/orchestration/orchestrator.test.ts extensions/tools/agent-status-tool.test.ts
       - run: pnpm typecheck

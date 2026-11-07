@@ -1250,6 +1250,14 @@ export async function runReadAgentInProcess(
       if (nativeToolNames.has("codemode")) activeNativeTools.add("codemode");
       session.setActiveToolsByName([...activeToolNames, ...activeNativeTools]);
     }
+    // Guard the request boundary too: older Agent loops have no turn-stop hook.
+    if (session.agent) {
+      const previous = session.agent.transformContext;
+      session.agent.transformContext = async (messages, signal) => {
+        if (submittedFinalReport) throw new Error("Agent already submitted its final report.");
+        return previous ? previous(messages, signal) : messages;
+      };
+    }
     // Hosts capture these public hooks when a prompt starts. Never abort from the reporting tool.
     if (session.agent && "finishTurn" in session.agent) {
       const agent = session.agent as typeof session.agent & {
@@ -1311,6 +1319,14 @@ export async function runReadAgentInProcess(
     if (state.stopRequested || !options.isCurrentReadAgentRun(key, state)) {
       if (state.teardownState !== "persistence_failed") await state.teardownPromise;
       return;
+    }
+    // Older hosts do not check cancellation between tool calls in a batch.
+    for (const tool of session.agent?.state.tools ?? []) {
+      const execute = tool.execute;
+      tool.execute = (...args) => {
+        if (submittedFinalReport) throw new Error("Agent already submitted its final report.");
+        return execute.apply(tool, args);
+      };
     }
     if (resourcePlan && process.env.HERDR_ENV === "1" && (member.delegationDepth ?? 0) === 0
       && !member.requestedBy && !member.parentAgentName && !member.allowNestedReadAgents
@@ -1419,7 +1435,15 @@ export async function runReadAgentInProcess(
     markReadAgentActivity(state, "started", "thinking");
     options.renderReadAgentStatus();
 
+    let reportStop: Promise<void> | undefined;
     session.subscribe((event: any) => {
+      if (event.type === "tool_execution_end" && submittedFinalReport && !reportStop) {
+        session.clearQueue();
+        // Abort the owning session, not just Agent. Do not await from an event:
+        // Pi waits for listeners before it can become idle and settle abort().
+        reportStop = session.abort();
+        void reportStop.catch(() => {});
+      }
       handleReadAgentSessionEvent(state, session, event, options.renderReadAgentStatus);
     });
 
@@ -1621,6 +1645,7 @@ export async function runReadAgentInProcess(
     } finally {
       state.acceptingMessages = false;
     }
+    await reportStop;
     await closeRecipient();
     state.status = "finishing";
     state.activeToolName = undefined;

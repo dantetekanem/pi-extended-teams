@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import { isNativeExtensionPath } from "../resources/native-extensions";
 
 /**
  * Build the command used to relaunch pi for teammate processes.
@@ -40,6 +41,7 @@ export function shellQuote(value: string): string {
 }
 
 function extensionPathIdentity(source: string): string {
+  if (isNativeExtensionPath(source)) return source;
   const absolute = path.resolve(source);
   try {
     return nodeFs.realpathSync(absolute);
@@ -133,7 +135,8 @@ export function buildPiCommand(
   selfExtensionSource?: string,
   sessionDir?: string,
 ): string {
-  const extensionArgs = buildExtensionArgs(allowedExtensions, projectTrusted, selfExtensionSource);
+  const toolArgs = allowedExtensions.includes("builtin:codemode") ? " --tools +codemode" : "";
+  const extensionArgs = buildExtensionArgs(allowedExtensions, projectTrusted, selfExtensionSource) + toolArgs;
   const sessionArgs = sessionDir ? ` --session-dir ${shellQuote(sessionDir)}` : "";
 
   if (chosenModel) {

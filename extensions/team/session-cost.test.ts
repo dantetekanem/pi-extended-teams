@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { createCombinedSessionCost, recordedSessionCost, COST_ENTRY_TYPE } from "./session-cost.js";
+import { createCombinedSessionCost, recordedSessionCost, recordedUsageEntries, COST_ENTRY_TYPE, type SessionCostBreakdown } from "./session-cost.js";
 
 const usage = (total: number) => ({ cost: { total } });
 const message = (role: string, total?: number) => ({ type: "message", message: { role, ...(total === undefined ? {} : { usage: usage(total) }) } });
@@ -40,6 +40,138 @@ function reloadedHost(entries: any[], root: string) {
   return { pi, handlers, ctx: { sessionManager: { getEntries: () => entries, getSessionId: () => root } } };
 }
 
+function breakdown(pi: Pick<ReturnType<typeof harness>["pi"], "events">, sessionId = "root-a") {
+  const request: { sessionId: string; result?: SessionCostBreakdown } = { sessionId };
+  pi.events.emit("pi-extended-teams:cost-breakdown-request", request);
+  return request.result;
+}
+
+describe("read-only session cost breakdown", () => {
+  it("reconciles own and finalized run costs without replay, child or nested double counting", () => {
+    const h = harness();
+    h.entries.push(message("assistant", 1));
+    const telemetry = {
+      schemaVersion: 1 as const, agentName: "reviewer", role: "read" as const,
+      startedAt: 10, completedAt: 20, modelSlot: "read-review",
+      entries: [{ type: "usage" as const, usage: usage(200) }],
+    };
+    h.cost.begin("root-a", "team", "parent").settle({ childSessionId: "child", costUsd: 2, telemetry }, "completed");
+    h.cost.begin("root-a", "nested", "helper").settle({ childSessionId: "nested-child", costUsd: 3 }, "failed");
+    h.cost.begin("root-a", "team", "duplicate").settle({ childSessionId: "child", costUsd: 2 }, "completed");
+    h.cost.begin("root-a", "team", "self").settle({ childSessionId: "root-a", costUsd: 1 }, "completed");
+    h.cost.begin("root-a", "team", "handoff").exclude();
+    h.cost.begin("root-a", "team", "free").settle({ childSessionId: "free-child", costUsd: 0 }, "cancelled");
+    h.entries.push(...structuredClone(h.entries.filter(entry => entry.type === "custom")));
+
+    const result = breakdown(h.pi)!;
+    expect(result).toMatchObject({ usd: 6, complete: true, own: { usd: 1, complete: true } });
+    expect(result.runs).toHaveLength(6);
+    expect(result.runs[0]).toEqual({
+      rootSessionId: "root-a", teamName: "team", lifecycleRunId: "parent", phase: "final",
+      childSessionId: "child", agentName: "reviewer", modelSlot: "read-review", costUsd: 2, accounting: "included",
+    });
+    expect(result.runs.map(run => run.accounting)).toEqual(["included", "included", "duplicate", "duplicate", "excluded", "included"]);
+    const reconciled = result.runs.reduce((usd, run) => usd + (run.accounting === "included" ? run.costUsd! : 0), result.own.usd);
+    expect(reconciled).toBe(result.usd);
+    expect(h.cost.total()).toEqual({ usd: result.usd, complete: result.complete });
+    const aggregate = { sessionId: "root-a", result: undefined };
+    h.pi.events.emit("pi-extended-teams:cost-request", aggregate);
+    expect(aggregate.result).toEqual(h.cost.total());
+
+    h.switchTo("fork-b");
+    expect(breakdown(h.pi)).toBeUndefined();
+    expect(breakdown(h.pi, "fork-b")?.runs[0].rootSessionId).toBe("root-a");
+    expect(breakdown(h.pi, "fork-b")?.usd).toBe(h.cost.total().usd);
+  });
+
+  it("distinguishes pending, unknown, legacy, malformed and unpersisted evidence", () => {
+    const h = harness();
+    h.entries.push({ type: "compaction" });
+    h.cost.begin("root-a", "team", "pending");
+    h.cost.begin("root-a", "team", "unknown").settle(undefined, "failed");
+    h.cost.begin("root-a", "team", "legacy").settle({ childSessionId: "legacy-child", costUsd: 2 }, "completed");
+    const failed = h.cost.begin("root-a", "team", "unpersisted");
+    h.pi.appendEntry.mockImplementationOnce(() => { throw new Error("disk unavailable"); });
+    failed.settle({ childSessionId: "retry-child", costUsd: 3 }, "completed");
+    h.entries.push({ type: "custom", customType: COST_ENTRY_TYPE, data: { phase: "final", costUsd: -1 } });
+
+    const result = breakdown(h.pi)!;
+    expect(result).toMatchObject({ usd: 2, complete: false, own: { usd: 0, complete: false } });
+    expect(result.runs.map(run => [run.lifecycleRunId, run.phase, run.costUsd, run.accounting])).toEqual([
+      ["pending", "pending", null, "incomplete"], ["unknown", "final", null, "incomplete"],
+      ["legacy", "final", 2, "included"], ["unpersisted", "final", 3, "incomplete"],
+    ]);
+    expect(result.runs[2].agentName).toBeUndefined();
+    expect(h.cost.total()).toEqual({ usd: result.usd, complete: result.complete });
+  });
+
+  it("marks malformed receipts and read failures incomplete even without pending runs", () => {
+    const h = harness();
+    h.entries.push({ type: "custom", customType: COST_ENTRY_TYPE, data: { phase: "final" } });
+    expect(breakdown(h.pi)).toEqual({ usd: 0, complete: false, own: { usd: 0, complete: true }, runs: [] });
+    h.ctx.sessionManager.getEntries = () => { throw new Error("unreadable"); };
+    expect(breakdown(h.pi)).toEqual({ usd: 0, complete: false, own: { usd: 0, complete: false }, runs: [] });
+  });
+
+  it("returns only detached scalar fields and never writes or emits a change while queried", () => {
+    const h = harness();
+    h.entries.push({ type: "message", message: { role: "assistant", usage: usage(1), content: "private transcript" } });
+    h.cost.begin("root-a", "team", "private").settle({ childSessionId: "child", costUsd: 2, telemetry: {
+      schemaVersion: 1, agentName: "helper", role: "read", startedAt: 1, completedAt: 2,
+      modelSlot: { arguments: "private arguments" }, entries: [{ content: "private transcript" }],
+    } as any }, "completed");
+    const original = structuredClone(h.entries);
+    h.pi.appendEntry.mockClear();
+    h.pi.events.emit.mockClear();
+
+    const result = breakdown(h.pi)!;
+    expect(result.runs).toEqual([{
+      rootSessionId: "root-a", teamName: "team", lifecycleRunId: "private", phase: "final",
+      childSessionId: "child", costUsd: 2, accounting: "included", agentName: "helper",
+    }]);
+    result.runs[0].costUsd = 999;
+    result.own.usd = 999;
+    result.runs.push(result.runs[0]);
+    expect(breakdown(h.pi)).toMatchObject({ usd: 3, own: { usd: 1 }, runs: [{ costUsd: 2 }] });
+    expect(h.entries).toEqual(original);
+    expect(h.pi.appendEntry).not.toHaveBeenCalled();
+    expect(h.pi.events.emit.mock.calls.map(call => call[0])).toEqual([
+      "pi-extended-teams:cost-breakdown-request", "pi-extended-teams:cost-breakdown-request",
+    ]);
+  });
+
+  it("replays after reload, rejects other roots and old hosts, and isolates session switches", () => {
+    const h = harness();
+    const run = h.cost.begin("root-a", "team", "reload");
+    h.cost.detach();
+    run.settle({ childSessionId: "child", costUsd: 2 }, "completed");
+    expect(breakdown(h.pi)).toBeUndefined();
+    const other = reloadedHost([], "other-root");
+    expect(h.cost.attach(other.pi as any, other.ctx as any)).toBe(false);
+    expect(breakdown(other.pi, "other-root")).toBeUndefined();
+    const fresh = reloadedHost(h.entries, "root-a");
+    expect(h.cost.attach(fresh.pi as any, fresh.ctx as any)).toBe(true);
+    expect(breakdown(h.pi)).toBeUndefined();
+    expect(breakdown(fresh.pi, "other-root")).toBeUndefined();
+    const saved = breakdown(fresh.pi);
+    expect(saved).toMatchObject({ usd: 2, complete: true, runs: [{ lifecycleRunId: "reload" }] });
+    h.cost.detach();
+    expect(h.cost.attach(fresh.pi as any, fresh.ctx as any)).toBe(true);
+    expect(breakdown(fresh.pi)).toEqual(saved);
+    h.cost.deactivate();
+    expect(breakdown(fresh.pi)).toBeUndefined();
+
+    const restarted = createCombinedSessionCost(fresh.pi as any);
+    fresh.handlers.get("session_start")!({}, fresh.ctx);
+    expect(breakdown(fresh.pi)).toEqual(saved);
+    const unrelated = reloadedHost([], "root-b");
+    fresh.handlers.get("session_start")!({}, unrelated.ctx);
+    expect(breakdown(fresh.pi)).toBeUndefined();
+    expect(breakdown(fresh.pi, "root-b")).toEqual({ usd: 0, complete: true, own: { usd: 0, complete: true }, runs: [] });
+    restarted.deactivate();
+  });
+});
+
 describe("combined Pi-recorded session cost", () => {
   it("serves live totals only to the current session's display, including incomplete and replayed costs", () => {
     const h = harness();
@@ -75,6 +207,39 @@ describe("combined Pi-recorded session cost", () => {
       expect(recordedSessionCost([entry])).toEqual({ usd: 0, complete: false });
     }
     expect(recordedSessionCost([message("assistant", 0)])).toEqual({ usd: 0, complete: true });
+  });
+
+  it("includes Pi 1.4 standalone usage in own cost without descending into nested calls", () => {
+    expect(recordedSessionCost([{ type: "usage", kind: "cache-warm", provider: "p", model: "m", usage: usage(2),
+      nestedCalls: [{ usage: usage(100) }] }])).toEqual({ usd: 2, complete: true });
+    expect(recordedSessionCost([{ type: "usage" }])).toEqual({ usd: 0, complete: false });
+  });
+
+  it("extracts only native usage evidence, preserving mixed models and unknown legacy summaries", () => {
+    const entries = [
+      { id: "a", type: "message", timestamp: "entry-time", parentId: "private", message: {
+        role: "assistant", provider: "p", model: "first", responseModel: "observed", timestamp: 10, durationMs: 5,
+        stopReason: "stop", content: "private", headers: { secret: "private" }, usage: {
+          input: 2, output: 3, reasoning: 1, cacheRead: 0, cacheWrite: null, totalTokens: 5,
+          cost: { input: 0.1, output: 0.2, total: 0.3, secret: "private" }, nestedCalls: [{ private: true }] } } },
+      { id: "b", type: "usage", timestamp: "later", kind: "cache-warm", provider: "p", model: "second",
+        usage: { input: -1, output: Infinity, totalTokens: "9", cost: { total: 2 } }, note: "private" },
+      { id: "c", type: "message", message: { role: "toolResult", content: "private", model: "not-proven", usage: usage(4) } },
+      { id: "d", type: "compaction", retainedTail: [message("assistant", 99)] },
+      { id: "e", type: "branch_summary", usage: usage(5) },
+      message("toolResult"), message("user", 99), { type: "custom", customType: COST_ENTRY_TYPE, usage: usage(99) },
+    ];
+    const original = structuredClone(entries);
+    expect(recordedUsageEntries(entries)).toEqual([
+      { id: "a", type: "message", timestamp: "entry-time", message: { role: "assistant", provider: "p", model: "first",
+        responseModel: "observed", timestamp: 10, durationMs: 5, stopReason: "stop", usage: {
+          input: 2, output: 3, reasoning: 1, cacheRead: 0, cacheWrite: null, totalTokens: 5,
+          cost: { input: 0.1, output: 0.2, total: 0.3 } } } },
+      { id: "b", type: "usage", timestamp: "later", kind: "cache-warm", provider: "p", model: "second", usage: { cost: { total: 2 } } },
+      { id: "c", type: "message", message: { role: "toolResult", usage: usage(4) } },
+      { id: "d", type: "compaction" }, { id: "e", type: "branch_summary", usage: usage(5) },
+    ]);
+    expect(entries).toEqual(original);
   });
 
   it("deduplicates public-entry replay by root/team/run and child session while counting new runs and nested own spend", () => {
@@ -142,13 +307,16 @@ describe("combined Pi-recorded session cost", () => {
     h.ctx.sessionManager.getSessionId = () => { throw new Error("old context used"); };
 
     const run = h.cost.begin("root-a", "team", "detached-terminal");
-    run.settle({ childSessionId: "child", costUsd: 3 }, "completed");
+    const telemetry = { schemaVersion: 1 as const, agentName: "helper", role: "read" as const,
+      startedAt: 10, completedAt: 20, parentLifecycleRunId: "writer-run", modelSlot: "read-review",
+      entries: recordedUsageEntries([{ id: "usage-1", type: "usage", model: "observed", usage: usage(3) }]) };
+    run.settle({ childSessionId: "child", costUsd: 3, telemetry }, "completed");
     run.settle({ childSessionId: "later", costUsd: 99 }, "failed");
     const fresh = reloadedHost(h.entries, "root-a");
     h.cost.attach(fresh.pi as any, fresh.ctx as any);
     expect(h.cost.total()).toEqual({ usd: 3, complete: true });
     expect(fresh.pi.appendEntry).toHaveBeenCalledExactlyOnceWith(COST_ENTRY_TYPE,
-      expect.objectContaining({ lifecycleRunId: "detached-terminal", phase: "final", outcome: "completed", costUsd: 3 }));
+      expect.objectContaining({ lifecycleRunId: "detached-terminal", phase: "final", outcome: "completed", costUsd: 3, telemetry }));
     h.cost.detach();
     h.cost.attach(fresh.pi as any, fresh.ctx as any);
     expect(fresh.pi.appendEntry).toHaveBeenCalledOnce();

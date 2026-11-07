@@ -5,7 +5,7 @@ import { isHeartbeatFresh, STARTUP_STALL_MS, type AgentRuntimeStatus } from "../
 export const AGENT_HANGING_MS = 15 * 60_000;
 
 export type ActiveAgentPhase = "starting" | "thinking" | "working" | "finishing"
-  | "stalled" | "stopping" | "quarantined" | "persistence-failed";
+  | "unknown" | "stalled" | "stopping" | "quarantined" | "persistence-failed";
 
 export interface AgentActivity {
   runId: string;
@@ -15,6 +15,7 @@ export interface AgentActivity {
   lastActivityAt?: number;
   teardownState?: string;
   handoffDetached?: boolean;
+  externalControl?: object;
   latestProgress?: string;
   progressUpdatedAt?: number;
   activeToolName?: string;
@@ -58,8 +59,9 @@ export function projectAgentStatus(input: {
   const inProcess = !!state && state.teardownState !== "finalized" && !state.handoffDetached;
   const externalAlive = member.isActive !== false && (hasRecentHeartbeat || input.terminalAlive === true);
   const alive = inProcess || externalAlive ? true
-    : member.isActive === false || input.terminalAlive === false || member.role === "read" ? false : null;
-  const startupStalled = alive === true && (input.unreadCount ?? 0) > 0
+    : member.isActive === false || input.terminalAlive === false ? false : null;
+  const telemetryUnavailable = !!state?.externalControl || (!state && !runtime);
+  const startupStalled = !telemetryUnavailable && alive === true && (input.unreadCount ?? 0) > 0
     && now - member.joinedAt > STARTUP_STALL_MS && !runtime?.ready;
   const teardownPhase = state?.teardownState === "persistence_failed" ? "persistence-failed"
     : state?.teardownState === "quarantined" ? "quarantined"
@@ -67,7 +69,8 @@ export function projectAgentStatus(input: {
   const fencedPhase = teardownPhase ?? persisted?.phase;
   let phase: ActiveAgentPhase;
   if (fencedPhase) phase = fencedPhase;
-  else if (inProcess) phase = now - (state.lastActivityAt || state.startedAt) >= AGENT_HANGING_MS ? "stalled" : state.status;
+  else if (inProcess) phase = !telemetryUnavailable && now - (state.lastActivityAt || state.startedAt) >= AGENT_HANGING_MS ? "stalled" : state.status;
+  else if (telemetryUnavailable && alive !== false) phase = "unknown";
   else if (!externalAlive) phase = member.isActive !== false && !runtime?.ready && now - member.joinedAt <= STARTUP_STALL_MS ? "starting" : "stalled";
   else phase = runtime?.currentAction === "done" ? "finishing" : runtime?.currentAction ?? (runtime?.ready ? "working" : "starting");
 
@@ -77,8 +80,9 @@ export function projectAgentStatus(input: {
         : startupStalled || (phase === "stalled" && alive) ? "stalled"
           : alive === null ? "unknown"
             : !alive ? "dead"
-              : runtime?.ready ? hasRecentHeartbeat ? "healthy" : "idle"
-                : inProcess && state.status !== "starting" ? "healthy" : "starting";
+              : telemetryUnavailable ? "unknown"
+                : runtime?.ready ? hasRecentHeartbeat ? "healthy" : "idle"
+                  : inProcess && state.status !== "starting" ? "healthy" : "starting";
   return {
     phase, alive, health, hasRecentHeartbeat, startupStalled,
     agentLoopReady: !fencedPhase && alive === true && (!!runtime?.ready || (inProcess && state.status !== "starting")),

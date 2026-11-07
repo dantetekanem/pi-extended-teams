@@ -64,6 +64,8 @@ export interface RoleModelConfig {
 export interface FavoriteModelConfig {
   model: string | null;
   thinking: string | null;
+  /** Select a global external profile; an empty string preserves an invalid binding. */
+  harness?: string;
 }
 
 /** A named preset bundling a role with optional model/thinking overrides. */
@@ -275,7 +277,10 @@ function favoriteModelConfigFromRaw(
   base?: FavoriteModelConfig
 ): FavoriteModelConfig | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const harness = raw.harness === undefined || raw.harness === null ? undefined : toStringOrNull(raw.harness) ?? "";
+  if (harness === "") return { model: null, thinking: null, harness };
   return {
+    ...(harness !== undefined ? { harness } : {}),
     // Keep configured and spawn-time model identities aligned.
     model: "model" in raw ? normalizeQualifiedModel(String(raw.model ?? "")) : (base?.model ?? null),
     thinking: "thinking" in raw ? normalizeThinking(raw.thinking) : (base?.thinking ?? null),
@@ -500,6 +505,11 @@ export function replaceGlobalFavoriteModels(
   for (const slot of FAVORITE_MODEL_SLOTS) {
     const config = canonicalInput[slot];
     if (!config) continue;
+    if (config.harness !== undefined && config.harness !== null) {
+      const normalized = favoriteModelConfigFromRaw(config);
+      if (normalized) next[slot] = normalized;
+      continue;
+    }
     const model = toStringOrNull(config.model);
     const thinking = normalizeThinking(config.thinking);
     if (!model || !thinking) continue;

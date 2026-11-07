@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { Key, visibleWidth } from "@mariozechner/pi-tui";
 import { globalSettingsPath, LEGACY_FAVORITE_MODEL_SLOT_ALIASES, projectSettingsPath } from "../src/utils/settings";
@@ -426,10 +427,11 @@ describe("extension integration", () => {
 
       expect(result.details).toMatchObject({ name: "editor", role: "write", mode: "in-process", terminalId: null, session: "session-edit-session", modelSlot: "write-critical" });
       expect(setup.terminal.spawn).not.toHaveBeenCalled();
+      const [, member] = setup.readAgentMock.runReadAgentInProcess.mock.calls[0];
       expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledWith(
         "session-edit-session",
-        expect.objectContaining({ name: "editor", role: "write", model: "provider/model", thinking: "xhigh", modelSlot: "write-critical" }),
-        "Edit the file",
+        expect.objectContaining({ name: "editor", role: "write", model: "provider/model", thinking: "xhigh", modelSlot: "write-critical", prompt: "Edit the file" }),
+        `${member.peerPlan}\n\nEdit the file`,
         expect.objectContaining({ cwd: ctx.cwd, model: ctx.model, modelRegistry: ctx.modelRegistry, sessionManager: ctx.sessionManager }),
         expect.any(Object),
       );
@@ -441,7 +443,7 @@ describe("extension integration", () => {
     }
   });
 
-  it("delivers completed read reports to lead context without rendering their bodies", async () => {
+  it("delivers a visible completion summary once while keeping the full report in lead context", async () => {
     const setup = await setupExtension({}, { withSendMessage: true });
     try {
       writeFavoriteLevels(setup.root);
@@ -462,6 +464,8 @@ describe("extension integration", () => {
         42,
         "Full report body for the lead model.",
         true,
+        false,
+        "Verified the project checks.",
       );
 
       expect(setup.pi.events.emit).toHaveBeenCalledWith(
@@ -478,8 +482,8 @@ describe("extension integration", () => {
         {
           customType: "pi-extended-teams-report",
           content: "Full report body for the lead model.",
-          display: false,
-          details: { name: "reader", elapsedMs: 1_000, tokens: 42, ok: true },
+          display: true,
+          details: { name: "reader", elapsedMs: 1_000, tokens: 42, ok: true, summary: "Verified the project checks." },
         },
         { triggerTurn: true, deliverAs: "followUp" },
       );
@@ -626,6 +630,29 @@ describe("extension integration", () => {
     }
   });
 
+  it("shows a fallback notice in the user transcript without requesting a model turn", async () => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    try {
+      writeFavoriteLevels(setup.root);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader",
+        prompt: "Inspect source",
+        cwd: setup.root,
+        model_slot: "read-review",
+      }, new AbortController().signal, undefined, makeCtx(setup.root));
+      const options = setup.readAgentMock.runReadAgentInProcess.mock.calls[0]![4];
+      const content = "reader: quota exhausted; falling back read-review → read-collect (provider/model).";
+
+      options.notifyFallback(content);
+
+      expect(setup.pi.sendMessage).toHaveBeenCalledWith({
+        customType: "pi-extended-teams-fallback", content, display: true,
+      }, { triggerTurn: false });
+    } finally {
+      setup.restoreEnv();
+    }
+  });
+
   it("emits only the minimal correlated nested-agent progress event", async () => {
     const setup = await setupExtension();
     try {
@@ -723,6 +750,110 @@ describe("extension integration", () => {
     }
   });
 
+  it("keeps team adoption and inbox polling when the lead watcher cannot start", async () => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    const ctx = makeCtx(setup.root);
+    const watch = fs.watch;
+    let watcherRefused = false;
+    vi.spyOn(fs, "watch").mockImplementation((...args) => {
+      if (path.basename(String(args[0])) === "inboxes") {
+        watcherRefused = true;
+        throw Object.assign(new Error("Watcher limit reached"), { code: "ENOSPC" });
+      }
+      return watch(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader", prompt: "Inspect", model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      expect(watcherRefused).toBe(true);
+      expect(setup.readAgentMock.runReadAgentInProcess).toHaveBeenCalledOnce();
+
+      const messaging = await import("../src/utils/messaging.js");
+      await messaging.sendPlainMessage("session-test-session", "reader", "team-lead", "Question", "Clarification");
+      expect(setup.pi.sendMessage).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(setup.pi.sendMessage).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ customType: "pi-extended-teams-wake" }),
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } finally {
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, ctx);
+      setup.restoreEnv();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it("wakes the coordinator immediately for a native agent question", async () => {
+    const setup = await setupExtension({}, { withSendMessage: true });
+    const ctx = makeCtx(setup.root);
+    try {
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader", prompt: "Inspect", model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      const [team, member, , , callbacks] = setup.readAgentMock.runReadAgentInProcess.mock.calls[0];
+      const { createSendMessageTool } = await import("./tools/send-message.js");
+      await createSendMessageTool({
+        agentName: member.name, isTeammate: true, getTeamName: () => team,
+        getLifecycleRunId: () => member.lifecycleRunId, notifySent: callbacks.notifyMessageSent,
+      }).execute("ask", { content: "Which API should I use?" });
+      expect(setup.pi.sendMessage).toHaveBeenCalledOnce();
+      const messaging = await import("../src/utils/messaging.js");
+      expect(await messaging.readInbox(team, "team-lead", true, false)).toMatchObject([{ from: "reader", text: "Which API should I use?" }]);
+    } finally {
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, ctx);
+      setup.restoreEnv();
+    }
+  });
+
+  it.each([false, true])("binds external message delivery to the persisted recipient run (replaced=%s)", async replaced => {
+    const setup = await setupExtension();
+    const ctx = makeCtx(setup.root);
+    let state: any;
+    let callbacks: any;
+    try {
+      setup.readAgentMock.runReadAgentInProcess.mockImplementation((teamName: string, member: any, _prompt: string, _ctx: any, options: any) => {
+        callbacks = options;
+        state = {
+          teamName, name: member.name, runId: member.lifecycleRunId, status: "working",
+          startedAt: Date.now(), lastActivityAt: Date.now(), tokensUsed: 0, recentEvents: [],
+          acceptingMessages: true, externalControl: { sendMessage: vi.fn() },
+        };
+        options.runningReadAgents.set(options.readAgentKey(teamName, member.name), state);
+      });
+      for (const handler of setup.eventHandlers.get("session_start") ?? []) await handler({}, ctx);
+      await setup.tools.get("spawn_agent")!.execute("spawn", {
+        name: "reader", prompt: "Inspect", model_slot: "read-review",
+      }, new AbortController().signal, undefined, ctx);
+      const messaging = await import("../src/utils/messaging.js");
+      const append = messaging.appendMessageOnceIfRunning;
+      const originalRunId = state.runId;
+      vi.spyOn(messaging, "appendMessageOnceIfRunning").mockImplementation(async (...args) => {
+        const result = await append(...args);
+        if (replaced) {
+          state = { ...state, runId: "replacement-run" };
+          callbacks.runningReadAgents.set(callbacks.readAgentKey(state.teamName, state.name), state);
+        }
+        return result;
+      });
+      setup.readAgentMock.sendMessageToRunningReadAgent.mockResolvedValue(true);
+      await setup.tools.get("send_message")!.execute("message", { recipient: "reader", content: "Question for original run" },
+        new AbortController().signal, undefined, ctx);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(setup.readAgentMock.sendMessageToRunningReadAgent).toHaveBeenCalledTimes(replaced ? 0 : 1);
+      expect(await messaging.readInbox(state.teamName, "reader", false, false)).toMatchObject([
+        { text: "Question for original run", read: !replaced, metadata: { recipientRunId: originalRunId } },
+      ]);
+    } finally {
+      if (state) callbacks.runningReadAgents.delete(callbacks.readAgentKey(state.teamName, state.name));
+      for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, ctx);
+      setup.restoreEnv();
+    }
+  });
+
   it("injects every new agent inbox message as a lead follow-up even while busy", async () => {
     const setup = await setupExtension({}, { withSendMessage: true });
     try {
@@ -751,7 +882,6 @@ describe("extension integration", () => {
         { metadata: { finalReport: true } }
       );
       await vi.advanceTimersByTimeAsync(30_000);
-
       expect(setup.pi.sendMessage).toHaveBeenCalledTimes(1);
       expect(setup.pi.sendMessage).toHaveBeenCalledWith(
         expect.objectContaining({ customType: "pi-extended-teams-wake", content: expect.stringContaining("A teammate finished and sent its final report"), display: false }),
@@ -1180,7 +1310,11 @@ describe("extension integration", () => {
     }
   });
 
-  it("renders zero before provider context usage and updates without remounting", async () => {
+  it.each([
+    { modelSlot: "read-review", external: false },
+    { modelSlot: "read-review", external: true },
+    { modelSlot: "write-critical", external: true },
+  ])("updates $modelSlot context usage without remounting (external: $external)", async ({ modelSlot, external }) => {
     const setup = await setupExtension();
     try {
       let billedTokenCount = 0;
@@ -1206,6 +1340,7 @@ describe("extension integration", () => {
           thinking: member.thinking,
           modelSlot: member.modelSlot,
           latestAssistantSnippet: "secret agent thought",
+          externalControl: external ? {} : undefined,
           latestProgress: "Reviewing focused test coverage",
           progressUpdatedAt: Date.now(),
           heartbeatTimer: setInterval(heartbeatWork, 5_000),
@@ -1229,7 +1364,7 @@ describe("extension integration", () => {
         name: "reader",
         prompt: "Think about this",
         cwd: setup.root,
-        model_slot: "reading-default",
+        model_slot: modelSlot,
       }, abort, undefined, ctx);
       await vi.advanceTimersByTimeAsync(100);
 
@@ -1241,7 +1376,13 @@ describe("extension integration", () => {
       const widget = widgetCall![1]({ requestRender });
       const initialRendered = widget.render(160).join("\n");
       expect(initialRendered).toContain("agent activity");
-      expect(initialRendered).toMatch(/\(reader\) model\/high · read-review · 1s · 0 tok \(0%\) · Reviewing focused test coverage\.{1,3}/);
+      if (external) {
+        expect(initialRendered.split("\n")[1].trimEnd()).toBe(`└─ (reader) · ${modelSlot} · external agent running · 1s`);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(widget.render(160).join("\n")).toContain(`(reader) · ${modelSlot} · external agent running · 2s`);
+      } else {
+        expect(initialRendered).toMatch(/\(reader\) model\/high · read-review · 1s · 0 tok \(0%\) · Reviewing focused test coverage\.{1,3}/);
+      }
       expect(initialRendered).not.toContain("597 tok");
       expect(initialRendered).not.toContain("secret agent thought");
       expect(initialRendered).not.toContain("reader read thinking");
@@ -1251,16 +1392,18 @@ describe("extension integration", () => {
       billedTokenCount = 2_300_000;
       contextTokenCount = 80_000;
       contextPercent = 40;
+      delete runningState.externalControl;
       runningState.latestProgress = "Writing the final report";
       runningState.progressUpdatedAt = Date.now();
       await vi.advanceTimersByTimeAsync(1_000);
 
       let updatedRendered = widget.render(160).join("\n");
-      expect(updatedRendered).toContain("Reviewing focused test coverage");
-      expect(updatedRendered).not.toContain("Writing the final report");
+      expect(updatedRendered).toContain(external ? "Writing the final report" : "Reviewing focused test coverage");
+      if (!external) expect(updatedRendered).not.toContain("Writing the final report");
       await vi.advanceTimersByTimeAsync(1_000);
       updatedRendered = widget.render(160).join("\n");
-      expect(updatedRendered).toMatch(/\(reader\) model\/high · read-review · 3s · 80k tok \(40%\) · Writing the final report\.{1,3}/);
+      const elapsed = external ? "4s" : "3s";
+      expect(updatedRendered).toContain(`(reader) model/${runningState.thinking} · ${modelSlot} · ${elapsed} · 80k tok (40%) · Writing the final report`);
       expect(updatedRendered).not.toContain("2.3M tok");
       expect(requestRender).toHaveBeenCalled();
       expect(ctx.ui.setWidget.mock.calls.filter((call: any[]) => call[0] === "01-pi-extended-teams-readers" && typeof call[1] === "function")).toHaveLength(1);
@@ -1692,6 +1835,7 @@ describe("extension integration", () => {
           lastActivityAt: Date.now(), role: member.role, model: member.model,
           thinking: member.thinking, modelSlot: member.modelSlot,
           acceptingMessages: true, messageDeliveryClosed: false,
+          inbox: { refresh: vi.fn(async () => {}) },
           session: { abort, dispose, clearQueue: () => ({ steering: [], followUp: [] }),
             getSessionStats: () => ({ tokens: { total: 0 } }) },
         };
@@ -1745,7 +1889,9 @@ describe("extension integration", () => {
       setup.readAgentMock.sendMessageToRunningReadAgent.mockResolvedValue(true);
       await setup.tools.get("send_message")!.execute("message", { recipient: "reader", content: "Continue" },
         new AbortController().signal, undefined, reloaded.ctx);
-      expect(setup.readAgentMock.sendMessageToRunningReadAgent).toHaveBeenCalledWith(state, "Continue", false);
+      expect(state.inbox.refresh).toHaveBeenCalledOnce();
+      const messaging = await import("../src/utils/messaging.js");
+      expect(await messaging.readInbox(state.teamName, "reader", true, false)).toMatchObject([{ text: "Continue", from: "team-lead" }]);
 
       for (const handler of setup.eventHandlers.get("session_shutdown") ?? []) await handler({ reason: "quit" }, reloaded.ctx);
       expect(abort).toHaveBeenCalledOnce();
@@ -2165,10 +2311,10 @@ describe("extension integration", () => {
       expect(latestActivityCall?.[1]).toBeTypeOf("function");
       const card = latestActivityCall![1]({ requestRender: vi.fn() }).render(160).join("\n");
       expect(card).toContain("reader");
-      expect(card).toContain("stalled");
+      expect(card).toContain(telemetry === "stale" ? "stalled" : "unknown");
       expect(card).toContain(telemetry === "stale" ? "heartbeat stale" : "telemetry unavailable");
       const snapshot = await setup.tools.get("get_agent_status")!.execute("status", { agent_name: "reader" }, abort, undefined, ctx);
-      expect(snapshot.details.statuses).toMatchObject([{ name: "reader", phase: "stalled" }]);
+      expect(snapshot.details.statuses).toMatchObject([{ name: "reader", phase: telemetry === "stale" ? "stalled" : "unknown" }]);
     } finally {
       setup.restoreEnv();
     }

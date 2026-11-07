@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { registerFavoriteModelsCommand } from "./favorite-models-command.js";
 import { globalSettingsPath } from "../../src/utils/settings";
+import * as externalProfiles from "../../src/utils/external-harness-config";
 
 let homeDir: string;
 
@@ -36,10 +37,103 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   fs.rmSync(homeDir, { recursive: true, force: true });
 });
 
 describe("/agents-favorite-models", () => {
+  it.each(["text", "tui"])("resolves a valid fallback profile in %s output using its tier", async mode => {
+    const file = globalSettingsPath(homeDir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      favoriteModels: {
+        "write-critical": { harness: "fallback" },
+        "write-system": { model: "provider/model", thinking: "high" },
+      },
+      externalHarnesses: { fallback: { kind: "claude", nativeFallback: true } },
+    }));
+    fs.writeFileSync(path.join(homeDir, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    vi.stubEnv("PATH", homeDir);
+    const { commands, ctx } = setupCommand();
+    const command = commands.get("agents-favorite-models");
+    const profile = "claude · CLI defaults (fallback)";
+
+    if (mode === "text") {
+      await command.handler("", ctx);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining(`- write-critical: ${profile}`),
+        "info",
+      );
+      return;
+    }
+
+    let rendered = "";
+    const custom = async (factory: any) => {
+      const component = factory(
+        { requestRender: vi.fn(), terminal: { rows: 40 } },
+        testTheme(),
+        {},
+        vi.fn(),
+      );
+      for (let index = 0; index < 7; index++) {
+        component.handleInput("\x1b[B");
+      }
+      rendered = component.render(220).join("\n");
+    };
+    await command.handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
+    expect(rendered).toContain(`write-critical  ${profile}`);
+    expect(rendered).toContain(`Selected write-critical: ${profile}`);
+  });
+
+  it("shows a harness binding, preserves it while editing other slots, and switches back to Pi on model selection", async () => {
+    const file = globalSettingsPath(homeDir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ favoriteModels: { "write-critical": { harness: "opus" } } }));
+    vi.spyOn(externalProfiles, "resolveExternalHarness").mockReturnValue({
+      name: "opus", kind: "claude", command: "/bin/claude",
+      args: ["--model", "claude-opus-5-5", "--effort", "max"], instructions: "",
+    });
+    const { commands, ctx } = setupCommand();
+    const saved = () => JSON.parse(fs.readFileSync(file, "utf8")).favoriteModels;
+    const custom = async (factory: any) => {
+      const component = factory({ requestRender: vi.fn(), terminal: { rows: 40 } }, testTheme(), {}, vi.fn());
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[B");
+      expect(saved()["write-critical"].harness).toBe("opus");
+      component.handleInput("\x1b[D");
+      for (let index = 0; index < 7; index++) component.handleInput("\x1b[B");
+      expect(component.render(220).join("\n")).toContain("claude-opus-5-5 --effort max");
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[A");
+      expect(saved()["write-critical"].harness).toBe("opus");
+      component.handleInput("\x1b[D");
+      component.handleInput("\x1b[B");
+      expect(saved()["write-critical"]).toEqual({ model: "provider/model", thinking: "high" });
+    };
+
+    await commands.get("agents-favorite-models").handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("keeps the picker usable and preserves an invalid binding when editing another tier", async () => {
+    const file = globalSettingsPath(homeDir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ favoriteModels: { "write-critical": { harness: 123 } } }));
+    const { commands, ctx } = setupCommand();
+    const custom = vi.fn(async (factory: any) => {
+      const component = factory({ requestRender: vi.fn(), terminal: { rows: 40 } }, testTheme(), {}, vi.fn());
+      component.handleInput("\x1b[C");
+      component.handleInput("\x1b[B");
+      const saved = JSON.parse(fs.readFileSync(file, "utf8")).favoriteModels;
+      expect(saved["read-collect"]).toEqual({ model: "provider/model", thinking: "high" });
+      expect(saved["write-critical"]).toEqual({ model: null, thinking: null, harness: "" });
+    });
+    await commands.get("agents-favorite-models").handler("", { ...ctx, mode: "tui", ui: { ...ctx.ui, custom } });
+    expect(custom).toHaveBeenCalledOnce();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
   it("registers and displays empty slots", async () => {
     const { commands, ctx } = setupCommand();
 

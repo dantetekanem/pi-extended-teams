@@ -2,7 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2.6.3] - 2026-11-04
+
+### Changed
+- Show finished agent reports in Pi's tool-call box, with the agent name, status, elapsed time, token count, and summary. Expand the box to read the full report; failed agents use the tool error background. Reports without a saved summary keep their existing layout (#52).
+
+## [2.6.2] - 2026-11-04
+
+### Changed
+- Show compact grey agent-completion notices in the lead conversation.
+- Update delegation guidance to use bounded execution lanes for substantial independent work and explicit team-leader requests.
+
+## [2.6.1] - 2026-10-31
+
+### Added
+- Let native Pi agents message peers directly and wait for a matching clarification reply for up to 60 seconds without polling.
+- Give spawned agents a shared assignment snapshot, including every planned batch member before launch and through queueing.
+
+### Fixed
+- End reply waits on cancellation or timeout even when message storage or notification is still pending, and keep notifications bound to the intended agent run.
+- Keep team adoption and inbox polling working when the lead's filesystem watcher cannot start.
+
+## [2.6.0] - 2026-10-27
+
+### Added
+- Optional global profiles for Claude Code, OpenCode, Amp, and Codex subagents in Herdr sibling panes. Bind a profile through `favoriteModels.<tier>.harness`; spawn calls select only the tier and reject harness overrides.
+- Display external harnesses and CLI arguments in the existing favorite-model picker. Preserve bindings when other tiers change; selecting a Pi model or clearing a tier removes its binding.
+- Validate private, run-bound report artifacts before saving and delivering results to the spawning owner. Route a departed owner's report to the lead rather than a replacement agent; Herdr idle/done is not a completion receipt.
+- Keep external agents in role capacity and the activity view, with pane focus, messaging, interrupts, and same-process reload support. Retain ownership when pane cleanup cannot be verified.
+- Include an external-harness setup guide with native CLI configuration, permissions, and supported controls.
+
+### Changed
+- Honor explicit requests for a scoped agent before optional planning. Keep other delegation focused on independent work.
+
+### Limits
+- External harnesses require Herdr and an installed CLI; missing prerequisites do not trigger fallback. Claude quota/capacity fallback to the immediately lower native tier is opt-in. They use their own permissions and do not expose Pi transcripts or usage telemetry. Assigned checks, automatic repair, checkpoints, batch-report grouping, and delegation from an external agent are not supported. Process-restart recovery remains unsupported.
 
 ## [2.5.1] - 2026-09-19
 

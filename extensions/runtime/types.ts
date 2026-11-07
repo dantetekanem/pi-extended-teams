@@ -52,11 +52,19 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   /** Optional accounting observer, called only after exact successful lifecycle settlement. */
   onCostSettled?(): void;
   session?: AgentSession;
+  inbox?: import("../../src/utils/agent-inbox").AgentInbox;
+  externalControl?: {
+    stop(): Promise<void>;
+    message(content: string): Promise<void>;
+    interrupt(): Promise<void>;
+    focus(): Promise<void>;
+  };
   moveToHerdr?(): Promise<void>;
   finished?: Promise<void>;
 }
 
 export type AgentReportSource =
+  | "external-harness"
   | "report_and_exit"
   | "persisted-report_and_exit"
   | "assistant-text"

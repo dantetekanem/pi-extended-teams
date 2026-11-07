@@ -13,6 +13,7 @@ import {
   type ThinkingLevelName,
 } from "../../src/utils/settings";
 import { normalizeQualifiedModel } from "../../src/utils/model-resolution";
+import { resolveExternalHarness } from "../../src/utils/external-harness-config";
 import { clampThinkingLevel, getSupportedThinkingLevels } from "../../src/utils/thinking-levels";
 import { getAvailableModels, type AvailableRegisteredModel } from "../internal/model-selection";
 
@@ -36,7 +37,17 @@ const DEFAULT_THINKING_BY_SLOT: Record<CanonicalFavoriteModelSlot, ThinkingLevel
 
 const COLUMNS: PickerColumn[] = ["slots", "models", "thinking"];
 
+function formatExternalHarness(name: string, modelSlot: CanonicalFavoriteModelSlot): string {
+  try {
+    const profile = resolveExternalHarness(name, { modelSlot });
+    return `${profile.kind} · ${profile.args.join(" ") || "CLI defaults"} (${name})`;
+  } catch (error) {
+    return `harness ${name} !unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
 function formatSlot(slot: CanonicalFavoriteModelSlot, config?: FavoriteModelConfig): string {
+  if (config?.harness !== undefined) return `- ${slot}: ${formatExternalHarness(config.harness, slot)}`;
   if (!config?.model || !config.thinking) return `- ${slot}: (empty)`;
   return `- ${slot}: ${config.model} · ${config.thinking}`;
 }
@@ -103,8 +114,8 @@ function cloneFavoriteModels(input: FavoriteModelsDraft): FavoriteModelsDraft {
   const draft: FavoriteModelsDraft = {};
   for (const slot of FAVORITE_MODEL_SLOTS) {
     const config = input[slot];
-    if (!config?.model || !config.thinking) continue;
-    draft[slot] = { model: config.model, thinking: config.thinking };
+    if (!config || (config.harness === undefined && (!config.model || !config.thinking))) continue;
+    draft[slot] = { ...config };
   }
   return draft;
 }
@@ -187,6 +198,10 @@ async function showFavoriteModelsPicker(ctx: any): Promise<void> {
 
     const setThinkingByDelta = (delta: number) => {
       const slot = selectedSlot();
+      if (draft[slot]?.harness !== undefined) {
+        notice = "Set effort in the external harness profile, not Pi thinking.";
+        return;
+      }
       if (!draft[slot]?.model) {
         notice = `Pick a scoped model for ${slot} before choosing thinking.`;
         return;
@@ -239,6 +254,7 @@ async function showFavoriteModelsPicker(ctx: any): Promise<void> {
         const config = draft[slot];
         const selected = index === selectedSlotIndex;
         const pointer = selected ? "›" : " ";
+        if (config?.harness !== undefined) return `${pointer} ${slot}  ${formatExternalHarness(config.harness, slot)}`;
         const model = config?.model ?? "empty";
         const thinking = config?.thinking ?? "unset";
         const unavailable = config?.model && !availableSet.has(config.model) ? " !unavailable" : "";
@@ -265,6 +281,7 @@ async function showFavoriteModelsPicker(ctx: any): Promise<void> {
 
     const buildThinkingRows = (): string[] => {
       const config = selectedConfig();
+      if (config?.harness !== undefined) return ["Harness-managed"];
       if (!config?.model) return ["  Pick a model first."];
       const levels = selectedThinkingLevels();
       if (levels.length === 0) return ["  Model unavailable."];
@@ -295,6 +312,7 @@ async function showFavoriteModelsPicker(ctx: any): Promise<void> {
         colors.dim(`${availableModels.length} scoped model(s) available from this Pi session · saves to ${globalSettingsPath()}`),
         colors.dim("←/→: move columns · ↑/↓: change selection · type anywhere to filter model names"),
         colors.success("Changes auto-save · esc/enter: leave · delete: clear slot · ctrl+a: clear all"),
+        colors.dim("Other harnesses: ask your model to read pi-extended-teams/docs/external-harnesses.md."),
         "",
       ];
 
@@ -310,7 +328,11 @@ async function showFavoriteModelsPicker(ctx: any): Promise<void> {
 
       const config = selectedConfig();
       lines.push("");
-      lines.push(colors.dim(`Selected ${selectedSlot()}: ${config?.model ?? "empty"} · ${config?.thinking ?? "unset"}`));
+      const selection = config?.harness !== undefined
+        ? formatExternalHarness(config.harness, selectedSlot())
+        : `${config?.model ?? "empty"} · ${config?.thinking ?? "unset"}`;
+      lines.push(colors.dim(`Selected ${selectedSlot()}: ${selection}`));
+      if (config?.harness !== undefined) lines.push(colors.dim("Selecting a scoped model switches this tier back to Pi. Edit the external profile for CLI options."));
       if (notice) {
         lines.push(colors.warning(notice));
       }

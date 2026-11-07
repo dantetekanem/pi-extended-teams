@@ -52,6 +52,36 @@ function writeProject(obj: unknown) {
 }
 
 describe("loadSettings", () => {
+  it.each([{ model: null, thinking: null }, { model: "provider/model", thinking: "high" }])("preserves global harness bindings and native fallback %j through picker saves", native => {
+    writeGlobal({ favoriteModels: { "write-critical": { ...native, harness: "claude-opus" } } });
+    writeProject({ favoriteModels: { "write-critical": { harness: "other" }, "read-review": { harness: "other" } } });
+    const favorites = loadSettings({ homeDir, projectDir }).favoriteModels;
+    expect(favorites["write-critical"]).toEqual({ ...native, harness: "claude-opus" });
+    expect(favorites["read-review"]).toBeUndefined();
+
+    favorites["read-collect"] = { model: "provider/model", thinking: "high" };
+    replaceGlobalFavoriteModels(favorites, { homeDir });
+    expect(loadSettings({ homeDir }).favoriteModels["write-critical"]).toEqual(favorites["write-critical"]);
+
+    setGlobalFavoriteModel("write-critical", { model: "provider/model", thinking: "max" }, { homeDir });
+    expect(loadSettings({ homeDir }).favoriteModels["write-critical"]).toEqual({ model: "provider/model", thinking: "max" });
+  });
+
+  it.each(["", "  ", 123, false, {}])("isolates an invalid harness binding while preserving it through saves: %j", harness => {
+    const native = { model: "provider/model", thinking: "high" };
+    writeGlobal({ favoriteModels: { "write-critical": { ...native, harness }, "read-review": native } });
+    const favorites = loadSettings({ homeDir }).favoriteModels;
+    expect(favorites["read-review"]).toEqual(native);
+    expect(favorites["write-critical"]).toEqual({ model: null, thinking: null, harness: "" });
+    replaceGlobalFavoriteModels(favorites, { homeDir });
+    expect(loadSettings({ homeDir }).favoriteModels).toEqual(favorites);
+  });
+
+  it("treats a null harness as unbound", () => {
+    writeGlobal({ favoriteModels: { "write-critical": { model: "provider/model", thinking: "high", harness: null } } });
+    expect(loadSettings({ homeDir }).favoriteModels["write-critical"]).toEqual({ model: "provider/model", thinking: "high" });
+  });
+
   it("merges valid activity colors by layer without accepting terminal escapes or mutating defaults", () => {
     writeGlobal({ activityColors: { name: "#12ab34", model: "#ABCDEF", message: "#112233" } });
     writeProject({ activityColors: {

@@ -1,4 +1,4 @@
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { AgentSession, ExtensionFactory } from "@mariozechner/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -8,6 +8,7 @@ import { recordAgentActivity } from "../runtime/agent-activity";
 import * as runtime from "../../src/utils/runtime";
 import * as teams from "../../src/utils/teams";
 import * as messaging from "../../src/utils/messaging";
+import { AgentInbox } from "../../src/utils/agent-inbox";
 import * as reportEvents from "../../src/utils/report-events";
 import { checkpointReference, preflightReportCheckpoint, saveReportCheckpoint } from "../../src/results/checkpoint-report";
 import type { Member, TeamReportEvent } from "../../src/utils/models";
@@ -19,7 +20,7 @@ import { VerificationController, type VerificationDecision } from "../../src/res
 import type { CheckRunnerOptions } from "../../src/results/check-runner";
 import { loadNativeCheckOperations } from "../internal/pi-check-operations";
 import type { AgentReportSource, CompletedAgentReport, RunningReadAgent } from "../runtime/types";
-import { extractTextParts, sanitizeTuiLine } from "../ui/renderers";
+import { extractTextParts, formatInboxMessagesForModel, sanitizeTuiLine } from "../ui/renderers";
 import { createAgentCommunicationTools, formatRepairRequest, type SubmittedAgentReport } from "../tools/agent-communication-tools";
 import { registerSpawnedAgentCommunicationGuard, SPAWNED_AGENT_COMMUNICATION_GUIDANCE, USER_INTERACTION_TOOLS } from "../tools/spawned-agent-policy";
 import { requireWriteAgentTeam } from "../team/roster";
@@ -29,13 +30,15 @@ import { parseQualifiedModel } from "../../src/utils/model-resolution";
 import { closePersistedRecipient } from "../team/recipient-closure";
 import { generateExtensionInstanceId, generateLifecycleRunId, withLifecycleTombstoneLock } from "../../src/utils/lifecycle-tombstone";
 import { createLifecycleRuntime, type ShutdownTeammateOptions } from "../team/lifecycle";
-import { recordedSessionCost, type AgentCostSnapshot, type CostOutcome, type CostRun } from "../team/session-cost";
+import { recordedSessionCost, recordedUsageEntries, type AgentCostSnapshot, type CostOutcome, type CostRun } from "../team/session-cost";
 import {
   createSpawnResourcePlan,
   parentProjectTrustForSpawn,
   type SpawnResourcePlan,
 } from "../resources/spawn-resource-plan";
 import { loadPiRuntimeApi } from "../internal/pi-runtime-api";
+import { hasNativeChildPolicy, prepareNativeChildPolicy } from "../../src/native-child-policy";
+import { createNativeExtensionFactories, isNativeExtensionPath } from "../resources/native-extensions";
 import { preparePrivateAgentSessionDirectory } from "../internal/agent-session-files";
 import { isEligibleNestedReadParent, NESTED_DELEGATION_TOOL_NAMES } from "../runtime/nested-read-agents";
 import { CHILD_AGENT_LIFECYCLE_PROBE, type NestedReadAgentToolBinding } from "../tools/team-tools";
@@ -112,7 +115,7 @@ export interface RunReadAgentOptions {
   ensureReadAgentStatusTicker(): void;
   renderReadAgentStatus(): void;
   rememberCompletedAgentReport(teamName: string, report: CompletedAgentReport): void;
-  emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection?: boolean): void;
+  emitAgentReport(teamName: string, name: string, startedAt: number, tokens: number, report: string, ok: boolean, suppressLeadInjection?: boolean, summary?: string): void;
   emitAgentProgress?(teamName: string, name: string, status: string, updatedAt: number): void;
   releaseAllClaimsForAgent(teamName: string, agentName: string): Promise<string[]>;
   shutdownTeammate?(
@@ -121,6 +124,7 @@ export interface RunReadAgentOptions {
     options?: ShutdownTeammateOptions
   ): Promise<ReadAgentTeardownResult>;
   agentName?: string;
+  notifyMessageSent?: import("../tools/send-message").SendMessageOptions["notifySent"];
   renderLeadInboxStatus?(): Promise<void>;
   notifyLeadOfInboxReports?(teamName: string): Promise<void>;
   deliverMessageToActiveAgent?(
@@ -374,6 +378,12 @@ export async function sendMessageToRunningReadAgent(
   requireReceipt = false
 ): Promise<boolean> {
   if (!agent) return false;
+  if (agent.externalControl) {
+    if (!agent.acceptingMessages || agent.messageDeliveryClosed || agent.stopRequested) throw new Error(`Cannot send message to ${agent.name}: agent is finishing.`);
+    if (requireReceipt) throw new Error("External harnesses do not provide Pi message receipts.");
+    await enqueueReadAgentMessageDelivery(agent, agent.name, () => agent.externalControl!.message(content));
+    return true;
+  }
   if (!agent.session || !agent.acceptingMessages || agent.messageDeliveryClosed || agent.stopRequested) {
     throw new Error(`Cannot send message to ${agent.name}: agent is finishing.`);
   }
@@ -729,6 +739,7 @@ export async function runReadAgentInProcess(
   let submittedFinalReport: SubmittedAgentReport | undefined;
   let finalReportSubmissionInProgress = false;
   let childSessionManager: any;
+  let inbox: AgentInbox | undefined;
   let childLifecycleProbeUnsubscribe = (): void => {};
   let privateSessionDirectory: string | undefined;
   let completedReportPersisted = false;
@@ -977,7 +988,7 @@ export async function runReadAgentInProcess(
       // Workflow orchestrators consume full reports from TeamReportEvent storage.
       // Pi Prompt consumes its writer report through the private event without a lead turn.
     } else if (!options.isTeammate && (options.getTeamName() === readTeamName || readTeamName.startsWith("prompt-build-"))) {
-      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, leadReport, true);
+      options.emitAgentReport(readTeamName, member.name, state.startedAt, state.tokensUsed, leadReport, true, false, resolution.summary);
     } else {
       await ensureLeadCompletionMessage(readTeamName, member, state.startedAt, leadReport, completionSummary, member.color, completionMetadata);
     }
@@ -1019,6 +1030,7 @@ export async function runReadAgentInProcess(
       }, 5000);
     }
 
+    const piRuntimeApi = await loadPiRuntimeApi();
     const {
       createAgentSession,
       createEventBus,
@@ -1026,21 +1038,7 @@ export async function runReadAgentInProcess(
       getAgentDir,
       SessionManager,
       SettingsManager,
-    } = await loadPiRuntimeApi();
-    const agentDir = getAgentDir();
-    const projectTrusted = parentProjectTrustForSpawn(ctx, member.cwd);
-    const resourcePlan = await (options.createResourcePlan ?? createSpawnResourcePlan)({
-      cwd: member.cwd,
-      projectTrusted,
-    });
-    const createSettingsManager = SettingsManager.create as unknown as (
-      cwd: string,
-      agentDir: string,
-      options: { projectTrusted: boolean },
-    ) => any;
-    const childSettingsManager = createSettingsManager(member.cwd, agentDir, {
-      projectTrusted: resourcePlan.trust.projectTrusted,
-    });
+    } = piRuntimeApi;
     const nestedReadBinding = isEligibleNestedReadParent(member)
       ? {
           teamName: readTeamName,
@@ -1054,22 +1052,21 @@ export async function runReadAgentInProcess(
       : [];
     const nestedReadDelegationEnabled = nestedReadAgentTools.length > 0;
     const childEventBus = createEventBus();
-    const loader = new DefaultResourceLoader({
-      eventBus: childEventBus,
-      cwd: member.cwd,
-      agentDir,
-      settingsManager: childSettingsManager,
-      noExtensions: true,
-      additionalExtensionPaths: [...resourcePlan.extensionPaths],
-      extensionFactories: [registerSpawnedAgentCommunicationGuard],
-      noSkills: false,
-      appendSystemPrompt: [
+    let communicationGuardInstalled = false;
+    const mandatoryFactories: ExtensionFactory[] = [pi => {
+      registerSpawnedAgentCommunicationGuard(pi, () => submittedFinalReport !== undefined);
+      communicationGuardInstalled = true;
+    }];
+    const restricted = hasNativeChildPolicy(ctx.sessionManager);
+    const rolePrompt = [
         `You are ${roleLabel} agent '${member.name}' in Pi session '${readTeamName}', running in-process so the lead can follow and control you from Pi.`,
         role === "write"
           ? "You may use edit/write tools for the assigned scope only. Keep changes small, avoid unrelated cleanup, and report every file changed. Do not install or remove packages, start long-running services, commit, push, deploy, or make destructive changes unless the lead explicitly assigned that side effect."
+          : restricted ? ""
           : "You have the full toolset and may run any read-only shell command you need to investigate — git status/log/diff/show, grep/rg, ls, cat, running tests or builds, etc.",
         role === "write"
           ? "Use read/bash/edit/write as needed for the assignment. Prefer precise edits. Stop and report if you need broader product or architecture approval."
+          : restricted ? ""
           : "Even though the edit/write tools are available, do not use them: do not edit or write files, install or remove packages, start long-running services, commit, push, deploy, or make any other mutating or destructive change. Investigate and report; if a change is needed, recommend it to the lead instead of applying it.",
         SPAWNED_AGENT_COMMUNICATION_GUIDANCE,
         "Progress reporting is required, not optional UI polish. Call report_progress before your first work tool with a concise phrase describing what you are starting. Call it again whenever you change phase or evidence source, hit a blocker, or begin synthesis; never make more than 3 work-tool calls without a fresh progress update. Use a new phrase describing what you are doing now. It updates the activity widget without messaging or waking the lead; do not use it as a heartbeat.",
@@ -1087,11 +1084,53 @@ export async function runReadAgentInProcess(
         repairPolicy
           ? `Use report_and_exit with the complete deliverable in content. The lead authorized at most ${repairPolicy.maxAttempts} additional repair attempts for assigned checks. If the tool requests repair, stay active, inspect its observed evidence and repair only within your role and assigned scope. Report blocked or failed if you cannot continue safely. Stop only after the report is accepted; never replace the deliverable with a summary.`
           : "When finished, use report_and_exit with the complete required deliverable in content and only a short label in summary, then stop. Never replace required output with a summary. Do not wait for the lead to kill you — report and exit cleanly.",
-      ],
+      ].filter(Boolean);
+    const prepared = await prepareNativeChildPolicy(ctx.sessionManager, {
+      teamName: readTeamName, agentName: member.name, cwd: member.cwd, role,
+      piRuntimeApi, eventBus: childEventBus, mandatoryFactories, rolePrompt,
     });
-    await loader.reload();
+    if (prepared && (!communicationGuardInstalled || !rolePrompt.every(part => prepared.resourceLoader.getAppendSystemPrompt().includes(part)))) {
+      throw new Error("Native child policy omitted the mandatory communication guard or role prompt.");
+    }
+    const agentDir = getAgentDir();
+    const resourcePlan = prepared ? undefined : await (options.createResourcePlan ?? createSpawnResourcePlan)({
+      cwd: member.cwd, projectTrusted: parentProjectTrustForSpawn(ctx, member.cwd),
+    });
+    const createSettingsManager = SettingsManager.create as unknown as (
+      cwd: string, agentDir: string, options: { projectTrusted: boolean },
+    ) => any;
+    const childSettingsManager = prepared?.settingsManager ?? createSettingsManager(member.cwd, agentDir, {
+      projectTrusted: resourcePlan!.trust.projectTrusted,
+    });
+    const nativeExtensions = createNativeExtensionFactories(piRuntimeApi, resourcePlan?.extensionPaths ?? []);
+    const loader = prepared?.resourceLoader ?? new DefaultResourceLoader({
+      eventBus: childEventBus, cwd: member.cwd, agentDir, settingsManager: childSettingsManager,
+      noExtensions: true, additionalExtensionPaths: [...resourcePlan!.extensionPaths],
+      // Named builtin descriptors exist only on capable hosts; legacy SDK types accept functions only.
+      extensionFactories: [...mandatoryFactories, ...nativeExtensions] as ExtensionFactory[],
+      noSkills: false, appendSystemPrompt: rolePrompt,
+    });
+    if (!prepared) await loader.reload();
 
+    inbox = new AgentInbox(readTeamName, member.name, state.runId, async message => {
+      if (!options.isCurrentReadAgentRun(key, state)) throw new Error("Agent run changed before message delivery.");
+      await sendMessageToRunningReadAgent(state, formatInboxMessagesForModel([message]));
+    }, error => {
+      if (!state.stopRequested && !state.messageDeliveryClosed) {
+        state.lastError = runtime.createRuntimeError(error);
+        options.renderReadAgentStatus();
+      }
+    });
     const communicationTools = createAgentCommunicationTools({
+      inbox,
+      notifySent: options.notifyMessageSent,
+      onWait: (recipient, waiting) => {
+        const status = waiting ? `Waiting for reply from ${recipient} (max 60s)` : "Resuming assignment";
+        state.latestProgress = status;
+        state.progressUpdatedAt = Date.now();
+        options.emitAgentProgress?.(readTeamName, member.name, status, state.progressUpdatedAt);
+        options.renderReadAgentStatus();
+      },
       isTeammate: true,
       agentName: member.name,
       role,
@@ -1143,13 +1182,18 @@ export async function runReadAgentInProcess(
     const communicationToolNames = communicationTools.map(tool => tool.name);
     const communicationToolNameSet = new Set(communicationToolNames);
     const delegationToolNameSet = new Set<string>(NESTED_DELEGATION_TOOL_NAMES);
-    const extensionToolNames = loader.getExtensions().extensions.flatMap(extension => {
+    const loadedExtensions = loader.getExtensions().extensions;
+    const nativeToolNames = new Set(loadedExtensions
+      .filter(extension => isNativeExtensionPath(extension.path))
+      .flatMap(extension => Array.from(extension.tools.keys())));
+    const extensionToolNames = loadedExtensions.flatMap(extension => {
       return Array.from(extension.tools.keys()).filter(name =>
-        !communicationToolNameSet.has(name) && !delegationToolNameSet.has(name) && !USER_INTERACTION_TOOLS.includes(name)
+        !communicationToolNameSet.has(name) && !delegationToolNameSet.has(name)
+        && !USER_INTERACTION_TOOLS.includes(name) && !nativeToolNames.has(name)
       );
     });
     const nestedReadAgentToolNames = nestedReadAgentTools.map(tool => tool.name);
-    const activeToolNames = Array.from(new Set([
+    const activeToolNames = Array.from(new Set(prepared ? [...prepared.tools, ...communicationToolNames] : [
       "read",
       "bash",
       "edit",
@@ -1186,15 +1230,26 @@ export async function runReadAgentInProcess(
       // sessions retain custom providers and runtime-scoped credentials.
       modelRuntime: parentModelRuntime,
       modelRegistry: ctx.modelRegistry,
-      tools: activeToolNames,
-      excludeTools: USER_INTERACTION_TOOLS,
-      customTools: [...communicationTools, ...nestedReadAgentTools],
+      // An SDK allowlist would hide MCP tools registered later during session_start.
+      ...(!prepared && nativeExtensions.length ? {} : { tools: activeToolNames }),
+      excludeTools: [
+        ...prepared?.excludeTools ?? [],
+        ...USER_INTERACTION_TOOLS,
+        ...(nativeExtensions.length ? NESTED_DELEGATION_TOOL_NAMES.filter(name => !nestedReadAgentToolNames.includes(name)) : []),
+      ],
+      customTools: [...prepared?.customTools ?? [], ...communicationTools, ...nestedReadAgentTools],
       resourceLoader: loader,
       settingsManager: childSettingsManager,
       sessionManager: childSessionManager,
     } as Parameters<typeof createAgentSession>[0] & { modelRuntime?: unknown });
 
     state.session = session;
+    await prepared?.enroll(session);
+    if (!prepared && nativeExtensions.length) {
+      const activeNativeTools = new Set(session.getActiveToolNames().filter(name => nativeToolNames.has(name)));
+      if (nativeToolNames.has("codemode")) activeNativeTools.add("codemode");
+      session.setActiveToolsByName([...activeToolNames, ...activeNativeTools]);
+    }
     // Guard the request boundary too: older Agent loops have no turn-stop hook.
     if (session.agent) {
       const previous = session.agent.transformContext;
@@ -1203,10 +1258,10 @@ export async function runReadAgentInProcess(
         return previous ? previous(messages, signal) : messages;
       };
     }
-    // End the completed tool turn without requesting another model response.
+    // Hosts capture these public hooks when a prompt starts. Never abort from the reporting tool.
     if (session.agent && "finishTurn" in session.agent) {
       const agent = session.agent as typeof session.agent & {
-        finishTurn?: (...args: unknown[]) => Promise<{ action: "continue" | "end" } | undefined>;
+        finishTurn?: (...args: unknown[]) => unknown;
       };
       const previous = agent.finishTurn;
       agent.finishTurn = async (...args) => {
@@ -1225,12 +1280,36 @@ export async function runReadAgentInProcess(
     }
     const sessionLifecycle = installReadAgentSessionLifecycle(session, () => {
       if (handoffRequested) return;
-      const own = recordedSessionCost(childSessionManager.getEntries());
-      costSnapshot = { childSessionId: childSessionManager.getSessionId(), costUsd: own.complete ? own.usd : null };
+      const completedAt = Date.now();
+      const entries = childSessionManager.getEntries();
+      const own = recordedSessionCost(entries);
+      costSnapshot = {
+        childSessionId: childSessionManager.getSessionId(),
+        costUsd: own.complete ? own.usd : null,
+        telemetry: {
+          schemaVersion: 1,
+          agentName: state.name,
+          role,
+          startedAt: state.startedAt,
+          completedAt,
+          ...(member.parentLifecycleRunId ? { parentLifecycleRunId: member.parentLifecycleRunId } : {}),
+          ...(modelSlot ? { modelSlot } : {}),
+          entries: recordedUsageEntries(entries),
+        },
+      };
     });
     try {
       if (typeof session.bindExtensions === "function") {
         await (session.bindExtensions as (bindings: { mode: "print" }) => Promise<void>)({ mode: "print" });
+      } else if (prepared) {
+        throw new Error("Native child policy requires extension binding support.");
+      }
+      if (prepared) {
+        await prepared.assertReady(session);
+        const active = session.getActiveToolNames();
+        if (active.some(name => !activeToolNames.includes(name)) || communicationToolNames.some(name => !active.includes(name))) {
+          throw new Error("Native child policy tool allowlist or mandatory communication tools changed during startup.");
+        }
       }
     } finally {
       // Selected extensions emit session_start while binding. Open the startup gate
@@ -1249,7 +1328,7 @@ export async function runReadAgentInProcess(
         return execute.apply(tool, args);
       };
     }
-    if (process.env.HERDR_ENV === "1" && (member.delegationDepth ?? 0) === 0
+    if (resourcePlan && process.env.HERDR_ENV === "1" && (member.delegationDepth ?? 0) === 0
       && !member.requestedBy && !member.parentAgentName && !member.allowNestedReadAgents
       && !shouldSuppressLeadReportInjection(member)) {
       let moving: Promise<void> | undefined;
@@ -1351,6 +1430,8 @@ export async function runReadAgentInProcess(
         }
       })().catch(error => { moving = undefined; throw error; });
     }
+    state.inbox = inbox;
+    inbox.start();
     markReadAgentActivity(state, "started", "thinking");
     options.renderReadAgentStatus();
 
@@ -1716,6 +1797,8 @@ export async function runReadAgentInProcess(
       }
     }
   } finally {
+    inbox?.close();
+    state.inbox = undefined;
     childLifecycleProbeUnsubscribe();
     if (state.stopRequested) await cancelAutomaticRepair().catch(() => {});
     repairCancellationHandlers.delete(state);

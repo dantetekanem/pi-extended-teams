@@ -66,7 +66,7 @@ External agents write private temporary report artifacts. Pi validates and saves
 
 [Agent reference](docs/reference.md) covers tiers, keyboard controls, Herdr eligibility, configuration, checks, repair, checkpoints, and extension integration. [External harnesses](docs/external-harnesses.md) covers CLI profiles, tier bindings, permissions, and limits. [The teams skill](skills/teams.md) has orchestration and handoff examples. See [the changelog](CHANGELOG.md) for release history.
 
-Agents run with your system permissions. Read-only roles and file claims are coordination contracts, not sandboxes. See [access disclosures](docs/access.md) and [security reporting](SECURITY.md).
+Agents run with your system permissions. Read-only roles and file claims are coordination contracts, not sandboxes. See [access disclosures](docs/access.md) and [security reporting](SECURITY.md). [Dependabot alerts setup](docs/dependabot-alerts-setup.md) is a prepared, unexecuted plan for enabling alerts on this repository without automatic remediation PRs.
 
 ## Development
 

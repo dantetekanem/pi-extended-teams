@@ -2,6 +2,8 @@
 
 Prepared on 2026-11-02 for `dantetekanem/pi-extended-teams`, against main commit `617dedda2f648d3057da8e6e43cd6bf42fbe61ca`. This is a local plan, not an enabled control. No GitHub settings, notification preferences, dependencies or automation were changed.
 
+_Updated 2026-11-07: PR #46 has merged, so the two references below that treated it as open now say so. The rest is the plan as prepared, and its dated observations were not rerun._
+
 ## Verified state
 
 Read-only requests at 2026-11-02 10:13 UTC returned:
@@ -9,7 +11,7 @@ Read-only requests at 2026-11-02 10:13 UTC returned:
 - `GET /repos/dantetekanem/pi-extended-teams/dependabot/alerts`: HTTP 403, `Dependabot alerts are disabled for this repository.` This is not zero alerts.
 - `GET /repos/dantetekanem/pi-extended-teams/vulnerability-alerts`: HTTP 404, `Vulnerability alerts are disabled.`
 - Repository metadata: public, default branch `main`, current caller has admin access, and Dependabot security updates are separately disabled.
-- PR #46 is open at `fa92231c8a6b36b23f457bb35e73c9f19fa6451e` and changes both `package.json` and `pnpm-lock.yaml`: https://github.com/dantetekanem/pi-extended-teams/pull/46
+- PR #46 merged on 2026-11-07 as `e3464d5`, changing both `package.json` and `pnpm-lock.yaml`: https://github.com/dantetekanem/pi-extended-teams/pull/46. The plan was written while it was still open at `fa92231`.
 
 GitHub CLI printed a scope-refresh suggestion after the 403. The server's explicit disabled response and the independent setting check establish the observed state; no credential changes were attempted. A generic 403 or 404 without this evidence could instead mean insufficient access.
 
@@ -50,7 +52,7 @@ The checked-in `pnpm-lock.yaml:11-13` still selects `@mariozechner/pi-coding-age
 
 The advisory requires a local attacker on a shared writable temporary directory and a victim loading a temporary npm/git extension source. It primarily concerns shared Linux hosts; default macOS/Windows temporary directories are usually user-scoped. The lockfile establishes an affected version, not a reproduced attack or the version installed in the user's running host.
 
-Coordinate remediation with PR #46 before changing either dependency file. A package-name migration needs compatibility checks for this extension's imports and peer contract, not a blind version bump. Keep alert enablement, dependency repair and host upgrades as distinct outcomes. This branch makes none of those runtime changes.
+PR #46 has since merged, so work against main rather than that branch. A package-name migration needs compatibility checks for this extension's imports and peer contract, not a blind version bump. Keep alert enablement, dependency repair and host upgrades as distinct outcomes. This branch makes none of those runtime changes.
 
 ## Sources and remaining gaps
 

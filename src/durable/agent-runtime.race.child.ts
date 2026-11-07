@@ -20,6 +20,11 @@ const hold = defineTool({
   },
 });
 
+// Held for the whole process on purpose. The owner lock lives in the runtime's SQLite handle, so a runtime
+// that only a finished function referenced can be collected, and collecting it drops the lock while this
+// process is still alive. The test this child serves depends on the lock staying held until it is killed.
+let held: DurableAgentRuntime | undefined;
+
 async function main(): Promise<void> {
   const models = createModels();
   const faux = fauxProvider();
@@ -30,6 +35,7 @@ async function main(): Promise<void> {
     models,
     extensions: [defineExtension({ name: "hold-tools", tools: [hold] })],
   });
+  held = runtime;
   await runtime.spawn({
     name: "reader",
     role: "read",

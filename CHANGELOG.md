@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.7.0] - 2026-11-07
+
+### Experimental
+
+Durable agents ship for testing only. They are opt-in, pin `@earendil-works/pi-durable` and `@earendil-works/chord` at exactly `1.0.0` because those APIs are experimental, and may change. Nothing here is supported behaviour yet.
+
+- Spawn agents on the Pi Durable runtime with one `durable_agents` tool that starts, messages, interrupts, stops and inspects them. Enable it with `experimental.durableAgents`; while the setting is off the tool is absent and behaviour is unchanged. Each session keeps its agents in `~/.pi/agent/pi-extended-teams/durable-agents/<session id>/agents.sqlite`, outside the team folders that startup cleanup removes.
+- Reopen a session and its unfinished agents resume, delivering reports for each. A report goes out only while the lead is idle, one per lead turn, and counts as delivered only once it appears in the session history. A report that never got there is sent again. A same-process `/reload` keeps the runtime open for 60 seconds so the reloaded extension can reattach.
+- Durable agents receive `AGENTS.md` and skills but no Pi extensions, team tools, claims, checks, completion groups, live view or Herdr. `spawn_agent` is unchanged.
+
+### Added
+
+- Save a private `startup-failure.json` before an external agent's failed startup is cleaned up, holding an allowlisted Herdr error code and ownership-verified status fields, and reference only existing report or diagnostic files. Raw CLI errors are discarded, so the exact blocking reason stays unknown rather than guessed (#53).
+
+### Fixed
+
+- Stop an agent's owning session once `report_and_exit` is accepted. Ending the low-level turn alone let the session restart for queued messages or before-settle continuation, so an agent could keep working after reporting. Later model requests and tool execution stay guarded on older hosts without turn-stop hooks, rejected reports remain runnable for repair, and closed reporters leave the active count while cleanup finishes (#45).
+- Report `unknown` instead of `stalled` for an old run whose runtime telemetry is unavailable.
+- Ship real `allowBuilds` booleans in `pnpm-workspace.yaml`. The file carried the literal placeholder text `set this to true or false`, which pnpm 11 rejects, and pnpm then refused to run any script, so a fresh checkout could not install, typecheck or test.
+- Keep the durable race child's runtime alive so it holds the owner lock. The lock lived in a runtime the child no longer referenced, so collection released it while the child was still alive and the concurrency test failed intermittently.
+
+### Dependencies
+
+- `vitest` 4.1.8 to 5.1.0, `uuid` 11.1.1 to 14.0.3, `@types/node` 25.9.2 to 26.6.6.
+- `actions/checkout` 4 to 7, `actions/setup-node` 4 to 7, `pnpm/action-setup` refreshed.
+- Weekly Dependabot version updates for the pnpm lockfile and the Actions used by CI and publishing.
+
 ## [2.6.3] - 2026-11-04
 
 ### Changed

@@ -50,11 +50,13 @@
     "!src/**/*.race.child.ts",
     "package.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "SECURITY.md",
     "docs/access.md",
     "docs/reference.md",
     "docs/external-harnesses.md",
+    "docs/dependabot-alerts-setup.md",
     "assets/pi-extended-teams-demo.gif"
   ],
   "dependencies": {

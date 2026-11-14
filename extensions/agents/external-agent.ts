@@ -143,7 +143,13 @@ export async function runExternalAgent(
       try {
         await messaging.sendPlainMessageOnceIfRunning(teamName, member.name, parent, attributed, event.summary ?? "External harness report", {
           expectedRecipientRunId: parentRun, operationId: `external-report:${runId}`,
-          metadata: { helperReport: true, helperCompletion: true, runId, requestedBy: parent },
+          metadata: {
+            helperReport: true,
+            helperCompletion: true,
+            runId,
+            requestedBy: parent,
+            recipientRunId: parentRun,
+          },
         });
         // Persisted inbox delivery owns the report; waking is not the parent's entire model turn.
         void Promise.resolve()

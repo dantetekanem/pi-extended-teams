@@ -7,6 +7,7 @@ import * as teams from "../../src/utils/teams";
 import * as claims from "../../src/utils/claims";
 import * as reports from "../../src/utils/report-events";
 import * as messaging from "../../src/utils/messaging";
+import { AgentInbox } from "../../src/utils/agent-inbox";
 import { readLifecycleTombstone } from "../../src/utils/lifecycle-tombstone";
 import type { Member } from "../../src/utils/models";
 import type { RunningReadAgent } from "../runtime/types";
@@ -266,13 +267,33 @@ describe("external agent ownership and reports", () => {
     expect(f.states.size).toBe(0);
   });
 
-  it("delivers a nested report to the exact parent run", async () => {
+  it.each(["current", "replacement"])("delivers a persisted nested report only to its parent run: %s", async recipient => {
     const f = await setup("parent-run");
     const work = f.launch();
     f.complete();
     await work;
     expect(f.options.deliverMessageToActiveAgent).toHaveBeenCalledWith("test", "writer", expect.stringContaining("Reviewed"), f.member.parentLifecycleRunId, true);
-    expect((await messaging.readInbox("test", "writer", false, false)).length).toBe(1);
+    const pending = await messaging.readInbox("test", "writer", true, false);
+    expect(pending).toEqual([expect.objectContaining({ text: expect.stringContaining("Reviewed"), read: false })]);
+
+    const recipientRunId = recipient === "current" ? f.member.parentLifecycleRunId : "replacement";
+    await teams.updateMember("test", "writer", { lifecycleRunId: recipientRunId });
+    const receive = vi.fn(async () => {});
+    const mailbox = new AgentInbox("test", "writer", recipientRunId, receive);
+    try {
+      await mailbox.refresh();
+      if (recipient === "current") {
+        expect(receive).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("Reviewed") }));
+        await vi.waitFor(async () => {
+          expect(await messaging.readInbox("test", "writer", true, false)).toEqual([]);
+        });
+      } else {
+        expect(receive).not.toHaveBeenCalled();
+        expect(await messaging.readInbox("test", "writer", true, false)).toEqual(pending);
+      }
+    } finally {
+      mailbox.close();
+    }
   });
 
   it("falls back to lead rather than waking a replacement parent", async () => {

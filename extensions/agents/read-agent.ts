@@ -599,7 +599,14 @@ async function ensureReadHelperCompletionMessages(
         color,
         operationId: `helper-report:${runId}`,
         expectedRecipientRunId: expectedRequesterRunId,
-        metadata: { helperReport: true, helperCompletion: true, runId, outcome, requestedBy: member.requestedBy },
+        metadata: {
+          helperReport: true,
+          helperCompletion: true,
+          runId,
+          outcome,
+          requestedBy: member.requestedBy,
+          recipientRunId: expectedRequesterRunId,
+        },
       }
     );
     requesterReceivedReport = true;

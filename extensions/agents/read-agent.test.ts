@@ -26,6 +26,7 @@ import { readInbox, requireRunningMessageRecipient, sendPlainMessage, sendPlainM
 import { listTeamReportEvents } from "../../src/utils/report-events.js";
 import * as reportEvents from "../../src/utils/report-events.js";
 import type { Member } from "../../src/utils/models.js";
+import { AgentInbox } from "../../src/utils/agent-inbox.js";
 
 const piMocks = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
@@ -4443,6 +4444,40 @@ describe("in-process read agent tool wiring", () => {
       expect(options.runningReadAgents.get("team:writer")?.runId).toBe("replacement-run");
       expect(requesterSession.sendUserMessage).toHaveBeenCalledOnce();
     });
+  });
+
+  it.each(["writer-run", "replacement-run"])("keeps a persisted helper report bound to its requester when consumed by %s", async recipientRunId => {
+    const helper = {
+      ...fixtureMember("helper"),
+      requestedBy: "writer",
+      parentAgentName: "writer",
+      parentLifecycleRunId: "writer-run",
+    };
+    writeTeamConfig("team", helper, [{ ...fixtureMember("writer", "write"), lifecycleRunId: "writer-run" }]);
+    piMocks.createAgentSession.mockResolvedValue({ session: makeSession() });
+    await runReadAgentInProcess("team", helper, "inspect", {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, { ...makeRunOptions(), deliverMessageToActiveAgent: vi.fn(async () => true) });
+    const pending = await readInbox("team", "writer", true, false);
+    expect(pending).toEqual([expect.objectContaining({ text: "final report", read: false })]);
+
+    await teams.updateMember("team", "writer", { lifecycleRunId: recipientRunId });
+    const receive = vi.fn(async () => {});
+    const mailbox = new AgentInbox("team", "writer", recipientRunId, receive);
+    try {
+      await mailbox.refresh();
+      if (recipientRunId === "writer-run") {
+        expect(receive).toHaveBeenCalledWith(expect.objectContaining({ text: "final report" }));
+        await vi.waitFor(async () => {
+          expect(await readInbox("team", "writer", true, false)).toEqual([]);
+        });
+      } else {
+        expect(receive).not.toHaveBeenCalled();
+        expect(await readInbox("team", "writer", true, false)).toEqual(pending);
+      }
+    } finally {
+      mailbox.close();
+    }
   });
 
   it.each([false, undefined])("forwards the full helper report to the lead when direct wake is unavailable: %s", async (available) => {

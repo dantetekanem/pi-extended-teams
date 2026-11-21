@@ -250,6 +250,28 @@ describe("spawn resource planning", () => {
     ]);
   });
 
+  it("gives every agent the absolute paths its launcher names in PI_EXTENDED_TEAMS_AGENT_EXTENSIONS, past the allow list", () => {
+    const root = tempRoot();
+    const lead = touch(path.join(root, "lead.ts"));
+    const named = touch(path.join(root, "host", "named.mjs"));
+    const namedLink = path.join(root, "named-link.mjs");
+    fs.symlinkSync(named, namedLink);
+    const leadExtensions = snapshotLeadExtensions({
+      getCommands: () => [{ name: "lead", source: "extension", sourceInfo: sourceInfo(lead) }],
+      getAllTools: () => [],
+    });
+    const env = { PI_EXTENDED_TEAMS_AGENT_EXTENSIONS: [named, "relative.mjs", "", namedLink, lead].join(path.delimiter) };
+    const extensionPathsFor = (allow: string[] | null, planEnv: Record<string, string | undefined>) => {
+      const settings = structuredClone(DEFAULT_SETTINGS);
+      settings.extensions.allow = allow;
+      return createSpawnResourcePlan({ cwd: root, projectTrusted: false, settings, leadExtensions, env: planEnv }).extensionPaths;
+    };
+
+    expect(extensionPathsFor([], env)).toEqual([named, lead]);
+    expect(extensionPathsFor(null, env)).toEqual([lead, named]);
+    expect(extensionPathsFor(null, {})).toEqual([lead]);
+  });
+
   it("never transfers project trust across cwd", () => {
     const root = tempRoot();
     const project = path.join(root, "project");

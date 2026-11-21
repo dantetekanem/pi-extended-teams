@@ -79,6 +79,17 @@ export interface CreateSpawnResourcePlanOptions {
   settings?: PiExtendedTeamsSettings;
   pi?: LeadRegistrationApi;
   leadExtensions?: readonly LeadExtensionSnapshot[];
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * Extensions the program that started this Pi gives every agent it spawns, as absolute paths split by the path
+ * delimiter. Agents inherit the variable, so the agents they spawn load them too. The lead itself does not.
+ */
+export const AGENT_EXTENSIONS_ENV = "PI_EXTENDED_TEAMS_AGENT_EXTENSIONS";
+
+function launcherAgentExtensions(env: Record<string, string | undefined>): string[] {
+  return (env[AGENT_EXTENSIONS_ENV] ?? "").split(path.delimiter).filter((entry) => path.isAbsolute(entry));
 }
 
 function canonicalPath(filePath: string): string {
@@ -239,9 +250,19 @@ export function createSpawnResourcePlan(options: CreateSpawnResourcePlanOptions)
     }
   }
 
+  const extensionPaths = records.filter((extension) => extension.selected).map((extension) => extension.path);
+  // The launcher's extensions come on top of the user's selection: the allow list only chooses among the lead's own.
+  const loaded = new Set(extensionPaths.map(canonicalPath));
+  for (const entry of launcherAgentExtensions(options.env ?? process.env)) {
+    const identity = canonicalPath(entry);
+    if (loaded.has(identity)) continue;
+    loaded.add(identity);
+    extensionPaths.push(entry);
+  }
+
   return deepFreezePlan({
     selectionMode: allow === null ? "default" : "explicit",
-    extensionPaths: records.filter((extension) => extension.selected).map((extension) => extension.path),
+    extensionPaths,
     selfExtensionPath: records.find((extension) => extension.isSelf)?.path,
     extensions: records,
     diagnostics,

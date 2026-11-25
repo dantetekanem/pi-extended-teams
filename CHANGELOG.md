@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.8.0] - 2026-11-25
+
+### Added
+
+- Load the extensions named in `PI_EXTENDED_TEAMS_AGENT_EXTENSIONS` in every spawned agent. A program that starts Pi can list absolute extension paths, separated by the platform's path delimiter, and each agent the session spawns loads them on top of the user's selection, even when `extensions.allow` leaves them out. Agents inherit the variable, so nested agents load them too; the lead does not. Relative paths are ignored, and a path the agent already loads is not added twice.
+
+### Fixed
+
+- Bind each persisted helper report to the parent run that requested it. A replacement agent with the same name could receive its predecessor's unread report; it now skips reports bound to another run, which stay unread in the inbox. This covers native and external helpers. Inbox messages without a bound run are delivered as before.
+- Include `CHANGELOG.md` and `docs/dependabot-alerts-setup.md` in the npm package. The README links to both.
+
 ## [2.7.1] - 2026-11-07
 
 ### Experimental

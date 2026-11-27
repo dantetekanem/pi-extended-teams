@@ -1560,7 +1560,11 @@ export async function runReadAgentInProcess(
         while (state.awaitingReply && !submittedFinalReport) {
           markReadAgentActivity(state, `waiting for an answer from ${state.awaitingReply.recipient}`, "thinking");
           options.renderReadAgentStatus();
-          if (!await waitForPostInterruptOperation(state.completedOperationGeneration ?? 0, readAgentWakeGeneration(state))) return;
+          const resumed = await waitForPostInterruptOperation(
+            state.completedOperationGeneration ?? 0,
+            readAgentWakeGeneration(state),
+          );
+          if (!resumed) return;
           refreshReadAgentStats(state, session);
         }
         completionResolution = resolveCurrentReport();

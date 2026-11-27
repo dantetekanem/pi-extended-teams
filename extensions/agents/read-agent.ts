@@ -1121,6 +1121,8 @@ export async function runReadAgentInProcess(
 
     inbox = new AgentInbox(readTeamName, member.name, state.runId, async message => {
       if (!options.isCurrentReadAgentRun(key, state)) throw new Error("Agent run changed before message delivery.");
+      // Whatever the asked agent sends next answers the question, or the turn it starts asks again.
+      if (message.from === state.awaitingReply?.recipient) state.awaitingReply = undefined;
       await sendMessageToRunningReadAgent(state, formatInboxMessagesForModel([message]));
     }, error => {
       if (!state.stopRequested && !state.messageDeliveryClosed) {
@@ -1137,6 +1139,9 @@ export async function runReadAgentInProcess(
         state.progressUpdatedAt = Date.now();
         options.emitAgentProgress?.(readTeamName, member.name, status, state.progressUpdatedAt);
         options.renderReadAgentStatus();
+      },
+      onUnanswered: (messageId, recipient) => {
+        state.awaitingReply = { messageId, recipient };
       },
       isTeammate: true,
       agentName: member.name,
@@ -1550,6 +1555,18 @@ export async function runReadAgentInProcess(
           if (state.completedOperationError) throw state.completedOperationError;
         }
       } else if (!state.stopRequested && options.isCurrentReadAgentRun(key, state)) {
+        // An agent whose question was still unanswered when its wait ended stays alive, taking messages, until a reply
+        // starts its next turn. Only report_and_exit, a stop or a failure ends it meanwhile.
+        while (state.awaitingReply && !submittedFinalReport) {
+          markReadAgentActivity(state, `waiting for an answer from ${state.awaitingReply.recipient}`, "thinking");
+          options.renderReadAgentStatus();
+          const resumed = await waitForPostInterruptOperation(
+            state.completedOperationGeneration ?? 0,
+            readAgentWakeGeneration(state),
+          );
+          if (!resumed) return;
+          refreshReadAgentStats(state, session);
+        }
         completionResolution = resolveCurrentReport();
         if (completionResolution.terminalFailure) {
           throw unavailableReportError(completionResolution.terminalFailure);

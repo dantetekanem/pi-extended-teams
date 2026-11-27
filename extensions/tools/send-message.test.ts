@@ -76,6 +76,25 @@ it("caps a requested wait at 60 seconds and returns timeout rather than an inven
   expect(vi.getTimerCount()).toBe(0);
 });
 
+it("hands a question still unanswered at the deadline to the runner that keeps the agent alive for it", async () => {
+  let waiting!: () => void;
+  const ready = new Promise<void>(resolve => { waiting = resolve; });
+  vi.useFakeTimers();
+  const onUnanswered = vi.fn();
+  const sending = tool("reader", {
+    onWait: (_recipient, active) => { if (active) waiting(); },
+    onUnanswered,
+  }).execute("question", { content: "Which branch?", wait_for_reply: true });
+  await ready;
+  await vi.advanceTimersByTimeAsync(60_000);
+  const result = await sending;
+
+  expect(result.details).toMatchObject({ status: "timed_out" });
+  expect(onUnanswered).toHaveBeenCalledWith(result.details.messageId, "team-lead");
+  expect(result.content[0].text).toMatch(/end your turn without report_and_exit/i);
+  expect(result.content[0].text).toMatch(/reply resumes you/i);
+});
+
 it.each([
   ["append", "cancel"], ["append", "timeout"],
   ["notification", "cancel"], ["notification", "timeout"],

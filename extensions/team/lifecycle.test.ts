@@ -311,7 +311,8 @@ describe("team lifecycle performance", () => {
       expect(notice).toHaveBeenCalledTimes(2);
     });
 
-    it.each(["tool", "parallel-tools", "check", "checkpoint", "starting", "finishing", "closing", "child", "replaced"])("protects %s work", async kind => {
+    it.each(["tool", "parallel-tools", "check", "checkpoint", "starting", "finishing", "closing", "child", "replaced", "awaiting-reply"])("protects %s work", async kind => {
+      if (kind === "awaiting-reply") state.awaitingReply = { messageId: "question-1", recipient: "team-lead" };
       if (kind === "tool") state.activeToolName = "bash";
       if (kind === "parallel-tools") state.activeWork = new Set(["tool:pending"]);
       if (kind === "check") state.checkOperation = { controller: new AbortController(), settled: Promise.resolve() };

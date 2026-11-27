@@ -5274,4 +5274,63 @@ describe("in-process read agent tool wiring", () => {
       name: "reader", status: "completed", report: "resumed final report",
     }));
   });
+
+  /** An edit agent that asks the lead a question it cannot go on without, whose one-second wait ends unanswered. */
+  async function startAskingWriter() {
+    const writer = { ...fixtureMember("writer", "write"), prompt: "Fix the totals" };
+    writeTeamConfig("team", writer);
+    const runningReadAgents = new Map<string, RunningReadAgent>();
+    const session = makeSession();
+    session.isStreaming = false;
+    session.messages = [{ role: "assistant", content: "Which branch should the fix go on?" }];
+    const tools = () => piMocks.createAgentSession.mock.calls.at(-1)![0].customTools;
+    let asked: any;
+    session.prompt.mockImplementation(async () => {
+      const send = tools().find((tool: any) => tool.name === "send_message");
+      asked = await send.execute("ask", { content: "Which branch should the fix go on?", wait_for_reply: true, timeout_seconds: 1 });
+    });
+    piMocks.createAgentSession.mockResolvedValue({ session });
+    const options = makeRunOptions(runningReadAgents);
+    let settled = false;
+    const run = runReadAgentInProcess("team", writer, writer.prompt, {
+      modelRegistry: { find: () => ({ provider: "provider", id: "model" }) },
+    }, options).then(() => { settled = true; });
+    await vi.waitFor(() => expect(asked?.details.status).toBe("timed_out"), { timeout: 3000 });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    return { writer, session, tools, options, run, state: runningReadAgents.get("team:writer")!, settled: () => settled };
+  }
+
+  it("keeps an edit agent whose question went unanswered alive until the lead's reply, then ends with its own report", async () => {
+    const asking = await startAskingWriter();
+    asking.session.sendUserMessage.mockImplementation(async (...args: any[]) => {
+      expect(args[0]).toContain("Put it on fix-totals.");
+      await asking.tools().find((tool: any) => tool.name === "report_and_exit").execute("done", { content: "Fixed on fix-totals." });
+    });
+
+    expect(asking.settled()).toBe(false);
+    expect(asking.options.rememberCompletedAgentReport).not.toHaveBeenCalled();
+    expect(asking.state).toMatchObject({ acceptingMessages: true, awaitingReply: { recipient: "team-lead" } });
+
+    await sendPlainMessage("team", "team-lead", "writer", "Put it on fix-totals.", "Answer");
+    await asking.state.inbox!.refresh();
+    await asking.run;
+
+    expect(asking.session.sendUserMessage).toHaveBeenCalledOnce();
+    expect(asking.options.rememberCompletedAgentReport).toHaveBeenCalledOnce();
+    expect(asking.options.rememberCompletedAgentReport).toHaveBeenCalledWith("team", expect.objectContaining({
+      name: "writer", status: "completed", report: "Fixed on fix-totals.",
+    }));
+  });
+
+  it("ends an agent waiting on an answer when it is stopped, without taking its question as its report", async () => {
+    const asking = await startAskingWriter();
+    const lifecycle = createLifecycleRuntime({ ...asking.options, terminal: null, drainWriteQueue: async () => {}, getSessionCwd: () => root });
+
+    await lifecycle.shutdownTeammate("team", asking.writer);
+    await asking.run;
+
+    expect(asking.options.rememberCompletedAgentReport).not.toHaveBeenCalled();
+    expect(asking.session.sendUserMessage).not.toHaveBeenCalled();
+    expect(asking.options.runningReadAgents.size).toBe(0);
+  });
 });

@@ -521,7 +521,7 @@ export function createLifecycleRuntime(options: LifecycleRuntimeOptions) {
       if (state) {
         return state.status === "starting" || state.status === "finishing" || !!state.stopRequested
           || state.acceptingMessages === false || !!state.activeToolName || !!state.activeWork?.size
-          || !!state.checkOperation || !!state.checkpointOperation;
+          || !!state.checkOperation || !!state.checkpointOperation || !!state.awaitingReply;
       }
       return status?.ready !== true || status.currentAction === "starting" || status.currentAction === "finishing"
         || status.currentAction === "done" || !!status.activeToolName || !!status.activeWorkCount;

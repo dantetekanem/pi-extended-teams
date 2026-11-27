@@ -61,7 +61,7 @@
   ],
   "dependencies": {
     "@earendil-works/chord": "1.0.0",
-    "@earendil-works/pi-durable": "1.0.0",
+    "@earendil-works/pi-durable": "1.5.2",
     "uuid": "^14.0.3"
   },
   "peerDependencies": {

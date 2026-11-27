@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.8.1] - 2026-11-26
+
+### Fixed
+
+- Keep an in-process spawned agent alive while its question to the lead is unanswered. An agent that asked with `send_message` and `wait_for_reply` ended once the 60-second wait ran out and its turn ended: its question became its final report, and it never heard the answer. It now stays alive and keeps taking messages, and the lead's reply starts its next turn with its work as it left it. The timeout result tells it to end its turn and wait. It ends only with `report_and_exit`, a stop or a failure, and the idle watchdog does not stop it while it waits. An agent that ends its turn with its work done still reports and exits as before.
+
 ## [2.8.0] - 2026-11-25
 
 ### Added

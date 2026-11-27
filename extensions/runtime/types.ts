@@ -31,6 +31,8 @@ export interface RunningReadAgent extends ManagedReadAgentLifecycleState {
   completedOperationInterrupted?: boolean;
   completedOperationError?: unknown;
   operationAwaitingResume?: boolean;
+  /** A question this agent cannot go on without, still unanswered when its reply wait ended. It stays alive until a reply. */
+  awaitingReply?: { messageId: string; recipient: string };
   lastError?: RuntimeError;
   idleNudgeLevel?: "soft" | "hard";
   role?: string;

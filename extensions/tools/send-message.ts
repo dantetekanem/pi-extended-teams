@@ -12,6 +12,8 @@ export interface SendMessageOptions {
   getLifecycleRunId?(): string | undefined;
   inbox?: AgentInbox;
   onWait?(recipient: string, waiting: boolean): void;
+  /** A runner that keeps the agent alive while its question is unanswered, told when a wait ends without the reply. */
+  onUnanswered?(messageId: string, recipient: string): void;
   notifySent?(teamName: string, recipient: string, message: InboxMessage): Promise<void>;
 }
 interface SendMessageParams {
@@ -96,10 +98,13 @@ export function createSendMessageTool(options: SendMessageOptions) {
           await delivery;
         }
         const status = result?.status ?? "sent";
+        if (status === "timed_out") options.onUnanswered?.(messageId, recipient);
         const text = result?.status === "replied"
           ? `Reply from ${result.message.from}:\n${result.message.text}`
           : status === "timed_out"
-            ? "No reply before the deadline. Continue only independent work within your assignment. Keep essential unanswered decisions blocked; silence grants no permission."
+            ? options.onUnanswered
+              ? `No reply yet. Continue only work that does not depend on the answer. If none is left, end your turn without report_and_exit: you stay alive, and ${recipient}'s reply resumes you here. Silence grants no permission.`
+              : "No reply before the deadline. Continue only independent work within your assignment. Keep essential unanswered decisions blocked; silence grants no permission."
             : `Message sent to ${recipient}.`;
         const storageWarning = persisted ? "" : "\nMessage storage is still pending; delivery is unconfirmed.";
         return {

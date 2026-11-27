@@ -60,7 +60,7 @@
     "assets/pi-extended-teams-demo.gif"
   ],
   "dependencies": {
-    "@earendil-works/chord": "1.0.0",
+    "@earendil-works/chord": "1.5.2",
     "@earendil-works/pi-durable": "1.0.0",
     "uuid": "^14.0.3"
   },

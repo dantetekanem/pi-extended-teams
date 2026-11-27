@@ -79,7 +79,7 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-ai": "1.5.2",
     "@types/node": "^26.6.6",
     "jiti": "2.7.0",
     "ts-node": "^10.9.2",
